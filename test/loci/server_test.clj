@@ -1,6 +1,7 @@
 (ns loci.server-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is]]
+            [loci.agent :as agent]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.server :as srv]
@@ -348,6 +349,30 @@
     (is (= "note:n-1" (srv/resolve-ref flow "$9")))       ; past the end → the latest output
     (is (= "tbl:t" (srv/resolve-ref flow "tbl:t")))       ; plain ids pass through
     (is (= 5 (srv/resolve-ref flow 5)))))                 ; non-strings untouched
+
+(deftest compute-retries-once-with-error-feedback
+  ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
+  ;; coin-flipped the whole flow. One retry, error fed back, then honest.
+  (let [calls (atom [])]
+    (with-redefs [agent/make-clj-transform
+                  (fn [cols sample prompt & [prev-code err]]
+                    (swap! calls conj err)
+                    (if err "(mapv #(assoc % :x 1) rows)" "(bad"))]
+      (let [st (store-with-table)
+            r  (srv/compute-clj! st "tbl:t" "add x" nil)]
+        (is (nil? (:error r)))
+        (is (= 2 (count @calls)))
+        (is (nil? (first @calls)))                        ; first attempt: no error context
+        (is (string? (second @calls)))                    ; retry got the eval error
+        (is (= 1 (:x (first (:value (sub/object st (:openId r)))))))))))
+
+(deftest compute-fails-honestly-after-two-bad-attempts
+  (with-redefs [agent/make-clj-transform (fn [& _] "(bad")]
+    (let [st (store-with-table)
+          before (count (sub/history st))
+          r (srv/compute-clj! st "tbl:t" "x" nil)]
+      (is (str/starts-with? (:error r) "compute failed:"))
+      (is (= before (count (sub/history st)))))))         ; nothing committed
 
 (deftest flow-step-refs-walk-back-past-outputless-steps
   ;; the live-fire bug: the planner counted 1-based, so "$1" hit the GATE

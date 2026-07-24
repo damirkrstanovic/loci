@@ -267,11 +267,21 @@
     (let [o (sub/object st id) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "compute works on tables"}
-        (let [code (agent/make-clj-transform (mapv name (keys (first rows))) (take 3 rows) prompt)
-              r    (run-clj-rows code rows)
+        (let [cols    (mapv name (keys (first rows)))
+              sample  (take 3 rows)
+              attempt (fn [prev-code err]
+                        (let [code (agent/make-clj-transform cols sample prompt prev-code err)]
+                          (assoc (try (run-clj-rows code rows)
+                                      (catch Exception e {:error (.getMessage e)}))
+                                 :code code)))
+              ;; one bad generation shouldn't sink the request: retry once,
+              ;; feeding the eval error back so the model can fix its code
+              r1   (attempt nil nil)
+              r    (if (:error r1) (attempt (:code r1) (:error r1)) r1)
+              code (:code r)
               out  (:rows r)]
           (if (:error r)
-            r
+            {:error (str "compute failed: " (:error r))}
             (let [nf (count (filter #(= :fn (:kind %)) (vals (sub/objects st))))
                   nt (count (filter #(= :table (:kind %)) (vals (sub/objects st))))
                   p  (str/trim prompt)

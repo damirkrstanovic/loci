@@ -122,8 +122,9 @@
 (defn make-clj-transform
   "Natural-language request → a Clojure expression that evaluates to a pure
    (fn [rows] …) returning new rows. Run SCI-sandboxed on the JVM — computation
-   stays in the substrate's own language; the browser only renders the result."
-  [columns sample prompt]
+   stays in the substrate's own language; the browser only renders the result.
+   With prev-code + err, asks the model to correct its failed attempt."
+  [columns sample prompt & [prev-code err]]
   (let [kws (str/join " " (map #(str ":" %) columns))
         sys (str "You write ONE Clojure expression over `rows` — a vector of maps with KEYWORD keys " kws " "
                  "(sample: " (json/write-str sample) "). `rows` is already bound; write a bare expression that "
@@ -133,8 +134,13 @@
                  "Math/* (e.g. Math/round, Math/pow, Math/sqrt). NO other Java interop, NO I/O, NO atoms. "
                  "IMPORTANT: numeric results must be doubles or rounded longs, NEVER ratios — wrap division "
                  "as (double (/ a b)) or round it. Respond with ONLY the Clojure expression — no markdown "
-                 "fences, no prose, no comments.")]
-    (strip-code-fence (chat [{:role "system" :content sys} {:role "user" :content prompt}]))))
+                 "fences, no prose, no comments.")
+        msgs (cond-> [{:role "system" :content sys} {:role "user" :content prompt}]
+               ;; a failed attempt comes back with its error so the model can fix it
+               err (conj {:role "assistant" :content (str prev-code)}
+                         {:role "user" :content (str "That expression failed with: " err
+                                                     "\nReturn a corrected expression — same rules, ONLY the expression.")}))]
+    (strip-code-fence (chat msgs))))
 
 (defn describe-view
   "Natural-language request → a JSON view-spec over the given columns."
