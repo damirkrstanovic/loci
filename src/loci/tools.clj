@@ -27,6 +27,45 @@
         ks (mapv keyword hdr)]
     (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
 
+;; ---- markdown-table salvage: models sometimes write the table INTO prose
+;; instead of calling save_table. Deterministic extraction from the agent's
+;; own text — parsed by rules, never re-asked. ----
+(defn- md-cells [line]
+  (let [line (str/trim line)
+        line (cond-> line (str/starts-with? line "|") (subs 1))
+        line (cond-> line (str/ends-with? line "|") (subs 0 (dec (count line))))]
+    (mapv #(str/trim (str/replace % "**" "")) (str/split line #"\|"))))
+
+(defn- md-sep? [line] (boolean (re-matches #"[\s|:\-]+" line)))
+
+(defn- md-cell-val
+  "\"~30% (estimated)\" → 30; \"1.5\" → 1.5; letters-first cells stay strings."
+  [s]
+  (if-let [m (re-find #"^[^A-Za-z]*?(-?\d+(?:\.\d+)?)" s)]
+    (->val (second m))
+    s))
+
+(defn md-table->rows
+  "The first markdown table in text → vector of maps with keyword columns,
+   or nil when there is no table worth the name (≥2 cols, ≥1 data row)."
+  [text]
+  (let [tbl (->> (str/split-lines (str text))
+                 (partition-by #(str/includes? % "|"))
+                 (filter #(str/includes? (first %) "|"))
+                 (filter #(>= (count %) 2))
+                 first)]
+    (when tbl
+      (let [[hdr & body] (remove md-sep? tbl)
+            ks   (mapv #(keyword (-> % str/lower-case
+                                     (str/replace #"[^a-z0-9]+" "_")
+                                     (str/replace #"^_+|_+$" "")))
+                       (md-cells hdr))
+            rows (keep (fn [l] (let [cs (md-cells l)]
+                                 (when (= (count cs) (count ks))
+                                   (zipmap ks (map md-cell-val cs)))))
+                       body)]
+        (when (and (>= (count ks) 2) (seq rows)) (vec rows))))))
+
 ;; ---- tool specs (OpenAI-style) ----
 (def specs
   [{:type "function"

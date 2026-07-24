@@ -690,10 +690,16 @@
                    (remembered-context prompt))
           text (agent/chat-tools [{:role "system" :content sys} {:role "user" :content prompt}]
                                  tools/specs tf)
-          tid (first @saved)
+          p (str/trim prompt)
+          tid (or (first @saved)
+                  ;; the model wrote its table INTO the prose instead of
+                  ;; calling save_table — salvage it deterministically
+                  (when-let [rows (tools/md-table->rows text)]
+                    (:saved_as (tools/save-table!
+                                st (str "Extracted — " (if (> (count p) 40) (str (subs p 0 40) "…") p))
+                                rows space))))
           sp (sub/object st space)
           fid (next-id st (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
-          p (str/trim prompt)
           title (str "Findings — " (if (> (count p) 44) (str (subs p 0 44) "…") p))]
       (sub/commit! st {:op :tx :events [{:op :put :id fid :value {:id fid :kind :doc :title title :value text}}
                                         (nb/append-cell-event st space {:ref fid})]})

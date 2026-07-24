@@ -377,6 +377,15 @@
           (srv/run-flow! st fid)
           (is (= "tbl:t" @seen)))))))                            ; skipped the note, found the table
 
+(deftest research-salvages-prose-tables
+  (with-redefs [agent/chat-tools (fn [& _] "intro\n\nname | share_pct\n--- | ---\nA | 30%\nB | 20%\n\ndone")
+                loci.server/distill! (fn [& _] nil)]
+    (let [st (store-with-table)
+          r  (srv/research! st "space:n" "extract a table of shares")]
+      (is (clojure.string/starts-with? (str (:openId r)) "tbl:extract"))
+      (is (= [{:name "A" :share_pct 30} {:name "B" :share_pct 20}]
+             (:value (sub/object st (:openId r))))))))
+
 (deftest compute-retries-once-with-error-feedback
   ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
   ;; coin-flipped the whole flow. One retry, error fed back, then honest.
