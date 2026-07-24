@@ -134,6 +134,16 @@
   .chips{font-size:10.5px;font-family:var(--mono);color:var(--faint);padding:5px 11px;border-top:1px dashed var(--line-2)}
   .ghostchip{display:inline-block;padding:0 6px;border-radius:4px;background:var(--panel);border:1px solid var(--line);color:var(--muted);cursor:pointer;margin:0 2px}
   .ghostchip:hover{border-color:var(--accent-line);color:var(--accent)}
+  .flowgoal{font-weight:600;font-size:13.5px;margin-bottom:8px}
+  .flowsteps{display:flex;flex-direction:column;gap:4px}
+  .flowstep{display:flex;gap:8px;align-items:baseline;font-size:12.5px}
+  .flowstep .fic{width:16px;flex:none;color:var(--accent)}
+  .flowstep.s-failed .fic,.flowstep.s-rejected .fic{color:var(--attn)}
+  .flowstep.s-needs-you .fic{color:var(--attn)}
+  .flowstep .fverb{font-family:var(--mono);font-size:11px;color:var(--muted);width:64px;flex:none}
+  .flowstep .fnote{color:var(--ink-2)}
+  .flowstep .fwhy{color:var(--attn);font-size:11.5px}
+  .fstat{margin-top:6px;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
   .nbrow{display:flex;gap:16px;align-items:flex-start}
   .rail{flex:none;width:210px}
   .raillink{border:1px solid var(--line);border-radius:9px;background:var(--white);padding:8px 11px;margin-bottom:8px;cursor:pointer;font-size:12.5px}
@@ -191,6 +201,8 @@ const API = {
   keepNote: (space,title,text) => POST('/api/keep-note',{space,title,text}),
   importCsv: (title,csv,space) => POST('/api/import-csv',{title,csv,space}),
   research: (space,prompt) => POST('/api/research',{space,prompt}),
+  flow: (space,goal) => POST('/api/flow',{space,goal}),
+  flowGate: (id,approve) => POST('/api/flow-gate',{id,approve}),
   notebook: (id,at) => fetch('/api/notebook?id='+encodeURIComponent(id)+(at!=null?'&at='+at:'')).then(r=>r.json()),
   events: () => fetch('/api/events').then(r=>r.json()),
   notebookOp: body => POST('/api/notebook', body),
@@ -375,6 +387,7 @@ async function renderNotebook(i){
     '<button class="btn sm" id="askBtn">✦ Ask</button>'+
     '<button class="btn ghost sm" id="researchBtn">🔍 Research</button>'+
     '<button class="btn ghost sm" id="ddBtn">⌘ Deep-dive</button>'+
+    '<button class="btn ghost sm" id="flowBtn">⚑ Flow</button>'+
     '<button class="btn ghost sm" id="draftBtn">✎ Draft</button>'+
     '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button></div>'+
     (nb['spawned-by']?'<div style="font-size:11px;font-family:var(--mono);color:var(--faint);margin-bottom:8px">spawned from <span class="ghostchip" data-space="'+esc(nb['spawned-by'].space)+'">'+esc(nb['spawned-by'].space)+'</span> · “'+esc(nb['spawned-by'].prompt||'')+'”</div>':'');
@@ -400,6 +413,7 @@ async function renderNotebook(i){
       showToast('Spawned '+r.spawned.length+' connected deep-dive notebook'+(r.spawned.length===1?'':'s'));
     });
   });
+  b.querySelector('#flowBtn').addEventListener('click',()=>startFlow(i));
   b.querySelectorAll('[data-remold]').forEach(sel=>sel.addEventListener('change',()=>cellOp(i,{op:'set-view',idx:+sel.dataset.remold,view:sel.value})));
   b.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>openObject(el.dataset.open)));
   b.querySelectorAll('[data-make]').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();makeOn(el.dataset.make);}));
@@ -421,6 +435,16 @@ async function renderNotebook(i){
   }));
   b.querySelectorAll('[data-space]').forEach(el=>el.addEventListener('click',()=>{
     const j=STATE.spaces.findIndex(s=>s.id===el.dataset.space); if(j>=0) enter(j);
+  }));
+  b.querySelectorAll('[data-gate]').forEach(el=>el.addEventListener('click',async ev=>{
+    ev.stopPropagation();
+    if(TIME){ showToast('time mode — ↩ now to decide'); return; }
+    const ok=el.dataset.gate==='yes';
+    let r; try{ r=await API.flowGate(el.dataset.flow, ok); }catch(e){ showToast('gate: network error'); return; }
+    if(r.error){ showToast(r.error); return; }
+    if(TIME){ showToast('finished — ↩ now to see it'); return; }
+    if(ok){ showToast('Approved — the flow continues'); watchFlow(i, r.job); renderBody(i); }
+    else  { applyState(r.state); renderBody(i); showToast('Rejected — the flow stopped (reversible)', undo); }
   }));
   b.querySelectorAll('.cellbar button').forEach(btn=>btn.addEventListener('click',ev=>{
     ev.stopPropagation();
@@ -468,6 +492,42 @@ function startResearch(i){
   b.querySelector('#rq').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
   b.querySelector('#cancelRes').addEventListener('click',()=>renderBody(i));
   b.querySelector('#rq').focus();
+}
+function startFlow(i){
+  const sp=STATE.spaces[i], b=document.getElementById('body'+i);
+  b.innerHTML='<div class="actions"><input id="fq" placeholder="what should the agent take on? e.g. “map the EV battery supply chain and brief me” " '+
+    'style="flex:1;min-width:280px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:14px">'+
+    '<button class="btn sm" id="goFlow">Plan &amp; run</button><button class="btn ghost sm" id="cancelFlow">Cancel</button></div>'+
+    '<div style="font-size:12px;color:var(--muted);margin-top:8px">the agent plans a short flow (research → gate → compute → draft), runs it step by step, and STOPS to ask you at gates — every step reversible</div>';
+  const go=async()=>{
+    const g=b.querySelector('#fq').value.trim(); if(!g) return;
+    b.innerHTML='<div class="sec-h">planning</div><div style="color:var(--muted);font-size:13px">the agent is planning the flow…</div>';
+    let res; try{ res=await API.flow(sp.id, g); }catch(e){ showToast('flow: network error'); renderBody(i); return; }
+    if(res.error){ showToast('flow: '+res.error); renderBody(i); return; }
+    watchFlow(i, res.job);
+  };
+  b.querySelector('#goFlow').addEventListener('click',go);
+  b.querySelector('#fq').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
+  b.querySelector('#cancelFlow').addEventListener('click',()=>renderBody(i));
+  b.querySelector('#fq').focus();
+}
+// watch a running flow: refresh the notebook every 2.5s so the checklist is
+// live, and toast when the job ends (done / needs-you / failed).
+function watchFlow(i, job){
+  const tick=async()=>{
+    let s; try{ s=await API.job(job); }catch(e){ setTimeout(tick,4000); return; }
+    const ae=document.activeElement, typing=ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
+    if(!TIME && !typing && mode==='focus' && focusIdx===i && !openId) renderBody(i);
+    if(!s.done){ setTimeout(tick,2500); return; }
+    const r=s.result||{};
+    if(r.error){ showToast('flow: '+r.error); return; }
+    if(TIME){ showToast('flow '+(r.status==='needs-you'?'needs you':'finished')+' — ↩ now to see it'); return; }
+    if(r.state){ applyState(r.state); safeRebuild(); }
+    showToast(r.status==='needs-you' ? 'The flow needs you — open the notebook to approve'
+             : r.status==='failed' ? 'Flow stopped — a step failed (see the flow cell)'
+             : 'Flow complete — everything it made is in the notebook (reversible)');
+  };
+  setTimeout(tick,1500);
 }
 function startImport(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
@@ -530,6 +590,17 @@ function renderDetail(i,m){
   if(selEl) selEl.addEventListener('change',()=>remold(m.id, selEl.value));
   const eb=b.querySelector('#editbtn'); if(eb) eb.addEventListener('click',()=>startEdit(i,m));
   const mk=b.querySelector('#makebtn'); if(mk) mk.addEventListener('click',()=>startDo(i,m));
+  b.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>openObject(el.dataset.open)));
+  b.querySelectorAll('[data-gate]').forEach(el=>el.addEventListener('click',async ev=>{
+    ev.stopPropagation();
+    if(TIME){ showToast('time mode — ↩ now to decide'); return; }
+    const ok=el.dataset.gate==='yes';
+    let r; try{ r=await API.flowGate(el.dataset.flow, ok); }catch(e){ showToast('gate: network error'); return; }
+    if(r.error){ showToast(r.error); return; }
+    if(TIME){ showToast('finished — ↩ now to see it'); return; }
+    if(ok){ showToast('Approved — the flow continues'); watchFlow(i, r.job); openObject(m.id); }
+    else  { applyState(r.state); openObject(m.id); showToast('Rejected — the flow stopped (reversible)', undo); }
+  }));
   if(m.kind==='applet') runApplet(m);
 }
 // run an agent-written applet over the object's data. ponytail: new Function in
@@ -650,8 +721,27 @@ function renderMold(m){
     case 'cards':  return renderCards(d);
     case 'kpi':    return renderKPI(d);
     case 'applet': return '<div id="appletHost" style="min-height:340px"></div>';
+    case 'flow':   return renderFlow(m.rendered, m.id);
     default:       return '<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
   }
+}
+const FLOWICON={pending:'○',running:'◐',done:'●','needs-you':'⚑',failed:'✕',rejected:'⊘'};
+function renderFlow(f, fid){
+  let h='<div class="flowgoal">'+esc(f.goal)+'</div><div class="flowsteps">';
+  (f.steps||[]).forEach((s,k)=>{
+    h+='<div class="flowstep s-'+esc(s.status)+'"><span class="fic">'+(FLOWICON[s.status]||'○')+'</span>'+
+      '<span class="fverb">'+esc(s.verb)+'</span>'+
+      (s.verb==='gate'?'<span class="fnote">'+esc((s.args&&s.args.question)||'')+'</span>'
+                      :'<span class="fnote">'+esc(s.note||((s.args&&s.args.prompt)||''))+'</span>')+
+      (s.out?' <span class="ghostchip" data-open="'+esc(s.out)+'">'+esc(s.out)+'</span>':'')+
+      (s.why?' <span class="fwhy">'+esc(s.why)+'</span>':'')+'</div>';
+  });
+  h+='</div>';
+  if(f.status==='needs-you')
+    h+='<div class="actions" style="margin-top:8px"><button class="btn sm" data-gate="yes" data-flow="'+esc(fid)+'">Approve &amp; continue</button>'+
+       '<button class="btn ghost sm" data-gate="no" data-flow="'+esc(fid)+'">Reject</button></div>';
+  else h+='<div class="fstat">'+esc(f.status)+'</div>';
+  return h;
 }
 function fmtNum(n){ return (+n).toLocaleString(); }
 function renderCards(rows){
