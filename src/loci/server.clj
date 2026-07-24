@@ -782,6 +782,24 @@
       v)
     v))
 
+(defn- table-shaped? [st id]
+  (let [rows (:value (sub/object st id))]
+    (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
+
+(defn resolve-table-ref
+  "Like resolve-ref, but for compute steps: a $-ref prefers the nearest
+   earlier output that is actually a TABLE (research can land prose-only).
+   No tabular output anywhere → the plain walk result, so the failure
+   downstream stays honest. Literal ids are never second-guessed."
+  [st flow v]
+  (if (and (string? v) (str/starts-with? v "$"))
+    (let [r (resolve-ref flow v)]
+      (if (and (string? r) (table-shaped? st r))
+        r
+        (or (->> (:steps flow) (keep :out) reverse (filter #(table-shaped? st %)) first)
+            r)))
+    v))
+
 (defn flow-create!
   "Commit the flow object + its notebook cell as ONE :tx. Steps must already
    be validated. Returns the flow id."
@@ -809,7 +827,7 @@
   (case verb
     "research" (let [r (research! st space (str (:prompt args)))]
                  (if (:error r) {:why (:error r)} {:out (:openId r)}))
-    "compute"  (let [r (compute-clj! st (str (resolve-ref flow (:id args))) (str (:prompt args)) space)]
+    "compute"  (let [r (compute-clj! st (str (resolve-table-ref st flow (:id args))) (str (:prompt args)) space)]
                  (if (:error r) {:why (:error r)} {:out (:openId r)}))
     "draft"    (let [r (delegate! st space)]
                  (if (:error r) {:why (:error r)} {:out (:openId r)}))

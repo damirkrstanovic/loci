@@ -209,7 +209,7 @@
   (let [sys (str "You plan a short agent flow for a research notebook. Return JSON "
                  "{\"steps\":[{\"verb\":…,\"args\":{…},\"note\":\"why this step\"}]} — at most 6 steps.\n"
                  "Verbs:\n"
-                 "- research {\"prompt\"}: web+data research, lands findings (and often a table) in the notebook\n"
+                 "- research {\"prompt\"}: web+data research, lands findings in the notebook. If a later step computes over it, phrase the prompt to EXTRACT A TABLE (e.g. \"…extract a table of supplier, market_share_pct\")\n"
                  "- compute {\"id\",\"prompt\"}: derive a new table from table `id` (steps are numbered from 0; \"$N\" means the output of step N — only research/compute produce outputs)\n"
                  "- ask {\"prompt\"}: answer a question from the notebook's data, kept as a note\n"
                  "- draft {}: write a brief from everything in the notebook\n"

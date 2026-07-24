@@ -350,6 +350,33 @@
     (is (= "tbl:t" (srv/resolve-ref flow "tbl:t")))       ; plain ids pass through
     (is (= 5 (srv/resolve-ref flow 5)))))                 ; non-strings untouched
 
+(deftest flow-compute-refs-prefer-tabular-outputs
+  ;; live-fire finding #2: research sometimes lands prose only; a $-ref from
+  ;; compute must find the nearest TABLE output, never hand compute a note.
+  (let [st (store-with-table)]
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "prose"}})
+    (let [flow {:steps [{:out "tbl:t"} {:out "doc:d"} {}]}]
+      (is (= "tbl:t" (srv/resolve-table-ref st flow "$1")))      ; $1 is a doc → nearest table wins
+      (is (= "tbl:t" (srv/resolve-table-ref st flow "$0")))
+      ;; no table among outputs → pass the walk result through (honest failure downstream)
+      (is (= "doc:d" (srv/resolve-table-ref st {:steps [{:out "doc:d"}]} "$0")))
+      ;; literal ids are never hijacked
+      (is (= "tbl:x" (srv/resolve-table-ref st flow "tbl:x"))))))
+
+(deftest flow-compute-step-receives-a-table-not-a-note
+  (let [seen (atom nil)]
+    (with-redefs [srv/research!    (fn [st space prompt]
+                                     (if (str/includes? prompt "first") {:openId "tbl:t"} {:openId "doc:d"}))
+                  srv/compute-clj! (fn [st id prompt space] (reset! seen id) {:openId "tbl:d"})]
+      (let [st (store-with-table)]
+        (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "p"}})
+        (let [fid (srv/flow-create! st "space:n" "g"
+                                    [{:verb "research" :args {:prompt "first"} :note "" :status "pending"}
+                                     {:verb "research" :args {:prompt "second"} :note "" :status "pending"}
+                                     {:verb "compute" :args {:id "$1" :prompt "top"} :note "" :status "pending"}])]
+          (srv/run-flow! st fid)
+          (is (= "tbl:t" @seen)))))))                            ; skipped the note, found the table
+
 (deftest compute-retries-once-with-error-feedback
   ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
   ;; coin-flipped the whole flow. One retry, error fed back, then honest.
