@@ -344,7 +344,9 @@ function editProse(i,idx,text){
 
 async function renderNotebook(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
-  b.innerHTML='<div class="sec-h">loading notebook…</div>';
+  // don't flash "loading…" (and reset scroll) when this notebook is already
+  // painted — watchFlow re-renders every 2.5s; the fetch repaints fully below
+  if(!b.querySelector('.cellwrap')) b.innerHTML='<div class="sec-h">loading notebook…</div>';
   const nb=await API.notebook(sp.id,tat());
   if(mode!=='focus'||i!==focusIdx||openId) return;   // panel moved on while we fetched
   if(nb.error){ b.innerHTML='<div style="color:var(--attn);font-size:13px">'+esc(nb.error)+'</div>'; return; }
@@ -517,9 +519,13 @@ function watchFlow(i, job){
   const tick=async()=>{
     let s; try{ s=await API.job(job); }catch(e){ setTimeout(tick,4000); return; }
     const ae=document.activeElement, typing=ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
-    if(!TIME && !typing && mode==='focus' && focusIdx===i && !openId) renderBody(i);
+    // an open inline form (research/flow/import/ask/prose edit/ƒ palette) would be
+    // destroyed by a repaint even when unfocused — keep polling, skip the paint
+    const b=document.getElementById('body'+i);
+    const formOpen=b&&b.querySelector('#fq,#rq,#csv,#aq,#ctitle,.prosed,.fnpal');
+    if(!TIME && !typing && !formOpen && mode==='focus' && focusIdx===i && !openId) renderBody(i);
     if(!s.done){ setTimeout(tick,2500); return; }
-    const r=s.result||{};
+    const r=s.result||{error:s.error||'job lost'};
     if(r.error){ showToast('flow: '+r.error); return; }
     if(TIME){ showToast('flow '+(r.status==='needs-you'?'needs you':'finished')+' — ↩ now to see it'); return; }
     if(r.state){ applyState(r.state); safeRebuild(); }
