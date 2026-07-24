@@ -326,6 +326,27 @@
     (is (:error (srv/connect! st "nope" "space:a")))
     (is (= 1 (count (sub/history st))))))
 
+(deftest flow-plan-validation-drops-unknown-verbs-and-caps
+  (let [raw [{:verb "research" :args {:prompt "p"} :note "n"}
+             {:verb "hack-the-gibson" :args {}}
+             {:verb "gate" :args {:question "ok to proceed?"}}
+             {:verb "compute" :args {:id "$0" :prompt "top 5"}}
+             {:verb "ask"} {:verb "draft"} {:verb "research" :args {:prompt "x"}}
+             {:verb "research" :args {:prompt "y"}}]
+        v (srv/validate-plan raw)]
+    (is (= ["research" "gate" "compute" "ask" "draft" "research"] (map :verb v)))  ; unknown dropped, capped at 6
+    (is (every? #(= "pending" (:status %)) v))
+    (is (= {:prompt "p"} (:args (first v))))
+    (is (= "" (:note (second v))))))                      ; missing note → ""
+
+(deftest flow-step-refs-resolve-to-outputs
+  (let [flow {:steps [{:out "tbl:derived-3"} {:out "note:n-1"}]}]
+    (is (= "tbl:derived-3" (srv/resolve-ref flow "$0")))
+    (is (= "note:n-1" (srv/resolve-ref flow "$1")))
+    (is (= "$9" (srv/resolve-ref flow "$9")))             ; out-of-range → literal, honest
+    (is (= "tbl:t" (srv/resolve-ref flow "tbl:t")))       ; plain ids pass through
+    (is (= 5 (srv/resolve-ref flow 5)))))                 ; non-strings untouched
+
 (deftest state-payload-time-travels-via-frozen-store
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "space:n" :value {:id "space:n" :kind :space :title "N" :value {:intent "i" :cells []}}})

@@ -196,3 +196,20 @@
                                       {:role "user" :content "Propose the deep-dives now."}]
                                      :json? true)
                                :key-fn keyword))))
+
+(defn plan-flow
+  "Plan a multi-step flow toward `goal`. Returns raw steps (server validates)."
+  [goal ctx]
+  (let [sys (str "You plan a short agent flow for a research notebook. Return JSON "
+                 "{\"steps\":[{\"verb\":…,\"args\":{…},\"note\":\"why this step\"}]} — at most 6 steps.\n"
+                 "Verbs:\n"
+                 "- research {\"prompt\"}: web+data research, lands findings (and often a table) in the notebook\n"
+                 "- compute {\"id\",\"prompt\"}: derive a new table from table `id` (use \"$N\" for step N's output)\n"
+                 "- ask {\"prompt\"}: answer a question from the notebook's data, kept as a note\n"
+                 "- draft {}: write a brief from everything in the notebook\n"
+                 "- gate {\"question\"}: STOP and ask the human before continuing — use before expensive or judgment-heavy steps\n"
+                 "Prefer research → gate → compute/ask → draft shapes. Only JSON.")
+        out (request [{:role "system" :content sys}
+                      {:role "user" :content (str "Goal: " goal "\n\nNotebook context:\n" ctx)}]
+                     :json? true)]
+    (:steps (json/read-str (:content out) :key-fn keyword))))

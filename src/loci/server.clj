@@ -738,6 +738,30 @@
   (or (notebook-or-error st space)
       {:job (start-job! #(deep-dive! st space))}))
 
+;; ---- flows: the full agentic loop as a substrate object. The agent plans,
+;; the interpreter executes over the existing verbs, EVERY transition is a
+;; reversible event — checkpoint/resume/replay come from the log, and a
+;; gate step parks the flow needs-you until the human says go. ----
+(def ^:private flow-verbs #{"research" "compute" "ask" "draft" "gate"})
+
+(defn validate-plan
+  "Agent-proposed steps → trusted steps: unknown verbs dropped, capped at 6,
+   every step normalized to {:verb :args :note :status \"pending\"}."
+  [steps]
+  (->> steps
+       (keep (fn [s] (let [v (str (:verb s))]
+                       (when (flow-verbs v)
+                         {:verb v :args (or (:args s) {}) :note (str (or (:note s) ""))
+                          :status "pending"}))))
+       (take 6) vec))
+
+(defn resolve-ref
+  "\"$N\" in step args means step N's output object id."
+  [flow v]
+  (if (and (string? v) (str/starts-with? v "$"))
+    (or (get-in flow [:steps (or (parse-long (subs v 1)) -1) :out]) v)
+    v))
+
 (defn research-start! [st space prompt]
   (or (notebook-or-error st space)
       (when (str/blank? prompt) {:error "empty prompt"})
