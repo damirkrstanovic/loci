@@ -345,9 +345,22 @@
   (let [flow {:steps [{:out "tbl:derived-3"} {:out "note:n-1"}]}]
     (is (= "tbl:derived-3" (srv/resolve-ref flow "$0")))
     (is (= "note:n-1" (srv/resolve-ref flow "$1")))
-    (is (= "$9" (srv/resolve-ref flow "$9")))             ; out-of-range → literal, honest
+    (is (= "note:n-1" (srv/resolve-ref flow "$9")))       ; past the end → the latest output
     (is (= "tbl:t" (srv/resolve-ref flow "tbl:t")))       ; plain ids pass through
     (is (= 5 (srv/resolve-ref flow 5)))))                 ; non-strings untouched
+
+(deftest flow-step-refs-walk-back-past-outputless-steps
+  ;; the live-fire bug: the planner counted 1-based, so "$1" hit the GATE
+  ;; (no :out) and the literal "$1" reached compute. $N now means "the
+  ;; output at or before step min(N, last)" — deterministic, absorbs both
+  ;; numbering conventions for research → gate → compute shapes.
+  (let [flow {:steps [{:verb "research" :out "tbl:extract-1"}
+                      {:verb "gate"}
+                      {:verb "compute"}]}]
+    (is (= "tbl:extract-1" (srv/resolve-ref flow "$1")))  ; gate has no out → walk back
+    (is (= "tbl:extract-1" (srv/resolve-ref flow "$0")))
+    (is (= "$0" (srv/resolve-ref {:steps [{:verb "gate"}]} "$0")))  ; nothing to find → literal
+    (is (= "$x" (srv/resolve-ref flow "$x")))))           ; malformed → literal
 
 (defn- flow-store []
   (let [st (sub/fresh-store)]

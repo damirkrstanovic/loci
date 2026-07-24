@@ -760,10 +760,16 @@
        (take 6) vec))
 
 (defn resolve-ref
-  "\"$N\" in step args means step N's output object id."
+  "\"$N\" in step args means the output at or before step min(N, last) —
+   the backward walk skips output-less steps (gates), which also absorbs
+   planners that count 1-based. No output anywhere before N → literal."
   [flow v]
   (if (and (string? v) (str/starts-with? v "$"))
-    (or (get-in flow [:steps (or (parse-long (subs v 1)) -1) :out]) v)
+    (if-let [n (parse-long (subs v 1))]
+      (let [steps (:steps flow)
+            n     (min n (dec (count steps)))]
+        (or (first (keep #(:out (nth steps % nil)) (range n -1 -1))) v))
+      v)
     v))
 
 (defn flow-create!

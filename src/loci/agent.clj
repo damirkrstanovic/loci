@@ -204,7 +204,7 @@
                  "{\"steps\":[{\"verb\":…,\"args\":{…},\"note\":\"why this step\"}]} — at most 6 steps.\n"
                  "Verbs:\n"
                  "- research {\"prompt\"}: web+data research, lands findings (and often a table) in the notebook\n"
-                 "- compute {\"id\",\"prompt\"}: derive a new table from table `id` (use \"$N\" for step N's output)\n"
+                 "- compute {\"id\",\"prompt\"}: derive a new table from table `id` (steps are numbered from 0; \"$N\" means the output of step N — only research/compute produce outputs)\n"
                  "- ask {\"prompt\"}: answer a question from the notebook's data, kept as a note\n"
                  "- draft {}: write a brief from everything in the notebook\n"
                  "- gate {\"question\"}: STOP and ask the human before continuing — use before expensive or judgment-heavy steps\n"
