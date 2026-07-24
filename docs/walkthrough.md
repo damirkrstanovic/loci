@@ -55,3 +55,12 @@ out: connections (deep-dive spawns, merges) are drawn as dashed threads
 between panels, straight from the substrate. LEAP also finds everything
 you've *made*: a view or animation hit lands on its table, already molded;
 a function hit opens the ƒ inspector.
+
+## 7 · A full agent flow, gated (agent + web)
+On any notebook hit **⚑ Flow** and give it a goal. The agent plans a short
+flow — research → gate → compute → draft — as a real object IN the notebook:
+a live checklist, every step a reversible event. Watch it work; at a **gate**
+it stops and asks (⚑ needs-you) — approve to continue, reject to stop.
+When it's done, scrub ⏱ time backwards: you can watch the flow execute
+step by step through the substrate's own history. No framework — the
+substrate is the framework.

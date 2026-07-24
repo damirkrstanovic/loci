@@ -68,6 +68,8 @@ frontend only lays out the result.
 | any read + `?at=N` | the same payload as-of event N — read-only time travel |
 | `POST /api/rerun` | recompute a derived table + everything downstream — one reversible event |
 | `POST /api/connect` | a NEW notebook unioning two others — non-destructive, originals intact |
+| `POST /api/flow` | the agent plans + runs a multi-step flow (background job) |
+| `POST /api/flow-gate` | answer a flow's gate: approve resumes, reject stops |
 
 ## Layout
 
