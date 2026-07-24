@@ -6,18 +6,23 @@
    delegation it drafts text that lands as a reversible substrate object. The
    probabilistic model never touches the substrate's rules directly.
 
-   Key is read from .deepseek-key (gitignored) or DEEPSEEK_API_KEY."
+   Key is read from .deepseek-key (gitignored) or DEEPSEEK_API_KEY.
+   Model defaults to deepseek-v4-flash (the V4 name of what deepseek-chat
+   routed to); override via DEEPSEEK_MODEL or a .deepseek-model file."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [org.httpkit.client :as hc]))
 
 (def ^:private endpoint "https://api.deepseek.com/chat/completions")
-(def ^:private model "deepseek-chat")
+
+(defn- from-file [path] (let [f (io/file path)] (when (.exists f) (str/trim (slurp f)))))
+
+(defn- model []
+  (or (System/getenv "DEEPSEEK_MODEL") (from-file ".deepseek-model") "deepseek-v4-flash"))
 
 (defn- api-key []
-  (or (System/getenv "DEEPSEEK_API_KEY")
-      (let [f (io/file ".deepseek-key")] (when (.exists f) (str/trim (slurp f))))))
+  (or (System/getenv "DEEPSEEK_API_KEY") (from-file ".deepseek-key")))
 
 (defn request
   "POST to DeepSeek; return the assistant message map {:content .. :tool_calls ..}."
@@ -26,7 +31,7 @@
         resp @(hc/post endpoint
                 {:timeout 60000
                  :headers {"Authorization" (str "Bearer " key) "Content-Type" "application/json"}
-                 :body (json/write-str (cond-> {:model model :messages messages :temperature 0.2}
+                 :body (json/write-str (cond-> {:model (model) :messages messages :temperature 0.2}
                                          json? (assoc :response_format {:type "json_object"})
                                          tools (assoc :tools tools)))})]
     (when-let [e (:error resp)] (throw (ex-info (str "DeepSeek request failed: " e) {})))
