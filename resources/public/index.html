@@ -49,6 +49,9 @@
   .res .title{font-size:14px} .res .gp{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--faint)}
 
   .world{position:fixed;inset:0;z-index:10}
+  .edges{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;opacity:0;transition:opacity .45s}
+  .world.overview .edges{opacity:1}
+  .edges line{stroke:var(--accent-line);stroke-width:1.5;stroke-dasharray:5 5}
   .panel{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform,opacity;
          transition:transform .5s cubic-bezier(.6,.02,.1,1),opacity .4s;background:var(--panel);border:1px solid var(--line);
          border-radius:16px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 30px 60px -40px rgba(20,30,25,.5)}
@@ -162,7 +165,7 @@
   <div class="results" id="results"></div>
 </div></div>
 
-<div class="world" id="world"></div>
+<div class="world" id="world"><svg class="edges" id="edges"></svg></div>
 <div class="toast" id="toast"></div>
 <div class="timebar" id="timebar">
   <button class="btn ghost sm" id="timeNow">↩ now</button>
@@ -736,10 +739,24 @@ function layout(){
     const availH=vh-top, n=Math.max(1,panels.length), cols=Math.min(3,n), rows=Math.ceil(n/cols);
     const padX=vw*0.05, padTop=top+availH*0.05, cellW=(vw-2*padX)/cols, cellH=(availH*0.9)/rows;
     const s=Math.min((cellW*0.88)/fw,(cellH*0.88)/fh);
+    const ctr=[];
     panels.forEach((p,k)=>{const col=k%cols,row=Math.floor(k/cols);
       const cx=padX+col*cellW+cellW/2, cy=padTop+row*cellH+cellH/2+(col%2?availH*0.02:0);
+      ctr[k]=[cx,cy];
       p.style.transform='translate('+(cx-fw*s/2)+'px,'+(cy-fh*s/2)+'px) scale('+s+')';
       p.style.opacity='1';p.style.zIndex=2;p.style.pointerEvents='auto';});
+    // the connections, made visible: dashed threads from each spawned/connected
+    // notebook back to its source panel(s) — computed, never stored
+    const lines=[];
+    STATE.spaces.forEach((sp,k)=>{
+      const parents=[]; if(sp['spawned-by']) parents.push(sp['spawned-by']);
+      (sp['merged-from']||[]).forEach(pid=>parents.push(pid));
+      parents.forEach(pid=>{
+        const j=STATE.spaces.findIndex(x=>x.id===pid);
+        if(j>=0&&ctr[k]&&ctr[j]) lines.push('<line x1="'+ctr[k][0]+'" y1="'+ctr[k][1]+'" x2="'+ctr[j][0]+'" y2="'+ctr[j][1]+'"/>');
+      });
+    });
+    document.getElementById('edges').innerHTML=lines.join('');
   }
   crumbHint.style.display=mode==='overview'?'none':'inline';
   crumbName.textContent=mode==='overview'?'all notebooks':(STATE.spaces[focusIdx]||{}).title||'—';

@@ -50,7 +50,8 @@ the record, never the recall.
 
 ## 6 · Connect two notebooks (offline)
 Focus a notebook, LEAP, type another notebook's name → **⧉ Connect**. A NEW
-notebook appears holding everything from both — the originals untouched, the
-connection visible in the overview and both rails. LEAP also finds everything
+notebook appears holding everything from both — the originals untouched. Zoom
+out: connections (deep-dive spawns, merges) are drawn as dashed threads
+between panels, straight from the substrate. LEAP also finds everything
 you've *made*: a view or animation hit lands on its table, already molded;
 a function hit opens the ƒ inspector.
