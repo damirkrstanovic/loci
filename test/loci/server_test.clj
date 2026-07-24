@@ -337,7 +337,9 @@
     (is (= ["research" "gate" "compute" "ask" "draft" "research"] (map :verb v)))  ; unknown dropped, capped at 6
     (is (every? #(= "pending" (:status %)) v))
     (is (= {:prompt "p"} (:args (first v))))
-    (is (= "" (:note (second v))))))                      ; missing note → ""
+    (is (= "" (:note (second v)))))                       ; missing note → ""
+  ;; non-map :args from a weird LLM must not survive as-is
+  (is (= {} (:args (first (srv/validate-plan [{:verb "research" :args "foo"}]))))))
 
 (deftest flow-step-refs-resolve-to-outputs
   (let [flow {:steps [{:out "tbl:derived-3"} {:out "note:n-1"}]}]

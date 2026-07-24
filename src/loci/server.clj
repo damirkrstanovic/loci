@@ -755,8 +755,8 @@
   (->> steps
        (keep (fn [s] (let [v (str (:verb s))]
                        (when (flow-verbs v)
-                         {:verb v :args (or (:args s) {}) :note (str (or (:note s) ""))
-                          :status "pending"}))))
+                         {:verb v :args (let [a (:args s)] (if (map? a) a {}))
+                          :note (str (or (:note s) "")) :status "pending"}))))
        (take 6) vec))
 
 (defn resolve-ref
@@ -848,9 +848,8 @@
                  (run-flow! st (flow-create! st space goal steps))))))}))
 
 (defn flow-gate!
-  "The human answers the gate. Approve → gate step done, flow resumes (as a
-   job when async? else synchronously — tests call the sync path via run-flow!).
-   Reject → flow rejected, nothing more runs."
+  "The human answers the gate. Approve → gate step done, flow resumes via
+   start-job!. Reject → flow rejected, nothing more runs."
   [st fid approve]
   (let [o (sub/object st fid)]
     (if-not (= :flow (:kind o))
