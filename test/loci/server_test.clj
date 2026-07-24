@@ -347,6 +347,98 @@
     (is (= "tbl:t" (srv/resolve-ref flow "tbl:t")))       ; plain ids pass through
     (is (= 5 (srv/resolve-ref flow 5)))))                 ; non-strings untouched
 
+(defn- flow-store []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:f" :value {:id "space:f" :kind :space :title "F"
+                                                    :value {:intent "i" :cells []}}})
+    st))
+
+(defn- flow-of [st fid] (:value (sub/object st fid)))
+
+(deftest flow-executes-steps-in-order-and-lands-as-a-cell
+  (with-redefs [srv/research!   (fn [st space prompt] {:openId (str "find:" prompt)})
+                srv/compute-clj! (fn [st id prompt space] {:openId (str "tbl:d-" id)})]
+    (let [st  (flow-store)
+          fid (srv/flow-create! st "space:f" "g"
+                                [{:verb "research" :args {:prompt "a"} :note "" :status "pending"}
+                                 {:verb "compute" :args {:id "$0" :prompt "top"} :note "" :status "pending"}])
+          _   (srv/run-flow! st fid)
+          fl  (flow-of st fid)]
+      (is (= "done" (:status fl)))
+      (is (= ["done" "done"] (map :status (:steps fl))))
+      (is (= "find:a" (:out (first (:steps fl)))))
+      (is (= "tbl:d-find:a" (:out (second (:steps fl)))))          ; $0 resolved to step 0's out
+      ;; the flow is a CELL in the notebook
+      (is (some #(= fid (:ref %)) (get-in (sub/object st "space:f") [:value :cells])))
+      ;; every transition was an event: as-of mid-history shows step 0 done, step 1 pending
+      (let [n   (count (sub/history st))
+            mid (some (fn [k] (let [v (get-in (sub/as-of st k) [:objects fid :value])]
+                                (when (and (= "done" (get-in v [:steps 0 :status]))
+                                           (= "pending" (get-in v [:steps 1 :status]))) k)))
+                      (range n))]
+        (is (some? mid))))))                                       ; the scrubber can watch it work
+
+(deftest flow-gate-parks-then-approve-resumes-reject-stops
+  ;; start-job! stubbed synchronous so approve's resume can't race the test
+  (with-redefs [srv/research! (fn [st space prompt] {:openId "find:x"})
+                srv/delegate! (fn [st space] {:openId "draft:x"})
+                srv/start-job! (fn [f] (f) "job:test")]
+    (let [st  (flow-store)
+          fid (srv/flow-create! st "space:f" "g"
+                                [{:verb "research" :args {:prompt "a"} :note "" :status "pending"}
+                                 {:verb "gate" :args {:question "go on?"} :note "" :status "pending"}
+                                 {:verb "draft" :args {} :note "" :status "pending"}])]
+      (srv/run-flow! st fid)
+      (let [fl (flow-of st fid)]
+        (is (= "needs-you" (:status fl)))
+        (is (= ["done" "needs-you" "pending"] (map :status (:steps fl)))))
+      ;; reject on a fresh identical flow stops it
+      (let [fid2 (srv/flow-create! st "space:f" "g2"
+                                   [{:verb "gate" :args {:question "?"} :note "" :status "pending"}
+                                    {:verb "draft" :args {} :note "" :status "pending"}])]
+        (srv/run-flow! st fid2)
+        (srv/flow-gate! st fid2 false)
+        (let [fl2 (flow-of st fid2)]
+          (is (= "rejected" (:status fl2)))
+          (is (= "rejected" (get-in fl2 [:steps 0 :status])))
+          (is (= "pending" (get-in fl2 [:steps 1 :status])))))     ; never ran
+      ;; approve resumes the first flow to completion (start-job! stub is sync)
+      (srv/flow-gate! st fid true)
+      (let [fl (flow-of st fid)]
+        (is (= "done" (:status fl)))
+        (is (= "draft:x" (:out (nth (:steps fl) 2))))))))
+
+(deftest flow-step-failure-fails-the-flow-honestly
+  (with-redefs [srv/research! (fn [st space prompt] {:error "no key"})]
+    (let [st  (flow-store)
+          fid (srv/flow-create! st "space:f" "g"
+                                [{:verb "research" :args {:prompt "a"} :note "" :status "pending"}
+                                 {:verb "draft" :args {} :note "" :status "pending"}])]
+      (srv/run-flow! st fid)
+      (let [fl (flow-of st fid)]
+        (is (= "failed" (:status fl)))
+        (is (= "failed" (get-in fl [:steps 0 :status])))
+        (is (= "no key" (get-in fl [:steps 0 :why])))
+        (is (= "pending" (get-in fl [:steps 1 :status])))))))      ; honest stop, no cascade
+
+(deftest flow-ask-step-lands-a-note
+  (with-redefs [srv/ask! (fn [st prompt space] {:answer "42"})]
+    (let [st  (flow-store)
+          fid (srv/flow-create! st "space:f" "g"
+                                [{:verb "ask" :args {:prompt "meaning?"} :note "" :status "pending"}])]
+      (srv/run-flow! st fid)
+      (let [out (:out (first (:steps (flow-of st fid))))]
+        (is (str/starts-with? out "note:"))
+        (is (= "42" (:value (sub/object st out))))))))
+
+(deftest flow-create-validates-and-flow-mold-renders
+  (let [st (flow-store)]
+    (is (:error (srv/flow-start! st "nope" "g")))                  ; not a notebook → sync error
+    (let [fid (srv/flow-create! st "space:f" "g" [{:verb "draft" :args {} :note "" :status "pending"}])
+          m   (srv/mold-payload st fid nil)]
+      (is (= "flow" (:kind m)))
+      (is (= "g" (get-in m [:rendered :goal]))))))
+
 (deftest state-payload-time-travels-via-frozen-store
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "space:n" :value {:id "space:n" :kind :space :title "N" :value {:intent "i" :cells []}}})

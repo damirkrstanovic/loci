@@ -97,6 +97,10 @@
 (defn mold-payload [st id view]
   (let [o (sub/object st id)]
     (cond
+      ;; a flow — no viewers, the shell renders the live checklist itself
+      (= :flow (:kind o))
+      {:id id :title (:title o) :kind "flow" :view nil :label "flow"
+       :rendered (:value o) :alternatives []}
       ;; an agent-WRITTEN code view — ship the JS + the data it runs over
       (and view (str/starts-with? view "app:"))
       (let [vo (sub/object st view)]
@@ -762,6 +766,104 @@
     (or (get-in flow [:steps (or (parse-long (subs v 1)) -1) :out]) v)
     v))
 
+(defn flow-create!
+  "Commit the flow object + its notebook cell as ONE :tx. Steps must already
+   be validated. Returns the flow id."
+  [st space goal steps]
+  (let [fid (next-id st "flow:")
+        fobj {:id fid :kind :flow :title (str "Flow — " (if (> (count goal) 40) (str (subs goal 0 40) "…") goal))
+              :value {:goal goal :space space :status "running" :steps (vec steps)}}]
+    (sub/commit! st {:op :tx :events [{:op :put :id fid :value fobj}
+                                      (nb/append-cell-event st space {:ref fid})]})
+    fid))
+
+(defn- flow-assoc! [st fid value]
+  (sub/commit! st {:op :assoc :id fid :path [:value] :value value}))
+
+(defn- flow-step!
+  "One transition: update step i (and optionally the flow status) — one event."
+  [st fid i patch & [flow-status]]
+  (let [fl (:value (sub/object st fid))
+        fl (cond-> (update-in fl [:steps i] merge patch)
+             flow-status (assoc :status flow-status))]
+    (flow-assoc! st fid fl)
+    fl))
+
+(defn- exec-step [st flow space {:keys [verb args]}]
+  (case verb
+    "research" (let [r (research! st space (str (:prompt args)))]
+                 (if (:error r) {:why (:error r)} {:out (:openId r)}))
+    "compute"  (let [r (compute-clj! st (str (resolve-ref flow (:id args))) (str (:prompt args)) space)]
+                 (if (:error r) {:why (:error r)} {:out (:openId r)}))
+    "draft"    (let [r (delegate! st space)]
+                 (if (:error r) {:why (:error r)} {:out (:openId r)}))
+    "ask"      (let [r (ask! st (str (:prompt args)) space)]
+                 (if (:error r)
+                   {:why (:error r)}
+                   (let [k (keep-note! st space (str "Answer — " (:prompt args)) (:answer r))]
+                     (if (:error k) {:why (:error k)} {:out (:openId k)}))))
+    {:why (str "unknown verb " verb)}))
+
+(defn run-flow!
+  "Execute pending steps in order. Stops at a gate (needs-you), a failure
+   (failed), or the end (done). Synchronous — callers wrap in start-job!."
+  [st fid]
+  (loop []
+    (let [fl (:value (sub/object st fid))
+          i  (first (keep-indexed (fn [k s] (when (= "pending" (:status s)) k)) (:steps fl)))]
+      (cond
+        (nil? i)
+        (do (when (not= "done" (:status fl)) (flow-assoc! st fid (assoc fl :status "done")))
+            {:state (state-payload st) :flowId fid :status "done"})
+
+        (= "gate" (get-in fl [:steps i :verb]))
+        (do (flow-step! st fid i {:status "needs-you"} "needs-you")
+            {:state (state-payload st) :flowId fid :status "needs-you"})
+
+        :else
+        (let [_  (flow-step! st fid i {:status "running"})
+              fl (:value (sub/object st fid))
+              r  (exec-step st fl (:space fl) (get-in fl [:steps i]))]
+          (if (:why r)
+            (do (flow-step! st fid i {:status "failed" :why (:why r)} "failed")
+                {:state (state-payload st) :flowId fid :status "failed"})
+            (do (flow-step! st fid i {:status "done" :out (:out r)})
+                (recur))))))))
+
+(defn flow-start!
+  "Endpoint entry: validate the notebook NOW, then plan + create + run in a job."
+  [st space goal]
+  (cond
+    (not (space? st space)) {:error (str "not a notebook: " space)}
+    (str/blank? goal)       {:error "what should the flow do?"}
+    :else
+    {:job (start-job!
+           (fn []
+             (let [sp    (sub/object st space)
+                   ctx   (str/join "\n" (map #(str "- " (:id %) " — " (:title %))
+                                             (keep #(sub/object st (:ref %)) (nb/cells-of sp))))
+                   steps (validate-plan (agent/plan-flow goal ctx))]
+               (if (empty? steps)
+                 {:error "the agent could not plan that — try rephrasing the goal"}
+                 (run-flow! st (flow-create! st space goal steps))))))}))
+
+(defn flow-gate!
+  "The human answers the gate. Approve → gate step done, flow resumes (as a
+   job when async? else synchronously — tests call the sync path via run-flow!).
+   Reject → flow rejected, nothing more runs."
+  [st fid approve]
+  (let [o (sub/object st fid)]
+    (if-not (= :flow (:kind o))
+      {:error (str "not a flow: " fid)}
+      (let [fl (:value o)
+            i  (first (keep-indexed (fn [k s] (when (= "needs-you" (:status s)) k)) (:steps fl)))]
+        (cond
+          (nil? i) {:error "this flow isn't waiting on you"}
+          approve  (do (flow-step! st fid i {:status "done"} "running")
+                       {:job (start-job! #(run-flow! st fid)) :flowId fid})
+          :else    (do (flow-step! st fid i {:status "rejected"} "rejected")
+                       {:state (state-payload st) :flowId fid :status "rejected"}))))))
+
 (defn research-start! [st space prompt]
   (or (notebook-or-error st space)
       (when (str/blank? prompt) {:error "empty prompt"})
@@ -782,6 +884,8 @@
       (= uri "/api/edit")    (let [{:keys [id value]} (body-json req)] (json-resp (edit! st id value)))
       (= uri "/api/delegate")(let [{:keys [space]} (body-json req)] (json-resp (delegate! st space)))
       (= uri "/api/research")(let [{:keys [space prompt]} (body-json req)] (json-resp (research-start! st space prompt)))
+      (= uri "/api/flow")     (let [{:keys [space goal]} (body-json req)] (json-resp (flow-start! st space goal)))
+      (= uri "/api/flow-gate")(let [{:keys [id approve]} (body-json req)] (json-resp (flow-gate! st id approve)))
       (= uri "/api/job")     (json-resp (job-status (params "id")))
       (= uri "/api/do")      (let [{:keys [id prompt space]} (body-json req)] (json-resp (do! st id prompt space)))
       (= uri "/api/functions")(json-resp (functions-list st))
