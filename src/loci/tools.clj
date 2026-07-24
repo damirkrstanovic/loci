@@ -39,9 +39,11 @@
 (defn- md-sep? [line] (boolean (re-matches #"[\s|:\-]+" line)))
 
 (defn- md-cell-val
-  "\"~30% (estimated)\" → 30; \"1.5\" → 1.5; letters-first cells stay strings."
+  "\"~30% (estimated)\" → 30; \"1.5\" → 1.5. Letters-first cells stay strings,
+   and so does anything with MORE digits after the number (\"$1,234\",
+   \"2025-06-01\") — half-parsing those would be silently wrong."
   [s]
-  (if-let [m (re-find #"^[^A-Za-z]*?(-?\d+(?:\.\d+)?)" s)]
+  (if-let [m (re-matches #"[^A-Za-z0-9]*?(-?\d+(?:\.\d+)?)[^0-9]*" s)]
     (->val (second m))
     s))
 

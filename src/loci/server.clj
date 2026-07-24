@@ -695,7 +695,7 @@
           text (let [t (run-once)] (if (str/blank? t) (run-once) t))
           p (str/trim prompt)]
       (if (str/blank? text)
-        {:error "research came back empty — try again"}
+        {:error "research came back empty — try again (anything it saved mid-way is in the notebook, reversible)"}
         (let [tid (or (first @saved)
                       ;; the model wrote its table INTO the prose instead of
                       ;; calling save_table — salvage it deterministically

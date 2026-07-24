@@ -21,6 +21,14 @@
   (let [rows (tools/md-table->rows "| name | q | when |\n|---|---|---|\n| A | 1.5 | Q3 2025 |")]
     (is (= [{:name "A" :q 1.5 :when "Q3 2025"}] rows))))  ; letters-first cells stay strings
 
+(deftest md-table-salvage-never-mangles-numbers
+  ;; final-review finding: thousands separators and dates must NOT half-parse
+  (let [rows (tools/md-table->rows "a | b | c | d\n---|---|---|---\n$1,234 | 2025-06-01 | ~30% | -5")]
+    (is (= "$1,234" (:a (first rows))))                   ; not 1
+    (is (= "2025-06-01" (:b (first rows))))               ; not 2025
+    (is (= 30 (:c (first rows))))
+    (is (= -5 (:d (first rows))))))
+
 (deftest md-table-salvage-honest-nil
   (is (nil? (tools/md-table->rows "no table here at all")))
   (is (nil? (tools/md-table->rows "just one | piped line"))))
