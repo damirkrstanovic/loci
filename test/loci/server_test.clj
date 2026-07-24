@@ -377,6 +377,25 @@
           (srv/run-flow! st fid)
           (is (= "tbl:t" @seen)))))))                            ; skipped the note, found the table
 
+(deftest research-retries-empty-responses-then-fails-honestly
+  ;; live-fire finding #4: v4-flash occasionally returns an empty final
+  ;; message from the tool loop. One retry, then an honest error.
+  (let [n (atom 0)]
+    (with-redefs [agent/chat-tools (fn [& _] (if (= 1 (swap! n inc)) "" "real findings"))
+                  loci.server/distill! (fn [& _] nil)]
+      (let [st (store-with-table)
+            r  (srv/research! st "space:n" "q")]
+        (is (= 2 @n))
+        (is (nil? (:error r)))
+        (is (= "real findings" (:value (sub/object st (:openId r))))))))
+  (with-redefs [agent/chat-tools (fn [& _] "  ")
+                loci.server/distill! (fn [& _] nil)]
+    (let [st (store-with-table)
+          before (count (sub/history st))
+          r (srv/research! st "space:n" "q")]
+      (is (:error r))
+      (is (= before (count (sub/history st)))))))          ; nothing committed
+
 (deftest research-salvages-prose-tables
   (with-redefs [agent/chat-tools (fn [& _] "intro\n\nname | share_pct\n--- | ---\nA | 30%\nB | 20%\n\ndone")
                 loci.server/distill! (fn [& _] nil)]

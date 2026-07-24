@@ -688,25 +688,29 @@
                    "shows and a final '## Sources' section. If there is nothing tabular, write a normal "
                    "markdown findings note instead. Be specific.\n\n" context
                    (remembered-context prompt))
-          text (agent/chat-tools [{:role "system" :content sys} {:role "user" :content prompt}]
-                                 tools/specs tf)
-          p (str/trim prompt)
-          tid (or (first @saved)
-                  ;; the model wrote its table INTO the prose instead of
-                  ;; calling save_table — salvage it deterministically
-                  (when-let [rows (tools/md-table->rows text)]
-                    (:saved_as (tools/save-table!
-                                st (str "Extracted — " (if (> (count p) 40) (str (subs p 0 40) "…") p))
-                                rows space))))
-          sp (sub/object st space)
-          fid (next-id st (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
-          title (str "Findings — " (if (> (count p) 44) (str (subs p 0 44) "…") p))]
-      (sub/commit! st {:op :tx :events [{:op :put :id fid :value {:id fid :kind :doc :title title :value text}}
-                                        (nb/append-cell-event st space {:ref fid})]})
-      (distill! prompt text fid space)
-      ;; when extraction produced a real table, THAT is the artifact — open it,
-      ;; not the prose note. ponytail: open the data, keep the note as context.
-      {:state (state-payload st) :openId (or tid fid)})
+          run-once (fn [] (agent/chat-tools [{:role "system" :content sys} {:role "user" :content prompt}]
+                                            tools/specs tf))
+          ;; the tool loop occasionally returns an empty final message —
+          ;; retry once, then fail honestly rather than land a blank note
+          text (let [t (run-once)] (if (str/blank? t) (run-once) t))
+          p (str/trim prompt)]
+      (if (str/blank? text)
+        {:error "research came back empty — try again"}
+        (let [tid (or (first @saved)
+                      ;; the model wrote its table INTO the prose instead of
+                      ;; calling save_table — salvage it deterministically
+                      (when-let [rows (tools/md-table->rows text)]
+                        (:saved_as (tools/save-table!
+                                    st (str "Extracted — " (if (> (count p) 40) (str (subs p 0 40) "…") p))
+                                    rows space))))
+              fid (next-id st (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
+              title (str "Findings — " (if (> (count p) 44) (str (subs p 0 44) "…") p))]
+          (sub/commit! st {:op :tx :events [{:op :put :id fid :value {:id fid :kind :doc :title title :value text}}
+                                            (nb/append-cell-event st space {:ref fid})]})
+          (distill! prompt text fid space)
+          ;; when extraction produced a real table, THAT is the artifact — open it,
+          ;; not the prose note. ponytail: open the data, keep the note as context.
+          {:state (state-payload st) :openId (or tid fid)})))
     (catch Exception e {:error (.getMessage e)})))
 
 ;; deep-dive: the agent proposes subtopics (grounded in the hub's findings AND
