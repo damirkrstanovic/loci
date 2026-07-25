@@ -78,6 +78,17 @@
   table.mold th{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px;color:var(--muted)}
   table.mold td{padding:4px 8px;border-bottom:1px solid #eee}
   .moldtext{white-space:pre-wrap;font-size:13px;line-height:1.5} .moldlist{margin:0;padding-left:18px}
+  .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
+  .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
+  .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
+  .md h3:first-child,.md h4:first-child{margin-top:0}
+  .md h4{font-size:13.5px;font-weight:600;margin:12px 0 4px;color:var(--ink)}
+  .md ul,.md ol{margin:0 0 10px;padding-left:20px} .md li{margin:2px 0}
+  .md code{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--line-2);border-radius:4px;padding:0 4px}
+  .md .mdcode{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;white-space:pre;margin:0 0 10px}
+  .md blockquote{border-left:3px solid var(--accent-line);margin:0 0 10px;padding:2px 0 2px 12px;color:var(--muted)}
+  .md hr{border:0;border-top:1px dashed var(--line);margin:12px 0}
+  .md a{color:var(--accent)} .md table{margin:0 0 10px}
 
   .p-status{position:absolute;top:18px;right:20px;display:none;align-items:center;gap:7px;font-size:11.5px;font-family:var(--mono);color:var(--muted)}
   .world.overview .p-status{display:flex}
@@ -721,7 +732,7 @@ function renderMold(m){
   switch(m.kind){
     case 'table':  return tableHTML(d);
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
-    case 'text':   return '<div class="moldtext">'+esc(d)+'</div>';
+    case 'text':   return '<div class="moldtext">'+mdToHtml(d)+'</div>';
     case 'chart':  return chartSVG(d);
     case 'report': return renderReport(d);
     case 'cards':  return renderCards(d);
@@ -782,7 +793,7 @@ function renderReport(blocks){
   return blocks.map(b=>{
     switch(b.block){
       case 'heading': return '<h3 style="font-family:\'IBM Plex Serif\',serif;font-weight:400;font-size:18px;margin:18px 0 6px">'+esc(b.text)+'</h3>';
-      case 'text':    return '<p style="font-size:13.5px;line-height:1.6;color:var(--ink-2);margin:0 0 10px">'+esc(b.text)+'</p>';
+      case 'text':    return mdToHtml(b.text);
       case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+tableHTML(b.rows);
       case 'chart':   return '<div style="margin:6px 0 14px">'+chartSVG(b.spec)+'</div>';
       default:        return '';
@@ -973,9 +984,49 @@ async function createSpace(prompt){
 // ---------------- ask the agent (grounded answer) ----------------
 const modal=document.getElementById('modal');
 let lastAnswer=null;
-function mdToHtml(md){ return esc(md)
-  .replace(/^### (.*)$/gm,'<h4>$1</h4>').replace(/^## (.*)$/gm,'<h3>$1</h3>').replace(/^# (.*)$/gm,'<h3>$1</h3>')
-  .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/^- (.*)$/gm,'• $1').replace(/\n/g,'<br>'); }
+// agent outputs are markdown — render them properly. esc() FIRST (everything
+// below operates on escaped text), then a small line-walker: fences, tables,
+// headings, lists, quotes, then inline marks. No library, no surprises.
+function mdToHtml(md){
+  const lines=esc(md||'').split('\n');
+  const out=[]; let i=0, para=[];
+  const inline=s=>s
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g,'$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  const flush=()=>{ if(para.length){ out.push('<p>'+para.map(inline).join('<br>')+'</p>'); para=[]; } };
+  const sep=l=>/\|/.test(l)&&/^[\s|:\-]+$/.test(l);
+  const cells=l=>l.replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(c=>inline(c.trim()));
+  while(i<lines.length){
+    const l=lines[i]; let m;
+    if(/^```/.test(l)){ flush(); const buf=[]; i++;
+      while(i<lines.length&&!/^```/.test(lines[i])){ buf.push(lines[i]); i++; }
+      i++; out.push('<pre class="mdcode">'+buf.join('\n')+'</pre>'); continue; }
+    if(/\|/.test(l)&&sep(lines[i+1]||'')){
+      flush();
+      let t='<table class="mold"><tr>'+cells(l).map(c=>'<th>'+c+'</th>').join('')+'</tr>'; i+=2;
+      while(i<lines.length&&/\|/.test(lines[i])&&!sep(lines[i])){
+        t+='<tr>'+cells(lines[i]).map(c=>'<td>'+c+'</td>').join('')+'</tr>'; i++; }
+      out.push(t+'</table>'); continue; }
+    if(m=l.match(/^###+\s+(.*)/)){ flush(); out.push('<h4>'+inline(m[1])+'</h4>'); i++; continue; }
+    if(m=l.match(/^##?\s+(.*)/)){ flush(); out.push('<h3>'+inline(m[1])+'</h3>'); i++; continue; }
+    if(/^\s*[-*]\s+/.test(l)){ flush(); const it=[];
+      while(i<lines.length&&/^\s*[-*]\s+/.test(lines[i])){ it.push('<li>'+inline(lines[i].replace(/^\s*[-*]\s+/,''))+'</li>'); i++; }
+      out.push('<ul>'+it.join('')+'</ul>'); continue; }
+    if(/^\s*\d+\.\s+/.test(l)){ flush(); const it=[];
+      while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){ it.push('<li>'+inline(lines[i].replace(/^\s*\d+\.\s+/,''))+'</li>'); i++; }
+      out.push('<ol>'+it.join('')+'</ol>'); continue; }
+    if(/^&gt;\s?/.test(l)){ flush(); const q=[];
+      while(i<lines.length&&(m=lines[i].match(/^&gt;\s?(.*)/))){ q.push(inline(m[1])); i++; }
+      out.push('<blockquote>'+q.join('<br>')+'</blockquote>'); continue; }
+    if(/^\s*(---+|\*\*\*+)\s*$/.test(l)){ flush(); out.push('<hr>'); i++; continue; }
+    if(/^\s*$/.test(l)){ flush(); i++; continue; }
+    para.push(l); i++;
+  }
+  flush();
+  return '<div class="md">'+out.join('')+'</div>';
+}
 function openModal(html,question,canKeep,scope){
   modal.innerHTML='<div class="modalcard"><div class="modal-h">'+
     '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">ANSWER</span>'+
