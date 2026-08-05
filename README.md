@@ -40,8 +40,10 @@ clojure -X:start        # starts Clerk + opens notebooks/loci.clj
 clojure -M:test
 ```
 
-`clojure -M:serve` persists its state under `data/` (substrate + memory
-event logs) — delete that directory to reset to a clean slate.
+`clojure -M:serve` persists its state under `data/` — the substrate is a
+Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
+`data/memory.edn`. Delete that directory to reset to a clean slate. A pre-2026-08
+EDN log at `data/substrate.edn` is migrated with `clojure -M -m loci.migrate`.
 
 The shell talks to the Clojure backend over a JSON API — the HTTP boundary is the
 substrate/assistance seam. Molding is done server-side by `loci.mold`; the
@@ -75,6 +77,8 @@ frontend only lays out the result.
 
 ```
 src/loci/substrate.clj   layer 1: append-only event log behind a Store protocol
+src/loci/dlv.clj         layer 1, durable: the event log on Datalevin (LMDB) + touch index
+src/loci/migrate.clj     one-shot import of the old EDN log, verified by state equality
 src/loci/content.clj     layer 2: populated content + viewers; datafy/nav
 src/loci/mold.clj        layer 4: viewer registry, mold, Recall protocol (UI-free)
 src/loci/fnlib.clj       built-in single-table transforms — the ƒ function palette (UI-free)

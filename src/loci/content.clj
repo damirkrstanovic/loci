@@ -12,6 +12,7 @@
    its *shape* earns."
   (:require [clojure.core.protocols :as p]
             [clojure.string :as str]
+            [loci.dlv :as dlv]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]))
@@ -497,7 +498,7 @@
   store)
 
 (defonce store
-  (delay (let [s (sub/persistent-store)]
+  (delay (let [s (dlv/datalevin-store)]
            ;; a non-empty log on disk wins; otherwise seed (which writes the log)
            (if (seq (sub/history s)) s (seed! s)))))
 
