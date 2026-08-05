@@ -206,3 +206,87 @@
       ;; a FrozenStore is a legitimate Store a caller may hold — closing one
       ;; must be a no-op, not an IllegalArgumentException out of Datalevin
       (is (nil? (dlv/close! (sub/frozen-at s 1)))))))
+
+(deftest object-at-equals-a-full-prefix-fold
+  ;; the lazy path must agree with the honest one, at EVERY point in history.
+  ;; The shapes that can break it are all here: a plain :put, an :assoc, an
+  ;; object born inside a :tx, a :delete (existed, then did not), a re-put after
+  ;; that delete, a :delete nested inside a :tx, and an id that never existed.
+  (with-dir [dir]
+    (with-store [s dir]
+      (sub/commit! s {:op :put :id "a" :value {:id "a" :kind :doc :value 1}})
+      (sub/commit! s {:op :put :id "b" :value {:id "b" :kind :doc :value 10}})
+      (sub/commit! s {:op :assoc :id "a" :path [:value] :value 2})
+      (sub/commit! s {:op :tx :events [{:op :assoc :id "b" :path [:value] :value 11}
+                                       {:op :put :id "c" :value {:id "c" :kind :doc :value 100}}]})
+      (sub/commit! s {:op :assoc :id "a" :path [:value] :value 3})
+      (sub/commit! s {:op :delete :id "b"})
+      (sub/commit! s {:op :put :id "b" :value {:id "b" :kind :doc :value 99}})
+      (sub/commit! s {:op :tx :events [{:op :delete :id "c"}
+                                       {:op :assoc :id "a" :path [:meta :tag] :value "x"}]})
+      (doseq [n (range 0 10), id ["a" "b" "c" "never-existed"]]
+        (is (= (get-in (sub/as-of s n) [:objects id]) (dlv/object-at s id n))
+            (str "object-at disagreed for " id " at event " n)))
+      ;; and pin the answers, so the agreement above cannot be agreement on nil
+      (is (= 3 (:value (dlv/object-at s "a" 8))))
+      (is (= "x" (get-in (dlv/object-at s "a" 8) [:meta :tag])))
+      (is (= 100 (:value (dlv/object-at s "c" 4))))          ; born inside a :tx
+      (is (= 11 (:value (dlv/object-at s "b" 4))))
+      (is (nil? (dlv/object-at s "b" 6)))                    ; deleted → gone, not stale
+      (is (= 99 (:value (dlv/object-at s "b" 7))))           ; and back again
+      (is (nil? (dlv/object-at s "c" 8)))                    ; deleted inside a :tx
+      (is (nil? (dlv/object-at s "never-existed" 8)))
+      (is (nil? (dlv/object-at s "a" 0))))))                 ; before the first event
+
+(deftest counts-match-a-real-count-at-every-event
+  ;; layer 1 stores an honest histogram — consumers decide which kinds they
+  ;; count. state-payload excludes #{:space :viewspec :applet :fn}; the ⏱
+  ;; header can derive that from :kinds without the substrate knowing about it.
+  (with-dir [dir]
+    (with-store [s dir]
+      (sub/commit! s {:op :put :id "space:x" :value {:id "space:x" :kind :space :value {}}})
+      (sub/commit! s {:op :put :id "d" :value {:id "d" :kind :doc :value 1}})
+      (sub/commit! s {:op :put :id "space:y" :value {:id "space:y" :kind :space :value {}}})
+      (doseq [n (range 1 4)]
+        (let [objs (vals (:objects (sub/as-of s n)))]
+          (is (= {:objects (count objs)
+                  :kinds   (frequencies (map :kind objs))}
+                 (dlv/counts-at s n))
+              (str "counts disagreed at event " n))))
+      (is (= {:space 2 :doc 1} (:kinds (dlv/counts-at s 3))))
+      ;; an event that does not exist has no count — nil, not a zero census
+      (is (nil? (dlv/counts-at s 4)))
+      ;; and undo takes its count back out with it
+      (sub/undo! s)
+      (is (nil? (dlv/counts-at s 3)))
+      (is (= {:objects 2 :kinds {:space 1 :doc 1}} (dlv/counts-at s 2))))))
+
+(deftest rebuild-indices-restores-a-wiped-touch-index
+  (with-dir [dir]
+    (with-store [s dir]
+      (sub/commit! s {:op :put :id "a" :value {:id "a" :kind :doc :value 1}})
+      (sub/commit! s {:op :assoc :id "a" :path [:value] :value 2})
+      (sub/commit! s {:op :tx :events [{:op :put :id "b" :value {:id "b" :kind :space}}
+                                       {:op :delete :id "a"}]})
+      (sub/commit! s {:op :put :id "a" :value {:id "a" :kind :doc :value 3}})
+      (let [touched (fn [id] (vec (d/get-list (:kv s) "touched" id :string :long)))
+            counts  (fn [] (mapv #(dlv/counts-at s %) (range 1 5)))
+            before  {:a (touched "a") :b (touched "b") :counts (counts)}]
+        (dlv/clear-indices! s)
+        (is (nil? (dlv/object-at s "a" 4)))                  ; index gone → honest nil
+        (is (nil? (dlv/counts-at s 4)))
+        (dlv/rebuild-indices! s)
+        (is (= 3 (:value (dlv/object-at s "a" 4))))          ; and it comes back from the log
+        (is (nil? (dlv/object-at s "a" 3)))                  ; deleted inside the :tx
+        (is (= 1 (:value (dlv/object-at s "a" 1))))
+        ;; a rebuild reproduces exactly what commit! wrote — no duplicates, no drift
+        (is (= before {:a (touched "a") :b (touched "b") :counts (counts)}))
+        ;; and it is derived work only: the log and the state are untouched
+        (is (= 4 (count (sub/history s))))
+        (is (= (sub/state s) (sub/materialize (sub/history s))))
+        ;; a rebuild is a rebuild, not a merge — a stale entry left by a log
+        ;; that has since been rewritten must not survive it
+        (d/transact-kv (:kv s) [[:put-list "touched" "ghost" [1 2] :string :long]])
+        (dlv/rebuild-indices! s)
+        (is (empty? (touched "ghost")))
+        (is (= before {:a (touched "a") :b (touched "b") :counts (counts)}))))))
