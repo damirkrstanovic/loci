@@ -43,10 +43,11 @@ Four drivers, all of them stated:
 - **Embeddings come from the user's local llama server** (`lizard10.local:8080`):
   `embed-qwen3-0.6b`, 1024-dim, OpenAI-compatible; reranking via `rerank-bge-m3` at
   `/v1/rerank`. DeepSeek has **no** embeddings endpoint (verified: `POST /embeddings` → 404).
-- **Near-duplicate detection in `remember`: Jaccard first, cosine second** — the instant
-  lexical check still runs offline; the semantic check catches paraphrases when the
-  embedding exists. *(Recommended default — offered as one of three options during
-  brainstorming and not explicitly chosen. Changing it later is a one-function change.)*
+- **Near-duplicate detection: Jaccard at write, semantic merge in the background** (§5.1).
+  Embedding is asynchronous, so an incoming fact has no vector at the moment `remember`
+  runs — cosine cannot be a write-time check without breaking offline commits. The
+  semantic pass therefore belongs to the embed worker, and lands in **phase 3**; phase 1
+  ships today's behaviour unchanged.
 
 ## Measured evidence
 
@@ -190,9 +191,36 @@ sites in `server.clj` (`remembered-context`, `leap-payload`, the post-flow disti
 3. **`opts` grows additively** — `{:k 8 :rerank? false :filter {:space "space:semis"}}`.
    Existing callers keep working on defaults.
 
-Behind it: `recall` becomes hybrid; `remember` keeps its reinforce-on-near-duplicate
-semantics but gains cosine as a second dedup pass. Fact ids move off
-`(inc (count @!facts))` — safe only while nothing is ever deleted — onto a real sequence.
+Behind it: `recall` becomes hybrid. Fact ids move off `(inc (count @!facts))` — safe only
+while nothing is ever deleted — onto a real sequence.
+
+### 5.1 Dedup: Jaccard at write, semantic merge in the background
+
+This matters because auto-distill runs after every ask, research and draft, so the same
+fact is re-derived constantly. Without dedup, recall returns five rewordings of one
+sentence and `:strength` never accumulates — losing loci's only signal for "this keeps
+coming up".
+
+**At write:** unchanged. Jaccard ≥ 0.6 over token sets; on a hit, reinforce in place
+(bump `:strength`, refresh `:ts`, union `:entities`, keep the id). Instant, and it works
+with the embedder offline.
+
+**In the background:** having just embedded a new fact, the worker compares it against
+already-embedded facts (exact cosine — memory is small, and 100 candidates cost 0.61 ms)
+and merges above threshold. Merge rules:
+
+- the **older** fact survives — it holds the provenance and anything already references it
+- `:strength` sums; `:entities` union; `:ts` takes the newer
+- the merged fact's id and text are recorded on the survivor as `:merged-from`, so a merge
+  is auditable and reversible. Nothing is silently destroyed — consistent with "revisable,
+  never undone".
+
+**Threshold must be calibrated, not guessed.** Measured during brainstorming:
+`embed-qwen3-0.6b` scores **0.471 cosine between two entirely unrelated sentences**, so
+its similarity scale is compressed and a borrowed default like 0.85 is meaningless here.
+Calibrate against the existing 61 facts, and err high — a wrong merge folds two distinct
+facts together, and while `:merged-from` makes that recoverable, it still degrades recall
+until someone notices.
 
 ## 6. Migration
 
@@ -246,3 +274,4 @@ Phase 1 is worth shipping alone.
 - Multi-user, client/server Datalevin, or any deployment beyond single-process
 - Re-ranking inside the LEAP keystroke path
 - Blob/GC policy for superseded chunks
+- Un-merging a wrongly merged fact through the UI (`:merged-from` records it; no affordance)
