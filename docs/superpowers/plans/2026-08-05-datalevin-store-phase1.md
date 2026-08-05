@@ -329,17 +329,21 @@ Append to `test/loci/dlv_test.clj`:
     (dlv/close! s)))
 
 (deftest counts-match-a-real-count-at-every-event
+  ;; layer 1 stores an honest histogram — consumers decide which kinds they
+  ;; count. state-payload excludes #{:space :viewspec :applet :fn}; the ⏱
+  ;; header can derive that from :kinds without the substrate knowing about it.
   (let [dir (tmpdir)
         s   (dlv/datalevin-store dir)]
     (sub/commit! s {:op :put :id "space:x" :value {:id "space:x" :kind :space :value {}}})
     (sub/commit! s {:op :put :id "d" :value {:id "d" :kind :doc :value 1}})
     (sub/commit! s {:op :put :id "space:y" :value {:id "space:y" :kind :space :value {}}})
     (doseq [n (range 1 4)]
-      (let [objs (:objects (sub/as-of s n))]
+      (let [objs (vals (:objects (sub/as-of s n)))]
         (is (= {:objects (count objs)
-                :spaces  (count (filter #(= :space (:kind %)) (vals objs)))}
+                :kinds   (frequencies (map :kind objs))}
                (dlv/counts-at s n))
             (str "counts disagreed at event " n))))
+    (is (= {:space 2 :doc 1} (:kinds (dlv/counts-at s 3))))
     (dlv/close! s)))
 
 (deftest rebuild-indices-restores-a-wiped-touch-index

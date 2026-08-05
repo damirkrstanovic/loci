@@ -94,7 +94,8 @@ transaction — the record/recall separation is a rule about writes, not just ab
 
 | dbi | kind | contents |
 |---|---|---|
-| `events` | KV, key `:long` | **the truth.** event index → event map, with `{:objects n :spaces n}` counts stamped at commit |
+| `events` | KV, key `:long` | **the truth.** event index → event map, verbatim |
+| `counts` | KV, key `:long` | event index → `{:objects n :kinds {kind n}}`, so the ⏱ header is an O(1) read. An honest histogram: layer 1 counts kinds, consumers decide which ones they call "objects" |
 | `touched` | list, key `:string` | object id → sorted event indices that touched it |
 | ~~`head`~~ | — | **not built.** See "Boot" below |
 | `objects` | datalog | the spine: `:object/id · kind · title · from · via · spawned-by · merged-from · cells` |
