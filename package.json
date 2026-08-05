@@ -5,6 +5,9 @@
   "scripts": {
     "test:browser": "node --test 'test/browser/**/*.test.mjs'"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "devDependencies": {
     "playwright-core": "^1.62.0"
   }

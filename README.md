@@ -50,9 +50,24 @@ event logs) — delete that directory to reset to a clean slate.
 The two suites are deliberately separate: `clojure -M:test` stays fast and needs no
 browser, while the browser suite boots its own server against a throwaway substrate — it
 never opens `data/`. A failing browser test leaves a screenshot and a console log in
-`test/browser/failures/`, because the defect that motivated the suite (notebook titles
-rendering at ~3px when zoomed out) was invisible to every DOM assertion and only caught
-by looking.
+`test/browser/failures/` (cleared at the start of every run), because the defect that
+motivated the suite (notebook titles rendering at ~3px when zoomed out) was invisible to
+every DOM assertion and only caught by looking.
+
+The browser suite needs two things beyond `npm install`:
+
+- **Node 22 or newer.** `npm run test:browser` uses `node --test` with a glob, which
+  older Node does not understand and reports as a missing file.
+- **A Chromium already on disk.** `playwright-core` deliberately downloads no browser.
+  The harness looks in `~/.cache/ms-playwright/chromium-*` (put one there with
+  `npx playwright install chromium`), then `/usr/bin/chromium`,
+  `/usr/bin/chromium-browser`, `/usr/bin/google-chrome`. To use a specific binary, set
+  `PLAYWRIGHT_CHROMIUM=/path/to/chrome` — it is an override, not a hint: if it is set
+  and the path does not exist the suite fails and names it rather than quietly running
+  a different browser.
+
+The suite is offline-safe: `index.html` loads IBM Plex from a CDN, and every network
+assertion is filtered to the test server's own origin, so no network is not a red suite.
 
 The shell talks to the Clojure backend over a JSON API — the HTTP boundary is the
 substrate/assistance seam. Molding is done server-side by `loci.mold`; the

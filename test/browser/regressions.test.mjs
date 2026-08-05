@@ -55,13 +55,21 @@ test('the overview stays legible at 12 notebooks', async () => {
     await page.evaluate(() => overview());
     await page.waitForFunction(() => typeof mode !== 'undefined' && mode === 'overview');
 
-    const px = await page.evaluate(() => new Promise(res => {
+    // node:test's default timeout is Infinity, so an unbounded wait in here is a wait
+    // forever: cap the frames, and keep a wall clock too in case rAF stops firing at all.
+    const px = await page.evaluate(() => new Promise((res, rej) => {
       const t = document.querySelector('.panel .p-title');
-      let last = -1, stable = 0;
+      let last = -1, stable = 0, frames = 0;
+      const give = why => rej(new Error(`${why} — last height ${last.toFixed(2)}px; ` +
+        `the .5s panel transition settles in ~40 frames`));
+      const clock = setTimeout(() => give('panel title height never settled in 15s'), 15_000);
       const tick = () => {
         const h = t.getBoundingClientRect().height;    // ON SCREEN, after the ZUI transform
-        if (Math.abs(h - last) < 0.05) { if (++stable >= 3) return res(h); } else stable = 0;
+        if (Math.abs(h - last) < 0.05) {
+          if (++stable >= 3) { clearTimeout(clock); return res(h); }
+        } else stable = 0;
         last = h;
+        if (++frames > 600) { clearTimeout(clock); return give(`panel title height never settled in ${frames} frames`); }
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
@@ -93,23 +101,27 @@ test('undo reads read-only in time mode and recovers on ↩ now', async () => {
 // A 404 is a *completed* response, so it never reaches page.on('requestfailed'); and the
 // favicon is fetched by the browser process, so it never reaches page.on('response')
 // either. The console error is the one place it surfaces — and its text names no URL,
-// hence the extra listener that records where each error came from.
-// Response statuses are watched too, for a same-origin fetch that starts 404ing; the
-// shell also loads Google Fonts, and a flaky CDN is not a loci regression.
+// which is why the harness records m.location().url with every console error.
+// Response statuses are watched too, for a same-origin fetch that starts 404ing.
+// Every one of the three is filtered to this server's origin: index.html also pulls
+// IBM Plex from a CDN, and a flaky CDN — or no network at all — is not a loci
+// regression. Run this offline and it must still pass.
 test('a clean boot makes no failed requests and logs no errors', async () => {
   await withPage(browser, 'clean-boot', async (page, diag) => {
-    const bad = [], where = [];
+    const bad = [];
     const mine = u => u.startsWith(server.url);
+    // a console error with no location came from the page itself, so keep it
+    const mineErr = e => !e.url || mine(e.url);
     page.on('response', r => { if (r.status() >= 400 && mine(r.url())) bad.push(`${r.status()} ${r.url()}`); });
-    page.on('console', m => { if (m.type() === 'error') where.push(`${m.text()} ← ${m.location().url}`); });
 
     await bootedShell(page, server.url);
     // the favicon is fetched at low priority and can land after networkidle
     await page.waitForTimeout(1000);
 
+    const errs = diag.consoleErrors.filter(mineErr);
     assert.deepEqual(bad, [], 'error responses on boot');
     assert.deepEqual(diag.failedRequests.filter(mine), [], 'failed requests on boot');
-    assert.deepEqual(diag.consoleErrors, [], `console errors on boot: ${JSON.stringify(where)}`);
+    assert.deepEqual(errs, [], `console errors on boot: ${JSON.stringify(errs)}`);
     assert.deepEqual(diag.pageErrors, [], 'page errors on boot');
   });
 });
