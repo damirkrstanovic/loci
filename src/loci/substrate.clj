@@ -45,7 +45,7 @@
                 (str/replace #"^_+|_+$" ""))]
       (keyword (if (str/blank? s) "col" s)))))
 
-(defn- normalize-keys
+(defn normalize-keys
   "Only keys can poison a line — a string value with spaces is fine, a keyword
    key with spaces is not. Walk the event and fix the keys."
   [event]
