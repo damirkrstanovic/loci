@@ -9,10 +9,21 @@
      · audit / history  = the log *is* the audit trail
      · time-travel      = materialize a prefix (`as-of`)
 
-   This is an in-process implementation so it stays verifiable with no external
-   DB. It sits behind the `Store` protocol exactly so a real immutable,
-   time-aware engine (XTDB / Datahike / Datomic) can replace it later without
-   any caller changing — the same seam we used for `Recall`."
+   This is the in-process implementation: an EDN-lines log, verifiable with no
+   external DB. It sits behind the `Store` protocol so a durable engine could
+   replace it without any caller changing — the same seam we used for `Recall`,
+   and as of 2026-08-05 the seam has been used. `loci.dlv/DatalevinStore` is
+   what the server runs on; the candidates this docstring used to name were all
+   rejected on measurement (Datomic Local: a 4096-char string limit against
+   objects up to 134 KB; XTDB: server-shaped, its bitemporality idle under
+   events-as-truth; see the design spec).
+
+   `PersistentStore` below is not dead code. It stays as the parity reference —
+   the suite runs the whole substrate behaviour against both stores, so
+   equivalence is proven rather than asserted — and as the rollback. Note the
+   asymmetry recorded in `loci.dlv`: EDN log → Datalevin is always safe;
+   Datalevin → EDN log is not, because nippy keeps values that `pr-str` cannot
+   round-trip."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]

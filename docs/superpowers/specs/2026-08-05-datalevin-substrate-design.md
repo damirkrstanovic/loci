@@ -1,7 +1,10 @@
 # loci — Datalevin substrate + hybrid recall: design
 
 Date: 2026-08-05
-Status: accepted in brainstorming, not yet planned
+Status: **phase 1 planned, built and merge-ready** (plan:
+`docs/superpowers/plans/2026-08-05-datalevin-store-phase1.md`; code: `src/loci/dlv.clj`,
+`src/loci/migrate.clj`). Phases 2 and 3 remain as designed below. Sections corrected
+against what was actually built are marked "as built".
 
 ## Goal
 
@@ -126,18 +129,31 @@ them, and `content.clj:500` swaps `persistent-store` → `datalevin-store`. `Fro
 wraps any `Store`, so `?at=N` and the ⏱ scrubber need no changes. No caller in
 `server.clj` changes.
 
-- **`commit!`** — one LMDB transaction: append the event (with stamped counts), update
-  `touched`, update the state atom, update the projection. Enqueue an embed job.
+- **`commit!`** — one LMDB transaction: append the event **verbatim** to `events`, write
+  that event index's census to `counts`, and append the index to `touched` for every
+  object the event names; then update the state atom. The counts are a *separate dbi
+  keyed by event index*, not fields stamped onto the event — the event is stored exactly
+  as it was committed, so the log is still the truth and nothing derived is mixed into
+  it (see the table in §1). Projection and embed jobs are phases 2 and 3.
 - **`state` / `objects` / `object`** — read the in-memory atom. This is where the
   per-request 10.6 ms goes to zero. Note honestly: that win comes from the atom, which
   the EDN store could also have had; Datalevin's contribution is the indices and the
   write path.
-- **`as-of` / `frozen-at`** — **lazy**. Reconstruct only the objects asked for, by folding
-  that object's events from `touched`. Counts for the scrubber header come from the
-  stamped values on event N — an O(1) read, never a scan.
+- **`as-of` / `frozen-at`** — **as built, neither is lazy.** `as-of` folds a prefix of the
+  in-RAM log (`dlv.clj`), and `frozen-at` is untouched: it still takes a prefix of
+  `history` and materializes it. The lazy reader exists and is tested — `dlv/object-at`
+  reconstructs ONE object by folding only its own `touched` indices, bounded at n by
+  `list-range` — but nothing is wired to it yet, deliberately. Wiring it means changing
+  what `store-at` hands the `?at=` readers, and a `FrozenStore` has no back-pointer to
+  the store it froze, so the reader that would call `object-at` cannot reach the index
+  from it. That is phase 2's work, and it is a change to the seam, not to this record.
+  Counts for the scrubber header are the O(1) read today, via `dlv/counts-at`.
 - **`undo!`** — delete the last event, reverse its effect in the atom, projection and
   `touched`. Still a pop; unchanged semantics.
-- **`history`** — a range read, or the stamped count when only the length is needed.
+- **`history`** — as built, a read of the in-RAM log vector, which is the whole point of
+  keeping log and state in one atom: `history` and `state` can never disagree because
+  they are one value. The durable range read happens once, at boot (`read-log`), and
+  again on `reload!`.
 
 **Ceiling, accepted and documented:** the present-state atom holds every object in heap
 (~800 MB at 1M objects). That is a limit on *objects*, not events, and it is far beyond
@@ -245,7 +261,7 @@ The `.edn` files remain on disk as the rollback.
 
 | | |
 |---|---|
-| **LMDB map size** | LMDB preallocates a maximum; exceeding it fails writes with `MAP_FULL`. Hit during benchmarking. Needs a generous default and an honest error. |
+| **LMDB map size** | ~~Needs a generous default and an honest error.~~ **Neither was built, on evidence.** LMDB does preallocate a maximum and `MAP_FULL` was hit during benchmarking, but Datalevin already catches `Util$MapFullException` and grows the map itself (`binding/cpp.clj`), and it honours `:mapsize` **only when the directory does not yet exist** — so a default passed at `open-kv` is a knob that silently stops applying after the first boot, and an error handler for a case the library retries is dead code. Both were written and then deleted. `open-env!` passes no `:mapsize` and says why. |
 | embedder offline | commits succeed, lexical works, semantic degrades, backfill drains later, UI says so |
 | crash mid-write | LMDB is ACID — the 2026-08-05 bug class becomes structurally impossible |
 | concurrent writers | LMDB serializes writes, so no corruption — but loci's own read-modify-write races (`nb/append-cell-event` losing a cell append) are **unchanged**, and must not be claimed as fixed |

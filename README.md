@@ -9,7 +9,7 @@ This repo is the Clojure build. (The earlier single-file interaction prototype i
 
 | Layer | Role | record / recall |
 |---|---|---|
-| 1. Event log | deterministic, reversible (an immutable time-aware DB later: XTDB / Datahike) | **record** |
+| 1. Event log | deterministic, reversible — durable on Datalevin (embedded LMDB) behind the `Store` seam | **record** |
 | 2. Content store | tables, documents, blobs — stored canonically, `datafy`/`nav`-able | **record** |
 | 3. Recall / AI-memory | `loci.memory` — Clojure-native engine (keyword+entity+recency+strength), persisted, agent-written | **recall** |
 | 4. Mold layer | views molded per object, by user *or* agent (Clerk viewer registry) | both |
@@ -43,7 +43,20 @@ clojure -M:test
 `clojure -M:serve` persists its state under `data/` — the substrate is a
 Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
 `data/memory.edn`. Delete that directory to reset to a clean slate. A pre-2026-08
-EDN log at `data/substrate.edn` is migrated with `clojure -M -m loci.migrate`.
+EDN log at `data/substrate.edn` is migrated with `clojure -M:migrate`, which
+imports it verbatim and verifies the two logs materialize to the same state.
+
+**What rollback costs, stated plainly.** The migration never modifies
+`data/substrate.edn`, and `loci.substrate/PersistentStore` is kept — it is the
+parity reference the test suite holds `DatalevinStore` to, and it is the
+rollback. But the rollback only recovers the log as it stood at migration.
+The Datalevin write path serializes with nippy and therefore drops
+`safe-event`'s pr-str/read round-trip check (see `src/loci/dlv.clj`), so events
+written since are not guaranteed to be EDN-expressible, and there is no
+`datalevin->edn!` to carry them back. Reverting `content.clj` after a week on
+the new store means losing everything committed in that week. That is the
+accepted trade: the check existed to stop an unreadable line truncating a text
+file, and a KV store has no lines to truncate.
 
 The shell talks to the Clojure backend over a JSON API — the HTTP boundary is the
 substrate/assistance seam. Molding is done server-side by `loci.mold`; the
