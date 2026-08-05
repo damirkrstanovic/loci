@@ -24,7 +24,9 @@
      · `counts`  — event index → {:objects n :kinds {kind n}} (the ⏱ header)
    Both are derived, so both are rebuildable from `events` alone —
    `rebuild-indices!` does exactly that, which is why a stale or missing index
-   is a rebuild and never a data loss."
+   is a rebuild and never a data loss. A third dbi, `meta`, holds only the mark
+   that says whether the other two can be believed: derived data that is
+   half-built is worse than derived data that is missing, because it answers."
   (:require [datalevin.core :as d]
             [loci.substrate :as sub]))
 
@@ -55,6 +57,7 @@
     (d/open-dbi kv "events")
     (d/open-dbi kv "counts")
     (d/open-list-dbi kv "touched")
+    (d/open-dbi kv "meta")
     kv))
 
 (defn- read-log
@@ -194,6 +197,45 @@
 ;; the readers of the derived dbis — the reason they are maintained at all
 ;; ----------------------------------------------------------------------------
 
+(def ^:private dirty-key
+  "The mark in `meta` that says the derived dbis do not describe the log.
+   ABSENT means trustworthy — a store written before this mark existed has an
+   index `commit!` maintained event by event, and must keep answering."
+  :indices-dirty)
+
+(defn- kv-of
+  "The LMDB env behind `st`, or a refusal that names what was wanted.
+
+   The derived indices live in the env, and a Store without one is not an
+   error the caller invented: `store-at` hands a FrozenStore to every `?at=`
+   reader, which is the very path `object-at` exists for. It has to hear which
+   store this needs, the way `reload!` says it, rather than an
+   IllegalArgumentException about a nil that Datalevin cannot dispatch on."
+  [st what]
+  (or (:kv st)
+      (throw (ex-info (str what " needs a DatalevinStore — it reads the durable index, "
+                           "and this store has none")
+                      {:store (class st) :fn what}))))
+
+(defn- assert-usable!
+  "Refuse to answer from an index that is mid-rebuild or was left half-built.
+
+   Every transaction a rebuild writes is atomic, but the sequence of them is
+   not, and an index missing its last events answers confidently and wrongly —
+   `object-at` would hand back the object as of the last event that made it in.
+   Wrong is worse than absent, so the mark goes down before the clear and comes
+   off only after the last event, and readers stop rather than guess.
+
+   Writers are not blocked: the log is the source of truth and a derived index
+   being stale is no reason to refuse an append. Only readers of the derived
+   data can be misled, so only they refuse."
+  [kv what]
+  (when-let [dirty (d/get-value kv "meta" dirty-key :keyword)]
+    (throw (ex-info (str what " will not answer from a torn index — a rebuild was started "
+                         "and has not finished, so parts of it describe no log at all. "
+                         "The events are intact: run `rebuild-indices!`.")
+                    (assoc dirty :fn what)))))
+
 (defn object-at
   "One object as it was after event `n` — folding only the events that touched
    it. Cost is the object's own history, not the world's: measured 0.2 ms
@@ -201,57 +243,84 @@
 
    Folding a subset is sound because every `apply-event` method writes under
    `[:objects id]` and reads nothing outside it, so no event this skips could
-   have changed `id`. A `:tx` in the list replays all of its sub-events,
-   including ones for other objects — harmless, since only `id` is read back.
+   have changed `id` (see `apply-event`, which asks new methods to keep that
+   true). A `:tx` in the list replays all of its sub-events, including ones for
+   other objects — harmless, since only `id` is read back.
 
    nil when the object did not exist yet, never existed, or had been deleted by
    `n`: the same answer `(get-in (as-of st n) [:objects id])` gives, which is
    the property the tests hold it to."
   [st id n]
-  ;; take-while, not filter: LMDB keeps a list dbi's values sorted, and the
-  ;; :long encoding is order-preserving, so the indices arrive ascending and
-  ;; the scan can stop at n instead of reading the object's whole future.
-  (let [idxs (take-while #(<= % n) (d/get-list (:kv st) "touched" id :string :long))]
-    (when (seq idxs)
-      (-> (reduce (fn [state i]
-                    (sub/apply-event state (d/get-value (:kv st) "events" i :long)))
-                  {:objects {}} idxs)
-          (get-in [:objects id])))))
+  (let [kv (kv-of st "object-at")]
+    (assert-usable! kv "object-at")
+    ;; `list-range` bounded at n, not `get-list` filtered afterwards:
+    ;; `get-list` loops the iterator to exhaustion into a vector, so a
+    ;; take-while over it still pays for the object's whole FUTURE — for a
+    ;; notebook touched by every event in its own history, dragging the ⏱
+    ;; scrubber to an early frame is the worst case, and it is the case this
+    ;; index exists to make cheap. Measured through this fn, 16001 events with
+    ;; an 8001-entry touch list: n=1 3.21 → 0.03 ms, n=101 2.97 → 0.23 ms.
+    ;; The far end costs ~20% more (pairs, not bare values, and both read it
+    ;; all) against a fold that by then dominates — the right trade for a
+    ;; reader whose whole purpose is the past.
+    (let [idxs (map second (d/list-range kv "touched" [:closed id id] :string [:at-most n] :long))]
+      (when (seq idxs)
+        (-> (reduce (fn [state i]
+                      (sub/apply-event state (d/get-value kv "events" i :long)))
+                    {:objects {}} idxs)
+            (get-in [:objects id]))))))
 
 (defn counts-at
   "`{:objects n :kinds {kind n}}` after event `n` — an O(1) read, never a scan.
    nil for an event that does not exist (never committed, or undone)."
   [st n]
-  (d/get-value (:kv st) "counts" n :long))
+  (let [kv (kv-of st "counts-at")]
+    (assert-usable! kv "counts-at")
+    (d/get-value kv "counts" n :long)))
 
 (defn clear-indices!
-  "Drop the derived dbis. They are rebuildable; the log is untouched."
+  "Drop the derived dbis. They are rebuildable; the log is untouched.
+
+   Marks them untrustworthy BEFORE dropping them. In the other order, a clear
+   that half-succeeded would leave an index that reads as believable and is
+   not; in this order the worst case is a mark that outlives its reason, and
+   the cure for that is a rebuild — which is what the caller was doing anyway."
   [st]
-  (d/clear-dbi (:kv st) "touched")
-  (d/clear-dbi (:kv st) "counts"))
+  (let [kv (kv-of st "clear-indices!")]
+    (d/transact-kv kv [[:put "meta" dirty-key {:since (System/currentTimeMillis)} :keyword]])
+    (d/clear-dbi kv "touched")
+    (d/clear-dbi kv "counts")))
 
 (defn rebuild-indices!
   "Replay the log to rebuild `touched` and `counts`. Safe to run at any time —
    a stale or missing index is a rebuild, never a data loss.
 
+   Replays the DURABLE log, not the in-RAM one. The caller this exists for is
+   the bulk writer that put events into `events` by some other route than
+   `commit!`; asking it to `reload!` first would be a precondition it could
+   forget, and forgetting it builds an index that is silently short.
+
    Under the same lock `commit!` takes: between the clear and the last event
-   rebuilt, the index does not describe the log, and a commit landing in that
-   window would either be wiped by the clear or have its entry overwritten by a
-   census that predates it."
+   rebuilt the index does not describe the log, and an `undo!` landing in that
+   window would have its deleted event written back into the index by a replay
+   that had already read it.
+
+   Clears first, so a rebuild is a rebuild and not a merge with whatever a
+   rewritten log left behind; and lifts the untrustworthy mark last, so a
+   rebuild that dies partway leaves readers refusing rather than guessing."
   [st]
-  (locking (:lock st)
-    ;; clear first: a rebuild has to be a rebuild, not a merge. Entries left by
-    ;; a log that has since been rewritten would otherwise survive it, pointing
-    ;; an object at events that are no longer its own.
-    (clear-indices! st)
-    (reduce (fn [state [i ev]]
-              (let [state' (sub/apply-event state ev)]
-                ;; one transaction per event, same op shapes commit! uses
-                (d/transact-kv (:kv st)
-                               (into [[:put "counts" i (census state') :long]]
-                                     (map (fn [id] [:put-list "touched" id [i] :string :long]))
-                                     (touched-ids ev)))
-                state'))
-            {:objects {}}
-            (map-indexed (fn [k ev] [(inc k) ev]) (sub/history st)))
-    :ok))
+  (let [kv (kv-of st "rebuild-indices!")]
+    (locking (:lock st)
+      (clear-indices! st)
+      (reduce (fn [state [i ev]]
+                (let [state' (sub/apply-event state ev)]
+                  ;; one transaction per event, same op shapes commit! uses
+                  (d/transact-kv kv
+                                 (into [[:put "counts" i (census state') :long]]
+                                       (map (fn [id] [:put-list "touched" id [i] :string :long]))
+                                       (touched-ids ev)))
+                  state'))
+              {:objects {}}
+              (map-indexed (fn [k ev] [(inc k) ev]) (read-log kv)))
+      (d/transact-kv kv [[:del "meta" dirty-key :keyword]])
+      :ok)))

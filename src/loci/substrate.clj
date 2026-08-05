@@ -76,7 +76,14 @@
 
 (defmulti apply-event
   "How one event transforms state. Open for extension (an agent's new op is a
-   new method, not a fork of the reducer)."
+   new method, not a fork of the reducer).
+
+   A new method must write only under `[:objects (:id event)]` and read nothing
+   outside it (a `:tx` delegates, so its sub-events carry the same obligation).
+   `loci.dlv/object-at` rebuilds one object by folding only the events that
+   touched that id — an op that derived one object's value from another's, say
+   a `:copy`, would make that fold silently disagree with a full one, and the
+   disagreement would show up as a wrong answer in the past, not as an error."
   (fn [_state event] (:op event)))
 
 (defmethod apply-event :put     [st {:keys [id value]}] (assoc-in st [:objects id] value))
