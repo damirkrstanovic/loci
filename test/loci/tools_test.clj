@@ -1,5 +1,7 @@
 (ns loci.tools-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is]]
+            [loci.substrate :as sub]
             [loci.tools :as tools]))
 
 (deftest md-table-salvage-parses-prose-tables
@@ -32,3 +34,21 @@
 (deftest md-table-salvage-honest-nil
   (is (nil? (tools/md-table->rows "no table here at all")))
   (is (nil? (tools/md-table->rows "just one | piped line"))))
+
+;; ---- every ingest path must mint readable column keywords ----
+;; save_table (agent JSON) and CSV headers used to keywordize verbatim, so a
+;; column called "Key Proponent(s)" became a keyword the log could not read back.
+
+(deftest save-table-sanitizes-agent-column-names
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{(keyword "Key Proponent(s)") "Canon"
+                                       (keyword "How It Works") "stamp"
+                                       :year 2026}])
+        rows (:value (sub/object st (:saved_as r)))]
+    (is (= {:key_proponent_s "Canon" :how_it_works "stamp" :year 2026} (first rows)))
+    (is (= #{"key_proponent_s" "how_it_works" "year"} (set (:columns r))))
+    (is (= rows (edn/read-string (pr-str rows))))))
+
+(deftest parse-csv-sanitizes-headers
+  (let [rows (tools/parse-csv "Key Proponent(s),Total Revenue ($)\nCanon,5")]
+    (is (= {:key_proponent_s "Canon" :total_revenue 5} (first rows)))))

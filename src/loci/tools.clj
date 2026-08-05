@@ -24,7 +24,7 @@
 
 (defn parse-csv [text]
   (let [[hdr & rows] (csv/read-csv (java.io.StringReader. (str/trim text)))
-        ks (mapv keyword hdr)]
+        ks (mapv sub/col-kw hdr)]                          ; "Total Revenue ($)" → :total_revenue
     (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
 
 ;; ---- markdown-table salvage: models sometimes write the table INTO prose
@@ -58,10 +58,7 @@
                  first)]
     (when tbl
       (let [[hdr & body] (remove md-sep? tbl)
-            ks   (mapv #(keyword (-> % str/lower-case
-                                     (str/replace #"[^a-z0-9]+" "_")
-                                     (str/replace #"^_+|_+$" "")))
-                       (md-cells hdr))
+            ks   (mapv sub/col-kw (md-cells hdr))
             rows (keep (fn [l] (let [cs (md-cells l)]
                                  (when (= (count cs) (count ks))
                                    (zipmap ks (map md-cell-val cs)))))
@@ -140,7 +137,12 @@
   "Land agent-gathered/extracted rows as a reversible, moldable :table object.
    With a space, also assoc it into that space's members (one :tx step)."
   [st title rows & [space]]
-  (let [rows (vec rows)]
+  ;; the model names its own columns — "Key Proponent(s)" must not become a
+  ;; keyword the log cannot read back (the substrate would refuse the event)
+  (let [rows (mapv (fn [r] (if (map? r)
+                             (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)
+                             r))
+                   (vec rows))]
     (if (empty? rows)
       {:error "no rows to save"}
       (let [nid (str "tbl:extract-" (count (table-objs st)) "-" (inc (rand-int 9999)))

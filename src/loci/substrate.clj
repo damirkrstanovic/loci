@@ -14,7 +14,56 @@
    time-aware engine (XTDB / Datahike / Datomic) can replace it later without
    any caller changing — the same seam we used for `Recall`."
   (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]))
+            [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.walk :as walk]))
+
+;; ----------------------------------------------------------------------------
+;; readable keys — a log is only a log if it can be read back.
+;;
+;; Column names arrive from agents and CSV headers and become keywords. A
+;; keyword like :Key Proponent(s) PRINTS without complaint and then cannot be
+;; read back at all, so one such line truncated the file at boot and every
+;; event after it vanished silently. Normalize on the way in, by rule (the same
+;; deterministic move as the markdown-table salvage — never re-asked, never
+;; guessed), and refuse anything that still cannot round-trip.
+;; ----------------------------------------------------------------------------
+
+(defn- readable? [x]
+  (let [s (pr-str x)]
+    (= s (try (pr-str (edn/read-string s)) (catch Exception _ ::unreadable)))))
+
+(defn col-kw
+  "Any column name → a keyword that survives a pr-str/read round-trip.
+   Keywords that already read back cleanly (`:year`, `:table/rows`) pass through."
+  [x]
+  (if (and (keyword? x) (readable? x))
+    x
+    (let [s (-> (if (keyword? x) (subs (str x) 1) (str x))
+                str/lower-case
+                (str/replace #"[^a-z0-9]+" "_")
+                (str/replace #"^_+|_+$" ""))]
+      (keyword (if (str/blank? s) "col" s)))))
+
+(defn- normalize-keys
+  "Only keys can poison a line — a string value with spaces is fine, a keyword
+   key with spaces is not. Walk the event and fix the keys."
+  [event]
+  (walk/postwalk
+   (fn [n] (if (map? n)
+             (reduce-kv (fn [m k v] (assoc m (cond-> k (keyword? k) col-kw) v)) {} n)
+             n))
+   event))
+
+(defn safe-event
+  "The event as it will be written: keys normalized, round-trip proven. Throws
+   rather than append a line that would truncate the log on the next boot."
+  [event]
+  (let [ev (normalize-keys event)]
+    (if (readable? ev)
+      ev
+      (throw (ex-info "event cannot be read back from the log — refusing to write it"
+                      {:id (:id event) :op (:op event)})))))
 
 (defprotocol Store
   (commit! [this event] "append an event map; returns the new tx count")
@@ -43,7 +92,7 @@
 (defrecord EventStore [!log]
   Store
   (commit! [_ event]
-    (swap! !log conj (assoc event :ts (System/currentTimeMillis)))
+    (swap! !log conj (safe-event (assoc event :ts (System/currentTimeMillis))))
     (count @!log))
   (state   [_] (materialize @!log))
   (objects [this] (:objects (state this)))
@@ -65,14 +114,31 @@
   []
   (or (System/getProperty "loci.data-dir") (System/getenv "LOCI_DATA") "data"))
 
-(defn- load-events [file]
+(defn- load-events
+  "Replay the log line by line. A crash mid-append can truncate the LAST line —
+   salvage the prefix quietly. An unreadable line anywhere else is a bug: skip
+   it so the rest of the history still replays, and say so out loud (it used to
+   be swallowed as EOF, silently discarding every event after it)."
+  [file]
   (let [f (io/file file)]
     (if (.exists f)
-      (with-open [r (java.io.PushbackReader. (io/reader f))]
-        (loop [acc []]
-          ;; a crash mid-append can truncate the last line — salvage the prefix
-          (let [ev (try (edn/read {:eof ::eof} r) (catch Exception _ ::eof))]
-            (if (= ::eof ev) acc (recur (conj acc ev))))))
+      (with-open [r (io/reader f)]
+        (let [lines (vec (line-seq r))
+              last-i (dec (count lines))]
+          (reduce-kv
+           (fn [acc i line]
+             (if (str/blank? line)
+               acc
+               (let [ev (try (edn/read-string line) (catch Exception _ ::bad))]
+                 (cond
+                   (not= ::bad ev) (conj acc ev)
+                   (= i last-i)    acc                     ; truncated tail — expected
+                   :else (do (binding [*out* *err*]
+                               (println (str "loci: substrate log line " (inc i)
+                                             " is unreadable — skipped: "
+                                             (subs line 0 (min 90 (count line))) "…")))
+                             acc)))))
+           [] lines)))
       [])))
 
 (defn- write-all! [file events]
@@ -82,7 +148,7 @@
 (defrecord PersistentStore [!log file]
   Store
   (commit! [_ event]
-    (let [ev (assoc event :ts (System/currentTimeMillis))]
+    (let [ev (safe-event (assoc event :ts (System/currentTimeMillis)))]
       (io/make-parents (io/file file))
       (spit file (str (pr-str ev) "\n") :append true)
       (count (swap! !log conj ev))))
