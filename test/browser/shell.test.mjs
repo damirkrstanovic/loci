@@ -11,6 +11,19 @@ after(async () => { await browser?.close(); await server?.stop(); });
 // an unfocused panel has pointer-events:none but is still "visible" to Playwright.
 const body = i => `#body${i}`;
 
+// The write half of index.html's `.world.timemode …{display:none!important}` rule, as
+// far as a user can reach it in the past. `.fnpal` is left out on purpose: it only
+// exists after a click on ƒ, and ƒ (.mkcell) is hidden by this very rule.
+const NOTEBOOK_WRITES = ['.actions', '.addrow', 'select[data-remold]', '.mkcell'];
+
+// dom AND visible: a selector that matches nothing is not "hidden", it is absent, and
+// an assertion about an absent element holds however the stylesheet is butchered.
+const affordances = async (page, sels) => {
+  const out = {};
+  for (const s of sels) out[s] = { dom: await page.locator(s).count(), vis: await page.locator(`${s}:visible`).count() };
+  return out;
+};
+
 test('boots and renders the seeded world', async () => {
   await withPage(browser, 'boots-and-renders', async (page) => {
     await bootedShell(page, server.url);
@@ -79,27 +92,90 @@ test('time mode drops the event count, hides writes, and ↩ now restores', asyn
   await withPage(browser, 'time-travel', async (page) => {
     await bootedShell(page, server.url);
     const before = await page.textContent('#ambient');
+    const eventCount = async () => Number((await page.textContent('#ambient')).match(/(\d+) events/)[1]);
+    const now = await eventCount();
+    // the slider repaints the strip on every step; wait for the repaint, not a timeout
+    const scrub = async v => {
+      const was = await page.textContent('#ambient');
+      await page.evaluate(x => {
+        const r = document.getElementById('timeRange');
+        r.value = x; r.dispatchEvent(new Event('input', { bubbles: true }));
+      }, String(v));
+      await page.waitForFunction(w => document.getElementById('ambient').textContent !== w, was);
+    };
 
     await page.click('#timeBtn');
     await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME !== null);
     const max = Number(await page.getAttribute('#timeRange', 'max'));
     assert.ok(max > 1, `time slider has no history: max=${max}`);
-    await page.evaluate(v => {
-      const r = document.getElementById('timeRange');
-      r.value = v; r.dispatchEvent(new Event('input', { bubbles: true }));
-    }, String(Math.floor(max * 0.5)));
 
-    await page.waitForFunction(e => document.getElementById('ambient').textContent !== e, before);
-    assert.equal(await page.locator('.actions:visible').count(), 0, 'write affordances visible in the past');
+    await scrub(Math.floor(max * 0.5));
+    const halfway = await eventCount();
+    assert.ok(halfway < now, `the past still shows all ${now} events`);
     assert.ok(await page.evaluate(() => document.getElementById('world').classList.contains('timemode')));
     // undo is the one write control that survives overview mode — it must read as read-only
     assert.ok(await page.evaluate(() => document.getElementById('undoBtn').classList.contains('dim')),
       'undo still looks writable in the past');
 
+    // Write affordances live inside a *focused* notebook — the overview renders a bare
+    // title list — and half way through this fixture's history the seed has not created
+    // a notebook at all. So enter one, from the newest past state: still the past (one
+    // event short of now), and furnished. Clicking a panel in time mode calls enter(),
+    // so this is a place a real user lands, not a contrivance.
+    await scrub(max - 1);
+    assert.ok(await eventCount() < now, 'one event before the present is not the past');
+    const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+    assert.ok(i >= 0, 'space:cosmos missing one event before the present');
+    await page.evaluate(n => enter(n), i);
+    await page.waitForSelector(`${body(i)} .actions`, { state: 'attached', timeout: 20_000 });
+
+    const past = await affordances(page, NOTEBOOK_WRITES);
+    for (const [sel, c] of Object.entries(past)) {
+      assert.ok(c.dom > 0, `${sel} is absent from the notebook, not hidden — this check cannot fail`);
+      assert.equal(c.vis, 0, `${sel} is a write affordance and it is visible in the past: ${JSON.stringify(past)}`);
+    }
+    // the per-cell ↑↓✎✕ bar only appears on hover, so hover it — otherwise "hidden"
+    // means nothing and .cellbar in that CSS rule is untested
+    await page.locator(`${body(i)} .cellwrap`).first().hover();
+    assert.ok(await page.locator(`${body(i)} .cellbar`).count() > 0, 'no .cellbar in the notebook');
+    assert.equal(await page.locator(`${body(i)} .cellbar:visible`).count(), 0, '✎/✕ cell bar reachable in the past');
+
+    // the other two live on an opened object: ✦ make… (table-shaped) and Edit (text)
+    await page.evaluate(() => openObject('tbl:planets'));
+    await page.waitForSelector('#moldsel');
+    assert.ok(await page.locator('#makebtn').count() > 0, '#makebtn absent, not hidden');
+    assert.equal(await page.locator('#makebtn:visible').count(), 0, '✦ make… is clickable in the past');
+    assert.equal(await page.locator('#moldsel:visible').count(), 1,
+      'the past went read-only *and* unreadable — "view this as" is a read, it must survive');
+    await page.evaluate(() => openObject('doc:cosmos'));
+    await page.waitForSelector('#editbtn', { state: 'attached' });
+    assert.equal(await page.locator('#editbtn:visible').count(), 0, 'Edit is clickable in the past');
+
+    // back to the notebook before leaving the past, so ↩ now returns to a body that
+    // renders itself (rebuild() drops the opened object's payload)
+    await page.evaluate(n => enter(n), i);
+    await page.waitForSelector(`${body(i)} .actions`, { state: 'attached', timeout: 20_000 });
+
     await page.click('#timeNow');
     await page.waitForFunction(e => document.getElementById('ambient').textContent === e, before);
     assert.ok(await page.evaluate(() => typeof TIME !== 'undefined' && TIME === null));
     assert.equal(await page.evaluate(() => document.getElementById('undoBtn').classList.contains('dim')), false);
+
+    // …and the control the old one-sided assertion lacked: in the present the very same
+    // affordances are on screen. Without this, deleting the CSS rule leaves the suite green.
+    // ↩ now re-applies the present state, so re-read the panel index rather than assume it.
+    const j = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+    await page.waitForSelector(`${body(j)} .actions`, { state: 'visible', timeout: 20_000 });
+    const restored = await affordances(page, NOTEBOOK_WRITES);
+    for (const [sel, c] of Object.entries(restored)) {
+      assert.ok(c.vis > 0, `${sel} never comes back in the present: ${JSON.stringify(restored)}`);
+    }
+    await page.locator(`${body(j)} .cellwrap`).first().hover();
+    await page.locator(`${body(j)} .cellbar`).first().waitFor({ state: 'visible', timeout: 5_000 });
+    await page.evaluate(() => openObject('tbl:planets'));
+    await page.waitForSelector('#makebtn', { state: 'visible' });
+    await page.evaluate(() => openObject('doc:cosmos'));
+    await page.waitForSelector('#editbtn', { state: 'visible' });
   });
 });
 
