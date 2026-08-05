@@ -13,7 +13,7 @@
 **Facts the implementer needs:**
 - The shell is one file, `resources/public/index.html` (1,155 lines). Read it — every selector below comes from it.
 - Element ids: `#world`, `#q` (LEAP input), `#results`, `#crumb`, `#ambient` (the "N notebooks · M objects · K events" strip), `#memBtn`, `#fnBtn`, `#timeBtn`, `#undoBtn`, `#timebar`, `#timeRange`, `#timeNow`, `#toast`, `#modal`. Panels are `.panel`, their bodies `#body<i>`, titles `.p-title`.
-- Useful globals on `window`: `STATE` (`{spaces, objects, events}`), `enter(i)`, `overview()`, `openObject(id)`, `mode`, `focusIdx`, `TIME`.
+- Useful globals: `STATE` (`{spaces, objects, events}`), `enter(i)`, `overview()`, `openObject(id)`, `mode`, `focusIdx`, `TIME`. **They are NOT properties of `window`** — `index.html:238` declares them with `let`/`function` at the top level of a classic `<script>`, which creates lexical globals. `page.evaluate(() => overview())` works (evaluate runs in global scope), but `window.STATE` is permanently `undefined`. In `waitForFunction`, reference them bare and guard with `typeof x !== 'undefined'` so a not-yet-initialised binding is a false rather than a `ReferenceError`.
 - In overview past ~7 notebooks the world gains class `cards`; in time mode it gains `timemode` and `#undoBtn` gains `dim`.
 - `server.clj`'s `-main` hardcodes port 7777 — do NOT use `:serve`. Start the handler directly (the exact command is in Task 1).
 - A fresh `LOCI_DATA` seeds **35 events, 35 objects, 12 spaces** including `space:cosmos`, `tbl:planets`, `doc:cosmos`.
@@ -24,6 +24,23 @@
 ---
 
 ### Task 1: package.json, harness, and one smoke test
+
+> **AS BUILT — read `test/browser/harness.mjs`; the code below is superseded.** Four defects
+> in this plan's version, all found by running it:
+> 1. **`node --test test/browser/` does not work on Node 26** — a bare directory is treated
+>    as a module. The script is `node --test 'test/browser/**/*.test.mjs'`.
+> 2. **The flow fixture would have erased `space:cosmos`'s seeded members.** The space seeds
+>    with `:members`, not `:cells`, and `notebook.clj:15` prefers `:cells` when present — so
+>    `(conj (vec nil) …)` would have replaced three members with one flow ref for the whole
+>    suite. Uses `nb/cells-of` instead.
+> 3. **`window.STATE` is always `undefined`** (see the globals note above).
+> 4. **`proc.kill()` could orphan a JVM holding the port** during the classpath window, and
+>    the readiness-timeout path never killed at all. The server is spawned `detached` and
+>    the whole group is killed, with the exit awaited before the tmpdir is removed.
+>
+> Also changed: `localhost` → `127.0.0.1` everywhere (Node resolving `::1` while http-kit
+> binds IPv4 is an intermittent hang), and the failure log now always carries the absolute
+> screenshot path.
 
 The harness is the whole risk in this plan — if it can't boot a server and drive a browser reliably, nothing else matters. Build it against a single trivial assertion first.
 
@@ -259,11 +276,11 @@ test('a panel click enters focus and the crumb returns to overview', async () =>
 
     const title = await page.locator('.panel .p-title').first().textContent();
     await page.locator('.panel').first().click();
-    await page.waitForFunction(() => window.mode === 'focus');
+    await page.waitForFunction(() => typeof mode !== 'undefined' && mode === 'focus');
     assert.match(await page.textContent('#crumb'), new RegExp(title.trim().slice(0, 20)));
 
     await page.locator('#crumb').click();
-    await page.waitForFunction(() => window.mode === 'overview');
+    await page.waitForFunction(() => typeof mode !== 'undefined' && mode === 'overview');
     assert.match(await page.textContent('#crumb'), /all notebooks/);
   });
 });
@@ -284,7 +301,7 @@ test('LEAP finds seeded content and a hit opens the object', async () => {
 
     const objHit = page.locator('#results .res').filter({ hasText: 'tbl:planets' }).first();
     await objHit.click();
-    await page.waitForFunction(() => window.openId === 'tbl:planets');
+    await page.waitForFunction(() => typeof openId !== 'undefined' && openId === 'tbl:planets');
   });
 });
 ```
@@ -320,7 +337,7 @@ test('time mode drops the event count, hides writes, and ↩ now restores', asyn
     const before = await page.textContent('#ambient');
 
     await page.click('#timeBtn');
-    await page.waitForFunction(() => window.TIME !== null && window.TIME !== undefined);
+    await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME !== null);
     const max = Number(await page.getAttribute('#timeRange', 'max'));
     await page.evaluate(v => {
       const r = document.getElementById('timeRange');
@@ -343,7 +360,7 @@ test('time mode drops the event count, hides writes, and ↩ now restores', asyn
 test('+ prose adds a cell and ↺ undo reverts it', async () => {
   await withPage(browser, 'write-then-undo', async (page) => {
     await bootedShell(page, server.url);
-    const events = () => page.evaluate(() => window.STATE.events);
+    const events = () => page.evaluate(() => STATE.events);
     const before = await events();
 
     const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
@@ -354,10 +371,10 @@ test('+ prose adds a cell and ↺ undo reverts it', async () => {
     await page.fill('.prosed', 'a note written by the browser suite');
     await page.keyboard.press('Meta+Enter').catch(() => {});
     // if that is not the save gesture, click the save control — read editProse in index.html
-    await page.waitForFunction(b => window.STATE.events === b + 1, before, { timeout: 15_000 });
+    await page.waitForFunction(b => STATE.events === b + 1, before, { timeout: 15_000 });
 
     await page.click('#undoBtn');
-    await page.waitForFunction(b => window.STATE.events === b, before, { timeout: 15_000 });
+    await page.waitForFunction(b => STATE.events === b, before, { timeout: 15_000 });
   });
 });
 ```
@@ -441,11 +458,11 @@ test('undo reads read-only in time mode and recovers on ↩ now', async () => {
     assert.equal(await dim(), false, 'dimmed before entering time mode');
 
     await page.click('#timeBtn');
-    await page.waitForFunction(() => window.TIME);
+    await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME);
     assert.equal(await dim(), true, 'undo looks live while the past is read-only');
 
     await page.click('#timeNow');
-    await page.waitForFunction(() => !window.TIME);
+    await page.waitForFunction(() => typeof TIME === 'undefined' || !TIME);
     assert.equal(await dim(), false, 'dim never cleared on return to the present');
   });
 });
