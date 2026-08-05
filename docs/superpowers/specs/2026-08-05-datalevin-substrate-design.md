@@ -71,7 +71,7 @@ At 10,000,000 synthetic events (87 bytes each, 871 MB, 1M objects):
 | write, durable, batched | 23.8 s (0.0024 ms/event) |
 | datalog lineage @ 1M objects | **0.1 ms** |
 | full-text @ 1M docs | **0.1 ms** |
-| boot from head snapshot | 2.53 s (heap 806 MB) |
+| boot from a snapshot + tail (measured, but not built — see §1) | 2.53 s (heap 806 MB) |
 | as-of, full-state fold + snapshot | 642 ms |
 | **as-of, lazy per-object** | **0.2 ms — one object; 4.2 ms — 18 panels** |
 
@@ -96,16 +96,24 @@ transaction — the record/recall separation is a rule about writes, not just ab
 |---|---|---|
 | `events` | KV, key `:long` | **the truth.** event index → event map, with `{:objects n :spaces n}` counts stamped at commit |
 | `touched` | list, key `:string` | object id → sorted event indices that touched it |
-| `head` | KV | one state snapshot for fast boot — written on clean shutdown and every 10,000 commits; a stale or missing one costs a fold, never correctness |
+| ~~`head`~~ | — | **not built.** See "Boot" below |
 | `objects` | datalog | the spine: `:object/id · kind · title · from · via · spawned-by · merged-from · cells` |
 | `chunks` | datalog | `:chunk/id · object · text · model · dim · embedded?` |
 | `facts` | datalog | `:fact/id · source · entities · ts · strength` (layer 3) |
 | — | vector index | 1024-dim, cosine, keyed by chunk id |
 | — | FTS | over titles, prose cells, doc bodies, fact text |
 
-**Truth vs derived.** Only `events` is truth. `touched`, `head`, the projection, FTS and
-vectors are all rebuildable from it — a corrupted or stale index is a rebuild, never a
-data loss. Memory facts are a *parallel* truth with their own log; undo never touches them.
+**Truth vs derived.** Only `events` is truth. `touched`, the projection, FTS and vectors
+are all rebuildable from it — a corrupted or stale index is a rebuild, never a data loss.
+Memory facts are a *parallel* truth with their own log; undo never touches them.
+
+**Boot: fold the log, no snapshot.** Measured fold rate is ~0.75 µs/event, so boot costs
+~2 ms at today's 80 events, 227 ms at 10k, and 3.75 s at 1M. A head snapshot buys nothing
+below roughly a million events and costs a second thing that can go stale, disagree with
+the log, and be got wrong in `undo!`. Build it when boot is actually felt, and derive the
+interval then: with a 200 ms budget the tail can run to ~265,000 events. An earlier draft
+of this spec said "every 10,000 commits", which was a guess 26× tighter than the
+measurement supports — recorded here so the mistake isn't repeated.
 
 Datalevin serializes EDN natively (nippy). There is no `pr-str`/`read-string` anywhere in
 the write path.
