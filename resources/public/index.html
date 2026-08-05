@@ -3,6 +3,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>loci</title>
+<!-- inline so the shell asks the server for nothing it doesn't need (the 404 was noise) -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ECEEEA'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%232f6f5b'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Serif&display=swap" rel="stylesheet">
@@ -56,6 +58,11 @@
          transition:transform .5s cubic-bezier(.6,.02,.1,1),opacity .4s;background:var(--panel);border:1px solid var(--line);
          border-radius:16px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 30px 60px -40px rgba(20,30,25,.5)}
   .world.overview .panel{cursor:pointer} .world.overview .panel:hover{border-color:var(--accent-line)}
+  /* zoomed far out: the notebook reads as a card — head only, intent clamped */
+  .world.cards .p-body{display:none}
+  .world.cards .p-head{border-bottom:none}
+  .world.cards .p-intent{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .world.cards .p-eyebrow{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:72%}  /* clear the status pill */
   .panel.child{border-left:4px solid var(--accent-line)}
   .p-head{padding:22px 26px 12px;border-bottom:1px solid var(--line-2)}
   .p-eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:9px}
@@ -98,6 +105,7 @@
   .btn.sm{padding:4px 10px;font-size:12px}
   .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .undoBtn{display:flex;align-items:center;gap:7px;border:1px solid var(--line);background:transparent;font-size:12.5px;color:var(--muted);padding:6px 11px;border-radius:999px;cursor:pointer;font-family:var(--mono)}
+  .undoBtn.dim{opacity:.4;cursor:not-allowed}          /* time mode: the past cannot be edited */
   .undoBtn:hover{border-color:var(--attn);color:var(--attn)}
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);z-index:80;background:var(--ink);color:var(--paper);font-size:12.5px;padding:9px 15px;border-radius:999px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;display:flex;gap:10px;align-items:center}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -381,7 +389,8 @@ async function renderNotebook(i){
       const mkable=(c.alternatives||[]).some(a=>a[1]==='Rows');   // table-shaped → ✦ make lives here too
       cellsH+='<div class="cellwrap" data-cell="'+c.i+'">'+bar+
         '<div class="cellmold"><div class="hd"><span class="t" data-open="'+esc(c.id)+'">'+esc(c.title)+'</span>'+
-        '<span class="chip">'+esc(c.id)+'</span><select data-remold="'+c.i+'">'+opts+'</select>'+
+        '<span class="chip">'+esc(c.id)+'</span>'+
+        ((c.alternatives||[]).length?'<select data-remold="'+c.i+'">'+opts+'</select>':'')+   // a flow has no molds — no empty control
         (mkable?'<button class="mkcell" data-make="'+esc(c.id)+'" title="✦ make… — ask for a view, a computed table, or a visualization of this data">✦</button>'+
                 '<button class="mkcell" data-fnp="'+esc(c.id)+'" title="ƒ apply a function — filter, group, pivot, top-N…">ƒ</button>':'')+'</div>'+
         '<div class="bd">'+renderMold(c)+'</div>'+(chips?'<div class="chips">'+chips+'</div>':'')+'</div></div>';
@@ -600,7 +609,7 @@ function renderDetail(i,m){
   const makeBtn = describable ? '<button class="btn ghost sm" id="makebtn" style="margin-left:8px">✦ make…</button>' : '';
   b.innerHTML='<button class="backlink" id="back">‹ back to the space</button>'+
     '<div class="molder"><div class="molder-h"><span class="t">'+esc(m.title)+'</span>'+
-    '<span class="lab">view this as</span><select id="moldsel">'+opts+'</select>'+editBtn+makeBtn+'</div>'+
+    (m.alternatives.length?'<span class="lab">view this as</span><select id="moldsel">'+opts+'</select>':'')+editBtn+makeBtn+'</div>'+
     '<div class="molder-b" id="moldbody">'+renderMold(m)+'</div></div>';
   b.querySelector('#back').addEventListener('click',()=>{ openId=null; renderBody(i); });
   const selEl=b.querySelector('#moldsel');
@@ -836,7 +845,7 @@ function layout(){
   const fw=Math.min(940,vw-48), fh=vh-top-28, fx=(vw-fw)/2;
   panels.forEach(p=>{p.style.width=fw+'px';p.style.height=fh+'px';});
   if(mode==='focus'){
-    world.classList.remove('overview');
+    world.classList.remove('overview'); world.classList.remove('cards');
     panels.forEach((p,k)=>{
       if(k===focusIdx){p.style.transform='translate('+fx+'px,'+top+'px) scale(1)';p.style.opacity='1';p.style.zIndex=3;p.style.pointerEvents='auto';}
       else{const off=k<focusIdx?-fw*1.12:fw*1.12;p.style.transform='translate('+(fx+off)+'px,'+top+'px) scale(.86)';p.style.opacity='0';p.style.zIndex=1;p.style.pointerEvents='none';}
@@ -845,12 +854,19 @@ function layout(){
     world.classList.add('overview');
     const availH=vh-top, n=Math.max(1,panels.length), cols=Math.min(3,n), rows=Math.ceil(n/cols);
     const padX=vw*0.05, padTop=top+availH*0.05, cellW=(vw-2*padX)/cols, cellH=(availH*0.9)/rows;
-    const s=Math.min((cellW*0.88)/fw,(cellH*0.88)/fh);
+    // past a handful of notebooks a whole panel shrinks below reading size and
+    // the overview stops answering "where was I?". Shed the body and show each
+    // notebook as a legible card instead — same ZUI, still one click to enter.
+    const cards=Math.min((cellW*0.88)/fw,(cellH*0.88)/fh)<0.3;
+    const pw=cards?400:fw, ph=cards?190:fh;
+    world.classList.toggle('cards',cards);
+    if(cards) panels.forEach(p=>{p.style.width=pw+'px';p.style.height=ph+'px';});
+    const s=Math.min((cellW*0.88)/pw,(cellH*0.88)/ph);
     const ctr=[];
     panels.forEach((p,k)=>{const col=k%cols,row=Math.floor(k/cols);
       const cx=padX+col*cellW+cellW/2, cy=padTop+row*cellH+cellH/2+(col%2?availH*0.02:0);
       ctr[k]=[cx,cy];
-      p.style.transform='translate('+(cx-fw*s/2)+'px,'+(cy-fh*s/2)+'px) scale('+s+')';
+      p.style.transform='translate('+(cx-pw*s/2)+'px,'+(cy-ph*s/2)+'px) scale('+s+')';
       p.style.opacity='1';p.style.zIndex=2;p.style.pointerEvents='auto';});
     // the connections, made visible: dashed threads from each spawned/connected
     // notebook back to its source panel(s) — computed, never stored
@@ -894,6 +910,9 @@ function timeCaption(){
 function paintTime(){
   timeLabel.textContent=timeCaption();
   world.classList.toggle('timemode', !!TIME);   // time mode on ⇒ read-only, at ANY slider position
+  // the past is read-only, so undo must LOOK read-only too — it still answers
+  // when clicked (with why), rather than being a control that quietly does nothing
+  document.getElementById('undoBtn').classList.toggle('dim', !!TIME);
 }
 async function scrubTo(n){
   TIME.n=n; paintTime();
@@ -909,6 +928,7 @@ async function scrubTo(n){
 async function exitTime(){
   let s; try{ s=await API.state(); }catch(e){ showToast('network error — still in the past'); return; }
   TIME=null; timebar.classList.remove('on'); world.classList.remove('timemode');
+  document.getElementById('undoBtn').classList.remove('dim');   // the present is writable again
   applyState(s); rebuild();
 }
 document.getElementById('timeBtn').addEventListener('click',()=>TIME?exitTime():enterTime());
