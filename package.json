@@ -1,0 +1,11 @@
+{
+  "name": "loci-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:browser": "node --test 'test/browser/**/*.test.mjs'"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.62.0"
+  }
+}
