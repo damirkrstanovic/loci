@@ -1,12 +1,15 @@
 (ns loci.dlv
   "Layer 1, durable: the same append-only event log, on Datalevin (LMDB).
 
-   The log vector and the materialized state stay in RAM — that is what keeps
-   `history`, `as-of` and `frozen-at` behaving exactly as they did over the EDN
-   log, and what takes `state` off the per-request re-fold. Datalevin is the
-   durable, indexed backing: events serialize natively (nippy), so there is no
-   pr-str/read-string anywhere in the write path and a half-written or
-   unreadable line cannot exist.
+   The log vector and the materialized state stay in RAM, in ONE atom — that is
+   what keeps `history`, `as-of` and `frozen-at` behaving exactly as they did
+   over the EDN log, and what takes `state` off the per-request re-fold. One
+   atom rather than two because over the EDN log `state` was *derived* from the
+   log and so could never disagree with it; caching the fold is only free if
+   the pair is still published, and read, as a single value (`snapshot`).
+   Datalevin is the durable, indexed backing: events serialize natively
+   (nippy), so there is no pr-str/read-string anywhere in the write path and a
+   half-written or unreadable line cannot exist.
 
    Because there is no pr-str, there is no `sub/safe-event` either — events go
    through `sub/normalize-keys` only. Keys are still rewritten to survive a
@@ -56,6 +59,12 @@
 (defn- read-log [kv]
   (into [] (map second) (d/get-range kv "events" [:all] :long)))
 
+(defn- db-of
+  "The RAM half of the store: a log and the state it folds to, in one value so
+   they cannot be published — or read — apart."
+  [log]
+  {:log log :state (sub/materialize log)})
+
 (defn- commit-tx
   "Event, counts and touch index as ONE transaction. Splitting them would let a
    failure land the event durably while the caller is told the commit failed —
@@ -71,50 +80,67 @@
         (map (fn [id] [:del-list "touched" id [i] :string :long]))
         (touched-ids ev)))
 
-(defrecord DatalevinStore [kv dir lock !log !state]
+(defrecord DatalevinStore [kv dir !db lock]
   sub/Store
-  ;; `lock` makes commit! and undo! mutually exclusive. Reading the index off
-  ;; !log and the base state off !state, then writing both back, is only
-  ;; correct if nothing interleaves: the server commits from `future`s
-  ;; (start-job!) while the request thread commits too, and unserialized that
-  ;; loses both durable events and in-RAM objects. `locking` rather than a
-  ;; `swap!` because the critical section writes to LMDB, and swap! may retry —
-  ;; a side effect inside a retried swap happens twice.
+  ;; `lock` makes commit! and undo! mutually exclusive. Reading the index and
+  ;; the base state, then writing both back, is only correct if nothing
+  ;; interleaves: the server commits from `future`s (start-job!) while the
+  ;; request thread commits too, and unserialized that loses both durable
+  ;; events and in-RAM objects. `locking` rather than a `swap!` because the
+  ;; critical section writes to LMDB, and swap! may retry — a side effect
+  ;; inside a retried swap happens twice.
+  ;;
+  ;; Readers take no lock; they do not need one, because log and state are one
+  ;; value published in one write. A reader can be a commit behind, never
+  ;; half-past it.
   (commit! [_ event]
     (let [ev (sub/normalize-keys (assoc event :ts (System/currentTimeMillis)))]
       (locking lock
-        (let [i  (inc (count @!log))
-              st (sub/apply-event @!state ev)]
+        (let [{:keys [log state]} @!db
+              i  (inc (count log))
+              st (sub/apply-event state ev)]
           ;; durable first, RAM after: a refused write leaves the store exactly
-          ;; where it was rather than one event ahead of its own log. State
-          ;; before log, so a reader (which takes no lock) can never see a log
-          ;; entry whose effect is missing from `state`.
+          ;; where it was rather than one event ahead of its own log
           (d/transact-kv kv (commit-tx i ev st))
-          (reset! !state st)
-          (count (swap! !log conj ev))))))
-  (state   [_] @!state)
-  (objects [_] (:objects @!state))
-  (object  [_ id] (get-in @!state [:objects id]))
-  (history [_] @!log)
+          (count (:log (reset! !db {:log (conj log ev) :state st})))))))
+  (state   [_] (:state @!db))
+  (objects [_] (get-in @!db [:state :objects]))
+  (object  [_ id] (get-in @!db [:state :objects id]))
+  (history [_] (:log @!db))
   (undo!   [_]
     (locking lock
-      (let [i (count @!log)]
-        (when (pos? i)
-          (let [ev  (peek @!log)
-                log (pop @!log)]
+      (let [log (:log @!db)
+            i   (count log)]
+        (if (pos? i)
+          (let [ev (peek log)]
             (d/transact-kv kv (undo-tx i ev))
-            (reset! !log log)
-            (reset! !state (sub/materialize log))))
-        (count @!log))))
-  (as-of   [_ n] (sub/materialize (take n @!log))))
+            (count (:log (reset! !db (db-of (pop log))))))
+          i))))
+  (as-of   [_ n] (sub/materialize (take n (:log @!db)))))
 
 (defn datalevin-store
   "Open (or create) a durable store in `dir`. Defaults to <data-dir>/substrate."
   ([] (datalevin-store (str (sub/data-dir) "/substrate")))
   ([dir]
-   (let [kv  (open-env! dir)
-         log (read-log kv)]
-     (->DatalevinStore kv dir (Object.) (atom log) (atom (sub/materialize log))))))
+   (let [kv (open-env! dir)]
+     (->DatalevinStore kv dir (atom (db-of (read-log kv))) (Object.)))))
+
+(defn snapshot
+  "The log and the state as ONE consistent value, `{:log [...] :state {...}}`.
+   Anything that needs both must take them from a single snapshot — two calls
+   (`history` then `state`) are two reads, and a commit can land between them."
+  [st]
+  @(:!db st))
+
+(defn reload!
+  "Re-derive the in-RAM pair from what is actually durable. For a caller that
+   has written events to `events` by some other route than `commit!` — a bulk
+   migration, an index rebuild — this is how it republishes RAM without having
+   to be trusted to hand over the same log it wrote."
+  [st]
+  (locking (:lock st)
+    (reset! (:!db st) (db-of (read-log (:kv st)))))
+  st)
 
 (defn close!
   "Close the LMDB env behind `st`. A no-op for a Store that has none — a

@@ -132,6 +132,35 @@
       (is (= {:objects 1 :kinds {:space 1}} (d/get-value (:kv s) "counts" 1 :long)))
       (is (= {:objects 3 :kinds {:space 1 :doc 2}} (d/get-value (:kv s) "counts" 3 :long))))))
 
+(deftest datalevin-snapshot-is-never-torn
+  ;; the log and the state are ONE atom, so a reader that takes one snapshot
+  ;; cannot catch the pair mid-commit. Every sample has to satisfy the
+  ;; invariant on its own — eventual consistency is not the claim.
+  (with-dir [dir]
+    (with-store [s dir]
+      (let [n       400
+            stop    (atom false)
+            samples (atom 0)
+            torn    (atom [])
+            ;; ids are unique puts, so after k events state holds exactly k
+            ;; objects — a cheap per-sample check that runs often enough to
+            ;; actually catch a tear
+            reader  (future
+                      (while (not @stop)
+                        (let [{:keys [log state]} (dlv/snapshot s)]
+                          (swap! samples inc)
+                          (when-not (= (count log) (count (:objects state)))
+                            (swap! torn conj [(count log) (count (:objects state))])))))]
+        (dotimes [i n]
+          (sub/commit! s {:op :put :id (str "o" i) :value {:id (str "o" i) :kind :doc}}))
+        (reset! stop true)
+        @reader
+        (is (empty? @torn))
+        (is (pos? @samples))
+        ;; and the deep invariant on a final snapshot
+        (let [{:keys [log state]} (dlv/snapshot s)]
+          (is (= state (sub/materialize log))))))))
+
 (deftest close-is-safe-on-a-store-with-no-env
   (with-dir [dir]
     (with-store [s dir]
