@@ -23,9 +23,16 @@
           :main-opts   ["-m" "cognitect.test-runner"]
           :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
 
-  ;; Clerk notebook (the earlier render target)
+  ;; one-shot import of the old EDN log into Datalevin:  clojure -M:migrate
+  :migrate {:main-opts ["-m" "loci.migrate"]
+            :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+
+  ;; Clerk notebook (the earlier render target). Both reach the substrate
+  ;; through notebooks/loci.clj, so both need the native-access flag too.
   :dev   {:extra-paths ["dev" "notebooks"]
-          :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}}
+          :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
   :start {:extra-paths ["dev" "notebooks"]
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
           :exec-fn     user/start}}}
