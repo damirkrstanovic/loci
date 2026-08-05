@@ -36,12 +36,23 @@ clojure -M:demo
 # Clerk notebook (an alternative render target)
 clojure -X:start        # starts Clerk + opens notebooks/loci.clj
 
-# run the unit tests
+# the unit tests — Clojure: substrate, notebook, memory, tools, server
 clojure -M:test
+
+# the browser tests — Node: the shell itself, driven headless
+npm install            # once; pulls playwright-core, downloads no browser
+npm run test:browser
 ```
 
 `clojure -M:serve` persists its state under `data/` (substrate + memory
 event logs) — delete that directory to reset to a clean slate.
+
+The two suites are deliberately separate: `clojure -M:test` stays fast and needs no
+browser, while the browser suite boots its own server against a throwaway substrate — it
+never opens `data/`. A failing browser test leaves a screenshot and a console log in
+`test/browser/failures/`, because the defect that motivated the suite (notebook titles
+rendering at ~3px when zoomed out) was invisible to every DOM assertion and only caught
+by looking.
 
 The shell talks to the Clojure backend over a JSON API — the HTTP boundary is the
 substrate/assistance seam. Molding is done server-side by `loci.mold`; the
@@ -84,5 +95,6 @@ src/loci/server.clj      layer 5 backend: substrate + mold served as JSON
 resources/public/index.html   layer 5 frontend: spaces + LEAP shell
 src/loci/demo.clj        headless walkthrough  (clojure -M:demo)
 notebooks/loci.clj       Clerk render target (alternative to the shell)
+test/browser/            headless-browser tests for the shell (npm run test:browser)
 docs/walkthrough.md      the four demo flows, step by step
 ```
