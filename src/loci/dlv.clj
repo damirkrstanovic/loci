@@ -56,8 +56,27 @@
     (d/open-list-dbi kv "touched")
     kv))
 
-(defn- read-log [kv]
-  (into [] (map second) (d/get-range kv "events" [:all] :long)))
+(defn- read-log
+  "The durable events, oldest first.
+
+   An event's key IS its position: that is what lets `commit!` derive the next
+   index from the count and `undo!` delete by it. So the keys must be exactly
+   1..n, and a gap is not a thing to route around — the next `commit!` would
+   reuse a key that is still live and overwrite a durable event while telling
+   the caller it succeeded. `commit!`/`undo!` cannot produce a gap; a bulk
+   writer can, which is exactly the caller `reload!` is for. Refuse, and say
+   where, rather than repair silently."
+  [kv]
+  (reduce (fn [log [k ev]]
+            (if (= k (inc (count log)))
+              (conj log ev)
+              (throw (ex-info (str "substrate event keys are not contiguous — expected "
+                                   (inc (count log)) ", found " k
+                                   ". The events are intact; they must be renumbered 1..n "
+                                   "before this log can be replayed.")
+                              {:expected (inc (count log)) :found k}))))
+          []
+          (d/get-range kv "events" [:all] :long)))
 
 (defn- db-of
   "The RAM half of the store: a log and the state it folds to, in one value so
@@ -123,24 +142,46 @@
   ([] (datalevin-store (str (sub/data-dir) "/substrate")))
   ([dir]
    (let [kv (open-env! dir)]
-     (->DatalevinStore kv dir (atom (db-of (read-log kv))) (Object.)))))
+     (try
+       (->DatalevinStore kv dir (atom (db-of (read-log kv))) (Object.))
+       ;; an env we are not returning must not stay open — it would hold the
+       ;; directory for the life of the JVM and no one would have the handle
+       (catch Throwable t (d/close-kv kv) (throw t))))))
 
-(defn snapshot
+(defn view
   "The log and the state as ONE consistent value, `{:log [...] :state {...}}`.
-   Anything that needs both must take them from a single snapshot — two calls
-   (`history` then `state`) are two reads, and a commit can land between them."
+   Anything that needs both must take them from a single view — two calls
+   (`history` then `state`) are two reads, and a commit can land between them.
+
+   Serves any Store, not just this one: `?at=N` hands a FrozenStore to every
+   reader, and a FrozenStore's pair is two immutable fields, so reading them
+   separately is already consistent. For a live Store that is neither — an
+   EventStore, a PersistentStore — the fallback is two reads and can only be as
+   atomic as that store allows; state is read first so that if the pair does
+   skew, it skews the way those stores already skew (log ahead of state, never
+   an object with no event)."
   [st]
-  @(:!db st))
+  (if-let [!db (:!db st)]
+    @!db
+    (let [state (sub/state st)]
+      {:log (sub/history st) :state state})))
 
 (defn reload!
   "Re-derive the in-RAM pair from what is actually durable. For a caller that
    has written events to `events` by some other route than `commit!` — a bulk
    migration, an index rebuild — this is how it republishes RAM without having
-   to be trusted to hand over the same log it wrote."
+   to be trusted to hand over the same log it wrote.
+
+   Unlike `view`, this is not something every Store can do, and quietly doing
+   nothing for one that cannot would hide the caller's mistake."
   [st]
-  (locking (:lock st)
-    (reset! (:!db st) (db-of (read-log (:kv st)))))
-  st)
+  (if-let [lock (:lock st)]
+    (do (locking lock
+          (reset! (:!db st) (db-of (read-log (:kv st)))))
+        st)
+    (throw (ex-info (str "reload! needs a DatalevinStore — it re-reads the durable log, "
+                         "and this store has none")
+                    {:store (class st)}))))
 
 (defn close!
   "Close the LMDB env behind `st`. A no-op for a Store that has none — a

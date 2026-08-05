@@ -132,7 +132,7 @@
       (is (= {:objects 1 :kinds {:space 1}} (d/get-value (:kv s) "counts" 1 :long)))
       (is (= {:objects 3 :kinds {:space 1 :doc 2}} (d/get-value (:kv s) "counts" 3 :long))))))
 
-(deftest datalevin-snapshot-is-never-torn
+(deftest datalevin-view-is-never-torn
   ;; the log and the state are ONE atom, so a reader that takes one snapshot
   ;; cannot catch the pair mid-commit. Every sample has to satisfy the
   ;; invariant on its own — eventual consistency is not the claim.
@@ -147,7 +147,7 @@
             ;; actually catch a tear
             reader  (future
                       (while (not @stop)
-                        (let [{:keys [log state]} (dlv/snapshot s)]
+                        (let [{:keys [log state]} (dlv/view s)]
                           (swap! samples inc)
                           (when-not (= (count log) (count (:objects state)))
                             (swap! torn conj [(count log) (count (:objects state))])))))]
@@ -158,8 +158,46 @@
         (is (empty? @torn))
         (is (pos? @samples))
         ;; and the deep invariant on a final snapshot
-        (let [{:keys [log state]} (dlv/snapshot s)]
+        (let [{:keys [log state]} (dlv/view s)]
           (is (= state (sub/materialize log))))))))
+
+(deftest datalevin-refuses-a-gapped-event-log
+  ;; an event's key IS its position — that is what lets commit! derive the next
+  ;; index from the count and undo! delete by it. A gap breaks that silently:
+  ;; the next commit! would reuse a live key and overwrite a durable event.
+  ;; commit!/undo! cannot produce one, but a bulk migration writing `events`
+  ;; directly can, and `reload!` exists precisely for that caller.
+  (with-dir [dir]
+    (with-store [s dir]
+      (sub/commit! s {:op :put :id "a" :value {:id "a" :kind :doc}})
+      (sub/commit! s {:op :put :id "b" :value {:id "b" :kind :doc}})
+      ;; something other than commit!/undo! lands an event at 4, leaving 3 empty
+      (d/transact-kv (:kv s) [[:put "events" 4 {:op :put :id "d" :value {:id "d"} :ts 0} :long]])
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not contiguous" (dlv/reload! s)))
+      ;; and a refused reload leaves the store exactly as it was
+      (is (= 2 (count (sub/history s))))
+      (is (= #{"a" "b"} (set (keys (sub/objects s))))))
+    ;; a cold open of the same directory refuses too, rather than handing back a
+    ;; 3-event log whose next commit would overwrite the event at key 4
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not contiguous"
+                          (dlv/datalevin-store dir)))))
+
+(deftest view-serves-any-store-reload-refuses-politely
+  (with-dir [dir]
+    (with-store [s dir]
+      (sub/commit! s {:op :put :id "a" :value {:id "a" :kind :doc}})
+      (sub/commit! s {:op :put :id "b" :value {:id "b" :kind :doc}})
+      ;; ?at=N hands a FrozenStore to every reader (store-at), so `view` has to
+      ;; serve one — time travel must not 500 because the store has no atom
+      (let [fz (sub/frozen-at s 1)]
+        (is (= 1 (count (:log (dlv/view fz)))))
+        (is (= #{"a"} (set (keys (:objects (:state (dlv/view fz)))))))
+        (is (= (:state (dlv/view fz)) (sub/materialize (:log (dlv/view fz)))))
+        ;; reload! has no meaning without an env — it must say which store it
+        ;; wanted, not throw an NPE from a nil deref
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"DatalevinStore" (dlv/reload! fz))))
+      ;; and it still serves the live store it was written for
+      (is (= 2 (count (:log (dlv/view s))))))))
 
 (deftest close-is-safe-on-a-store-with-no-env
   (with-dir [dir]
