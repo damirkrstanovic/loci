@@ -93,6 +93,22 @@ git commit -m "deps: datalevin 1.0.0 + --enable-native-access; sci conflict veri
 
 ### Task 2: `DatalevinStore` — the Store protocol over LMDB
 
+> **AS BUILT — the code below is superseded; read `src/loci/dlv.clj`.** Review found
+> three defects in this plan's version, all measured rather than argued:
+> 1. **Concurrent `commit!`s destroyed durable events** — the index came from
+>    `(inc (count @!log))` outside any critical section. 900 commits from 3 threads
+>    yielded 900 in history, 308 objects and 692 on disk. Fixed with a `lock` field;
+>    `commit!` and `undo!` are `locking`, index computed inside.
+> 2. **`map-full!` was dead code with wrong advice** — Datalevin catches
+>    `Util$MapFullException` and auto-grows (`cpp.clj:1676-1688`), and `:mapsize`
+>    applies only when the directory does not yet exist. Both deleted.
+> 3. **The `touched` write sat outside the event transaction** — an exception there
+>    left an event durable that RAM denied. All ops now ride one `transact-kv`.
+>
+> The record is `[kv dir !db lock]` with `!db` holding `{:log [...] :state {...}}` in
+> one atom, so no reader can observe log and state apart. `counts` stores
+> `{:objects n :kinds {kind n}}`. Accessors: `dlv/view`, `dlv/reload!`, `dlv/close!`.
+
 **Files:**
 - Create: `src/loci/dlv.clj`
 - Modify: `src/loci/substrate.clj` (make `normalize-keys` public)
@@ -399,12 +415,14 @@ Add to `src/loci/dlv.clj`, after `close!`:
   (clear-indices! st)
   (reduce (fn [state [i ev]]
             (let [state' (sub/apply-event state ev)]
-              (d/transact-kv (:kv st) [[:put "counts" i (count-pair state') :long]])
-              (doseq [id (touched-ids ev)]
-                (d/put-list-items (:kv st) "touched" id [i] :string :long))
+              ;; one transaction per event, same op shape commit! uses
+              (d/transact-kv (:kv st)
+                             (into [[:put "counts" i (census state') :long]]
+                                   (map (fn [id] [:put-list "touched" id [i] :string :long]))
+                                   (touched-ids ev)))
               state'))
           {:objects {}}
-          (map-indexed (fn [k ev] [(inc k) ev]) @(:!log st)))
+          (map-indexed (fn [k ev] [(inc k) ev]) (sub/history st)))
   :ok)
 ```
 
@@ -649,8 +667,9 @@ Create `src/loci/migrate.clj`:
           ;; and rebuild the derived indices from them — the log must be verbatim
           (doseq [[i ev] (map-indexed (fn [k ev] [(inc k) ev]) (sub/history src))]
             (d/transact-kv (:kv dst) [[:put "events" i ev :long]]))
-          (reset! (:!log dst) (vec (sub/history src)))
-          (reset! (:!state dst) (sub/materialize (sub/history src)))
+          ;; republish RAM from what is actually durable, rather than trusting
+          ;; this function to hand back the same log it just wrote
+          (dlv/reload! dst)
           (dlv/rebuild-indices! dst)
           (let [ok? (= (sub/state src) (sub/state dst))]
             {:ok? ok?
