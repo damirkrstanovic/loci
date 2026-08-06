@@ -223,6 +223,11 @@
   .modal-b h3{font-family:'IBM Plex Serif',serif;font-weight:400;font-size:17px;margin:14px 0 6px;color:var(--ink)}
   .modal-b h4{font-size:14px;margin:12px 0 4px;color:var(--ink)}
   .modal-f{display:flex;gap:8px;align-items:center;padding:13px 18px;border-top:1px solid var(--line-2);background:var(--panel)}
+  .sgrow{display:flex;flex-direction:column;gap:5px;padding:10px 0;border-bottom:1px solid var(--line-2)}
+  .sgrow:last-child{border-bottom:none}
+  .sgrow label{display:flex;align-items:baseline;gap:8px;cursor:pointer;font-size:14px}
+  .sgrow .sgq{width:100%;border:1px solid var(--line);border-radius:3px;padding:6px 9px;
+              font:inherit;font-size:12.5px;color:var(--ink-2)}
   .prose{font-size:13.5px;line-height:1.65;color:var(--ink-2);margin:0 0 4px;white-space:pre-wrap}
   .cellwrap{position:relative;padding:2px 0;border-radius:8px}
   .cellwrap:hover{background:rgba(20,30,25,.02)}
@@ -322,7 +327,8 @@ const API = {
   events: () => fetch('/api/events').then(r=>r.json()),
   notebookOp: body => POST('/api/notebook', body),
   memory: q => fetch('/api/memory'+(q?'?q='+encodeURIComponent(q):'')).then(r=>r.json()),
-  deepDive: space => POST('/api/deep-dive',{space}),
+  suggest: space => POST('/api/suggest',{space}),
+  suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
   fns: id => fetch('/api/fns?id='+encodeURIComponent(id)).then(r=>r.json()),
   fnPreview: (id,fnid,params) => POST('/api/fn-preview',{id,fnid,params}),
@@ -538,7 +544,7 @@ async function renderNotebook(i){
   const actions='<div class="actions" style="margin-bottom:6px">'+
     '<button class="btn sm" id="askBtn">✦ Ask</button>'+
     '<button class="btn ghost sm" id="researchBtn">🔍 Research</button>'+
-    '<button class="btn ghost sm" id="ddBtn">⌘ Deep-dive</button>'+
+    '<button class="btn ghost sm" id="sgBtn">✧ Suggest</button>'+
     '<button class="btn ghost sm" id="flowBtn">⚑ Flow</button>'+
     '<button class="btn ghost sm" id="draftBtn">✎ Draft</button>'+
     '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button>'+
@@ -556,15 +562,21 @@ async function renderNotebook(i){
   });
   b.querySelector('#importBtn').addEventListener('click',()=>startImport(i));
   b.querySelector('#tagBtn').addEventListener('click',()=>startTags(i));
-  b.querySelector('#ddBtn').addEventListener('click',async()=>{
-    b.innerHTML='<div class="sec-h">deep-diving</div><div style="color:var(--muted);font-size:13px">the agent is proposing subtopics, spawning connected notebooks and researching each — this takes a while. You can keep working; they land when ready…</div>';
-    let res; try{ res=await API.deepDive(sp.id); }catch(e){ showToast('deep-dive: network error'); renderBody(i); return; }
-    if(res.error){ showToast('deep-dive: '+res.error); renderBody(i); return; }
+  // Proposing writes nothing, so this changes the button and nothing else: the
+  // notebook stays readable while the agent thinks, and putting it back needs no
+  // repaint — so an object opened while waiting is never yanked out from under you.
+  b.querySelector('#sgBtn').addEventListener('click',async()=>{
+    const btn=b.querySelector('#sgBtn');
+    const restore=()=>{ btn.textContent='✧ Suggest'; btn.disabled=false; };
+    btn.textContent='reading…'; btn.disabled=true;
+    let res; try{ res=await API.suggest(sp.id); }catch(e){ restore(); showToast('suggest: network error'); return; }
+    if(res.error){ restore(); showToast('suggest: '+res.error); return; }
     pollJob(res.job, r=>{
-      if(TIME){ showToast('agent finished — ↩ now to see it'); return; }
-      if(r.error){ showToast('deep-dive: '+r.error); if(mode==='focus'&&focusIdx===i&&!openId) renderBody(i); return; }
-      applyState(r.state); safeRebuild();
-      showToast('Spawned '+r.spawned.length+' connected deep-dive notebook'+(r.spawned.length===1?'':'s'));
+      restore();
+      if(TIME){ showToast('suggestions ready — ↩ now to choose'); return; }
+      if(r.error){ showToast('suggest: '+r.error); return; }
+      if(!r.proposals||!r.proposals.length){ showToast('suggest: nothing proposed'); return; }
+      openSuggest(i,sp,r.proposals);
     });
   });
   b.querySelector('#flowBtn').addEventListener('click',()=>startFlow(i));
@@ -795,6 +807,78 @@ function startAsk(i){
   b.querySelector('#aq').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
   b.querySelector('#cancelAsk').addEventListener('click',()=>renderBody(i));
   b.querySelector('#aq').focus();
+}
+// The agent proposes; you decide. Every question is an editable field, because
+// the phrasing is usually close and rarely exact, and refusing a good subtopic
+// over one wrong word is a real loss. Two destination buttons, never one button
+// whose meaning depends on a toggle: three new notebooks and three cells here are
+// sharply different outcomes, and a mis-click is expensive. Nothing has been
+// written when this opens, and Dismiss writes nothing either.
+function openSuggest(i,sp,proposals){
+  const rows=proposals.map((p,k)=>
+    '<div class="sgrow" data-k="'+k+'"><label><input type="checkbox" checked> '+
+    '<b>'+esc(p.title)+'</b></label>'+
+    '<input class="sgq" value="'+esc(p.query||'')+'"></div>').join('');
+  modal.innerHTML='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
+    '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">SUGGEST</span>'+
+    '<span class="q">questions worth pursuing in “<b>'+esc(sp.title)+'</b>”</span></div>'+
+    '<div class="modal-b">'+rows+'</div>'+
+    '<div class="modal-f">'+
+      '<button class="btn sm" id="sgNew"></button>'+
+      '<button class="btn sm" id="sgHere"></button>'+
+      '<button class="btn ghost sm" id="sgDismiss">Dismiss</button>'+
+      '<span style="font-size:11.5px;color:var(--muted)">nothing has been written yet</span>'+
+    '</div></div>';
+  modal.classList.add('on');
+  // each row is paired with its proposal through its own data-k, not through its
+  // position among the rows: the title travels with the proposal while the query
+  // is read off the field beside it, so a positional map would send A's title with
+  // B's question the day a row is hidden, sorted or dropped. A question edited to
+  // blank counts as refused — an empty prompt is not a research question.
+  const picked=()=>[...modal.querySelectorAll('.sgrow')].map(row=>{
+    const p=proposals[+row.dataset.k];
+    if(!p||!row.querySelector('input[type=checkbox]').checked) return null;
+    const query=row.querySelector('.sgq').value.trim();
+    return query?{title:p.title,intent:p.intent,query}:null;
+  }).filter(Boolean);
+  const relabel=()=>{ const n=picked().length;
+    modal.querySelector('#sgNew').textContent='Research '+n+' in new notebook'+(n===1?'':'s');
+    modal.querySelector('#sgHere').textContent='Research '+n+' in this notebook';
+    modal.querySelectorAll('#sgNew,#sgHere').forEach(x=>x.disabled=(n===0)); };
+  relabel();
+  modal.querySelectorAll('.sgrow input[type=checkbox]').forEach(c=>c.addEventListener('change',relabel));
+  modal.querySelectorAll('.sgrow .sgq').forEach(f=>f.addEventListener('input',relabel));
+  modal.querySelector('#sgDismiss').addEventListener('click',closeModal);
+  const go=async dest=>{
+    if(TIME){ showToast('time mode — ↩ now to edit'); return; }
+    const items=picked(); if(!items.length) return;
+    closeModal();
+    // this modal may have stood open while another job landed and applyState
+    // re-ordered the panels, so find the notebook by id every time rather than
+    // trusting the index captured when the button was drawn — otherwise the
+    // progress note and the error repaint land on somebody else's panel. -1 also
+    // means "an object is open there": don't paint over what is being read.
+    const panelOf=()=>{ const j=STATE.spaces.findIndex(s=>s.id===sp.id);
+      return (j>=0 && !(openId&&focusIdx===j)) ? j : -1; };
+    const repaint=()=>{ const j=panelOf(); if(j>=0) renderBody(j); };
+    const j=panelOf(), pb=j>=0?document.getElementById('body'+j):null;
+    if(pb) pb.innerHTML='<div class="sec-h">researching</div><div style="color:var(--muted);font-size:13px">'+
+      items.length+' question'+(items.length===1?'':'s')+' — this takes a while. You can keep working; results land when ready…</div>';
+    let res; try{ res=await API.suggestRun(sp.id,items,dest); }
+    catch(e){ showToast('suggest: network error'); repaint(); return; }
+    if(res.error){ showToast('suggest: '+res.error); repaint(); return; }
+    pollJob(res.job, r=>{
+      if(TIME){ showToast('agent finished — ↩ now to see it'); return; }
+      if(r.error){ showToast('suggest: '+r.error); repaint(); return; }
+      applyState(r.state); safeRebuild();
+      const n=(r.ran||[]).length;
+      showToast(dest==='new'
+        ? 'Spawned '+n+' connected notebook'+(n===1?'':'s')
+        : 'Researched '+n+' question'+(n===1?'':'s')+' here');
+    });
+  };
+  modal.querySelector('#sgNew').addEventListener('click',()=>go('new'));
+  modal.querySelector('#sgHere').addEventListener('click',()=>go('here'));
 }
 
 // ---------------- object detail (molder) ----------------
