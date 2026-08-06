@@ -69,11 +69,16 @@ never opens `data/`. A failing browser test leaves a screenshot and a console lo
 motivated the suite (notebook titles rendering at ~3px when zoomed out) was invisible to
 every DOM assertion and only caught by looking.
 
-Zoomed out, the overview groups each notebook with the deep-dives it spawned — the
+Zoomed out, the overview groups each notebook with the ones it spawned — the
 structure the substrate already computes from `spawned-by` and `merged-from`, rather than
 laying every notebook out as a peer. Cards are sized to their own content, the canvas
 scrolls, and a focused notebook names its parent, siblings and children in one line under
 its intention.
+
+✧ Suggest reads a notebook and proposes two or three questions worth pursuing. You see them
+before anything happens: edit the wording, uncheck what you don't want, then choose whether
+the answers land in new connected notebooks or as cells in this one. Proposing writes
+nothing at all — dismissing leaves the substrate untouched.
 
 LEAP ranks what it finds by what you touched most recently — a notebook counts as
 touched when anything inside it is. From the overview it also offers `⊟ Filter the
@@ -126,7 +131,8 @@ frontend only lays out the result.
 | `GET /api/links?space=` | computed connectedness (shares / spawned / lineage) |
 | `GET /api/memory?q=` | the agent's memory — browsable, recall-ranked |
 | `POST /api/research` | agent research as a background job — returns a job id |
-| `POST /api/deep-dive` | spawn + research connected sub-notebooks (background job) |
+| `POST /api/suggest` | the agent proposes questions (background job); writes nothing |
+| `POST /api/suggest-run` | research the questions you approved, in new notebooks or here |
 | `GET /api/job?id=` | poll a background agent job — the shell never holds a long fetch |
 | `GET /api/fns?id=` | the ƒ palette for a table: built-in verbs + agent-written functions |
 | `POST /api/fn-preview` | run a function over the live rows — before/after, commits nothing |
