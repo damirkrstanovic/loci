@@ -980,7 +980,7 @@ function layout(){
     });
   } else {
     world.classList.add('overview'); world.classList.add('cards');
-    const PW=380, KW=302, KH=96, KGAP=8, GROUPGAP=26, COLGAP=34, INDENT=26;
+    const PW=380, KW=302, KGAP=8, GROUPGAP=26, COLGAP=34, INDENT=26;
     const padX=vw*0.045, padTop=top+16;
     const colW=(vw-2*padX-COLGAP*2)/3;
     const s=Math.min(colW/PW,1);
@@ -993,6 +993,13 @@ function layout(){
     roots.forEach(r=>{ const p=panels[r.i];
       p.style.width=PW+'px'; p.classList.remove('kid');
       PH=Math.max(PH, p.querySelector('.p-head').scrollHeight+3); });
+    // a nested card is head-only too — so measure ITS head instead of padding
+    // every one out to a fixed 96px. A one-line title left 29px of empty card
+    // below it, which reads as a mistake rather than as breathing room; the
+    // card that needs two lines still gets them.
+    const kidH=n=>{ const p=panels[n.i];
+      p.style.width=KW+'px'; p.classList.add('kid');
+      return Math.max(66, p.querySelector('.p-head').scrollHeight+3); };
     // pack each cluster into whichever column is currently shortest — measured
     // as it is placed, so no height needs predicting
     const colY=[padTop,padTop,padTop], spines=[];
@@ -1015,11 +1022,11 @@ function layout(){
       (function walk(n,depth,railX,railTop){
         let lastTick=null;
         n.kids.forEach(k=>{
-          const kx=x+INDENT*depth+10, y0=y;
-          y=place(k,kx,y,KW,KH)+KGAP;
-          lastTick=y0+KH*s/2;
+          const kx=x+INDENT*depth+10, y0=y, kh=kidH(k);
+          y=place(k,kx,y,KW,kh)+KGAP;
+          lastTick=y0+kh*s/2;
           spines.push(['tick',railX,lastTick,kx]);   // the elbow into each child
-          walk(k,depth+1,kx+9,y0+KH*s);
+          walk(k,depth+1,kx+9,y0+kh*s);
         });
         if(lastTick!==null) spines.push(['spine',railX,railTop,lastTick]);
       })(r,1,x+9,top0+PH*s);
