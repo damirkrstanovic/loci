@@ -80,6 +80,7 @@
   .world.cards .panel.kid .p-head::before,
   .world.cards .panel.kid .p-head::after{display:none}
   .world.cards .panel.kid{box-shadow:0 10px 22px -20px rgba(20,30,25,.5)}
+  .world.cards .panel.kid .p-status{display:none}   /* the spine already says it */
   .panel.child{border-left:4px solid var(--accent-line)}
   /* the head is framed by registration ticks, not a box — an instrument's
      mark. The intention is set in serif: this is a thinking tool, and the one
@@ -356,8 +357,12 @@ function buildPanel(sp,i){
   const merged = sp['merged-from'];
   const mtitles = merged ? merged.map(id=>((STATE.spaces.find(s=>s.id===id)||{}).title)||id).join(' × ') : '';
   const p=document.createElement('div'); p.className='panel'+(hub?' child':''); p.dataset.i=i;
+  // In the overview a child sits UNDER its parent, so naming the parent in the
+  // eyebrow is redundant — and it was truncated at card width anyway. Focus
+  // mode has no such context, so the full form survives there via .p-structure.
   p.innerHTML='<div class="p-status"><span class="adot"></span>'+(merged?'connected':hub?'spawned':'notebook')+'</div>'+
-    '<div class="p-head"><div class="p-eyebrow">'+(merged?'connected · '+esc(mtitles):hub?'deep-dive · spawned from '+esc(hub.title):'notebook · intention')+'</div>'+
+    '<div class="p-head"><div class="p-eyebrow">'+
+      (merged?'connected · '+esc(mtitles):hub?'deep-dive':'notebook · intention')+'</div>'+
     '<h2 class="p-title">'+esc(sp.title)+'</h2><p class="p-intent">'+esc(sp.intent)+'</p></div>'+
     '<div class="p-body" id="body'+i+'"></div>';
   p.addEventListener('click',e=>{ if(mode==='overview'){ e.stopPropagation(); enter(i);} });
