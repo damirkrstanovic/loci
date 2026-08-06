@@ -69,6 +69,16 @@
   .tagedit .tagchip.byagent{border-style:dashed}   /* an inference, not your word */
   .tagedit .tagchip .x{cursor:pointer;color:var(--faint);margin-left:3px}
   .tagedit .tagchip .x:hover{color:var(--attn)}
+  /* in the editor the swatch is the one live spot on an otherwise inert chip —
+     the chip above is cursor:default, so the pointer here is what says "click me" */
+  .tagedit .tagchip .ink{cursor:pointer;outline-offset:2px}
+  .tagedit .tagchip .ink:hover{outline:1px solid var(--line)}
+  .inkpick{display:flex;gap:5px;padding:6px 8px;margin-top:8px;width:max-content;
+           border:1px solid var(--line);border-radius:4px;background:var(--white)}
+  .inkpick b{width:14px;height:14px;border-radius:2px;cursor:pointer;border:1px solid transparent}
+  /* the border is always there, transparent until chosen, so picking a colour
+     does not shift the row by 2px */
+  .inkpick b.on{border-color:var(--ink)}
   /* !important is load-bearing: layout() writes opacity inline on every panel it
      places, so an unqualified rule here loses to the style attribute and the
      filter dims nothing at all — a silent no-op that still shows the crumb. */
@@ -321,6 +331,7 @@ const API = {
   connect: (a,b) => POST('/api/connect',{a,b}),
   tags: (space,tags) => POST('/api/tags',{space,tags}),
   tagSuggest: (space) => POST('/api/tag-suggest',{space}),
+  tagColor: (tag,color) => POST('/api/tag-color',{tag,color}),
 };
 
 let STATE={spaces:[],objects:{}};
@@ -619,8 +630,11 @@ function startTags(i){
   const draw=()=>{
     b.innerHTML='<div class="sec-h">tags</div>'+
       '<div class="tagedit">'+(tags.length?tags.map((t,k)=>
-        '<span class="tagchip '+(t.by==='agent'?'byagent':'')+'" data-k="'+k+'">'+esc(t.tag)+
-        ' <span class="x">✕</span></span>').join(''):'<i style="color:var(--muted)">no tags yet</i>')+'</div>'+
+        '<span class="tagchip '+(t.by==='agent'?'byagent':'')+'" data-k="'+k+'" '+
+        'style="--tag-ink:'+tagInk(t.tag)+'">'+
+        '<u class="ink" data-ink="'+esc(t.tag)+'" title="choose a colour"></u>'+esc(t.tag)+
+        ' <span class="x">✕</span></span>').join(''):'<i style="color:var(--muted)">no tags yet</i>')+
+      '</div><div id="inkpickhost"></div>'+
       '<div class="actions" style="margin-top:10px">'+
         '<input id="tagIn" placeholder="add a tag…" style="min-width:180px;border:1px solid var(--line);'+
         'border-radius:3px;padding:6px 9px;font:inherit;font-size:12.5px">'+
@@ -631,6 +645,32 @@ function startTags(i){
         'tags group notebooks by subject — the one thing the substrate cannot work out for itself</div>';
     b.querySelectorAll('.tagedit .x').forEach(x=>x.addEventListener('click',e=>{
       tags.splice(+e.target.closest('[data-k]').dataset.k,1); draw(); }));
+    // the tag name is read back off dataset, which un-escapes what esc() wrote
+    // into the attribute — so a tag holding & or ' is compared and POSTed as
+    // itself. `sw` rather than e.target: the <u> has no children today, but a
+    // closure variable cannot become the wrong element if it ever gains one.
+    b.querySelectorAll('.tagedit .ink').forEach(sw=>sw.addEventListener('click',()=>{
+      const tag=sw.dataset.ink, host=b.querySelector('#inkpickhost');
+      if(host.dataset.open===tag){ host.innerHTML=''; host.dataset.open=''; return; }   // same swatch again: close
+      host.dataset.open=tag;
+      host.innerHTML='<div class="inkpick">'+TAG_INKS.map(c=>
+        '<b data-c="'+c+'" class="'+(tagInk(tag)===c?'on':'')+'" style="background:'+c+'"></b>'
+      ).join('')+'</div>';
+      host.querySelectorAll('.inkpick b').forEach(sq=>sq.addEventListener('click',async()=>{
+        if(TIME){ showToast('time mode — ↩ now to edit'); return; }
+        // a colour is global and standing: choosing one for a tag you have
+        // typed but not saved still records it, because the colour is about
+        // the name, not about this notebook
+        let r; try{ r=await API.tagColor(tag,sq.dataset.c); }
+        catch(e){ showToast('colour: network error'); return; }
+        if(r.error){ showToast(r.error); return; }
+        // draw() rewrites b.innerHTML wholesale, so it repaints the chips in the
+        // new ink AND replaces #inkpickhost with an empty one — the picker is
+        // gone without being closed, and cannot be left behind twice. It has to
+        // run after applyState, which is what puts the new ink in STATE.tagColors.
+        applyState(r.state); draw(); renderTagStrip();
+      }));
+    }));
     const add=()=>{ const v=b.querySelector('#tagIn').value.trim().toLowerCase();
       if(v && !tags.some(t=>t.tag===v)) tags.push({tag:v,by:'you'});
       b.querySelector('#tagIn').value=''; draw(); b.querySelector('#tagIn').focus(); };
