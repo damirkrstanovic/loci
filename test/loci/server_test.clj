@@ -843,3 +843,57 @@
     (let [kid (srv/inherit-tags st "space:t")]
       (is (= ["semiconductors"] (mapv :tag kid)))
       (is (= ["agent"] (mapv :by kid)) "an inherited tag is an inference, not your assertion"))))
+
+;; ---- tag colours ----
+;; Colour belongs to the NAME, globally: "world data" green here and plum there
+;; would defeat the point of colouring at all.
+
+(deftest eight-tags-receive-eight-distinct-inks
+  ;; the test that fails the moment assignment is reduced to a bare hash:
+  ;; with eight inks and eight names a hash collides more often than not
+  (let [st (tagged-store)]
+    (doseq [t ["a" "b" "c" "d" "e" "f" "g" "h"]]
+      (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
+    (let [reg (srv/tag-colors st)]
+      (is (= 8 (count reg)) "every name is in the registry")
+      (is (= 8 (count (set (vals reg)))) "and no two share an ink"))))
+
+(deftest real-tag-names-still-receive-distinct-inks
+  ;; the test above does NOT bite: "a".."h" are consecutive char codes, so a
+  ;; bare hash mod 8 is a perfect permutation for exactly that input and eight
+  ;; single letters come out distinct even with no least-used rule at all.
+  ;; Real subjects are not consecutive — these eight land on five slots — so
+  ;; this is the one that fails the moment assignment becomes a bare hash.
+  (let [st (tagged-store)]
+    (doseq [t ["semiconductors" "world data" "chokepoints" "supply chain"
+               "policy" "energy" "logistics" "materials"]]
+      (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
+    (let [reg (srv/tag-colors st)]
+      (is (= 8 (count reg)))
+      (is (= 8 (count (set (vals reg)))) "eight subjects, eight inks, no collision"))))
+
+(deftest the-ninth-tag-reuses-a-least-used-ink
+  (let [st (tagged-store)]
+    (doseq [t ["a" "b" "c" "d" "e" "f" "g" "h" "i"]]
+      (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
+    (let [reg (srv/tag-colors st)
+          f   (frequencies (vals reg))]
+      (is (= 9 (count reg)))
+      (is (every? (set srv/tag-inks) (vals reg)) "only palette inks are ever assigned")
+      (is (= 2 (apply max (vals f))) "exactly one ink is doubled")
+      (is (= 7 (count (filter #(= 1 %) (vals f)))) "the other seven are untouched"))))
+
+(deftest several-new-tags-in-one-call-get-different-inks
+  ;; assignment must accumulate within the call, or both new names take the
+  ;; same "least-used" ink because neither is in the registry yet
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "x" :by "you"} {:tag "y" :by "you"}])
+    (let [reg (srv/tag-colors st)]
+      (is (= 2 (count reg)))
+      (is (= 2 (count (set (vals reg))))))))
+
+(deftest assignment-is-deterministic
+  (let [ink (fn [] (let [st (tagged-store)]
+                     (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "you"}])
+                     (get (srv/tag-colors st) "semiconductors")))]
+    (is (= (ink) (ink)) "the same name always gets the same ink from an empty registry")))

@@ -254,6 +254,61 @@
   (let [prior (into {} (map (juxt (juxt :tag :by) :ts) was))]
     (mapv (fn [t] (if-let [ts (prior [(:tag t) (:by t)])] (assoc t :ts ts) t)) now)))
 
+;; ---- tag colours ----
+;; Eight inks in the paper's lightness band, so a strip of them reads as a
+;; family. Clay (--attn) is deliberately absent: clay means EXCLUDED in the
+;; strip, and a clay tag that was also excluded would be a chip you can't read.
+(def tag-inks
+  ["#2f6f5b"   ; green — loci's own accent, so the first tag looks like it belongs
+   "#2b6b74"   ; teal
+   "#3f5a8a"   ; indigo
+   "#6b4a8a"   ; violet
+   "#8c3f5a"   ; garnet
+   "#7a5a2f"   ; bronze
+   "#5f6b33"   ; olive
+   "#4a5560"]) ; slate
+
+(def ^:private palette-id "tag-palette")
+
+(defn tag-colors
+  "The registry: tag name → hex. Empty until the first tag is set."
+  [st]
+  (or (:value (sub/object st palette-id)) {}))
+
+(defn- name-hash [s]
+  (reduce (fn [h c] (unchecked-int (+ (* 31 h) (int c)))) 0 s))
+
+(defn- next-ink
+  "The ink used by the fewest tags already in `reg`, ties broken by a hash of
+   the name. Hashing alone would collide: with eight inks and six tags, two
+   subjects sharing an ink is likelier than not, and that is the one failure
+   colour exists to prevent. So the hash only picks WHERE to start looking."
+  [reg tag]
+  (let [used  (frequencies (vals reg))
+        n     (count tag-inks)
+        start (mod (Math/abs (long (name-hash tag))) n)]
+    (->> (range n)
+         (map #(nth tag-inks (mod (+ start %) n)))
+         (apply min-key #(get used % 0)))))
+
+(defn- assign-inks!
+  "Give every unseen name an ink — one event, or none when nothing is new.
+   Callers MUST commit this BEFORE the tag event: undo! undoes the last event,
+   so undoing a tagging has to remove the tags and leave the colour standing."
+  [st names]
+  (let [reg   (tag-colors st)
+        fresh (remove #(contains? reg %) (distinct names))]
+    (when (seq fresh)
+      ;; reduce over the accumulating map, not `reg` — two new names in one
+      ;; call would otherwise both take the same "least-used" ink
+      (let [reg' (reduce (fn [m t] (assoc m t (next-ink m t))) reg fresh)]
+        (if (sub/object st palette-id)
+          (sub/commit! st {:op :assoc :id palette-id :path [:value] :value reg'})
+          (sub/commit! st {:op :put :id palette-id
+                           :value {:id palette-id :kind :palette
+                                   :title "tag colours" :value reg'}}))
+        reg'))))
+
 (defn set-tags!
   "Replace a notebook's tags — one reversible event, or none when nothing
    changed. Provenance is content: approving the agent's tag as your own
@@ -265,6 +320,9 @@
       (let [was (get-in o [:value :tags])
             now (keep-tag-times was (clean-tags tags))]
         (when (not= (mapv (juxt :tag :by) was) (mapv (juxt :tag :by) now))
+          ;; colour first, tags second: undo! undoes the LAST event, so undoing
+          ;; a tagging must remove the tags and leave the ink standing
+          (assign-inks! st (mapv :tag now))
           (sub/commit! st {:op :assoc :id space :path [:value :tags] :value now}))
         {:state (state-payload st) :tags now}))))
 
