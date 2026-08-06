@@ -272,6 +272,15 @@ git commit -m "feat: LEAP ranks by what you touched last, and its cap keeps the 
 > every scroll, for a number nobody acts on. If the scroll turns out not to be enough,
 > add it then.
 
+> **AS BUILT — two corrections found by running it.** The plan's `.panel.dim{opacity:.22}`
+> never applied: `layout()`'s `place()` writes `p.style.opacity='1'` inline on every panel,
+> and an inline style beats a stylesheet rule, so the filter was a **silent no-op** — the
+> crumb updated, `dim` classes were set, and nothing changed on screen. The rule needs
+> `!important`. And the plan appended the filter entry last, which for a rich query put it
+> at flat index 11, below the dropdown's own `max-height:46vh` fold — burying the fix for
+> "the dropdown obscures the overview" inside the dropdown. It is spliced in after `Ask`
+> instead, and `paintSel()` now scrolls the selection into view.
+
 - [ ] **Step 1: Add the filter state and the matcher.** Immediately above `async function renderLeap(){`, add:
 
 ```js
