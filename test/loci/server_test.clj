@@ -739,3 +739,77 @@
                                                   :value [{:a 1}]}})
     (let [groups (mapv :group (leap-of st "rows"))]
       (is (= "viewer" (last groups)) "verbs stay at the end, unsorted"))))
+
+;; ---- tags: the one thing the substrate cannot derive ----
+;; Structure is computed (spawned-by, shares, lineage); subject is not. Tags
+;; are agent-proposed and human-approved, and carry :by so an inference is
+;; never mistaken for an assertion.
+
+(defn- tagged-store []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:t"
+                     :value {:id "space:t" :kind :space :title "T" :value {:intent "i" :cells []}}})
+    st))
+
+(deftest set-tags-commits-one-reversible-event
+  (let [st (tagged-store)
+        before (count (sub/history st))]
+    (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "you"}])
+    (is (= (inc before) (count (sub/history st))) "exactly one event")
+    (is (= ["semiconductors"] (mapv :tag (get-in (sub/object st "space:t") [:value :tags]))))
+    (sub/undo! st)
+    (is (nil? (get-in (sub/object st "space:t") [:value :tags])) "undo restores the previous tags")))
+
+(deftest set-tags-stamps-provenance-and-time
+  (let [st (tagged-store)
+        _  (srv/set-tags! st "space:t" [{:tag "world data" :by "agent"}])
+        t  (first (get-in (sub/object st "space:t") [:value :tags]))]
+    (is (= "agent" (:by t)))
+    (is (number? (:ts t)))))
+
+(deftest set-tags-normalizes-and-refuses-nonsense
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "  Semiconductors  " :by "you"}
+                                 {:tag "semiconductors" :by "you"}
+                                 {:tag "" :by "you"}])
+    (is (= ["semiconductors"] (mapv :tag (get-in (sub/object st "space:t") [:value :tags])))
+        "trimmed, lower-cased, de-duplicated; blanks dropped")
+    (is (:error (srv/set-tags! st "tbl:nope" [{:tag "x" :by "you"}])))
+    (is (re-find #"not a notebook" (:error (srv/set-tags! st "tbl:nope" [{:tag "x" :by "you"}]))))))
+
+(deftest setting-the-same-tags-commits-nothing
+  ;; the notebook-op! discipline: never commit a phantom event
+  (let [st (tagged-store)
+        _  (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+        n  (count (sub/history st))]
+    (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+    (is (= n (count (sub/history st))))))
+
+(deftest state-payload-carries-tags
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "a" :by "agent"}])
+    (is (= ["a"] (mapv :tag (:tags (first (:spaces (srv/state-payload st)))))))))
+
+(deftest your-assertion-outranks-the-agents-inference
+  ;; the same name arriving twice: de-duplication must not silently demote what
+  ;; you asserted into something the agent merely inferred
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "agent"}
+                                 {:tag "Semiconductors" :by "you"}])
+    (let [tags (get-in (sub/object st "space:t") [:value :tags])]
+      (is (= ["semiconductors"] (mapv :tag tags)))
+      (is (= ["you"] (mapv :by tags)) "you asserted it; the agent only guessed it"))))
+
+(deftest re-asserting-an-agents-tag-as-your-own-records-it
+  ;; :by is the whole point of the model, so a change of provenance IS a change
+  (let [st  (tagged-store)
+        _   (srv/set-tags! st "space:t" [{:tag "a" :by "agent"} {:tag "b" :by "you"}])
+        was (get-in (sub/object st "space:t") [:value :tags])
+        n   (count (sub/history st))
+        _   (Thread/sleep 2)
+        _   (srv/set-tags! st "space:t" [{:tag "a" :by "you"} {:tag "b" :by "you"}])
+        now (get-in (sub/object st "space:t") [:value :tags])]
+    (is (= (inc n) (count (sub/history st))) "approving an agent's tag is an event")
+    (is (= ["you" "you"] (mapv :by now)))
+    (is (= (:ts (second was)) (:ts (second now)))
+        "a tag you did not touch keeps when it was asserted")))

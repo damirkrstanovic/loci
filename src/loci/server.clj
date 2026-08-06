@@ -116,7 +116,9 @@
                                   (get-in s [:value :spawned-by :space])
                                   (assoc :spawned-by (get-in s [:value :spawned-by :space]))
                                   (get-in s [:value :merged-from])
-                                  (assoc :merged-from (get-in s [:value :merged-from])))))
+                                  (assoc :merged-from (get-in s [:value :merged-from]))
+                                  (seq (get-in s [:value :tags]))
+                                  (assoc :tags (get-in s [:value :tags])))))
                    vec)
      :objects (->> objs (remove #(#{:space :viewspec :applet :fn} (:kind %)))
                    (map (fn [o] {:id (:id o) :title (:title o) :kind (name (:kind o))}))
@@ -222,6 +224,49 @@
     {:id id :title (:title o) :intent (get-in o [:value :intent])
      :spawned-by (get-in o [:value :spawned-by])
      :cells cells :connected connected :events (count (sub/history st))}))
+
+;; ---- tags: subject, the one thing the substrate cannot compute ----
+;; Structure is derived (spawned-by, shares, lineage) and never maintained.
+;; Subject cannot be, so it is asserted — by the agent or by you, and :by
+;; records which, the way the memory pane cites its sources.
+(defn- clean-tags
+  "Trimmed, lower-cased, de-duplicated, blanks dropped, order preserved.
+   When one name arrives twice the first position wins, but YOUR assertion
+   outranks the agent's inference: de-duplication must never quietly demote
+   something you claimed into something the agent merely guessed."
+  [tags]
+  (->> tags
+       (keep (fn [t] (let [s (str/lower-case (str/trim (str (:tag t))))]
+                       (when-not (str/blank? s)
+                         {:tag s :by (if (= "agent" (:by t)) "agent" "you")
+                          :ts (or (:ts t) (System/currentTimeMillis))}))))
+       (reduce (fn [acc t]
+                 (if-let [i (first (keep-indexed #(when (= (:tag %2) (:tag t)) %1) acc))]
+                   (cond-> acc (= "you" (:by t)) (assoc-in [i :by] "you"))
+                   (conj acc t)))
+               [])))
+
+(defn- keep-tag-times
+  "Carry a tag's original :ts across an edit that did not touch it. The stamp
+   says when that tag was asserted; saving the strip again is not a fresh
+   assertion of everything already on it."
+  [was now]
+  (let [prior (into {} (map (juxt (juxt :tag :by) :ts) was))]
+    (mapv (fn [t] (if-let [ts (prior [(:tag t) (:by t)])] (assoc t :ts ts) t)) now)))
+
+(defn set-tags!
+  "Replace a notebook's tags — one reversible event, or none when nothing
+   changed. Provenance is content: approving the agent's tag as your own
+   changes what the tag claims, so it earns an event of its own."
+  [st space tags]
+  (let [o (sub/object st space)]
+    (if-not (= :space (:kind o))
+      {:error (str "not a notebook: " space)}
+      (let [was (get-in o [:value :tags])
+            now (keep-tag-times was (clean-tags tags))]
+        (when (not= (mapv (juxt :tag :by) was) (mapv (juxt :tag :by) now))
+          (sub/commit! st {:op :assoc :id space :path [:value :tags] :value now}))
+        {:state (state-payload st) :tags now}))))
 
 (defn notebook-op! [st {:keys [space] :as body}]
   (let [o (sub/object st space)]
@@ -987,6 +1032,8 @@
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
+      (= uri "/api/tags")    (let [{:keys [space tags]} (body-json req)]
+                               (json-resp (set-tags! st space tags)))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp {:facts (let [qq (params "q")]
                                                   (if (seq qq)
