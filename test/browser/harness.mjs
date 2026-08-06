@@ -57,6 +57,18 @@ const FAMILY_FIXTURE = `
 (System/exit 0)
 `;
 
+// Tags on the seeded corpus, so the strip has something to show. Two notebooks
+// share a tag and one carries two, which is what makes include/exclude testable.
+const TAG_FIXTURE = `
+(require '[loci.server :as srv] '[loci.content :as c])
+(let [st @c/store]
+  (srv/set-tags! st "space:cosmos"  [{:tag "astronomy" :by "agent"}])
+  (srv/set-tags! st "space:world"   [{:tag "world data" :by "agent"}])
+  (srv/set-tags! st "space:finance" [{:tag "company" :by "you"}])
+  (srv/set-tags! st "space:sales"   [{:tag "company" :by "you"} {:tag "pipeline" :by "you"}]))
+(System/exit 0)
+`;
+
 // http-kit binds the port itself and tells us which one it got. Asking the OS for a
 // free port here and handing the number to a JVM that binds it ~7s later is a race —
 // two test files start concurrently and would pick independently.
@@ -112,6 +124,7 @@ export async function startServer() {
   LIVE.add(rec);
   await run(['-M', '-e', FLOW_FIXTURE], { LOCI_DATA: dir });   // seeds, then adds the flow
   await run(['-M', '-e', FAMILY_FIXTURE], { LOCI_DATA: dir }); // …and a hub with a brood
+  await run(['-M', '-e', TAG_FIXTURE], { LOCI_DATA: dir });    // …and subject tags on four
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
