@@ -45,9 +45,23 @@
   .world.overview ~ #tagstrip{display:flex}
   .tagchip{font-family:var(--mono);font-size:10px;letter-spacing:.05em;padding:3px 9px;
            border-radius:2px;border:1px solid var(--line);background:var(--white);
-           color:var(--muted);cursor:pointer}
+           color:var(--muted);cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .tagchip i{font-style:normal;color:var(--faint);margin-left:4px}
-  .tagchip.in{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
+  /* the swatch carries identity; the fill and the strike carry state.
+     What keeps .out's line-through off the swatch is that the swatch is an
+     atomic box, not the text-decoration below: decorations are not propagated
+     into one. Measured in Chromium — deleting that declaration changes not a
+     single pixel. It is kept only as a guard for engines that have historically
+     painted through atomic inlines anyway, and inline-block is stated rather
+     than left to flex-item blockification so the swatch keeps its 6px box if
+     .tagchip ever stops being a flex container (as an inline <u> it would have
+     no box at all — width and height do not apply). */
+  .tagchip .ink{width:6px;height:6px;border-radius:1px;flex:none;display:inline-block;
+                background:var(--tag-ink,var(--accent));text-decoration:none}
+  .tagchip.in{border-color:var(--tag-ink,var(--accent-line));color:var(--tag-ink,var(--accent));
+              background:color-mix(in srgb,var(--tag-ink,var(--accent)) 11%,transparent)}
+  /* exclude overrides the ink: the strike and the clay are what say "subtracting",
+     and the swatch still says which tag it is */
   .tagchip.out{border-color:var(--attn);color:var(--attn);background:var(--attn-soft);
                text-decoration:line-through}
   .tagedit{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
@@ -334,6 +348,7 @@ function applyState(s){
   s.spaces.forEach(sp=>{ if(!seen.has(sp.id)) emit(sp); });   // paranoia: never drop a panel
   STATE.spaces=ordered;
   STATE.objects={}; s.objects.forEach(o=>STATE.objects[o.id]=o); STATE.events=s.events;
+  STATE.tagColors = s['tag-colors'] || {};   // kebab-case over the wire, like sp['spawned-by']
   const ni=STATE.spaces.findIndex(sp=>sp.id===fid); if(ni>=0) focusIdx=ni;
   else focusIdx=Math.min(focusIdx,Math.max(0,STATE.spaces.length-1));   // focused space vanished — stay in range
   renderStrip();
@@ -1236,6 +1251,25 @@ function allTags(){
   return [...seen.entries()].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]));
 }
 
+// The list is srv/tag-inks, same eight in the same order. Only the LIST is
+// mirrored — the server's *assignment* rule (least-used ink, hash only to pick
+// where to start looking) lives on the server and is not reimplemented here.
+const TAG_INKS=['#2f6f5b','#2b6b74','#3f5a8a','#6b4a8a','#8c3f5a','#7a5a2f','#5f6b33','#4a5560'];
+// The ink is interpolated into a style attribute, and esc() does not run on it,
+// so its shape is checked rather than trusted: set-tag-color! refuses a
+// non-palette hex but assign-inks! writes the registry without passing that
+// gate, and one quote reaching the attribute would end it early.
+const TAG_INK_RE=/^#[0-9a-fA-F]{6}$/;
+// A tag set before colours existed has no registry entry. This fallback is a
+// weaker, different rule from the server's — a bare hash, which can put two
+// tags on one ink where the server's least-used pick would not. It exists only
+// so such a corpus doesn't render every swatch the same accent green.
+function tagInk(t){
+  const c=(STATE.tagColors||{})[t]; if(TAG_INK_RE.test(c)) return c;
+  let h=0; for(let i=0;i<t.length;i++) h=(h*31+t.charCodeAt(i))>>>0;
+  return TAG_INKS[h%TAG_INKS.length];
+}
+
 // include if it carries any included tag (or none are included); exclude wins,
 // because "semiconductors except the geopolitics" is the question people ask
 function passesTags(sp){
@@ -1263,7 +1297,9 @@ function renderTagStrip(){
               document.body.appendChild(strip); }
   strip.innerHTML=tags.map(([t,n])=>
     '<button class="tagchip '+(tagState[t]||'')+'" data-tag="'+esc(t)+'" '+
-    'title="click: include · again: exclude · again: off">'+esc(t)+' <i>'+n+'</i></button>').join('');
+    'style="--tag-ink:'+tagInk(t)+'" '+
+    'title="click: include · again: exclude · again: off">'+
+    '<u class="ink"></u>'+esc(t)+' <i>'+n+'</i></button>').join('');
   strip.querySelectorAll('.tagchip').forEach(b=>
     b.addEventListener('click',()=>cycleTag(b.dataset.tag)));
 }
