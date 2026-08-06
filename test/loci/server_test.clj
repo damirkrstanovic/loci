@@ -542,3 +542,47 @@
       (is (= 1 (:events past)))
       (is (= ["space:n"] (map :id (:spaces past))))
       (is (empty? (:objects past))))))
+
+;; ---- real-world tables have gaps ----
+;; Found by importing World Bank data: not every country reports unemployment,
+;; so a numeric column arrives as a mix of numbers and "". Four of six viewers
+;; threw ClassCastException on it — the seeded corpus has no missing values, so
+;; nothing caught it. A substrate that cannot mold real data is not a substrate.
+
+(defn- gappy-store []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:gappy"
+                     :value {:id "tbl:gappy" :kind :table :title "With gaps"
+                             :value [{:country "A" :region "North" :gdp 10.0 :jobless 5.0}
+                                     {:country "B" :region "North" :gdp 20.0 :jobless ""}
+                                     {:country "C" :region "South" :gdp 30.0 :jobless 7.0}
+                                     {:country "D" :region "South" :gdp ""   :jobless ""}]}})
+    st))
+
+(deftest every-viewer-survives-missing-values
+  (let [st (gappy-store)]
+    (doseq [v ["table/rows" "table/summary" "table/cards" "table/pivot"
+               "table/bar" "table/hist"]]
+      (is (some? (:rendered (srv/mold-payload st "tbl:gappy" v)))
+          (str v " threw or rendered nothing on a table with gaps")))))
+
+(deftest aggregates-ignore-gaps-rather-than-counting-them
+  (let [st (gappy-store)
+        summ (:rendered (srv/mold-payload st "tbl:gappy" "table/summary"))
+        gdp  (first (filter #(= "gdp" (:column %)) summ))]
+    (is (= 3 (:n gdp)) "n must count the values that exist, not the rows")
+    (is (= 60.0 (:sum gdp)))
+    (is (= 20.0 (:avg gdp)) "the average must divide by what was measured")
+    (is (= 10.0 (:min gdp)))
+    (is (= 30.0 (:max gdp)))))
+
+(deftest a-column-is-numeric-even-when-its-first-value-is-missing
+  ;; numeric-cols used to sample only (first rows)
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:lead"
+                     :value {:id "tbl:lead" :kind :table :title "Leading gap"
+                             :value [{:name "A" :score ""} {:name "B" :score 5.0}
+                                     {:name "C" :score 7.0}]}})
+    (let [summ (:rendered (srv/mold-payload st "tbl:lead" "table/summary"))]
+      (is (= ["score"] (mapv :column summ)))
+      (is (= 12.0 (:sum (first summ)))))))

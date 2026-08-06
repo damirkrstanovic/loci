@@ -156,8 +156,25 @@
 (defn- table?  [x] (and (rows? x) (not (report? x))))
 (defn- doc?    [x] (string? x))
 
-(defn- numeric-cols [rows] (filter #(number? (get (first rows) %)) (keys (first rows))))
-(defn- string-cols  [rows] (filter #(string? (get (first rows) %)) (keys (first rows))))
+;; Real tables have holes — not every country reports unemployment, and a CSV
+;; says so with an empty cell. So a column's kind is decided by ALL its values,
+;; not by whichever row happens to be first, and every aggregate below measures
+;; the values that exist rather than casting a "" to a number.
+(defn- col-vals [rows c] (map #(get % c) rows))
+(defn- nums     [xs]     (filter number? xs))
+
+(defn- numeric-cols
+  "Columns holding at least one number. A leading blank no longer hides one."
+  [rows]
+  (filter #(seq (nums (col-vals rows %))) (keys (first rows))))
+
+(defn- string-cols
+  "Columns that are text — never a numeric column that merely starts blank."
+  [rows]
+  (let [numeric (set (numeric-cols rows))]
+    (filter #(and (not (numeric %))
+                  (some string? (remove str/blank? (map str (col-vals rows %)))))
+            (keys (first rows)))))
 (defn- cat-col [rows]
   (->> (string-cols rows)
        (filter (fn [c] (let [d (count (distinct (map #(get % c) rows)))] (and (> d 1) (<= d 12)))))
@@ -170,10 +187,11 @@
 
 (defn- summary [rows]
   (vec (for [c (numeric-cols rows)]
-         (let [xs (map #(get % c) rows)]
-           (array-map :column (name c) :n (count xs)
+         (let [xs (nums (col-vals rows c))
+               n  (count xs)]
+           (array-map :column (name c) :n n :missing (- (count rows) n)
                       :min (apply min xs) :max (apply max xs)
-                      :avg (round2 (/ (reduce + xs) (double (count xs))))
+                      :avg (round2 (/ (reduce + xs) (double n)))
                       :sum (round2 (reduce + xs)))))))
 
 (defn- bar [rows]
@@ -181,7 +199,7 @@
     {:chart "bar" :x (name cat) :y (name val)
      :rows (->> rows (group-by #(get % cat))
                 (map (fn [[k rs]] (array-map (name cat) (str k)
-                                             (name val) (round2 (reduce + (map #(get % val) rs))))))
+                                             (name val) (round2 (reduce + (nums (map #(get % val) rs)))))))
                 (sort-by #(get % (name val)) >) vec)}))
 
 (defn- line [rows]
@@ -204,15 +222,16 @@
   (let [cat (cat-col rows) val (first (numeric-cols rows))]
     (->> rows (group-by #(get % cat))
          (map (fn [[k rs]]
-                (let [vs (map #(get % val) rs)]
+                (let [vs (nums (map #(get % val) rs))]
                   (array-map (name cat) (str k) :count (count rs)
+                             :measured (count vs)
                              :sum (round2 (reduce + vs))
-                             :avg (round2 (/ (reduce + vs) (double (count rs))))))))
+                             :avg (when (seq vs) (round2 (/ (reduce + vs) (double (count vs)))))))))
          (sort-by :sum >) vec)))
 
 (defn- histogram [rows]
   (let [col (first (numeric-cols rows))
-        xs (map #(get % col) rows)
+        xs (nums (col-vals rows col))
         lo (apply min xs) hi (apply max xs)
         bins 8 w (max 1 (/ (- hi lo) (double bins)))
         bucket #(min (dec bins) (int (/ (- % lo) w)))
