@@ -643,6 +643,29 @@
                                          :source {:obj obj-id :space space}}))
       (catch Exception _))))
 
+(defn suggest-tags!
+  "Ask the agent for tags. Writes NOTHING — a proposal you ignore leaves no
+   trace at all, which is a stronger promise than reversibility."
+  [st space]
+  (let [o (sub/object st space)]
+    (if-not (= :space (:kind o))
+      {:error (str "not a notebook: " space)}
+      (try
+        (let [digest (->> (nb/cells-of o) (keep #(sub/object st (:ref %)))
+                          (map obj-digest) (str/join "\n"))]
+          {:tags (vec (take 3 (agent/propose-tags (:title o)
+                                                  (get-in o [:value :intent]) digest)))})
+        (catch Exception e {:error (.getMessage e)})))))
+
+(defn inherit-tags
+  "A deep-dive child is created ABOUT its parent's subject, so it starts with
+   the parent's tags — as inferences, because you asserted them of the parent,
+   not of the child. The stamp is now: the child was tagged when it was born,
+   not when you tagged its parent."
+  [st space]
+  (mapv #(assoc % :by "agent" :ts (System/currentTimeMillis))
+        (get-in (sub/object st space) [:value :tags])))
+
 (defn ask! [st prompt space]
   (try
     (let [objs    (if-let [sp (and space (sub/object st space))]
@@ -810,14 +833,17 @@
                                (map obj-digest) (str/join "\n"))
                           (remembered-context (str (:title sp) " " (get-in sp [:value :intent]))))
               subs*  (take 3 (agent/propose-subtopics (:title sp) (get-in sp [:value :intent]) digest))
+              ;; every child of this one act inherits the same subject, stamped once
+              ptags  (inherit-tags st space)
               spawned
               (vec (for [{:keys [title intent query]} subs*]
                      (let [n   (count (nb/notebooks st))
                            sid (str "space:dd-" (inc n))]
                        (sub/commit! st {:op :put :id sid
                                         :value {:id sid :kind :space :title title
-                                                :value {:intent intent :cells []
-                                                        :spawned-by {:space space :prompt query}}}})
+                                                :value (cond-> {:intent intent :cells []
+                                                                :spawned-by {:space space :prompt query}}
+                                                         (seq ptags) (assoc :tags ptags))}})
                        (research! st sid query)
                        sid)))]
           {:state (state-payload st) :spawned spawned})))
@@ -1034,6 +1060,10 @@
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
       (= uri "/api/tags")    (let [{:keys [space tags]} (body-json req)]
                                (json-resp (set-tags! st space tags)))
+      (= uri "/api/tag-suggest")(let [{:keys [space]} (body-json req)]
+                                  (json-resp (if (space? st space)
+                                               {:job (start-job! #(suggest-tags! st space))}
+                                               {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp {:facts (let [qq (params "q")]
                                                   (if (seq qq)

@@ -813,3 +813,33 @@
     (is (= ["you" "you"] (mapv :by now)))
     (is (= (:ts (second was)) (:ts (second now)))
         "a tag you did not touch keeps when it was asserted")))
+
+(deftest suggesting-tags-writes-nothing
+  ;; a proposal you ignore must leave no trace — not a reversible event, none
+  (with-redefs [agent/propose-tags (fn [_ _ _] ["semiconductors" "chokepoints"])]
+    (let [st (tagged-store)
+          before (count (sub/history st))
+          r (srv/suggest-tags! st "space:t")]
+      (is (= ["semiconductors" "chokepoints"] (:tags r)))
+      (is (= before (count (sub/history st))) "proposing must not commit"))))
+
+(deftest suggesting-tags-refuses-a-non-notebook
+  (with-redefs [agent/propose-tags (fn [_ _ _] ["x"])]
+    (let [st (tagged-store)]
+      (is (re-find #"not a notebook" (:error (srv/suggest-tags! st "tbl:nope")))))))
+
+(deftest a-failed-suggestion-leaves-the-notebook-untouched
+  (with-redefs [agent/propose-tags (fn [_ _ _] (throw (Exception. "no key")))]
+    (let [st (tagged-store)
+          before (count (sub/history st))
+          r (srv/suggest-tags! st "space:t")]
+      (is (:error r) "an agent failure is reported, not thrown")
+      (is (= before (count (sub/history st)))))))
+
+(deftest a-spawned-notebook-inherits-its-parents-tags
+  ;; without this a grandchild drops out of its own family under a filter
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "you"}])
+    (let [kid (srv/inherit-tags st "space:t")]
+      (is (= ["semiconductors"] (mapv :tag kid)))
+      (is (= ["agent"] (mapv :by kid)) "an inherited tag is an inference, not your assertion"))))

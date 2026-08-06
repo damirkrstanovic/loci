@@ -203,6 +203,20 @@
                                      :json? true)
                                :key-fn keyword))))
 
+(defn propose-tags
+  "Two or three subject tags for a notebook, drawn from what is actually in it.
+   Returns [string …] — the server cleans and the human approves."
+  [title intent digest]
+  (let [sys (str "You tag a research notebook by SUBJECT so it can be grouped with related "
+                 "work. Propose 2-3 short lower-case tags — one or two words each, the "
+                 "subject matter and not the activity ('semiconductors', not 'research'). "
+                 "Respond ONLY as JSON {\"tags\":[\"…\"]}.\n"
+                 "Notebook: " title ". Intent: " intent ".\nWhat is in it:\n" digest)]
+    (:tags (json/read-str (chat [{:role "system" :content sys}
+                                 {:role "user" :content "Propose the tags now."}]
+                                :json? true)
+                          :key-fn keyword))))
+
 (defn plan-flow
   "Plan a multi-step flow toward `goal`. Returns raw steps (server validates)."
   [goal ctx]
