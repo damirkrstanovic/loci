@@ -848,33 +848,26 @@
 ;; Colour belongs to the NAME, globally: "world data" green here and plum there
 ;; would defeat the point of colouring at all.
 
+;; The names below are deliberately real subjects, not "a".."h". Single letters
+;; are consecutive char codes, so a bare hash mod 8 is a perfect permutation of
+;; the eight inks and every test here passes with no least-used rule at all —
+;; certifying the one thing it was written to catch. These eight hash onto five
+;; slots, which is what real tags do.
+(def ^:private eight-subjects
+  ["semiconductors" "world data" "chokepoints" "supply chain"
+   "policy" "energy" "logistics" "materials"])
+
 (deftest eight-tags-receive-eight-distinct-inks
-  ;; the test that fails the moment assignment is reduced to a bare hash:
-  ;; with eight inks and eight names a hash collides more often than not
   (let [st (tagged-store)]
-    (doseq [t ["a" "b" "c" "d" "e" "f" "g" "h"]]
+    (doseq [t eight-subjects]
       (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
     (let [reg (srv/tag-colors st)]
       (is (= 8 (count reg)) "every name is in the registry")
       (is (= 8 (count (set (vals reg)))) "and no two share an ink"))))
 
-(deftest real-tag-names-still-receive-distinct-inks
-  ;; the test above does NOT bite: "a".."h" are consecutive char codes, so a
-  ;; bare hash mod 8 is a perfect permutation for exactly that input and eight
-  ;; single letters come out distinct even with no least-used rule at all.
-  ;; Real subjects are not consecutive — these eight land on five slots — so
-  ;; this is the one that fails the moment assignment becomes a bare hash.
-  (let [st (tagged-store)]
-    (doseq [t ["semiconductors" "world data" "chokepoints" "supply chain"
-               "policy" "energy" "logistics" "materials"]]
-      (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
-    (let [reg (srv/tag-colors st)]
-      (is (= 8 (count reg)))
-      (is (= 8 (count (set (vals reg)))) "eight subjects, eight inks, no collision"))))
-
 (deftest the-ninth-tag-reuses-a-least-used-ink
   (let [st (tagged-store)]
-    (doseq [t ["a" "b" "c" "d" "e" "f" "g" "h" "i"]]
+    (doseq [t (conj eight-subjects "lithography")]
       (srv/set-tags! st "space:t" [{:tag t :by "you"}]))
     (let [reg (srv/tag-colors st)
           f   (frequencies (vals reg))]
@@ -884,16 +877,51 @@
       (is (= 7 (count (filter #(= 1 %) (vals f)))) "the other seven are untouched"))))
 
 (deftest several-new-tags-in-one-call-get-different-inks
-  ;; assignment must accumulate within the call, or both new names take the
-  ;; same "least-used" ink because neither is in the registry yet
+  ;; "world data" and "supply chain" hash to the SAME starting ink, so this is
+  ;; the pair that catches assignment weighed against the registry as it was
+  ;; read: measured against a map holding neither, both take that ink. Two
+  ;; names that started apart would come out distinct even with the bug.
   (let [st (tagged-store)]
-    (srv/set-tags! st "space:t" [{:tag "x" :by "you"} {:tag "y" :by "you"}])
+    (srv/set-tags! st "space:t" [{:tag "world data" :by "you"}
+                                 {:tag "supply chain" :by "you"}])
     (let [reg (srv/tag-colors st)]
       (is (= 2 (count reg)))
-      (is (= 2 (count (set (vals reg))))))))
+      (is (= 2 (count (set (vals reg))))
+          "the second name is weighed against a registry that already holds the first"))))
 
 (deftest assignment-is-deterministic
   (let [ink (fn [] (let [st (tagged-store)]
                      (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "you"}])
                      (get (srv/tag-colors st) "semiconductors")))]
     (is (= (ink) (ink)) "the same name always gets the same ink from an empty registry")))
+
+(deftest concurrent-taggings-do-not-lose-colours
+  ;; The registry is the first thing in server.clj that is GLOBAL — every other
+  ;; write is scoped to one notebook, so nothing before it could contend. http-kit
+  ;; serves from a worker pool, so two notebooks being tagged at once is ordinary.
+  ;; A read-modify-write of the whole map loses whichever assignment lands second;
+  ;; the tags survive and the colour does not, so the symptom is a tag with no ink.
+  (let [st      (sub/fresh-store)
+        threads 8
+        per     8
+        names   (fn [i] (mapv #(str "subject " i "-" %) (range per)))
+        latch   (java.util.concurrent.CountDownLatch. 1)]
+    (doseq [i (range threads)]
+      (sub/commit! st {:op :put :id (str "space:" i)
+                       :value {:id (str "space:" i) :kind :space :title "T"
+                               :value {:intent "i" :cells []}}}))
+    (let [ts (mapv (fn [i]
+                     (doto (Thread.
+                            #(do (.await latch)
+                                 (srv/set-tags! st (str "space:" i)
+                                                (mapv (fn [n] {:tag n :by "you"}) (names i)))))
+                       (.start)))
+                   (range threads))]
+      (.countDown latch)
+      (doseq [t ts] (.join t)))
+    (let [reg  (srv/tag-colors st)
+          want (mapcat names (range threads))]
+      (is (= (* threads per) (count reg))
+          "every name assigned by every thread is still in the registry")
+      (is (every? #(contains? reg %) want) "no name lost its colour")
+      (is (every? (set srv/tag-inks) (vals reg))))))

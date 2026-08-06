@@ -275,38 +275,67 @@
   [st]
   (or (:value (sub/object st palette-id)) {}))
 
-(defn- name-hash [s]
-  (reduce (fn [h c] (unchecked-int (+ (* 31 h) (int c)))) 0 s))
-
 (defn- next-ink
   "The ink used by the fewest tags already in `reg`, ties broken by a hash of
-   the name. Hashing alone would collide: with eight inks and six tags, two
-   subjects sharing an ink is likelier than not, and that is the one failure
-   colour exists to prevent. So the hash only picks WHERE to start looking."
+   the name. Hashing alone would collide: with eight inks and eight real
+   subjects a bare hash lands them on five, and two subjects sharing an ink is
+   the one failure colour exists to prevent. So the hash only picks WHERE to
+   start looking, and the first least-used ink from there wins — FIRST, not
+   `min-key`'s last, so that swapping this for a sort does not silently
+   re-colour every tag in the registry.
+
+   `.hashCode` and not Clojure's `hash`: an ink has to survive a restart, and
+   murmur3's seed is an implementation detail, where String's is specified."
   [reg tag]
-  (let [used  (frequencies (vals reg))
-        n     (count tag-inks)
-        start (mod (Math/abs (long (name-hash tag))) n)]
-    (->> (range n)
-         (map #(nth tag-inks (mod (+ start %) n)))
-         (apply min-key #(get used % 0)))))
+  (let [used   (frequencies (vals reg))
+        n      (count tag-inks)
+        start  (mod (.hashCode ^String tag) n)   ; `mod` floors, so never negative
+        ranked (map #(nth tag-inks (mod (+ start %) n)) (range n))]
+    (reduce (fn [best ink] (if (< (get used ink 0) (get used best 0)) ink best))
+            (first ranked) (rest ranked))))
 
 (defn- assign-inks!
   "Give every unseen name an ink — one event, or none when nothing is new.
    Callers MUST commit this BEFORE the tag event: undo! undoes the last event,
    so undoing a tagging has to remove the tags and leave the colour standing."
   [st names]
-  (let [reg   (tag-colors st)
+  ;; one materialization, not one per read (see the `apply-event` note in
+  ;; substrate.clj): this ran `tag-colors` and `object` back to back, 0.94 ms
+  ;; each on a 3001-event log, to answer two questions about the same object
+  (let [pal   (sub/object st palette-id)
+        reg   (or (:value pal) {})
         fresh (remove #(contains? reg %) (distinct names))]
     (when (seq fresh)
-      ;; reduce over the accumulating map, not `reg` — two new names in one
-      ;; call would otherwise both take the same "least-used" ink
-      (let [reg' (reduce (fn [m t] (assoc m t (next-ink m t))) reg fresh)]
-        (if (sub/object st palette-id)
-          (sub/commit! st {:op :assoc :id palette-id :path [:value] :value reg'})
-          (sub/commit! st {:op :put :id palette-id
-                           :value {:id palette-id :kind :palette
-                                   :title "tag colours" :value reg'}}))
+      ;; reduce over the accumulating map, not `reg` — two new names in one call
+      ;; would otherwise both be weighed against a registry holding neither, and
+      ;; two whose hashes start at the same ink would take that same ink
+      (let [reg' (reduce (fn [m t] (assoc m t (next-ink m t))) reg fresh)
+            ;; One :assoc PER NAME, not one write of the whole map. This registry
+            ;; is the first global thing in this file — every other write here is
+            ;; scoped to one notebook — and http-kit answers from a worker pool,
+            ;; so two notebooks being tagged at once is ordinary. Writing the map
+            ;; whole made that a read-modify-write with no lock: whichever landed
+            ;; second dropped the other's names, 48 of 64 under eight threads. The
+            ;; tags survived and their colours did not, so what you saw was a tag
+            ;; with no ink at all. Per-name writes merge where a whole map clobbers.
+            ;;
+            ;; The object is CREATED the same way, key by key, for the same reason:
+            ;; a :put carries the whole object, so two threads arriving at an empty
+            ;; registry together would clobber each other exactly as before. These
+            ;; three are idempotent, so a racing creator writing them twice is fine.
+            ;;
+            ;; What this does NOT fix: two threads assigning two new names, each
+            ;; weighed against a registry holding neither, can still choose the same
+            ;; ink. That is a duplicate colour rather than a missing one — the strip
+            ;; still reads, and every name still has an ink.
+            shell (when-not pal
+                    [{:op :assoc :id palette-id :path [:id] :value palette-id}
+                     {:op :assoc :id palette-id :path [:kind] :value :palette}
+                     {:op :assoc :id palette-id :path [:title] :value "tag colours"}])
+            inks  (mapv (fn [t] {:op :assoc :id palette-id :path [:value t] :value (reg' t)})
+                        fresh)]
+        ;; still ONE event: a :tx undoes as a single step, so the ordering above holds
+        (sub/commit! st {:op :tx :events (into (vec shell) inks)})
         reg'))))
 
 (defn set-tags!
