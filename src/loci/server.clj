@@ -69,13 +69,49 @@
                                            :ts (:ts ev) :label (event-label objs ev)})
                                evs))}))
 
+;; ---- recency: one fold over the log gives every object its newest event ----
+;; Read from the log rather than Datalevin's `touched` dbi on purpose: the EDN
+;; store is still the documented rollback and the parity suite runs both, and a
+;; LEAP that ranks correctly on one store and arbitrarily on the other is worse
+;; than one uniformly a millisecond slower. O(events) per request — at ~10^5
+;; this must become a map maintained beside the state atom instead.
+(defn- event-ids
+  "Every object id an event names — a :tx has none of its own, its sub-events do."
+  [ev]
+  (if (= :tx (:op ev))
+    (mapcat event-ids (:events ev))
+    (when-let [id (:id ev)] [id])))
+
+(defn last-touched
+  "{object-id newest-event-ts} across the whole log."
+  [st]
+  (reduce (fn [m ev]
+            (let [ts (:ts ev)]
+              (reduce (fn [m id] (assoc m id ts)) m (event-ids ev))))
+          {} (sub/history st)))
+
+(defn- touched-of
+  "The recency of a notebook we already hold — taking the object as well as its
+   id keeps `state-payload` at one materialization, not one per space (`object`
+   on both EDN stores re-folds the whole log to answer)."
+  [touched id o]
+  (apply max 0 (keep touched (cons id (keep :ref (nb/cells-of o))))))
+
+(defn notebook-touched
+  "A notebook is as recent as the newest thing in it — editing a table inside a
+   hub makes the hub recent, which is what a reader means by 'touched'."
+  [st touched space-id]
+  (touched-of touched space-id (sub/object st space-id)))
+
 ;; ---- payloads ----
 (defn state-payload [st]
-  (let [objs (vals (sub/objects st))]
+  (let [objs (vals (sub/objects st))
+        touched (last-touched st)]
     {:events  (count (sub/history st))
      :spaces  (->> objs (filter #(= :space (:kind %)))
                    (map (fn [s] (cond-> {:id (:id s) :title (:title s)
                                          :intent (get-in s [:value :intent])
+                                         :touched (touched-of touched (:id s) s)
                                          :members (vec (keep :ref (nb/cells-of s)))}
                                   (get-in s [:value :spawned-by :space])
                                   (assoc :spawned-by (get-in s [:value :spawned-by :space]))

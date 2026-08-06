@@ -653,3 +653,50 @@
     (let [c (:rendered (srv/mold-payload st "tbl:pop" "table/bar"))]
       (is (= "population" (:y c)) (str "charted " (:y c)))
       (is (= "sum" (:agg c))))))
+
+;; ---- recency: what did you touch, and when ----
+;; LEAP capped each group at "the first 8 encountered", which after the move to
+;; Datalevin is hash order — so results were dropped by coin-flip. Ranking by
+;; last-touched turns that cap into "the 8 most recent".
+
+(deftest last-touched-picks-the-newest-event-that-names-an-id
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "a" :value {:id "a" :kind :doc :value 1}})
+    (Thread/sleep 2)
+    (sub/commit! st {:op :put :id "b" :value {:id "b" :kind :doc :value 1}})
+    (Thread/sleep 2)
+    (sub/commit! st {:op :assoc :id "a" :path [:value] :value 2})
+    (let [t (srv/last-touched st)]
+      (is (> (t "a") (t "b")) "a was edited after b was created")
+      (is (= (t "a") (:ts (last (sub/history st))))))))
+
+(deftest last-touched-sees-inside-a-tx
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "old" :value {:id "old" :kind :doc :value 1}})
+    (Thread/sleep 2)
+    (sub/commit! st {:op :tx :events [{:op :put :id "x" :value {:id "x" :kind :doc :value 1}}
+                                      {:op :put :id "y" :value {:id "y" :kind :doc :value 1}}]})
+    (let [t (srv/last-touched st)]
+      (is (some? (t "x")) "a :tx has no :id of its own; its sub-events do")
+      (is (= (t "x") (t "y")))
+      (is (> (t "x") (t "old"))))))
+
+(deftest a-notebook-is-touched-when-anything-in-it-is
+  ;; otherwise a hub you work in constantly looks dormant, because you never
+  ;; edit the space object itself
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:s"
+                     :value {:id "space:s" :kind :space :title "S"
+                             :value {:intent "i" :cells [{:ref "tbl:t"}]}}})
+    (Thread/sleep 2)
+    (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value []}})
+    (let [t   (srv/last-touched st)
+          nb  (srv/notebook-touched st t "space:s")]
+      (is (> (t "tbl:t") (t "space:s")) "the table is newer than the notebook object")
+      (is (= nb (t "tbl:t")) "the notebook inherits its newest member's recency"))))
+
+(deftest state-payload-carries-recency
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:s"
+                     :value {:id "space:s" :kind :space :title "S" :value {:intent "i" :cells []}}})
+    (is (number? (:touched (first (:spaces (srv/state-payload st))))))))
