@@ -87,6 +87,14 @@ asserted it, and proposing writes nothing at all. In the overview a tag chip cyc
 include → exclude → neither, and composes with LEAP's filter: a notebook is lit when it
 satisfies both.
 
+Each tag carries a colour, so a tag is recognisable before it is read. The first time a tag
+is set it takes the least-used ink from a palette of eight; the swatch on its chip opens the
+palette, and changing it changes that tag everywhere at once. On a chip the swatch carries
+identity and the fill carries state — an included tag fills with its own ink, an excluded
+one is struck in clay with its swatch intact. Undoing a tagging removes the tags and leaves
+the colour, because a colour is a standing preference about a subject rather than a claim
+about a notebook.
+
 The browser suite needs two things beyond `npm install`:
 
 - **Node 22 or newer.** `npm run test:browser` uses `node --test` with a glob, which
@@ -131,6 +139,7 @@ frontend only lays out the result.
 | `POST /api/flow-gate` | answer a flow's gate: approve resumes, reject stops |
 | `POST /api/tags` | replace a notebook's tags — one reversible event |
 | `POST /api/tag-suggest` | the agent proposes tags (background job); writes nothing |
+| `POST /api/tag-color` | choose a tag's colour — one reversible event |
 
 ## Layout
 
