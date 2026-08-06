@@ -55,9 +55,14 @@
   .res .title{font-size:14px} .res .gp{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--faint)}
 
   .world{position:fixed;inset:0;z-index:10}
+  /* the grouped overview is taller than the screen past ~20 notebooks; the
+     canvas scrolls rather than shrinking cards below reading size */
+  .world.overview{overflow-y:auto;overflow-x:hidden}
   .edges{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;opacity:0;transition:opacity .45s}
   .world.overview .edges{opacity:1}
-  .edges line{stroke:var(--accent-line);stroke-width:1.5;stroke-dasharray:5 5}
+  /* a solid spine joins a notebook to the deep-dives it spawned — this is
+     containment, not the dashed "related to" thread it replaces */
+  .edges line.spine{stroke:var(--accent-line);stroke-width:1;stroke-dasharray:none;opacity:.5}
   .panel{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform,opacity;
          transition:transform .5s cubic-bezier(.6,.02,.1,1),opacity .4s;background:var(--panel);border:1px solid var(--line);
          border-radius:16px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 30px 60px -40px rgba(20,30,25,.5)}
@@ -67,6 +72,14 @@
   .world.cards .p-head{border-bottom:none}
   .world.cards .p-intent{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .world.cards .p-eyebrow{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:72%}  /* clear the status pill */
+  /* a nested notebook is subordinate: smaller, quieter, no crop marks — its
+     position already says whose it is */
+  .world.cards .panel.kid .p-title{font-size:16px;line-height:1.2}
+  .world.cards .panel.kid .p-intent{display:none}
+  .world.cards .panel.kid .p-head{padding:13px 16px 11px}
+  .world.cards .panel.kid .p-head::before,
+  .world.cards .panel.kid .p-head::after{display:none}
+  .world.cards .panel.kid{box-shadow:0 10px 22px -20px rgba(20,30,25,.5)}
   .panel.child{border-left:4px solid var(--accent-line)}
   /* the head is framed by registration ticks, not a box — an instrument's
      mark. The intention is set in serif: this is a thinking tool, and the one
@@ -922,40 +935,76 @@ function layout(){
   panels.forEach(p=>{p.style.width=fw+'px';p.style.height=fh+'px';});
   if(mode==='focus'){
     world.classList.remove('overview'); world.classList.remove('cards');
+    // focus is one panel: nothing to scroll, nothing below the fold
+    world.scrollTop=0;
+    const endEl=document.getElementById('canvasEnd'); if(endEl) endEl.style.top='0px';
+    document.getElementById('edges').style.height='';
     panels.forEach((p,k)=>{
       if(k===focusIdx){p.style.transform='translate('+fx+'px,'+top+'px) scale(1)';p.style.opacity='1';p.style.zIndex=3;p.style.pointerEvents='auto';}
       else{const off=k<focusIdx?-fw*1.12:fw*1.12;p.style.transform='translate('+(fx+off)+'px,'+top+'px) scale(.86)';p.style.opacity='0';p.style.zIndex=1;p.style.pointerEvents='none';}
     });
   } else {
-    world.classList.add('overview');
-    const availH=vh-top, n=Math.max(1,panels.length), cols=Math.min(3,n), rows=Math.ceil(n/cols);
-    const padX=vw*0.05, padTop=top+availH*0.05, cellW=(vw-2*padX)/cols, cellH=(availH*0.9)/rows;
-    // past a handful of notebooks a whole panel shrinks below reading size and
-    // the overview stops answering "where was I?". Shed the body and show each
-    // notebook as a legible card instead — same ZUI, still one click to enter.
-    const cards=Math.min((cellW*0.88)/fw,(cellH*0.88)/fh)<0.3;
-    const pw=cards?400:fw, ph=cards?190:fh;
-    world.classList.toggle('cards',cards);
-    if(cards) panels.forEach(p=>{p.style.width=pw+'px';p.style.height=ph+'px';});
-    const s=Math.min((cellW*0.88)/pw,(cellH*0.88)/ph);
-    const ctr=[];
-    panels.forEach((p,k)=>{const col=k%cols,row=Math.floor(k/cols);
-      const cx=padX+col*cellW+cellW/2, cy=padTop+row*cellH+cellH/2+(col%2?availH*0.02:0);
-      ctr[k]=[cx,cy];
-      p.style.transform='translate('+(cx-pw*s/2)+'px,'+(cy-ph*s/2)+'px) scale('+s+')';
-      p.style.opacity='1';p.style.zIndex=2;p.style.pointerEvents='auto';});
-    // the connections, made visible: dashed threads from each spawned/connected
-    // notebook back to its source panel(s) — computed, never stored
-    const lines=[];
-    STATE.spaces.forEach((sp,k)=>{
-      const parents=[]; if(sp['spawned-by']) parents.push(sp['spawned-by']);
-      (sp['merged-from']||[]).forEach(pid=>parents.push(pid));
-      parents.forEach(pid=>{
-        const j=STATE.spaces.findIndex(x=>x.id===pid);
-        if(j>=0&&ctr[k]&&ctr[j]) lines.push('<line x1="'+ctr[k][0]+'" y1="'+ctr[k][1]+'" x2="'+ctr[j][0]+'" y2="'+ctr[j][1]+'"/>');
-      });
+    world.classList.add('overview'); world.classList.add('cards');
+    const PW=380, KW=302, KH=96, KGAP=8, GROUPGAP=26, COLGAP=34, INDENT=26;
+    const padX=vw*0.045, padTop=top+16;
+    const colW=(vw-2*padX-COLGAP*2)/3;
+    const s=Math.min(colW/PW,1);
+    const roots=clusterTree();
+    // a card's head is title + two-line intent, and a title that wraps needs a
+    // taller card. Measure the tallest head rather than guess a number: too
+    // short and an intent is sliced mid-sentence — and that one line saying
+    // what the notebook is FOR is the whole reason the overview is readable.
+    let PH=150;
+    roots.forEach(r=>{ const p=panels[r.i];
+      p.style.width=PW+'px'; p.classList.remove('kid');
+      PH=Math.max(PH, p.querySelector('.p-head').scrollHeight+3); });
+    // pack each cluster into whichever column is currently shortest — measured
+    // as it is placed, so no height needs predicting
+    const colY=[padTop,padTop,padTop], spines=[];
+    const place=(n,x,y,w,h)=>{
+      const p=panels[n.i];
+      p.style.width=w+'px'; p.style.height=h+'px';
+      p.style.transform='translate('+x+'px,'+y+'px) scale('+s+')';
+      p.style.opacity='1'; p.style.zIndex=2; p.style.pointerEvents='auto';
+      p.classList.toggle('kid', w!==PW);
+      return y+h*s;
+    };
+    roots.forEach(r=>{
+      const c=colY.indexOf(Math.min(...colY));
+      const x=padX+c*(colW+COLGAP);
+      const top0=colY[c];
+      let y=place(r,x,top0,PW,PH)+KGAP;
+      // every notebook that spawned something carries its own rail, so a
+      // grandchild hangs off the deep-dive that spawned it and not off the
+      // root — otherwise three levels read as one flat list of siblings
+      (function walk(n,depth,railX,railTop){
+        let lastTick=null;
+        n.kids.forEach(k=>{
+          const kx=x+INDENT*depth+10, y0=y;
+          y=place(k,kx,y,KW,KH)+KGAP;
+          lastTick=y0+KH*s/2;
+          spines.push(['tick',railX,lastTick,kx]);   // the elbow into each child
+          walk(k,depth+1,kx+9,y0+KH*s);
+        });
+        if(lastTick!==null) spines.push(['spine',railX,railTop,lastTick]);
+      })(r,1,x+9,top0+PH*s);
+      colY[c]=y+GROUPGAP;
     });
-    document.getElementById('edges').innerHTML=lines.join('');
+    // .world is fixed at viewport size; scrolling comes from content extending
+    // past it. Absolutely-positioned panels do create scrollable overflow, but a
+    // spacer makes the bottom margin explicit — and the edges SVG must grow too,
+    // or every spine below the fold is clipped.
+    const contentH=Math.max(vh,Math.max(...colY)+40);
+    let end=document.getElementById('canvasEnd');
+    if(!end){ end=document.createElement('div'); end.id='canvasEnd'; world.appendChild(end); }
+    end.style.cssText='position:absolute;left:0;width:1px;height:1px;top:'+contentH+'px';
+    const edges=document.getElementById('edges');
+    edges.style.height=contentH+'px';
+    edges.innerHTML=spines.map(sp=>
+      sp[0]==='spine'
+        ? '<line class="spine" x1="'+sp[1]+'" y1="'+sp[2]+'" x2="'+sp[1]+'" y2="'+sp[3]+'"/>'
+        : '<line class="spine" x1="'+sp[1]+'" y1="'+sp[2]+'" x2="'+sp[3]+'" y2="'+sp[2]+'"/>'
+    ).join('');
   }
   crumbHint.style.display=mode==='overview'?'none':'inline';
   crumbName.textContent=mode==='overview'?'all notebooks':(STATE.spaces[focusIdx]||{}).title||'—';
