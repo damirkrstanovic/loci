@@ -34,6 +34,15 @@
   .crumb{display:flex;align-items:center;gap:9px;cursor:pointer;border:0;background:transparent;font-size:13px;color:var(--muted);padding:6px 10px;border-radius:999px}
   .crumb:hover{background:var(--panel);color:var(--ink)} .crumb b{color:var(--ink);font-weight:500}
   .crumb .ov{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;color:var(--faint)}
+  .crumbfilter{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-left:7px}
+  .crumbfilter b{color:var(--accent);font-weight:500}
+  .crumbfilter .x{margin-left:5px;cursor:pointer;color:var(--faint);padding:0 3px}
+  .crumbfilter .x:hover{color:var(--attn)}
+  /* !important is load-bearing: layout() writes opacity inline on every panel it
+     places, so an unqualified rule here loses to the style attribute and the
+     filter dims nothing at all — a silent no-op that still shows the crumb. */
+  .panel.dim{opacity:.22 !important}
+  .panel.dim:hover{opacity:.5 !important}
   .spacer{margin-left:auto} .ambient{font-size:12px;color:var(--muted)}
 
   .leapwrap{position:fixed;top:58px;left:0;right:0;z-index:45;display:flex;justify-content:center;padding:14px 22px 6px;pointer-events:none}
@@ -1050,8 +1059,11 @@ function layout(){
   }
   crumbHint.style.display=mode==='overview'?'none':'inline';
   crumbName.textContent=mode==='overview'?'all notebooks':(STATE.spaces[focusIdx]||{}).title||'—';
+  applyOverviewFilter();   // survives resize and re-render
 }
-function enter(i){ mode='focus'; focusIdx=i; openId=null; closeLeap(); renderBody(i); layout(); }
+function enter(i){ mode='focus'; focusIdx=i; openId=null; closeLeap();
+                   overviewFilter=null;            // the filter belongs to the overview
+                   renderBody(i); layout(); }
 function overview(){ mode='overview'; openId=null; closeLeap(); layout(); }
 crumb.addEventListener('click',()=>mode==='focus'?overview():enter(focusIdx));
 addEventListener('resize',layout);
@@ -1102,6 +1114,50 @@ document.getElementById('timeBtn').addEventListener('click',()=>TIME?exitTime():
 document.getElementById('timeNow').addEventListener('click',exitTime);
 timeRange.addEventListener('input',()=>scrubTo(+timeRange.value));
 
+// ---------------- LEAP filters the overview ----------------
+// Filtering is an entry in LEAP's own list rather than a mode: the dropdown
+// closes because you finished with it, and Ask / New space / memory hits stay
+// reachable from the overview, which suppressing the panel would have cost.
+let overviewFilter=null;          // {q, ids:Set} — sticky until you leave overview
+
+// A notebook matches on its own title/id, on a prose cell inside it (LEAP
+// returns the NOTEBOOK's id for prose), or on containing an object that
+// matched — `in text` hits carry the document's id, not its notebook's.
+function notebooksMatching(entries){
+  const direct=new Set(entries.filter(e=>e.group==='space'||e.group==='prose').map(e=>e.id));
+  const hits=new Set(entries.map(e=>e.id));
+  const ids=new Set();
+  STATE.spaces.forEach(sp=>{
+    if(direct.has(sp.id) || (sp.members||[]).some(m=>hits.has(m))) ids.add(sp.id);
+  });
+  return ids;
+}
+
+function applyOverviewFilter(){
+  const on=!!overviewFilter;
+  panels.forEach((p,k)=>p.classList.toggle('dim', on && !overviewFilter.ids.has(STATE.spaces[k].id)));
+  const cr=document.getElementById('crumbFilter');
+  if(cr) cr.remove();
+  if(on){
+    const el=document.createElement('span'); el.id='crumbFilter'; el.className='crumbfilter';
+    el.innerHTML='· “'+esc(overviewFilter.q)+'” <b>'+overviewFilter.ids.size+' of '+
+                 STATE.spaces.length+'</b> <span class="x" title="clear the filter">✕</span>';
+    el.querySelector('.x').addEventListener('click',e=>{ e.stopPropagation(); clearOverviewFilter(); });
+    crumb.appendChild(el);
+  }
+}
+function clearOverviewFilter(){ overviewFilter=null; applyOverviewFilter(); }
+
+// with the canvas scrolling, a filter whose matches are all below the fold
+// shows a screen of grey and looks broken — bring the first one into view
+function scrollToFirstMatch(){
+  if(!overviewFilter) return;
+  const k=STATE.spaces.findIndex(s=>overviewFilter.ids.has(s.id));
+  if(k<0) return;
+  const r=panels[k].getBoundingClientRect(), w=document.getElementById('world');
+  if(r.top<140||r.bottom>innerHeight) w.scrollTop+=r.top-180;
+}
+
 // ---------------- LEAP ----------------
 async function renderLeap(){
   const qv=q.value.trim();
@@ -1118,14 +1174,20 @@ async function renderLeap(){
                      group:'create', connect:s.id});
     });
   }
+  // ⊟ filter: only from the overview, where the dropdown is what's in the way
+  if(mode==='overview'&&!TIME&&qv){
+    const n=notebooksMatching(entries).size;
+    filtered.push({id:'__filter__', group:'filter',
+                   label:'⊟ Filter the overview: “'+qv+'” · '+n+' of '+STATE.spaces.length});
+  }
   if(sel>=filtered.length) sel=0;
   if(!filtered.length){ results.innerHTML='<div class="group">no match</div>'; return; }
   let h='',last=null,flat=0;
-  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions'};
+  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions'};
   filtered.forEach(e=>{ const grp=gname[e.group]||'Content';
     if(grp!==last){h+='<div class="group">'+grp+'</div>';last=grp;}
-    const i=flat++; const cls=(e.group==='space')?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask')?'verb':'';
-    const ic=e.group==='ask'?'✦':e.group==='space'?'▢':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    const i=flat++; const cls=(e.group==='space')?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask'||e.group==='filter')?'verb':'';
+    const ic=e.group==='ask'?'✦':e.group==='space'?'▢':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
     h+='<div class="res '+cls+(i===sel?' sel':'')+'" data-i="'+i+'"><span class="ic">'+ic+'</span>'+
        '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(e.id)+'</span></div>'; });
   results.innerHTML=h;
@@ -1147,6 +1209,14 @@ async function act(){ const e=filtered[sel]; if(!e) return;
     closeLeap();
     await openObject(e.target);
     await remold(e.target, e.id);
+    return;
+  }
+  if(e.group==='filter'){
+    const qv=q.value.trim();
+    let entries; try{ entries=await API.leap(qv); }catch(err){ showToast('leap: network error'); return; }
+    overviewFilter={q:qv, ids:notebooksMatching(entries)};
+    closeLeap(); applyOverviewFilter(); scrollToFirstMatch();
+    if(!overviewFilter.ids.size) showToast('no notebook matches “'+qv+'”');
     return;
   }
   if(e.group==='ask'){ askAgent(e.prompt, mode==='focus'?STATE.spaces[focusIdx].id:null); }
@@ -1313,7 +1383,10 @@ addEventListener('keydown',e=>{
   if(document.activeElement===q) return;
   // don't steal typing from any focused field (code-a-view, describe, edit, …)
   { const a=document.activeElement, t=a&&a.tagName; if(t==='INPUT'||t==='TEXTAREA'||t==='SELECT'||(a&&a.isContentEditable)){ if(e.key==='Escape')a.blur(); return; } }
-  if(e.key==='Escape'){ if(TIME){ exitTime(); return; } if(openId){openId=null;renderBody(focusIdx);} else if(mode==='focus') overview(); return; }
+  if(e.key==='Escape'){ if(TIME){ exitTime(); return; }
+    if(openId){openId=null;renderBody(focusIdx);}
+    else if(overviewFilter){ clearOverviewFilter(); }
+    else if(mode==='focus') overview(); return; }
   if(TIME) return;   // LEAP is disabled while viewing the past
   if(e.key.length===1 && !e.metaKey && !e.ctrlKey && !e.altKey) q.focus();
 });
