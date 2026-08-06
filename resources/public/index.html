@@ -38,6 +38,18 @@
   .crumbfilter b{color:var(--accent);font-weight:500}
   .crumbfilter .x{margin-left:5px;cursor:pointer;color:var(--faint);padding:0 3px}
   .crumbfilter .x:hover{color:var(--attn)}
+  /* the strip sits under LEAP in its own row — the mock floated it beneath the
+     LEAP bar where nothing could be clicked, and only a scripted click hid that */
+  #tagstrip{position:fixed;left:0;right:0;top:132px;z-index:12;display:flex;gap:6px;
+            justify-content:center;flex-wrap:wrap;pointer-events:auto}
+  .world.overview ~ #tagstrip{display:flex}
+  .tagchip{font-family:var(--mono);font-size:10px;letter-spacing:.05em;padding:3px 9px;
+           border-radius:2px;border:1px solid var(--line);background:var(--white);
+           color:var(--muted);cursor:pointer}
+  .tagchip i{font-style:normal;color:var(--faint);margin-left:4px}
+  .tagchip.in{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
+  .tagchip.out{border-color:var(--attn);color:var(--attn);background:var(--attn-soft);
+               text-decoration:line-through}
   /* !important is load-bearing: layout() writes opacity inline on every panel it
      places, so an unqualified rule here loses to the style attribute and the
      filter dims nothing at all — a silent no-op that still shows the crumb. */
@@ -975,6 +987,10 @@ function clusterTree(){
 // ---------------- layout (focus / overview zoom) ----------------
 function layout(){
   const vw=innerWidth, vh=innerHeight, top=124;
+  // before anything is placed: the strip is a row of the page, not something
+  // floating over it. Rendered first so the cards can be pushed below it —
+  // at a fixed 150px it landed across the top of the middle column's card.
+  renderTagStrip();
   const fw=Math.min(940,vw-48), fh=vh-top-28, fx=(vw-fw)/2;
   panels.forEach(p=>{p.style.width=fw+'px';p.style.height=fh+'px';});
   if(mode==='focus'){
@@ -990,7 +1006,8 @@ function layout(){
   } else {
     world.classList.add('overview'); world.classList.add('cards');
     const PW=380, KW=302, KGAP=8, GROUPGAP=26, COLGAP=34, INDENT=26;
-    const padX=vw*0.045, padTop=top+16;
+    const strip=document.getElementById('tagstrip');
+    const padX=vw*0.045, padTop=top+16+(strip?strip.offsetHeight+12:0);
     const colW=(vw-2*padX-COLGAP*2)/3;
     const s=Math.min(colW/PW,1);
     const roots=clusterTree();
@@ -1062,7 +1079,7 @@ function layout(){
   applyOverviewFilter();   // survives resize and re-render
 }
 function enter(i){ mode='focus'; focusIdx=i; openId=null; closeLeap();
-                   overviewFilter=null;            // the filter belongs to the overview
+                   overviewFilter=null; tagState={};   // both belong to the overview
                    renderBody(i); layout(); }
 function overview(){ mode='overview'; openId=null; closeLeap(); layout(); }
 crumb.addEventListener('click',()=>mode==='focus'?overview():enter(focusIdx));
@@ -1134,19 +1151,65 @@ function notebooksMatching(entries){
 }
 
 function applyOverviewFilter(){
-  const on=!!overviewFilter;
-  panels.forEach((p,k)=>p.classList.toggle('dim', on && !overviewFilter.ids.has(STATE.spaces[k].id)));
-  const cr=document.getElementById('crumbFilter');
-  if(cr) cr.remove();
-  if(on){
-    const el=document.createElement('span'); el.id='crumbFilter'; el.className='crumbfilter';
-    el.innerHTML='· “'+esc(overviewFilter.q)+'” <b>'+overviewFilter.ids.size+' of '+
-                 STATE.spaces.length+'</b> <span class="x" title="clear the filter">✕</span>';
-    el.querySelector('.x').addEventListener('click',e=>{ e.stopPropagation(); clearOverviewFilter(); });
-    crumb.appendChild(el);
-  }
+  const lit = sp => (!overviewFilter || overviewFilter.ids.has(sp.id)) && passesTags(sp);
+  panels.forEach((p,k)=>p.classList.toggle('dim', mode==='overview' && !lit(STATE.spaces[k])));
+  const cr=document.getElementById('crumbFilter'); if(cr) cr.remove();
+  const tagBits=Object.entries(tagState).map(([t,v])=>(v==='in'?'+':'−')+t);
+  if(!overviewFilter && !tagBits.length) return;
+  const n=STATE.spaces.filter(lit).length;
+  const el=document.createElement('span'); el.id='crumbFilter'; el.className='crumbfilter';
+  el.innerHTML='· '+(overviewFilter?'“'+esc(overviewFilter.q)+'” ':'')+
+               (tagBits.length?esc(tagBits.join(' '))+' ':'')+
+               '<b>'+n+' of '+STATE.spaces.length+'</b>'+
+               ' <span class="x" title="clear the filter">✕</span>';
+  el.querySelector('.x').addEventListener('click',e=>{ e.stopPropagation(); clearAllFilters(); });
+  crumb.appendChild(el);
 }
 function clearOverviewFilter(){ overviewFilter=null; applyOverviewFilter(); }
+function clearAllFilters(){ overviewFilter=null; clearTags(); applyOverviewFilter(); }
+
+// ---------------- tags narrow the same set LEAP's filter narrows ----------------
+// One dimming path, one crumb, one predicate. A second parallel filter with its
+// own rules would be the mode this design has avoided throughout.
+let tagState={};                  // {tag: 'in' | 'out'} — absent means neutral
+
+function allTags(){
+  const seen=new Map();
+  STATE.spaces.forEach(sp=>(sp.tags||[]).forEach(t=>seen.set(t.tag,(seen.get(t.tag)||0)+1)));
+  return [...seen.entries()].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]));
+}
+
+// include if it carries any included tag (or none are included); exclude wins,
+// because "semiconductors except the geopolitics" is the question people ask
+function passesTags(sp){
+  const on=Object.entries(tagState);
+  if(!on.length) return true;
+  const mine=new Set((sp.tags||[]).map(t=>t.tag));
+  const inc=on.filter(([,v])=>v==='in').map(([t])=>t);
+  const exc=on.filter(([,v])=>v==='out').map(([t])=>t);
+  if(exc.some(t=>mine.has(t))) return false;
+  return !inc.length || inc.some(t=>mine.has(t));
+}
+
+function cycleTag(tag){
+  tagState[tag] = tagState[tag]==='in' ? 'out' : tagState[tag]==='out' ? undefined : 'in';
+  if(!tagState[tag]) delete tagState[tag];
+  renderTagStrip(); applyOverviewFilter();
+}
+function clearTags(){ tagState={}; renderTagStrip(); }
+
+function renderTagStrip(){
+  let strip=document.getElementById('tagstrip');
+  const tags=allTags();
+  if(mode!=='overview' || !tags.length){ if(strip) strip.remove(); return; }
+  if(!strip){ strip=document.createElement('div'); strip.id='tagstrip';
+              document.body.appendChild(strip); }
+  strip.innerHTML=tags.map(([t,n])=>
+    '<button class="tagchip '+(tagState[t]||'')+'" data-tag="'+esc(t)+'" '+
+    'title="click: include · again: exclude · again: off">'+esc(t)+' <i>'+n+'</i></button>').join('');
+  strip.querySelectorAll('.tagchip').forEach(b=>
+    b.addEventListener('click',()=>cycleTag(b.dataset.tag)));
+}
 
 // with the canvas scrolling, a filter whose matches are all below the fold
 // shows a screen of grey and looks broken — bring the first one into view
@@ -1396,7 +1459,7 @@ addEventListener('keydown',e=>{
   { const a=document.activeElement, t=a&&a.tagName; if(t==='INPUT'||t==='TEXTAREA'||t==='SELECT'||(a&&a.isContentEditable)){ if(e.key==='Escape')a.blur(); return; } }
   if(e.key==='Escape'){ if(TIME){ exitTime(); return; }
     if(openId){openId=null;renderBody(focusIdx);}
-    else if(overviewFilter){ clearOverviewFilter(); }
+    else if(overviewFilter||Object.keys(tagState).length){ clearAllFilters(); }
     else if(mode==='focus') overview(); return; }
   if(TIME) return;   // LEAP is disabled while viewing the past
   if(e.key.length===1 && !e.metaKey && !e.ctrlKey && !e.altKey) q.focus();
