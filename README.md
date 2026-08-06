@@ -69,6 +69,12 @@ never opens `data/`. A failing browser test leaves a screenshot and a console lo
 motivated the suite (notebook titles rendering at ~3px when zoomed out) was invisible to
 every DOM assertion and only caught by looking.
 
+Zoomed out, the overview groups each notebook with the deep-dives it spawned — the
+structure the substrate already computes from `spawned-by` and `merged-from`, rather than
+laying every notebook out as a peer. Cards are sized to their own content, the canvas
+scrolls, and a focused notebook names its parent, siblings and children in one line under
+its intention.
+
 The browser suite needs two things beyond `npm install`:
 
 - **Node 22 or newer.** `npm run test:browser` uses `node --test` with a glob, which
