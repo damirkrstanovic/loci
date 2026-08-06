@@ -23,7 +23,6 @@ rmSync(FAILURES, { recursive: true, force: true });
 // space has no :cells — so build the new cell vector through it, or appending
 // a cell would silently erase space:cosmos's three seeded members.
 const FLOW_FIXTURE = `
-(require '[loci.content :as c] '[loci.substrate :as sub] '[loci.notebook :as nb])
 (let [st @c/store
       flow {:id "flow:test" :kind :flow :title "Flow — fixture"
             :value {:goal "a fixture flow" :space "space:cosmos" :status "failed"
@@ -36,14 +35,12 @@ const FLOW_FIXTURE = `
                                     {:op :assoc :id "space:cosmos" :path [:value :cells]
                                      :value (conj (nb/cells-of (sub/object st "space:cosmos"))
                                                   {:ref "flow:test"})}]}))
-(System/exit 0)
 `;
 
 // A parent with two children, one of which has a child of its own — the
 // overview's clustering is only meaningful against a real tree, and the
 // deterministic seed contains none.
 const FAMILY_FIXTURE = `
-(require '[loci.content :as c] '[loci.substrate :as sub])
 (let [st @c/store
       mk (fn [id title parent]
            {:op :put :id id
@@ -54,26 +51,32 @@ const FAMILY_FIXTURE = `
                                     (mk "space:fam-a" "Fixture child A" "space:fam-root")
                                     (mk "space:fam-b" "Fixture child B" "space:fam-root")
                                     (mk "space:fam-a1" "Fixture grandchild" "space:fam-a")]}))
-(System/exit 0)
 `;
 
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `
-(require '[loci.server :as srv] '[loci.content :as c])
 (let [st @c/store]
   (srv/set-tags! st "space:cosmos"  [{:tag "astronomy" :by "agent"}])
   (srv/set-tags! st "space:world"   [{:tag "world data" :by "agent"}])
   (srv/set-tags! st "space:finance" [{:tag "company" :by "you"}])
   (srv/set-tags! st "space:sales"   [{:tag "company" :by "you"} {:tag "pipeline" :by "you"}]))
-(System/exit 0)
 `;
 
 // http-kit binds the port itself and tells us which one it got. Asking the OS for a
 // free port here and handing the number to a JVM that binds it ~7s later is a race —
 // two test files start concurrently and would pick independently.
+//
+// The fixtures run HERE, in the server's own JVM, rather than in three `clojure -M -e`
+// invocations of their own. Requiring loci.content loads the namespace and seeds the
+// store, measured at 9.9s; paying that four times per test file was the whole cost of
+// the browser suite. One JVM per file writes the same events in the same order.
 const SERVER_MAIN = `
-(require 'loci.server 'org.httpkit.server)
+(require '[loci.server :as srv] '[loci.content :as c] '[loci.substrate :as sub]
+         '[loci.notebook :as nb] 'org.httpkit.server)
+${FLOW_FIXTURE}
+${FAMILY_FIXTURE}
+${TAG_FIXTURE}
 (let [s (org.httpkit.server/run-server (var loci.server/handler)
           {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
   (println "LOCI-READY" (org.httpkit.server/server-port s))
@@ -108,23 +111,11 @@ function installCleanup() {
   process.on('SIGHUP', () => { reap(); process.exit(129); });
 }
 
-const run = (args, env, cwd = REPO) => new Promise((res, rej) => {
-  const p = spawn('clojure', args, { cwd, env: { ...process.env, ...env } });
-  let out = '';
-  p.stdout.on('data', d => out += d);
-  p.stderr.on('data', d => out += d);
-  p.on('error', rej);
-  p.on('exit', code => code === 0 ? res(out) : rej(new Error(`clojure ${args.join(' ')} exited ${code}:\n${out}`)));
-});
-
 export async function startServer() {
   installCleanup();
   const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
   const rec = { pid: null, dir };
   LIVE.add(rec);
-  await run(['-M', '-e', FLOW_FIXTURE], { LOCI_DATA: dir });   // seeds, then adds the flow
-  await run(['-M', '-e', FAMILY_FIXTURE], { LOCI_DATA: dir }); // …and a hub with a brood
-  await run(['-M', '-e', TAG_FIXTURE], { LOCI_DATA: dir });    // …and subject tags on four
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
