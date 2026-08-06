@@ -175,10 +175,54 @@
     (filter #(and (not (numeric %))
                   (some string? (remove str/blank? (map str (col-vals rows %)))))
             (keys (first rows)))))
+;; Which numeric column should a chart measure when the user hasn't said?
+;; Not "the first one" — a row map above 8 keys comes back in hash order (nippy
+;; thaws it as a PersistentHashMap), so "first" is arbitrary. It has to come
+;; from what the column MEANS: a quantity can be summed, a rate or a share can
+;; only be averaged, and a year is neither.
+(def ^:private rate-col-name
+  #"(?i)(^|_)(pct|percent|percentage|rate|ratio|share|index|avg|mean|median|year|id|latitude|longitude|lat|lon)$|per_capita$|_per_")
+
+(defn- year-like? [xs]
+  (and (seq xs) (every? #(and (integer? %) (<= 1500 % 2200)) xs)))
+
+(defn- rate-col?
+  "True when summing this column would produce a meaningless number."
+  [rows c]
+  (boolean (or (re-find rate-col-name (name c))
+               (year-like? (nums (col-vals rows c))))))
+
+(defn- magnitude
+  "Median absolute value — robust to one huge outlier, unlike a mean or a max."
+  [rows c]
+  (let [xs (sort (map abs (nums (col-vals rows c))))]
+    (if (seq xs) (nth xs (quot (count xs) 2)) 0)))
+
+(defn- measure-col
+  "The numeric column worth charting.
+
+   Not 'the first one': above eight keys a row map comes back in hash order
+   (nippy thaws it as a PersistentHashMap), so first is arbitrary. And not by
+   name alone: `life_expectancy` reads like a quantity and sums to nonsense.
+
+   So — drop the columns whose names or values mark them as rates, years, ids
+   or coordinates, then take the largest of what remains by median magnitude.
+   A table's headline quantity is nearly always its biggest number: population
+   dwarfs life expectancy, GDP dwarfs growth. If nothing survives, the biggest
+   numeric column is charted anyway and the caller averages it."
+  [rows]
+  (let [numeric (numeric-cols rows)
+        by-size #(- (magnitude rows %))]
+    (or (first (sort-by by-size (remove #(rate-col? rows %) numeric)))
+        (first (sort-by by-size numeric)))))
+
 (defn- cat-col [rows]
+  ;; the coarsest category wins, not whichever key the hash order offers first:
+  ;; grouping 211 countries by 7 regions says something, by 211 names it doesn't
   (->> (string-cols rows)
-       (filter (fn [c] (let [d (count (distinct (map #(get % c) rows)))] (and (> d 1) (<= d 12)))))
-       first))
+       (keep (fn [c] (let [d (count (distinct (map #(get % c) rows)))]
+                       (when (and (> d 1) (<= d 12)) [d c]))))
+       sort first second))
 
 (defn- numericish?  [x] (and (table? x) (seq (numeric-cols x))))
 (defn- categorical? [x] (and (table? x) (cat-col x) (seq (numeric-cols x))))
@@ -195,11 +239,16 @@
                       :sum (round2 (reduce + xs)))))))
 
 (defn- bar [rows]
-  (let [cat (cat-col rows) val (first (numeric-cols rows))]
-    {:chart "bar" :x (name cat) :y (name val)
+  (let [cat (cat-col rows) val (measure-col rows)
+        rate? (rate-col? rows val)
+        agg   (fn [xs] (let [ns (nums xs)]
+                         (cond (empty? ns) 0
+                               rate?       (round2 (/ (reduce + ns) (double (count ns))))
+                               :else       (round2 (reduce + ns)))))]
+    {:chart "bar" :x (name cat) :y (name val) :agg (if rate? "avg" "sum")
      :rows (->> rows (group-by #(get % cat))
                 (map (fn [[k rs]] (array-map (name cat) (str k)
-                                             (name val) (round2 (reduce + (nums (map #(get % val) rs)))))))
+                                             (name val) (agg (map #(get % val) rs)))))
                 (sort-by #(get % (name val)) >) vec)}))
 
 (defn- line [rows]
@@ -219,7 +268,7 @@
   (->> (str/split-lines text) (filter #(str/starts-with? % "#")) (mapv str/trim)))
 
 (defn- pivot [rows]
-  (let [cat (cat-col rows) val (first (numeric-cols rows))]
+  (let [cat (cat-col rows) val (measure-col rows)]
     (->> rows (group-by #(get % cat))
          (map (fn [[k rs]]
                 (let [vs (nums (map #(get % val) rs))]

@@ -586,3 +586,70 @@
     (let [summ (:rendered (srv/mold-payload st "tbl:lead" "table/summary"))]
       (is (= ["score"] (mapv :column summ)))
       (is (= 12.0 (:sum (first summ)))))))
+
+;; ---- the default chart must pick a column worth charting ----
+;; Found with World Bank data: Bar summed inflation percentages across
+;; countries and drew it confidently. It charted (first (numeric-cols rows)),
+;; and above 8 keys Clojure hands back hash order, so "first" was arbitrary.
+;; Column order cannot carry the answer — nippy thaws a 9-key map as a
+;; hash-map, so the order is gone before a viewer ever sees it. The choice has
+;; to come from what the column MEANS.
+
+(defn- charted [st id]
+  (:rendered (srv/mold-payload st id "table/bar")))
+
+(deftest bar-prefers-a-quantity-over-a-rate-whatever-the-key-order
+  (let [st (sub/fresh-store)
+        rows (for [i (range 20)]
+               {:country (str "C" i) :region (if (even? i) "North" "South")
+                :iso3 (str "X" i) :gdp_usd_bn (* 10.0 (inc i)) :gdp_year 2024
+                :gdp_per_capita 5000.0 :growth_pct 2.0
+                :inflation_pct 3.0 :unemployment_pct 4.0})]
+    (sub/commit! st {:op :put :id "tbl:wb"
+                     :value {:id "tbl:wb" :kind :table :title "WB" :value (vec rows)}})
+    (let [c (charted st "tbl:wb")]
+      (is (= "gdp_usd_bn" (:y c))
+          (str "charted " (:y c) " — a percentage or a year is not a quantity"))
+      (is (= "sum" (:agg c))))))
+
+(deftest bar-averages-when-every-numeric-column-is-a-rate
+  ;; summing percentages is meaningless; averaging them is not
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:rates"
+                     :value {:id "tbl:rates" :kind :table :title "Rates"
+                             :value [{:country "A" :region "North" :inflation_pct 2.0}
+                                     {:country "B" :region "North" :inflation_pct 4.0}
+                                     {:country "C" :region "South" :inflation_pct 9.0}]}})
+    (let [c (charted st "tbl:rates")]
+      (is (= "inflation_pct" (:y c)))
+      (is (= "avg" (:agg c)) "a rate must not be summed")
+      (is (= 3.0 (get (first (filter #(= "North" (get % "region")) (:rows c)))
+                      "inflation_pct"))
+          "North should be the mean of 2 and 4"))))
+
+(deftest a-year-column-is-never-the-measure
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:yr"
+                     :value {:id "tbl:yr" :kind :table :title "Years"
+                             :value [{:place "A" :region "N" :year 2024 :tonnes 5.0}
+                                     {:place "B" :region "S" :year 2023 :tonnes 7.0}]}})
+    (is (= "tonnes" (:y (charted st "tbl:yr"))))))
+
+(deftest bar-picks-the-headline-quantity-not-a-small-per-person-measure
+  ;; World Bank population table: summing life expectancy across countries is
+  ;; meaningless, and "life_expectancy" is not a rate by name — so the choice
+  ;; cannot come from names alone. Population is three orders of magnitude
+  ;; larger, and that is the signal.
+  (let [st (sub/fresh-store)
+        rows (for [i (range 12)]
+               {:country (str "C" i) :region (if (even? i) "North" "South")
+                :iso3 (str "X" i)
+                :population (* 1000000.0 (inc i)) :population_year 2024
+                :urban_pct 55.0 :life_expectancy (+ 70.0 i)
+                :density_per_km2 100.0 :fertility_rate 1.8
+                :age_65_plus_pct 12.0 :note "x"})]
+    (sub/commit! st {:op :put :id "tbl:pop"
+                     :value {:id "tbl:pop" :kind :table :title "Pop" :value (vec rows)}})
+    (let [c (:rendered (srv/mold-payload st "tbl:pop" "table/bar"))]
+      (is (= "population" (:y c)) (str "charted " (:y c)))
+      (is (= "sum" (:agg c))))))
