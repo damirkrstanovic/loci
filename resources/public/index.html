@@ -1174,11 +1174,14 @@ async function renderLeap(){
                      group:'create', connect:s.id});
     });
   }
-  // ⊟ filter: only from the overview, where the dropdown is what's in the way
+  // ⊟ filter: only from the overview, where the dropdown is what's in the way.
+  // Second, right under Ask — appended it sits at flat index 11 for a rich query,
+  // below the .results 46vh fold, which is precisely the burial this verb exists
+  // to undo. Ask keeps the top slot; from 25 notebooks, "show me fewer" is next.
   if(mode==='overview'&&!TIME&&qv){
     const n=notebooksMatching(entries).size;
-    filtered.push({id:'__filter__', group:'filter',
-                   label:'⊟ Filter the overview: “'+qv+'” · '+n+' of '+STATE.spaces.length});
+    filtered.splice(1,0,{id:'__filter__', group:'filter',
+      label:'⊟ Filter the overview: “'+qv+'” · '+n+' of '+STATE.spaces.length});
   }
   if(sel>=filtered.length) sel=0;
   if(!filtered.length){ results.innerHTML='<div class="group">no match</div>'; return; }
@@ -1193,7 +1196,15 @@ async function renderLeap(){
   results.innerHTML=h;
   results.querySelectorAll('.res').forEach(r=>{ r.addEventListener('mousemove',()=>{sel=+r.dataset.i;paintSel();}); r.addEventListener('click',()=>{sel=+r.dataset.i;act();}); });
 }
-function paintSel(){results.querySelectorAll('.res').forEach(r=>r.classList.toggle('sel',+r.dataset.i===sel));}
+// the list scrolls at 46vh, so arrowing past the fold used to move the selection
+// somewhere invisible — keep whatever is selected on screen
+function paintSel(){
+  results.querySelectorAll('.res').forEach(r=>{
+    const on=+r.dataset.i===sel;
+    r.classList.toggle('sel',on);
+    if(on) r.scrollIntoView({block:'nearest'});
+  });
+}
 async function act(){ const e=filtered[sel]; if(!e) return;
   if(e.connect){                       // ⧉ non-destructive merge of two notebooks
     let r; try{ r=await API.connect(STATE.spaces[focusIdx].id, e.connect); }catch(err){ showToast('connect: network error'); return; }
