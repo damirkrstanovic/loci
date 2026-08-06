@@ -4,6 +4,7 @@
             [loci.agent :as agent]
             [loci.memory :as mem]
             [loci.mold :as mold]
+            [loci.notebook :as nb]
             [loci.server :as srv]
             [loci.substrate :as sub]))
 
@@ -93,16 +94,25 @@
     (is (:done s))                 ; a poller must stop, not spin forever
     (is (:error s))))
 
-(deftest deep-dive-start-validates-then-runs-as-job
+(deftest suggest-start-validates-then-runs-as-job
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value [{:a 1}]}})
     (sub/commit! st {:op :put :id "space:h" :value {:id "space:h" :kind :space :title "Hub" :value {:intent "i" :cells []}}})
-    (is (:error (srv/deep-dive-start! st "tbl:t")))     ; not a notebook
-    (is (:error (srv/deep-dive-start! st "nope")))      ; missing
-    (with-redefs [srv/deep-dive! (fn [_ _] {:spawned ["space:dd-1"]})]
-      (let [{:keys [job error]} (srv/deep-dive-start! st "space:h")]
+    (is (:error (srv/suggest-start! st "tbl:t")))     ; not a notebook
+    (is (:error (srv/suggest-start! st "nope")))      ; missing
+    (with-redefs [srv/suggest! (fn [_ _] {:proposals [{:title "A"}]})]
+      (let [{:keys [job error]} (srv/suggest-start! st "space:h")]
         (is (nil? error))
-        (is (= ["space:dd-1"] (get-in (await-job job) [:result :spawned])))))))
+        (is (= [{:title "A"}] (get-in (await-job job) [:result :proposals])))))))
+
+(deftest suggest-run-start-validates-then-runs-as-job
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:h" :value {:id "space:h" :kind :space :title "Hub" :value {:intent "i" :cells []}}})
+    (is (:error (srv/suggest-run-start! st "nope" [{:title "A"}] "new")))   ; missing notebook
+    (with-redefs [srv/run-suggestions! (fn [_ _ _ _] {:ran ["space:dd-1"]})]
+      (let [{:keys [job error]} (srv/suggest-run-start! st "space:h" [{:title "A"}] "new")]
+        (is (nil? error))
+        (is (= ["space:dd-1"] (get-in (await-job job) [:result :ran])))))))
 
 (deftest research-start-validates-then-runs-as-job
   (let [st (sub/fresh-store)]
@@ -1046,3 +1056,135 @@
           want (mapcat names (range threads))]
       (is (= (* threads per) (count reg)) "every name coloured by every thread is still there")
       (is (every? #(contains? reg %) want) "no choice was clobbered by a concurrent one"))))
+
+;; ---- ✧ suggest ----
+;; The agent proposes; you decide. suggest! reads and proposes and commits
+;; NOTHING; run-suggestions! acts on exactly the list you approved and never
+;; re-asks the agent.
+
+(defn- hub-store []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:hub"
+                     :value {:id "space:hub" :kind :space :title "Hub"
+                             :value {:intent "the hub" :cells []}}})
+    st))
+
+(def ^:private three-proposals
+  [{:title "A" :intent "ai" :query "qa"}
+   {:title "B" :intent "bi" :query "qb"}
+   {:title "C" :intent "ci" :query "qc"}])
+
+(defn- spawned-kids [st]
+  (->> (nb/notebooks st) (filter #(get-in % [:value :spawned-by :space]))))
+
+(deftest suggest-commits-nothing-at-all
+  ;; the whole point: a proposal you may discard must not touch the substrate
+  (let [st (hub-store)
+        n  (count (sub/history st))]
+    (with-redefs [agent/propose-subtopics (fn [_ _ _] three-proposals)]
+      (let [r (srv/suggest! st "space:hub")]
+        (is (= 3 (count (:proposals r))))
+        (is (= "qa" (:query (first (:proposals r)))))))
+    (is (= n (count (sub/history st))) "zero events")))
+
+(deftest suggest-refuses-a-non-notebook
+  (let [st (hub-store)]
+    (is (re-find #"not a notebook" (:error (srv/suggest! st "tbl:nope"))))))
+
+(deftest a-failed-proposal-is-reported-not-thrown
+  (with-redefs [agent/propose-subtopics (fn [_ _ _] (throw (Exception. "no key")))]
+    (let [st (hub-store)
+          n  (count (sub/history st))]
+      (is (= "no key" (:error (srv/suggest! st "space:hub"))))
+      (is (= n (count (sub/history st)))))))
+
+(deftest run-suggestions-new-spawns-one-notebook-each
+  (let [st (hub-store)]
+    (with-redefs [srv/research! (fn [_ _ _] {:ok true})]
+      (srv/run-suggestions! st "space:hub" three-proposals "new"))
+    (let [kids (spawned-kids st)]
+      (is (= 3 (count kids)))
+      (is (every? #(= "space:hub" (get-in % [:value :spawned-by :space])) kids))
+      (is (= #{"A" "B" "C"} (set (map :title kids)))))))
+
+(deftest run-suggestions-here-spawns-nothing
+  (let [st (hub-store)
+        before (count (nb/notebooks st))
+        seen (atom [])]
+    (with-redefs [srv/research! (fn [_ sid q] (swap! seen conj [sid q]) {:ok true})]
+      (srv/run-suggestions! st "space:hub" three-proposals "here"))
+    (is (= before (count (nb/notebooks st))) "no notebook is created")
+    (is (= [["space:hub" "qa"] ["space:hub" "qb"] ["space:hub" "qc"]] @seen)
+        "each question is researched in the hub itself, in order")))
+
+(deftest run-suggestions-runs-only-what-you-approved
+  ;; the curated list is the input; the server must not re-ask the agent
+  (let [st (hub-store)
+        seen (atom [])]
+    (with-redefs [agent/propose-subtopics (fn [_ _ _] (throw (Exception. "must not be called")))
+                  srv/research! (fn [_ _ q] (swap! seen conj q) {:ok true})]
+      (srv/run-suggestions! st "space:hub"
+                            [{:title "A" :intent "ai" :query "edited by hand"}] "here"))
+    (is (= ["edited by hand"] @seen))))
+
+(deftest items-arrive-over-http-with-the-keys-the-code-destructures
+  ;; run-suggestions! destructures :title/:intent/:query, and `items` comes off
+  ;; the wire as JSON. Drive the REAL body reader so the assumption that
+  ;; body-json keywordizes nested object keys is proven, not assumed.
+  (let [st (hub-store)
+        body (str "{\"space\":\"space:hub\",\"destination\":\"here\",\"items\":"
+                  "[{\"title\":\"A\",\"intent\":\"ai\",\"query\":\"qa\"},"
+                  " {\"title\":\"B\",\"intent\":\"bi\",\"query\":\"qb\"}]}")
+        {:keys [space items destination]} (#'srv/body-json {:body (java.io.StringReader. body)})
+        seen (atom [])]
+    (with-redefs [srv/research! (fn [_ sid q] (swap! seen conj [sid q]) {:ok true})]
+      (srv/run-suggestions! st space items destination))
+    (is (= [["space:hub" "qa"] ["space:hub" "qb"]] @seen)
+        "the questions survived the JSON round-trip into the researcher")))
+
+(deftest run-suggestions-refuses-nonsense-honestly
+  (let [st (hub-store)]
+    (is (re-find #"not a notebook" (:error (srv/run-suggestions! st "tbl:x" three-proposals "new"))))
+    (is (:error (srv/run-suggestions! st "space:hub" [] "new")))
+    (is (re-find #"destination" (:error (srv/run-suggestions! st "space:hub" three-proposals "sideways"))))
+    (is (= 1 (count (nb/notebooks st))) "a refused run creates nothing")))
+
+(deftest a-failure-midway-keeps-what-already-landed
+  ;; deliberate: a partial result is worth keeping and is individually undoable.
+  ;; B's notebook is committed BEFORE its research runs, so a throw inside that
+  ;; research leaves B's notebook standing and empty — honest, and undoable.
+  ;; What must not happen is A's finished work being rolled back, or C running
+  ;; on after a failure nobody has seen yet.
+  (let [st (hub-store)
+        n  (atom 0)]
+    (with-redefs [srv/research! (fn [_ _ _] (if (= 2 (swap! n inc))
+                                              (throw (Exception. "boom"))
+                                              {:ok true}))]
+      (is (= "boom" (:error (srv/run-suggestions! st "space:hub" three-proposals "new")))
+          "the failure is reported, not thrown"))
+    (is (= #{"A" "B"} (set (map :title (spawned-kids st))))
+        "A's notebook survives B's failure; C never started")
+    (is (= 2 @n) "the run stopped at the failure")))
+
+(deftest a-new-notebook-never-overwrites-an-existing-one
+  ;; the id came from the TOTAL notebook count, so it had nothing to do with the
+  ;; dd sequence — and the write is a :put, which overwrites in silence. Two
+  ;; notebooks in the store is exactly the state where `(inc (count …))` mints
+  ;; "space:dd-3": the shape you get after two of an earlier batch are deleted.
+  (let [st (hub-store)]
+    (sub/commit! st {:op :put :id "space:dd-3"
+                     :value {:id "space:dd-3" :kind :space :title "PRECIOUS"
+                             :value {:intent "do not lose me" :cells []}}})
+    (with-redefs [srv/research! (fn [_ _ _] {:ok true})]
+      (srv/run-suggestions! st "space:hub" three-proposals "new"))
+    (is (= "PRECIOUS" (:title (sub/object st "space:dd-3"))) "untouched")
+    (is (= 5 (count (nb/notebooks st))) "hub + precious + three new")
+    (is (= 3 (count (set (map :id (spawned-kids st))))) "and the three got distinct ids")))
+
+(deftest spawned-children-inherit-the-hubs-tags
+  (let [st (hub-store)]
+    (srv/set-tags! st "space:hub" [{:tag "semiconductors" :by "you"}])
+    (with-redefs [srv/research! (fn [_ _ _] {:ok true})]
+      (srv/run-suggestions! st "space:hub" [(first three-proposals)] "new"))
+    (let [kid (first (spawned-kids st))]
+      (is (= ["semiconductors"] (mapv :tag (get-in kid [:value :tags])))))))

@@ -952,34 +952,79 @@
           {:state (state-payload st) :openId (or tid fid)})))
     (catch Exception e {:error (.getMessage e)})))
 
-;; deep-dive: the agent proposes subtopics (grounded in the hub's findings AND
-;; recalled memory), each spawned as a connected notebook and researched.
-(defn deep-dive! [st space]
+;; ---- suggest: the agent proposes, you decide ----
+;; This was deep-dive!, which proposed AND spawned AND researched on one click.
+;; The capability was right and the consent was missing, so it splits here: the
+;; half that reads and proposes writes nothing, and the half that acts takes only
+;; what you approved.
+(defn suggest!
+  "Questions worth pursuing in this notebook — proposed from the hub's findings
+   AND recalled memory. Commits NOTHING: not a reversible event, no event.
+   Dismissing leaves the substrate untouched."
+  [st space]
   (try
     (let [sp (sub/object st space)]
       (if-not (= :space (:kind sp))
         {:error (str "not a notebook: " space)}
         (let [digest (str (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
                                (map obj-digest) (str/join "\n"))
-                          (remembered-context (str (:title sp) " " (get-in sp [:value :intent]))))
-              subs*  (take 3 (agent/propose-subtopics (:title sp) (get-in sp [:value :intent]) digest))
-              ;; every child of this one act inherits the same subject, stamped once
-              ptags  (inherit-tags st space)
-              spawned
-              (vec (for [{:keys [title intent query]} subs*]
-                     (let [n   (count (nb/notebooks st))
-                           sid (str "space:dd-" (inc n))]
-                       (sub/commit! st {:op :put :id sid
-                                        :value {:id sid :kind :space :title title
-                                                :value (cond-> {:intent intent :cells []
-                                                                :spawned-by {:space space :prompt query}}
-                                                         (seq ptags) (assoc :tags ptags))}})
-                       (research! st sid query)
-                       sid)))]
-          {:state (state-payload st) :spawned spawned})))
+                          (remembered-context (str (:title sp) " " (get-in sp [:value :intent]))))]
+          {:proposals (vec (take 3 (agent/propose-subtopics
+                                    (:title sp) (get-in sp [:value :intent]) digest)))})))
     (catch Exception e {:error (.getMessage e)})))
 
-;; ---- jobs: long agent flows (research, deep-dive) run off-request so the
+(defn- fresh-dd-id
+  "One past the highest space:dd-N, and never one that already exists. The old
+   form derived the id from the TOTAL notebook count, which had nothing to do
+   with the dd sequence; two notebooks in the store mint \"space:dd-3\", so the
+   day anything deletes a notebook that :put would overwrite a live notebook in
+   silence. The existence loop terminates: n only rises, and the store holds
+   finitely many objects."
+  [st]
+  (let [highest (->> (nb/notebooks st)
+                     (keep #(some->> (:id %) (re-find #"^space:dd-(\d+)$") second parse-long))
+                     (reduce max 0))]
+    (loop [n (inc highest)]
+      (if (sub/object st (str "space:dd-" n)) (recur (inc n)) (str "space:dd-" n)))))
+
+(defn run-suggestions!
+  "Research the questions you approved. `items` is the curated, possibly edited
+   list — the agent is not re-asked and the originals are not re-read, so what
+   you approved is exactly what runs. `destination` is \"new\" (one connected
+   notebook each, as deep-dive did) or \"here\" (cells in this notebook, exactly
+   as pressing Research repeatedly would).
+
+   Not atomic across items, deliberately: three researches are three commits, and
+   a failure on the second leaves the first in place. A partial result is worth
+   keeping and is individually undoable."
+  [st space items destination]
+  (try
+    (let [sp (sub/object st space)]
+      (cond
+        (not= :space (:kind sp)) {:error (str "not a notebook: " space)}
+        (empty? items)           {:error "nothing to research"}
+        (not (#{"new" "here"} destination))
+        {:error (str "unknown destination: " destination)}
+        :else
+        ;; every child of this one act inherits the same subject, stamped once
+        (let [ptags (inherit-tags st space)
+              done  (reduce
+                     (fn [acc {:keys [title intent query]}]
+                       (if (= "new" destination)
+                         (let [sid (fresh-dd-id st)]
+                           (sub/commit! st {:op :put :id sid
+                                            :value {:id sid :kind :space :title title
+                                                    :value (cond-> {:intent intent :cells []
+                                                                    :spawned-by {:space space :prompt query}}
+                                                             (seq ptags) (assoc :tags ptags))}})
+                           (research! st sid query)
+                           (conj acc sid))
+                         (do (research! st space query) (conj acc space))))
+                     [] items)]
+          {:state (state-payload st) :ran done :destination destination})))
+    (catch Exception e {:error (.getMessage e)})))
+
+;; ---- jobs: long agent flows (research, suggest) run off-request so the
 ;; browser never holds a minutes-long fetch. The frontend polls /api/job. ----
 (defonce ^:private job-seq (atom 0))
 (defonce ^:private jobs (atom {}))
@@ -1000,9 +1045,13 @@
   (let [sp (sub/object st space)]
     (when-not (= :space (:kind sp)) {:error (str "not a notebook: " space)})))
 
-(defn deep-dive-start! [st space]
+(defn suggest-start! [st space]
   (or (notebook-or-error st space)
-      {:job (start-job! #(deep-dive! st space))}))
+      {:job (start-job! #(suggest! st space))}))
+
+(defn suggest-run-start! [st space items destination]
+  (or (notebook-or-error st space)
+      {:job (start-job! #(run-suggestions! st space items destination))}))
 
 ;; ---- flows: the full agentic loop as a substrate object. The agent plans,
 ;; the interpreter executes over the existing verbs, EVERY transition is a
@@ -1201,9 +1250,10 @@
                                                   (if (seq qq)
                                                     (mold/recall @mem/memory qq {:k 20})
                                                     (mem/all-facts @mem/memory)))})
-      (= uri "/api/deep-dive")(if (= :post (:request-method req))
-                                (json-resp (deep-dive-start! st (:space (body-json req))))
-                                {:status 405 :headers {"Content-Type" "text/plain"} :body "POST only"})
+      (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
+                               (json-resp (suggest-start! st space)))
+      (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
+                                  (json-resp (suggest-run-start! st space items destination)))
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at"))
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
