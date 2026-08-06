@@ -304,6 +304,17 @@
     (reduce (fn [best ink] (if (< (get used ink 0) (get used best 0)) ink best))
             (first ranked) (rest ranked))))
 
+(defn- palette-shell
+  "The events that make the registry an object, or nil when it already is one.
+   Both writers go through this so neither can drift into creating the object a
+   second way — key by key and never a whole-object :put, for the reason spelled
+   out in `assign-inks!`."
+  [pal]
+  (when-not pal
+    [{:op :assoc :id palette-id :path [:id] :value palette-id}
+     {:op :assoc :id palette-id :path [:kind] :value :palette}
+     {:op :assoc :id palette-id :path [:title] :value "tag colours"}]))
+
 (defn- assign-inks!
   "Give every unseen name an ink — one event, or none when nothing is new.
    Callers MUST commit this BEFORE the tag event: undo! undoes the last event,
@@ -329,19 +340,17 @@
             ;; tags survived and their colours did not, so what you saw was a tag
             ;; with no ink at all. Per-name writes merge where a whole map clobbers.
             ;;
-            ;; The object is CREATED the same way, key by key, for the same reason:
-            ;; a :put carries the whole object, so two threads arriving at an empty
-            ;; registry together would clobber each other exactly as before. These
-            ;; three are idempotent, so a racing creator writing them twice is fine.
+            ;; The object is CREATED the same way, key by key (`palette-shell`),
+            ;; for the same reason: a :put carries the whole object, so two threads
+            ;; arriving at an empty registry together would clobber each other
+            ;; exactly as before. Those three keys are idempotent, so a racing
+            ;; creator writing them twice is fine.
             ;;
             ;; What this does NOT fix: two threads assigning two new names, each
             ;; weighed against a registry holding neither, can still choose the same
             ;; ink. That is a duplicate colour rather than a missing one — the strip
             ;; still reads, and every name still has an ink.
-            shell (when-not pal
-                    [{:op :assoc :id palette-id :path [:id] :value palette-id}
-                     {:op :assoc :id palette-id :path [:kind] :value :palette}
-                     {:op :assoc :id palette-id :path [:title] :value "tag colours"}])
+            shell (palette-shell pal)
             inks  (mapv (fn [t] {:op :assoc :id palette-id :path [:value t] :value (reg' t)})
                         fresh)]
         ;; still ONE event: a :tx undoes as a single step, so the ordering above holds
@@ -364,6 +373,30 @@
           (assign-inks! st (mapv :tag now))
           (sub/commit! st {:op :assoc :id space :path [:value :tags] :value now}))
         {:state (state-payload st) :tags now}))))
+
+(defn set-tag-color!
+  "Choose a tag's colour — one reversible event, or none when it is already
+   that. The palette is a closed set: a free-form hex would let the shell write
+   a colour that fails the very contrast the palette was chosen for."
+  [st tag color]
+  ;; the same trim + lower-case `clean-tags` applies, or the colour lands on a
+  ;; name no tag actually carries and the chip keeps its old ink
+  (let [t (str/lower-case (str/trim (str tag)))]
+    (cond
+      (str/blank? t)               {:error "no tag"}
+      (not ((set tag-inks) color)) {:error (str "not a palette colour: " color)}
+      :else
+      (let [pal (sub/object st palette-id)]
+        (when (not= color (get (or (:value pal) {}) t))
+          ;; the picker can be opened on a store where nothing was ever tagged,
+          ;; so this may have to create the registry too — key by key, never a
+          ;; :put and never a whole-map write; see `assign-inks!` for what that
+          ;; cost. A :tx keeps creation and choice one undoable step.
+          (let [ink {:op :assoc :id palette-id :path [:value t] :value color}]
+            (sub/commit! st (if-let [shell (palette-shell pal)]
+                              {:op :tx :events (conj shell ink)}
+                              ink))))
+        {:state (state-payload st) :tag-colors (tag-colors st)}))))
 
 (defn notebook-op! [st {:keys [space] :as body}]
   (let [o (sub/object st space)]
@@ -1157,6 +1190,8 @@
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
       (= uri "/api/tags")    (let [{:keys [space tags]} (body-json req)]
                                (json-resp (set-tags! st space tags)))
+      (= uri "/api/tag-color")(let [{:keys [tag color]} (body-json req)]
+                                (json-resp (set-tag-color! st tag color)))
       (= uri "/api/tag-suggest")(let [{:keys [space]} (body-json req)]
                                   (json-resp (if (space? st space)
                                                {:job (start-job! #(suggest-tags! st space))}

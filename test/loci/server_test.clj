@@ -968,3 +968,81 @@
       (srv/suggest-tags! st "space:t"))
     (is (= n (count (sub/history st))) "zero events")
     (is (empty? (srv/tag-colors st)) "and no ink claimed by a proposal you may discard")))
+
+;; ---- choosing a colour yourself ----
+
+(deftest set-tag-color-changes-one-tag-everywhere
+  (let [st (tagged-store)
+        _  (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+        n  (count (sub/history st))
+        ink (nth srv/tag-inks 4)]
+    (srv/set-tag-color! st "a" ink)
+    (is (= ink (get (srv/tag-colors st) "a")))
+    (is (= (inc n) (count (sub/history st))) "one event")
+    (srv/set-tag-color! st "a" ink)
+    (is (= (inc n) (count (sub/history st))) "setting the colour it already is commits nothing")))
+
+(deftest set-tag-color-refuses-what-is-not-in-the-palette
+  (let [st (tagged-store)]
+    (is (re-find #"palette" (:error (srv/set-tag-color! st "a" "#ff00ff"))))
+    (is (:error (srv/set-tag-color! st "   " (first srv/tag-inks))))
+    (is (empty? (srv/tag-colors st)) "a refused write leaves nothing behind")))
+
+(deftest set-tag-color-normalizes-the-name
+  (let [st (tagged-store)]
+    (srv/set-tag-color! st "  World Data  " (first srv/tag-inks))
+    (is (contains? (srv/tag-colors st) "world data")
+        "the same normalisation clean-tags applies, or the colour attaches to a name no tag has")))
+
+(deftest choosing-a-colour-is-undoable
+  ;; every other write in this file is reversible, and the shell's undo is one
+  ;; button: a colour that could not be taken back would be the one write you
+  ;; cannot walk out of.
+  (let [st  (tagged-store)
+        _   (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+        was (get (srv/tag-colors st) "a")
+        ink (first (remove #{was} srv/tag-inks))]
+    (srv/set-tag-color! st "a" ink)
+    (is (= ink (get (srv/tag-colors st) "a")) "the chosen ink is the assigned one changed")
+    (sub/undo! st)
+    (is (= was (get (srv/tag-colors st) "a")) "undo restores the previous ink")
+    (is (= ["a"] (mapv :tag (get-in (sub/object st "space:t") [:value :tags])))
+        "and the tag it belongs to is still there")))
+
+(deftest set-tag-color-works-before-any-tag-exists
+  ;; the picker can be opened on a store where nothing has ever been tagged, so
+  ;; this is the path that has to CREATE the registry object rather than add a
+  ;; key to it
+  (let [st  (tagged-store)
+        n   (count (sub/history st))
+        ink (nth srv/tag-inks 2)]
+    (is (nil? (sub/object st "tag-palette")) "no registry yet")
+    (srv/set-tag-color! st "a" ink)
+    (is (= ink (get (srv/tag-colors st) "a")))
+    (is (= :palette (:kind (sub/object st "tag-palette")))
+        "the registry it created is a real object, hideable by :kind")
+    (is (= (inc n) (count (sub/history st))) "creating it is still one event")))
+
+(deftest concurrent-colour-choices-do-not-lose-each-other
+  ;; set-tag-color! writes the same global object assign-inks! does, so it
+  ;; inherits the same hazard: a whole-map read-modify-write drops whichever
+  ;; choice lands second. Written as a whole-map :put this function passes every
+  ;; other test in this namespace — only contention tells the two apart.
+  (let [st      (sub/fresh-store)
+        threads 8
+        per     8
+        names   (fn [i] (mapv #(str "subject " i "-" %) (range per)))
+        latch   (java.util.concurrent.CountDownLatch. 1)
+        ts (mapv (fn [i]
+                   (doto (Thread.
+                          #(do (.await latch)
+                               (doseq [n (names i)]
+                                 (srv/set-tag-color! st n (nth srv/tag-inks (mod i 8))))))
+                     (.start)))
+                 (range threads))]
+    (.countDown latch)
+    (doseq [t ts] (.join t))
+    (let [reg  (srv/tag-colors st)
+          want (mapcat names (range threads))]
+      (is (= (* threads per) (count reg)) "every name coloured by every thread is still there")
+      (is (every? #(contains? reg %) want) "no choice was clobbered by a concurrent one"))))
