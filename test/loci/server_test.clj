@@ -752,13 +752,18 @@
     st))
 
 (deftest set-tags-commits-one-reversible-event
+  ;; a first-time tag also earns its colour, so it costs two events: the
+  ;; palette first, the tags second. The ORDER is the point — undo! undoes
+  ;; the last event, so undo must remove the tags, not the colour.
   (let [st (tagged-store)
         before (count (sub/history st))]
     (srv/set-tags! st "space:t" [{:tag "semiconductors" :by "you"}])
-    (is (= (inc before) (count (sub/history st))) "exactly one event")
+    (is (= (+ 2 before) (count (sub/history st))) "one colour event, one tag event")
     (is (= ["semiconductors"] (mapv :tag (get-in (sub/object st "space:t") [:value :tags]))))
     (sub/undo! st)
-    (is (nil? (get-in (sub/object st "space:t") [:value :tags])) "undo restores the previous tags")))
+    (is (nil? (get-in (sub/object st "space:t") [:value :tags])) "undo restores the previous tags")
+    (is (= "semiconductors" (first (keys (srv/tag-colors st))))
+        "and leaves the colour standing — a colour is a preference about a subject")))
 
 (deftest set-tags-stamps-provenance-and-time
   (let [st (tagged-store)
@@ -925,3 +930,41 @@
           "every name assigned by every thread is still in the registry")
       (is (every? #(contains? reg %) want) "no name lost its colour")
       (is (every? (set srv/tag-inks) (vals reg))))))
+
+(deftest a-tag-whose-colour-exists-costs-one-event
+  (let [st (tagged-store)
+        _  (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+        n  (count (sub/history st))]
+    (srv/set-tags! st "space:t" [{:tag "a" :by "you"} {:tag "a" :by "agent"}])
+    (is (= n (count (sub/history st))) "nothing changed at all")
+    (srv/set-tags! st "space:t" [])
+    (is (= (inc n) (count (sub/history st))) "clearing is one event; no colour is involved")))
+
+(deftest refusing-a-non-notebook-assigns-nothing
+  (let [st (tagged-store)]
+    (is (:error (srv/set-tags! st "tbl:nope" [{:tag "ghost" :by "you"}])))
+    (is (empty? (srv/tag-colors st)) "a refused write must not leave a colour behind")))
+
+(deftest state-payload-carries-tag-colors
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+    (let [p (srv/state-payload st)]
+      (is (contains? (:tag-colors p) "a"))
+      (is (not-any? #(= "palette" (:kind %)) (:objects p))
+          "the registry is plumbing — it must not sit in the object list next to your notebooks"))))
+
+(deftest the-palette-object-never-appears-in-leap
+  (let [st (tagged-store)]
+    (srv/set-tags! st "space:t" [{:tag "a" :by "you"}])
+    (let [ids (map :id (leap-of st ""))]
+      (is (seq ids) "the empty query still lists objects, so this is a real exclusion")
+      (is (not-any? #(= "tag-palette" %) ids)))))
+
+(deftest suggesting-tags-assigns-no-colours
+  ;; proposing writes nothing at all — colours included
+  (let [st (tagged-store)
+        n  (count (sub/history st))]
+    (with-redefs [agent/propose-tags (fn [_ _ _] ["ghost-tag"])]
+      (srv/suggest-tags! st "space:t"))
+    (is (= n (count (sub/history st))) "zero events")
+    (is (empty? (srv/tag-colors st)) "and no ink claimed by a proposal you may discard")))
