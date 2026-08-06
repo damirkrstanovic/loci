@@ -75,6 +75,11 @@ laying every notebook out as a peer. Cards are sized to their own content, the c
 scrolls, and a focused notebook names its parent, siblings and children in one line under
 its intention.
 
+LEAP ranks what it finds by what you touched most recently — a notebook counts as
+touched when anything inside it is. From the overview it also offers `⊟ Filter the
+overview`, which dims everything that does not match and stays until you enter a notebook
+or clear it from the breadcrumb.
+
 The browser suite needs two things beyond `npm install`:
 
 - **Node 22 or newer.** `npm run test:browser` uses `node --test` with a glob, which
