@@ -3,25 +3,36 @@
         http-kit/http-kit     {:mvn/version "2.8.0"}
         org.clojure/data.json {:mvn/version "2.5.0"}
         org.clojure/data.csv  {:mvn/version "1.1.0"}
-        org.babashka/sci      {:mvn/version "0.8.43"}}
+        org.babashka/sci      {:mvn/version "0.8.43"}
+        datalevin/datalevin   {:mvn/version "1.0.0"}}
 
  :aliases
  ;; the loci shell — Clojure substrate served to a web frontend
  ;; run:  clojure -M:serve   then open http://localhost:7777
- {:serve {:main-opts ["-m" "loci.server"]}
+ {:serve {:main-opts ["-m" "loci.server"]
+          :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
 
   ;; headless demo of layers 1/2/4 — no server, no browser
-  :demo  {:main-opts ["-m" "loci.demo"]}
+  :demo  {:main-opts ["-m" "loci.demo"]
+          :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
 
   ;; run the unit tests:  clojure -M:test
   :test  {:extra-paths ["test"]
           :extra-deps  {io.github.cognitect-labs/test-runner
                         {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
-          :main-opts   ["-m" "cognitect.test-runner"]}
+          :main-opts   ["-m" "cognitect.test-runner"]
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
 
-  ;; Clerk notebook (the earlier render target)
+  ;; one-shot import of the old EDN log into Datalevin:  clojure -M:migrate
+  :migrate {:main-opts ["-m" "loci.migrate"]
+            :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+
+  ;; Clerk notebook (the earlier render target). Both reach the substrate
+  ;; through notebooks/loci.clj, so both need the native-access flag too.
   :dev   {:extra-paths ["dev" "notebooks"]
-          :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}}
+          :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
   :start {:extra-paths ["dev" "notebooks"]
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
           :exec-fn     user/start}}}

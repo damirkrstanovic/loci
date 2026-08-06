@@ -4,6 +4,7 @@
   (:require [clojure.datafy :as d]
             [clojure.pprint :refer [pprint]]
             [loci.content :as c]
+            [loci.dlv :as dlv]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -63,12 +64,6 @@
                  (str "   ¶ " (let [t (:text c)] (if (> (count t) 52) (str (subs t 0 52) "…") t)))
                  (str "   ▤ " (:ref c) (when (:view c) (str "  · molded as " (:view c)))))))
 
-    (banner "persistence — the substrate survives restart")
-    (let [n     (count (sub/history store))
-          again (sub/persistent-store (str (sub/data-dir) "/substrate.edn"))]
-      (println n "events on disk;" (count (sub/history again))
-               "replayed into a fresh store — identical state:" (= (sub/state store) (sub/state again))))
-
     (banner "links — connectedness is computed, never stored")
     (println "space:retention ↔"
              (mapv (fn [c] [(:id c) (mapv :type (:reasons c))])
@@ -87,6 +82,23 @@
       (println "after a substrate undo!, memory still holds" (count (mem/all-facts m))
                "fact — undo reverts the record, never the recall")
       (println "recall \"churn\" →" (mapv :fact (mold/recall m "churn" {}))))
+
+    ;; last, because it ends by closing the store: a real restart, not a second
+    ;; handle. Datalevin refuses two LMDB connections to one directory in one
+    ;; process, so the only honest way to show the log outliving its process is
+    ;; to close the store, reopen the SAME directory, and replay from disk.
+    ;; Nothing below this reads `store` again.
+    (banner "persistence — the substrate survives restart")
+    (let [n   (count (sub/history store))
+          st  (sub/state store)
+          _   (dlv/close! store)
+          dir (str (sub/data-dir) "/substrate")
+          again (dlv/datalevin-store dir)]
+      (println n "events on disk;" (count (sub/history again))
+               "replayed into a fresh store — identical state:" (= st (sub/state again)))
+      ;; and closed again: an open LMDB env is a live resource that keeps the
+      ;; JVM from exiting, and a headless demo has to end.
+      (dlv/close! again))
 
     (banner "done")
     (println "layers 1 (event log+undo), 2 (content), 4 (mold) hold; recall stubbed; shell next\n")))

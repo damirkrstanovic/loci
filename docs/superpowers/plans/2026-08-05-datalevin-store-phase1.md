@@ -34,7 +34,7 @@ Datalevin 1.0.0 pulls `org.babashka/sci 0.13.53`; loci pins `0.8.43` for the `co
 **Files:**
 - Modify: `deps.edn`
 
-- [ ] **Step 1: Add the dependency and the JVM flag.**
+- [x] **Step 1: Add the dependency and the JVM flag.**
 
 In `:deps`, after the `org.babashka/sci` entry:
 
@@ -58,7 +58,7 @@ Then add `:jvm-opts` to the three aliases that run code (`:serve`, `:demo`, `:te
            :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
 ```
 
-- [ ] **Step 2: Verify the sci-dependent tests still pass.**
+- [x] **Step 2: Verify the sci-dependent tests still pass.**
 
 Run: `clojure -M:test`
 
@@ -66,7 +66,7 @@ Expected: `Ran 80 tests containing 280 assertions. 0 failures, 0 errors.` — th
 
 The tests that matter here are `fn-apply-runs-agent-written-sci-fns`, `fn-preview-commits-nothing` and `fn-apply-commits-one-tx-with-provenance` in `test/loci/server_test.clj`; they exercise `run-clj-rows`, which is the only sci consumer.
 
-- [ ] **Step 3: If and only if step 2 failed, pin sci explicitly.**
+- [ ] **Step 3: If and only if step 2 failed, pin sci explicitly.** — **NOT DONE, and correctly so: step 2 passed.** This step was conditional on a failure that did not happen. `org.babashka/sci 0.8.43` was already a direct `:deps` entry before this branch, so Datalevin's transitive `0.13.53` lost the resolution on its own; `clojure -Stree` shows it as `X … :use-top`. Nothing was added.
 
 Clojure's dependency resolution lets a directly-declared version win over a transitive one. Add to `:deps` (keep the existing entry, this is the same coordinate):
 
@@ -76,13 +76,13 @@ Clojure's dependency resolution lets a directly-declared version win over a tran
 
 Re-run `clojure -M:test` and confirm 80/280 green. If it passes only with the pin, record that in the commit message — phase 3 will need to know.
 
-- [ ] **Step 4: Confirm which sci version is actually on the classpath.**
+- [x] **Step 4: Confirm which sci version is actually on the classpath.**
 
 Run: `clojure -Stree | grep -i "sci"`
 
 Expected: a single `org.babashka/sci` line. Note the version in the commit message.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add deps.edn
@@ -93,12 +93,28 @@ git commit -m "deps: datalevin 1.0.0 + --enable-native-access; sci conflict veri
 
 ### Task 2: `DatalevinStore` — the Store protocol over LMDB
 
+> **AS BUILT — the code below is superseded; read `src/loci/dlv.clj`.** Review found
+> three defects in this plan's version, all measured rather than argued:
+> 1. **Concurrent `commit!`s destroyed durable events** — the index came from
+>    `(inc (count @!log))` outside any critical section. 900 commits from 3 threads
+>    yielded 900 in history, 308 objects and 692 on disk. Fixed with a `lock` field;
+>    `commit!` and `undo!` are `locking`, index computed inside.
+> 2. **`map-full!` was dead code with wrong advice** — Datalevin catches
+>    `Util$MapFullException` and auto-grows (`cpp.clj:1676-1688`), and `:mapsize`
+>    applies only when the directory does not yet exist. Both deleted.
+> 3. **The `touched` write sat outside the event transaction** — an exception there
+>    left an event durable that RAM denied. All ops now ride one `transact-kv`.
+>
+> The record is `[kv dir !db lock]` with `!db` holding `{:log [...] :state {...}}` in
+> one atom, so no reader can observe log and state apart. `counts` stores
+> `{:objects n :kinds {kind n}}`. Accessors: `dlv/view`, `dlv/reload!`, `dlv/close!`.
+
 **Files:**
 - Create: `src/loci/dlv.clj`
 - Modify: `src/loci/substrate.clj` (make `normalize-keys` public)
 - Test: `test/loci/dlv_test.clj`
 
-- [ ] **Step 1: Make `normalize-keys` public.**
+- [x] **Step 1: Make `normalize-keys` public.**
 
 In `src/loci/substrate.clj`, change the definition from `defn-` to `defn`:
 
@@ -114,7 +130,7 @@ In `src/loci/substrate.clj`, change the definition from `defn-` to `defn`:
    event))
 ```
 
-- [ ] **Step 2: Write the failing test.**
+- [x] **Step 2: Write the failing test.**
 
 Create `test/loci/dlv_test.clj`:
 
@@ -178,13 +194,13 @@ Create `test/loci/dlv_test.clj`:
     (dlv/close! s)))
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail.**
+- [x] **Step 3: Run the tests to verify they fail.**
 
 Run: `clojure -M:test -n loci.dlv-test`
 
 Expected: FAIL — `Could not locate loci/dlv__init.class` (the namespace does not exist yet).
 
-- [ ] **Step 4: Write the implementation.**
+- [x] **Step 4: Write the implementation.**
 
 Create `src/loci/dlv.clj`:
 
@@ -279,19 +295,19 @@ Create `src/loci/dlv.clj`:
 (defn close! [st] (d/close-kv (:kv st)))
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass.**
+- [x] **Step 5: Run the tests to verify they pass.**
 
 Run: `clojure -M:test -n loci.dlv-test`
 
 Expected: `Ran 4 tests containing 14 assertions. 0 failures, 0 errors.`
 
-- [ ] **Step 6: Run the whole suite.**
+- [x] **Step 6: Run the whole suite.**
 
 Run: `clojure -M:test`
 
 Expected: `Ran 84 tests containing 294 assertions. 0 failures, 0 errors.`
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 git add src/loci/dlv.clj src/loci/substrate.clj test/loci/dlv_test.clj
@@ -302,13 +318,38 @@ git commit -m "feat: DatalevinStore — the event log on LMDB, state served from
 
 ### Task 3: touch index, counts, `object-at`, and rebuild
 
+> **AS BUILT — the code below is superseded; read `src/loci/dlv.clj`.** Three of this
+> branch's own fix commits landed on these listings:
+> 1. **`counts-at` returns a kind histogram, not a spaces tally** (`c0d7fb5`). The
+>    docstring below promising `{:objects n :spaces n}` was wrong about layer 1's job:
+>    the substrate stores `{:objects n :kinds {kind n}}` and lets each consumer decide
+>    which kinds it calls "objects" — the shell hides spaces, viewspecs, applets and fns,
+>    but that is the shell's rule, not the log's.
+> 2. **`object-at` is bounded at `n` by `list-range`, not filtered afterwards** (`9666d90`).
+>    `take-while` over `d/get-list` still loops the iterator to exhaustion, so it paid for
+>    the object's whole *future* — exactly the wrong cost for a reader whose purpose is
+>    the past. Measured through the fn, 16001 events with an 8001-entry touch list:
+>    **n=1 3.21 → 0.03 ms**, n=101 2.97 → 0.23 ms.
+> 3. **A torn index refuses instead of answering** (`9666d90`). `clear-indices!` below has
+>    no dirty mark, so a rebuild that died partway left an index that read as believable
+>    and was short. As built, a `:indices-dirty` mark in a fourth dbi (`meta`) goes down
+>    *before* the clear and comes off *after* the last event, and `object-at`/`counts-at`
+>    throw rather than guess. Writers are never blocked — only readers of derived data
+>    can be misled. `rebuild-indices!` also replays the DURABLE log under `commit!`'s
+>    lock, not `sub/history`, so the bulk writer this exists for cannot forget to
+>    `reload!` first and build an index that is silently short.
+>
+> Both readers go through `kv-of`, which names the store they need rather than letting a
+> nil reach Datalevin — `store-at` hands a `FrozenStore` to every `?at=` reader, which is
+> the very path `object-at` exists for.
+
 The index written in Task 2 is now proven correct and given its reader. `object-at` is the lazy per-object reconstruction that phase 2 wires into `?at=` read paths.
 
 **Files:**
 - Modify: `src/loci/dlv.clj`
 - Test: `test/loci/dlv_test.clj`
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
 
 Append to `test/loci/dlv_test.clj`:
 
@@ -329,17 +370,21 @@ Append to `test/loci/dlv_test.clj`:
     (dlv/close! s)))
 
 (deftest counts-match-a-real-count-at-every-event
+  ;; layer 1 stores an honest histogram — consumers decide which kinds they
+  ;; count. state-payload excludes #{:space :viewspec :applet :fn}; the ⏱
+  ;; header can derive that from :kinds without the substrate knowing about it.
   (let [dir (tmpdir)
         s   (dlv/datalevin-store dir)]
     (sub/commit! s {:op :put :id "space:x" :value {:id "space:x" :kind :space :value {}}})
     (sub/commit! s {:op :put :id "d" :value {:id "d" :kind :doc :value 1}})
     (sub/commit! s {:op :put :id "space:y" :value {:id "space:y" :kind :space :value {}}})
     (doseq [n (range 1 4)]
-      (let [objs (:objects (sub/as-of s n))]
+      (let [objs (vals (:objects (sub/as-of s n)))]
         (is (= {:objects (count objs)
-                :spaces  (count (filter #(= :space (:kind %)) (vals objs)))}
+                :kinds   (frequencies (map :kind objs))}
                (dlv/counts-at s n))
             (str "counts disagreed at event " n))))
+    (is (= {:space 2 :doc 1} (:kinds (dlv/counts-at s 3))))
     (dlv/close! s)))
 
 (deftest rebuild-indices-restores-a-wiped-touch-index
@@ -354,13 +399,13 @@ Append to `test/loci/dlv_test.clj`:
     (dlv/close! s)))
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail.**
+- [x] **Step 2: Run the tests to verify they fail.**
 
 Run: `clojure -M:test -n loci.dlv-test`
 
 Expected: FAIL — `No such var: dlv/object-at`.
 
-- [ ] **Step 3: Write the implementation.**
+- [x] **Step 3: Write the implementation.**
 
 Add to `src/loci/dlv.clj`, after `close!`:
 
@@ -395,22 +440,24 @@ Add to `src/loci/dlv.clj`, after `close!`:
   (clear-indices! st)
   (reduce (fn [state [i ev]]
             (let [state' (sub/apply-event state ev)]
-              (d/transact-kv (:kv st) [[:put "counts" i (count-pair state') :long]])
-              (doseq [id (touched-ids ev)]
-                (d/put-list-items (:kv st) "touched" id [i] :string :long))
+              ;; one transaction per event, same op shape commit! uses
+              (d/transact-kv (:kv st)
+                             (into [[:put "counts" i (census state') :long]]
+                                   (map (fn [id] [:put-list "touched" id [i] :string :long]))
+                                   (touched-ids ev)))
               state'))
           {:objects {}}
-          (map-indexed (fn [k ev] [(inc k) ev]) @(:!log st)))
+          (map-indexed (fn [k ev] [(inc k) ev]) (sub/history st)))
   :ok)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass.**
+- [x] **Step 4: Run the tests to verify they pass.**
 
 Run: `clojure -M:test -n loci.dlv-test`
 
 Expected: `Ran 7 tests containing 40 assertions. 0 failures, 0 errors.`
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add src/loci/dlv.clj test/loci/dlv_test.clj
@@ -426,7 +473,7 @@ This is the task that makes the swap safe. Rather than trusting that `DatalevinS
 **Files:**
 - Modify: `test/loci/substrate_test.clj`
 
-- [ ] **Step 1: Add the flavour helper.**
+- [x] **Step 1: Add the flavour helper.**
 
 Both records already carry what the helper needs — `PersistentStore` has `:file`, `DatalevinStore` has `:dir`. At the top of `test/loci/substrate_test.clj`, after the `tmpfile` helper:
 
@@ -447,7 +494,7 @@ Both records already carry what the helper needs — `PersistentStore` has `:fil
           (fn [s] (dlv/close! s))]])
 ```
 
-- [ ] **Step 2: Write the parity tests.**
+- [x] **Step 2: Write the parity tests.**
 
 Add to `test/loci/substrate_test.clj`:
 
@@ -515,7 +562,7 @@ Add to `test/loci/substrate_test.clj`:
       (close s))))
 ```
 
-- [ ] **Step 3: Add the require.**
+- [x] **Step 3: Add the require.**
 
 At the top of `test/loci/substrate_test.clj`, extend the `:require`:
 
@@ -526,19 +573,19 @@ At the top of `test/loci/substrate_test.clj`, extend the `:require`:
             [loci.substrate :as sub]))
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass.**
+- [x] **Step 4: Run the tests to verify they pass.**
 
 Run: `clojure -M:test -n loci.substrate-test`
 
 Expected: all green. If `dlv` disagrees with `edn` on any assertion, the failure message names the flavour — fix `DatalevinStore`, never the test.
 
-- [ ] **Step 5: Run the whole suite.**
+- [x] **Step 5: Run the whole suite.**
 
 Run: `clojure -M:test`
 
 Expected: `Ran 89 tests containing 320 assertions. 0 failures, 0 errors.` (counts approximate — the point is zero failures.)
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 git add test/loci/substrate_test.clj src/loci/dlv.clj
@@ -553,7 +600,7 @@ git commit -m "test: the substrate suite runs against both stores — parity pro
 - Create: `src/loci/migrate.clj`
 - Test: `test/loci/migrate_test.clj`
 
-- [ ] **Step 1: Write the failing test.**
+- [x] **Step 1: Write the failing test.**
 
 Create `test/loci/migrate_test.clj`:
 
@@ -598,13 +645,13 @@ Create `test/loci/migrate_test.clj`:
       (is (re-find #"not empty" (:error report))))))
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail.**
+- [x] **Step 2: Run the tests to verify they fail.**
 
 Run: `clojure -M:test -n loci.migrate-test`
 
 Expected: FAIL — `Could not locate loci/migrate__init.class`.
 
-- [ ] **Step 3: Write the implementation.**
+- [x] **Step 3: Write the implementation.**
 
 Create `src/loci/migrate.clj`:
 
@@ -645,8 +692,9 @@ Create `src/loci/migrate.clj`:
           ;; and rebuild the derived indices from them — the log must be verbatim
           (doseq [[i ev] (map-indexed (fn [k ev] [(inc k) ev]) (sub/history src))]
             (d/transact-kv (:kv dst) [[:put "events" i ev :long]]))
-          (reset! (:!log dst) (vec (sub/history src)))
-          (reset! (:!state dst) (sub/materialize (sub/history src)))
+          ;; republish RAM from what is actually durable, rather than trusting
+          ;; this function to hand back the same log it just wrote
+          (dlv/reload! dst)
           (dlv/rebuild-indices! dst)
           (let [ok? (= (sub/state src) (sub/state dst))]
             {:ok? ok?
@@ -665,13 +713,13 @@ Create `src/loci/migrate.clj`:
      (System/exit (if ok? 0 1)))))
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass.**
+- [x] **Step 4: Run the tests to verify they pass.**
 
 Run: `clojure -M:test -n loci.migrate-test`
 
 Expected: `Ran 2 tests containing 8 assertions. 0 failures, 0 errors.`
 
-- [ ] **Step 5: Migrate the real log, into a scratch copy first.**
+- [x] **Step 5: Migrate the real log, into a scratch copy first.**
 
 Never migrate `data/` in place on the first run.
 
@@ -684,7 +732,7 @@ Expected: `migrated 80 events: /tmp/loci-mig/substrate.edn → /tmp/loci-mig/sub
 
 If it reports a state mismatch, stop and diff the two states — do not proceed to Task 6.
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 git add src/loci/migrate.clj test/loci/migrate_test.clj
@@ -699,7 +747,7 @@ git commit -m "feat: migrate the EDN log into Datalevin — verified by state eq
 - Modify: `src/loci/content.clj:499`
 - Modify: `README.md`
 
-- [ ] **Step 1: Migrate the real data directory.**
+- [x] **Step 1: Migrate the real data directory.**
 
 ```bash
 clojure -M -m loci.migrate
@@ -709,7 +757,7 @@ Expected: `migrated 80 events: data/substrate.edn → data/substrate (state veri
 
 `data/substrate.edn` stays exactly where it is — it is the rollback.
 
-- [ ] **Step 2: Swap the store singleton.**
+- [x] **Step 2: Swap the store singleton.**
 
 In `src/loci/content.clj`, change the `require` to add `[loci.dlv :as dlv]`, then replace the `defonce`:
 
@@ -720,7 +768,7 @@ In `src/loci/content.clj`, change the `require` to add `[loci.dlv :as dlv]`, the
            (if (seq (sub/history s)) s (seed! s)))))
 ```
 
-- [ ] **Step 3: Verify against the real data, headless.**
+- [x] **Step 3: Verify against the real data, headless.**
 
 `-M:serve` hardcodes port 7777 (`server.clj:965`), so start the handler directly on **7779** against a *copy* of `data/`. Never point a scratch server at the real directory.
 
@@ -747,15 +795,22 @@ Expected: `44`, then a JSON payload containing `"kind":"flow"`.
 
 Kill the server when done: `pkill -f 7779`
 
-- [ ] **Step 4: Run the whole suite.**
+- [x] **Step 4: Run the whole suite.**
 
 Run: `clojure -M:test`
 
 Expected: zero failures.
 
-- [ ] **Step 5: Update the README.**
+- [x] **Step 5: Update the README.**
 
 In the Run section, after the `clojure -M:serve` paragraph, replace the sentence about `data/`:
+
+> **Superseded at the pre-merge review.** The paragraph below is what this step wrote; the
+> README now says `clojure -M:migrate` (the bare `-m` invocation carried no alias and so
+> printed three restricted-method warnings), and adds a paragraph on what rollback
+> actually costs — `PersistentStore` is retained, but the Datalevin write path has no
+> `safe-event` round-trip check and there is no `datalevin->edn!`, so reverting recovers
+> the log as it stood at migration and nothing committed since.
 
 ```markdown
 `clojure -M:serve` persists its state under `data/` — the substrate is a
@@ -771,7 +826,7 @@ src/loci/dlv.clj         layer 1, durable: the event log on Datalevin (LMDB) + t
 src/loci/migrate.clj     one-shot import of the old EDN log, verified by state equality
 ```
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 git add src/loci/content.clj README.md
@@ -782,12 +837,27 @@ git commit -m "feat: the shell runs on the Datalevin substrate"
 
 ## Verification checklist
 
-- [ ] `clojure -M:test` — zero failures, and the parity tests report both flavours
-- [ ] `clojure -M -m loci.migrate` on a copy of `data/` reports state verified identical
-- [ ] The served shell shows 80 events, 18 notebooks, 40 objects
-- [ ] `?at=44` returns 44 events; `flow:1` still molds
-- [ ] `clojure -Stree | grep sci` shows one version, and the sci-backed tests pass
-- [ ] No `--enable-native-access` warnings on `clojure -M:serve`
+- [x] `clojure -M:test` — zero failures, and the parity tests report both flavours
+- [x] `clojure -M -m loci.migrate` on a copy of `data/` reports state verified identical
+- [x] The served shell shows 80 events, 18 notebooks, 40 objects
+- [x] `?at=44` returns 44 events; `flow:1` still molds
+- [x] `clojure -Stree | grep sci` shows one version, and the sci-backed tests pass
+- [x] No `--enable-native-access` warnings on `clojure -M:serve`
+
+**All six re-run first-hand at the pre-merge review (2026-08-05), against a *copy* of
+`data/` — never the real directory. Evidence, in order:**
+
+1. `Ran 121 tests containing 581 assertions. 0 failures, 0 errors.` The plan's expected
+   `80 tests / 280 assertions` was the pre-branch baseline; the branch added the parity,
+   dlv and migration suites, and `with-flavours` labels every `is` with its store.
+2. `migrated 80 events: …/substrate.edn → …/substrate (log verbatim, state and index
+   verified)`, exit 0 — run through the **new `:migrate` alias** added at review.
+3. `events 80 | spaces 18 | objects 40`.
+4. `?at=44` → `events 44`; `/api/object/flow:1` → `"kind":"flow"`.
+5. `clojure -Stree` → `org.babashka/sci 0.8.43` used, `0.13.53` marked `X … :use-top`.
+6. No restricted-method warnings from any alias. The flag was missing from `:dev` and
+   `:start` and had no alias at all for the migration — fixed at review; `:serve`,
+   `:demo` and `:test` had it from Task 1.
 
 ## Out of scope (phase 2 and later)
 
