@@ -166,7 +166,12 @@
                          (if (> (count s) n) (str (subs s 0 n) "…") s)))
         snip (fn [text] (let [i (or (str/index-of (str/lower-case text) q) 0)]
                           (ell (subs text (max 0 (- i 20))) 70)))
-        cap  (fn [xs] (vec (take 8 xs)))
+        touched (last-touched st)
+        ;; recency BEFORE the cap: taking "the first 8 encountered" dropped
+        ;; results by whatever order the objects happened to enumerate in
+        recent  (fn [e] (or (:touched e) 0))
+        cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
+                           (sort-by recent >) (take 8) vec))
         objs  (->> (sub/objects st) vals
                    (remove #(#{:viewspec :applet :fn} (:kind %)))
                    (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))

@@ -700,3 +700,42 @@
     (sub/commit! st {:op :put :id "space:s"
                      :value {:id "space:s" :kind :space :title "S" :value {:intent "i" :cells []}}})
     (is (number? (:touched (first (:spaces (srv/state-payload st))))))))
+
+(defn- leap-of [st q] (srv/leap-payload st (mem/file-memory (tmpfile)) q))
+
+(deftest leap-orders-each-group-most-recent-first
+  (let [st (sub/fresh-store)]
+    (doseq [n (range 3)]
+      (sub/commit! st {:op :put :id (str "doc:d" n)
+                       :value {:id (str "doc:d" n) :kind :doc :title (str "widget " n) :value "x"}})
+      (Thread/sleep 2))
+    (let [ids (->> (leap-of st "widget") (filter #(= "doc" (:group %))) (mapv :id))]
+      (is (= ["doc:d2" "doc:d1" "doc:d0"] ids) "newest first"))))
+
+(deftest leaps-cap-keeps-the-newest-eight-not-the-first-eight
+  ;; the assertion that would have failed before this change: 12 matches, and
+  ;; the 8 kept must be the 8 most recently touched
+  (let [st (sub/fresh-store)]
+    (doseq [n (range 12)]
+      (sub/commit! st {:op :put :id (str "doc:w" n)
+                       :value {:id (str "doc:w" n) :kind :doc :title (str "widget " n) :value "x"}})
+      (Thread/sleep 2))
+    (let [ids (->> (leap-of st "widget") (filter #(= "doc" (:group %))) (mapv :id) set)]
+      (is (= 8 (count ids)))
+      (is (= (set (map #(str "doc:w" %) (range 4 12))) ids)
+          "the eight most recent, not doc:w0..w7"))))
+
+(deftest leap-entries-carry-their-recency
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "doc:one"
+                     :value {:id "doc:one" :kind :doc :title "widget" :value "x"}})
+    (is (number? (:touched (first (filter #(= "doc" (:group %)) (leap-of st "widget"))))))))
+
+(deftest ask-and-verbs-are-not-reordered-by-recency
+  ;; "the top result is already the action" — Ask stays first, and view verbs
+  ;; (which have no timestamp) keep their existing order
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "rows here"
+                                                  :value [{:a 1}]}})
+    (let [groups (mapv :group (leap-of st "rows"))]
+      (is (= "viewer" (last groups)) "verbs stay at the end, unsorted"))))
