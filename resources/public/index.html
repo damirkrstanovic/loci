@@ -892,6 +892,29 @@ function chartSVG(spec){
   return '<svg width="'+W+'" height="'+H+'">'+g+'</svg>';
 }
 
+// ---------------- the shape the substrate already knows ----------------
+// A notebook spawned by a deep-dive belongs UNDER it, recursively — the
+// substrate computes spawned-by/merged-from and the overview should show that
+// rather than laying 24 notebooks out as peers. Returns root nodes:
+//   {i, sp, kids:[…same…]}
+function clusterTree(){
+  const byId={}, roots=[];
+  STATE.spaces.forEach((sp,i)=>{ byId[sp.id]={i,sp,kids:[]}; });
+  STATE.spaces.forEach(sp=>{
+    // /api/state flattens spawned-by to a bare id; merged-from is a vector
+    const parent = sp['spawned-by'] || (sp['merged-from']||[])[0];
+    const node = byId[sp.id];
+    if(parent && byId[parent] && parent!==sp.id) byId[parent].kids.push(node);
+    else roots.push(node);
+  });
+  // a cycle would orphan its members from every root; surface them rather
+  // than letting them vanish from the overview entirely
+  const seen=new Set();
+  (function walk(ns){ ns.forEach(n=>{ seen.add(n.i); walk(n.kids); }); })(roots);
+  STATE.spaces.forEach((sp,i)=>{ if(!seen.has(i)) roots.push(byId[sp.id]); });
+  return roots;
+}
+
 // ---------------- layout (focus / overview zoom) ----------------
 function layout(){
   const vw=innerWidth, vh=innerHeight, top=124;
