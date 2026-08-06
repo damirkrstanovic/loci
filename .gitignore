@@ -6,3 +6,5 @@ target/
 .superpowers/
 data/
 .deepseek-model
+node_modules/
+test/browser/failures/
