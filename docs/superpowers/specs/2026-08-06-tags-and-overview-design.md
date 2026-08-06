@@ -1,7 +1,8 @@
 # loci — notebook tags + a structural overview: design
 
 Date: 2026-08-06
-Status: accepted in brainstorming
+Status: **§1 built and merged** (commits f813f73…5583209); §2 (tags) is what remains.
+Amended 2026-08-06 for tri-state include/exclude filtering.
 
 ## Goal
 
@@ -87,8 +88,28 @@ of its own family under a filter — observed in the mock, where `Geopolitical S
 Scenarios` dimmed while its siblings stayed lit.
 
 **The strip.** A row beneath LEAP — not a floating overlay; the mock put it under the LEAP
-bar where nothing could be clicked, and only a programmatic click hid the fact. Selecting
-several tags takes the union. Selection dims non-matching notebooks to 22%.
+bar where nothing could be clicked, and only a programmatic click hid the fact.
+
+**Each tag is tri-state: neutral → include → exclude → neutral**, cycled by clicking it.
+Include and exclude are visually distinct (accent fill vs a struck, clay-coloured chip), so
+a glance says which is which without a legend.
+
+The predicate is the ordinary one: **a notebook shows if it carries at least one included
+tag (or none are included) AND carries none of the excluded ones.** Exclude beats include,
+because "everything about semiconductors except the geopolitics" is the question people
+actually ask, and the alternative — include winning — makes exclusion unexpressible.
+
+**It composes with LEAP's filter rather than replacing it.** Both narrow the same set, and
+both dim rather than hide (`2026-08-06-leap-filter-and-recency-design.md` §3). A notebook
+is lit when it satisfies the LEAP filter *and* the tag predicate; the crumb shows both, e.g.
+`all notebooks · "lithography" +semiconductors −geopolitics · 4 of 25`. There is exactly one
+dimming mechanism and one place that says what is narrowing the view — a second, parallel
+filter with its own rules would be the mode this design has avoided throughout.
+
+Clearing follows the same rules as the LEAP filter: `Escape` in overview clears everything,
+entering a notebook clears everything, and the crumb's ✕ clears everything. Tag state does
+not survive entering a notebook, for the same reason the LEAP filter does not — it belongs
+to the overview.
 
 **Endpoints.** `POST /api/tags {space, tags}` sets them (one event, honest error on a
 non-space id, same `space?` guard as every other notebook write). `POST /api/tag-suggest
@@ -100,9 +121,14 @@ non-space id, same `space?` guard as every other notebook write). `POST /api/tag
 - **Clojure:** setting tags commits exactly one reversible event; `undo` restores the
   previous tags; a non-space id is refused with an honest message; `state-payload` carries
   tags; a spawned child inherits its parent's tags at creation.
-- **Browser:** 24 notebooks render as 15 clusters; a grandchild nests two levels deep; the
-  tag strip is clickable where it sits (the mock's actual failure); selecting a tag dims
-  non-matching notebooks without removing them; the structure line links to the parent.
+- **Browser:** the tag strip is clickable where it sits (the mock's actual failure —
+  it was under the LEAP bar, and only a programmatic click concealed that); a tag cycles
+  neutral → include → exclude → neutral; an included tag lights its notebooks and dims the
+  rest **by computed opacity, not by class** (a class-counting assertion passed throughout a
+  shipped no-op on 2026-08-06 — `layout()` writes inline `opacity:1` on every panel, which
+  beats a stylesheet rule); an excluded tag dims its notebooks even when they also carry an
+  included one; a LEAP filter and a tag filter together light only their intersection; and
+  entering a notebook clears both.
 - The agent's proposal quality is not testable and is not tested. What is tested is that a
   proposal never applies itself, and that a failed or offline suggestion leaves the
   notebook untouched.
