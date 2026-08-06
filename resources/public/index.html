@@ -50,6 +50,11 @@
   .tagchip.in{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
   .tagchip.out{border-color:var(--attn);color:var(--attn);background:var(--attn-soft);
                text-decoration:line-through}
+  .tagedit{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .tagedit .tagchip{cursor:default}
+  .tagedit .tagchip.byagent{border-style:dashed}   /* an inference, not your word */
+  .tagedit .tagchip .x{cursor:pointer;color:var(--faint);margin-left:3px}
+  .tagedit .tagchip .x:hover{color:var(--attn)}
   /* !important is load-bearing: layout() writes opacity inline on every panel it
      places, so an unqualified rule here loses to the style attribute and the
      filter dims nothing at all — a silent no-op that still shows the crumb. */
@@ -300,6 +305,8 @@ const API = {
   fnApply: (id,fnid,params,space) => POST('/api/fn-apply',{id,fnid,params,space}),
   rerun: id => POST('/api/rerun',{id}),
   connect: (a,b) => POST('/api/connect',{a,b}),
+  tags: (space,tags) => POST('/api/tags',{space,tags}),
+  tagSuggest: (space) => POST('/api/tag-suggest',{space}),
 };
 
 let STATE={spaces:[],objects:{}};
@@ -508,7 +515,8 @@ async function renderNotebook(i){
     '<button class="btn ghost sm" id="ddBtn">⌘ Deep-dive</button>'+
     '<button class="btn ghost sm" id="flowBtn">⚑ Flow</button>'+
     '<button class="btn ghost sm" id="draftBtn">✎ Draft</button>'+
-    '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button></div>'+
+    '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button>'+
+    '<button class="btn ghost sm" id="tagBtn">⌗ tags</button></div>'+
     (nb['spawned-by']?'<div style="font-size:11px;font-family:var(--mono);color:var(--faint);margin-bottom:8px">spawned from <span class="ghostchip" data-space="'+esc(nb['spawned-by'].space)+'">'+esc(nb['spawned-by'].space)+'</span> · “'+esc(nb['spawned-by'].prompt||'')+'”</div>':'');
   b.innerHTML=actions+'<div class="nbrow"><div style="flex:1;min-width:0">'+cellsH+add+'</div>'+rail+'</div>';
   b.querySelector('#askBtn').addEventListener('click',()=>startAsk(i));
@@ -521,6 +529,7 @@ async function renderNotebook(i){
     showToast('Draft written by the agent (reversible)', undo);
   });
   b.querySelector('#importBtn').addEventListener('click',()=>startImport(i));
+  b.querySelector('#tagBtn').addEventListener('click',()=>startTags(i));
   b.querySelector('#ddBtn').addEventListener('click',async()=>{
     b.innerHTML='<div class="sec-h">deep-diving</div><div style="color:var(--muted);font-size:13px">the agent is proposing subtopics, spawning connected notebooks and researching each — this takes a while. You can keep working; they land when ready…</div>';
     let res; try{ res=await API.deepDive(sp.id); }catch(e){ showToast('deep-dive: network error'); renderBody(i); return; }
@@ -585,6 +594,54 @@ async function renderNotebook(i){
       if(host){ try{(new Function('data','el',c.code))(c.rendered,host);}catch(e){host.textContent='applet error: '+e.message;} }
     }
   });
+}
+// tags are asserted, never computed — so they are shown and approved, never
+// applied behind your back. Existing tags are editable; the agent's proposal
+// arrives as more chips you can drop.
+function startTags(i){
+  const sp=STATE.spaces[i], b=document.getElementById('body'+i);
+  let tags=(sp.tags||[]).map(t=>({...t}));
+  const draw=()=>{
+    b.innerHTML='<div class="sec-h">tags</div>'+
+      '<div class="tagedit">'+(tags.length?tags.map((t,k)=>
+        '<span class="tagchip '+(t.by==='agent'?'byagent':'')+'" data-k="'+k+'">'+esc(t.tag)+
+        ' <span class="x">✕</span></span>').join(''):'<i style="color:var(--muted)">no tags yet</i>')+'</div>'+
+      '<div class="actions" style="margin-top:10px">'+
+        '<input id="tagIn" placeholder="add a tag…" style="min-width:180px;border:1px solid var(--line);'+
+        'border-radius:3px;padding:6px 9px;font:inherit;font-size:12.5px">'+
+        '<button class="btn ghost sm" id="tagAsk">✦ suggest</button>'+
+        '<button class="btn sm" id="tagSave">Save</button>'+
+        '<button class="btn ghost sm" id="tagCancel">Cancel</button></div>'+
+      '<div style="font-size:11.5px;color:var(--muted);margin-top:8px">'+
+        'tags group notebooks by subject — the one thing the substrate cannot work out for itself</div>';
+    b.querySelectorAll('.tagedit .x').forEach(x=>x.addEventListener('click',e=>{
+      tags.splice(+e.target.closest('[data-k]').dataset.k,1); draw(); }));
+    const add=()=>{ const v=b.querySelector('#tagIn').value.trim().toLowerCase();
+      if(v && !tags.some(t=>t.tag===v)) tags.push({tag:v,by:'you'});
+      b.querySelector('#tagIn').value=''; draw(); b.querySelector('#tagIn').focus(); };
+    b.querySelector('#tagIn').addEventListener('keydown',e=>{ if(e.key==='Enter') add(); });
+    b.querySelector('#tagCancel').addEventListener('click',()=>renderBody(i));
+    b.querySelector('#tagSave').addEventListener('click',async()=>{
+      if(TIME){ showToast('time mode — ↩ now to edit'); return; }
+      let r; try{ r=await API.tags(sp.id,tags); }catch(e){ showToast('tags: network error'); return; }
+      if(r.error){ showToast(r.error); return; }
+      applyState(r.state); renderBody(i); renderTagStrip();
+      showToast('Tags saved (reversible)', undo);
+    });
+    b.querySelector('#tagAsk').addEventListener('click',async()=>{
+      const btn=b.querySelector('#tagAsk'); btn.textContent='thinking…'; btn.disabled=true;
+      let r; try{ r=await API.tagSuggest(sp.id); }catch(e){ showToast('tags: network error'); draw(); return; }
+      if(r.error){ showToast(r.error); draw(); return; }
+      pollJob(r.job,res=>{
+        if(res.error){ showToast('tags: '+res.error); draw(); return; }
+        (res.tags||[]).forEach(t=>{ if(!tags.some(x=>x.tag===t)) tags.push({tag:t,by:'agent'}); });
+        draw();
+        showToast('Proposed — drop any you disagree with, then Save');
+      });
+    });
+  };
+  draw();
+  b.querySelector('#tagIn').focus();
 }
 function startResearch(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
