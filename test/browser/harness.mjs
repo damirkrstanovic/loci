@@ -39,6 +39,24 @@ const FLOW_FIXTURE = `
 (System/exit 0)
 `;
 
+// A parent with two children, one of which has a child of its own — the
+// overview's clustering is only meaningful against a real tree, and the
+// deterministic seed contains none.
+const FAMILY_FIXTURE = `
+(require '[loci.content :as c] '[loci.substrate :as sub])
+(let [st @c/store
+      mk (fn [id title parent]
+           {:op :put :id id
+            :value (cond-> {:id id :kind :space :title title
+                            :value {:intent (str title " — fixture") :cells []}}
+                     parent (assoc-in [:value :spawned-by] {:space parent}))})]
+  (sub/commit! st {:op :tx :events [(mk "space:fam-root" "Fixture hub" nil)
+                                    (mk "space:fam-a" "Fixture child A" "space:fam-root")
+                                    (mk "space:fam-b" "Fixture child B" "space:fam-root")
+                                    (mk "space:fam-a1" "Fixture grandchild" "space:fam-a")]}))
+(System/exit 0)
+`;
+
 // http-kit binds the port itself and tells us which one it got. Asking the OS for a
 // free port here and handing the number to a JVM that binds it ~7s later is a race —
 // two test files start concurrently and would pick independently.
@@ -93,6 +111,7 @@ export async function startServer() {
   const rec = { pid: null, dir };
   LIVE.add(rec);
   await run(['-M', '-e', FLOW_FIXTURE], { LOCI_DATA: dir });   // seeds, then adds the flow
+  await run(['-M', '-e', FAMILY_FIXTURE], { LOCI_DATA: dir }); // …and a hub with a brood
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
