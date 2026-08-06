@@ -80,6 +80,13 @@ touched when anything inside it is. From the overview it also offers `⊟ Filter
 overview`, which dims everything that does not match and stays until you enter a notebook
 or clear it from the breadcrumb.
 
+Notebooks carry tags — the one thing the substrate cannot work out for itself, since
+structure is computed but subject is not. The agent proposes them from what is actually in
+a notebook and you approve, edit or ignore; each tag records whether you or the agent
+asserted it, and proposing writes nothing at all. In the overview a tag chip cycles
+include → exclude → neither, and composes with LEAP's filter: a notebook is lit when it
+satisfies both.
+
 The browser suite needs two things beyond `npm install`:
 
 - **Node 22 or newer.** `npm run test:browser` uses `node --test` with a glob, which
@@ -122,6 +129,8 @@ frontend only lays out the result.
 | `POST /api/connect` | a NEW notebook unioning two others — non-destructive, originals intact |
 | `POST /api/flow` | the agent plans + runs a multi-step flow (background job) |
 | `POST /api/flow-gate` | answer a flow's gate: approve resumes, reject stops |
+| `POST /api/tags` | replace a notebook's tags — one reversible event |
+| `POST /api/tag-suggest` | the agent proposes tags (background job); writes nothing |
 
 ## Layout
 
