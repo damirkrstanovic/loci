@@ -167,11 +167,41 @@ perfectly:
   Related, but the second states the law and the first states an observation. Merging them
   would lose the law's formulation.
 
-**Threshold: 0.85.** It merges 8 pairs of 3,160 with zero false merges in the sample, and
-misses two true duplicates. That is the trade the spec asked for — a miss costs one redundant
-fact, a wrong merge silently destroys a distinct one. Recalibrate whenever the embedding
-model changes; the numbers above are meaningless for a different model, which is exactly why
-`:model` is stored per fact.
+**Threshold: 0.85** for `embed-qwen3-0.6b`. It merges 8 pairs of 3,160 with zero false merges
+in the sample, and misses two true duplicates. That is the trade the spec asked for — a miss
+costs one redundant fact, a wrong merge silently destroys a distinct one.
+
+### 5.1.1 The threshold is per model, and this is not theoretical
+
+Re-run 2026-08-07 with `embed-qwen3-4b` on the same 80 facts. The *global* distribution is
+almost identical — median 0.291 vs 0.298, p95 0.612 vs 0.612, p99 0.741 vs 0.741 — which is
+exactly what makes this dangerous. **The tail moved.**
+
+| pair | 0.6b | 4b | truth |
+|---|---|---|---|
+| TSMC revenue/share restatement | 0.954 | 0.962 | duplicate |
+| latitude–income gradient naming | 0.838 | 0.887 | duplicate |
+| **Kepler: law *stated* vs law *observed*** | **0.829** | **0.868** | **distinct** |
+| Taiwan blockade: $5–10tn shock vs 2.8% of GDP | — | 0.863 | distinct (different estimates) |
+| Jupiter+Saturn 92.5% vs Jupiter alone 71.2% | — | 0.841 | distinct |
+
+**Carrying 0.85 over to the 4B would silently merge the two Kepler facts**, destroying the
+law's formulation — the precise failure the calibration exists to prevent. The 4B's clean cut
+is **0.88** (above Kepler at 0.868 and the blockade pair at 0.863; below the gradient naming
+at 0.887).
+
+| model | dim | threshold |
+|---|---|---|
+| `embed-qwen3-0.6b` | 1024 | 0.85 |
+| `embed-qwen3-4b` | 2560 | 0.88 |
+| `embed-bge-m3` | 1024 | *uncalibrated* |
+
+**Therefore merge must not take a threshold as a constant.** It looks the configured model up
+in a calibrated table and, for a model that is not in it, **refuses to merge and says so** —
+it does not fall back to the nearest number, and it does not guess. An unmerged corpus is
+merely redundant; a wrongly merged one has lost something.
+
+`:model` is stored per fact for exactly this reason.
 
 **Merge ships behind the calibration, in its own step.** The distribution separates well
 enough at 0.85 that it can proceed.
@@ -202,6 +232,29 @@ Mercury above Neptune, i.e. exactly wrong. It returns raw logits (0.687 down to 
 probabilities, so a score threshold would need its own calibration. This is why rerank is
 applied to the *fused* candidate set rather than trusted alone, and never in the keystroke
 path.
+
+### 5.3 Which embedder to run
+
+Measured on the same 80 facts and six queries with known targets, top-1 accuracy:
+
+| model | dim | top-1 | embed cost | notes |
+|---|---|---|---|---|
+| `embed-qwen3-0.6b` | 1024 | 3/6 | — | misses *"which world is slowest to circle the sun"* |
+| `embed-qwen3-4b` | 2560 | **4/6** | ~41 ms/fact | gets it right; 2.5× the storage |
+
+Both are L2-normalised (norm 1.0), so cosine is a dot product for either — and neither is the
+"non-normalised range" one might expect from a larger model.
+
+The 4B is better and fast enough. Its cost is storage: a 2560-float vector is ~30 KB as EDN
+against ~12 KB, so the point at which the EDN-lines file stops being the right home arrives
+2.5× sooner. That is the trade, and it is the reason §2's honest note about not scaling past
+a few thousand facts matters more with the 4B than with the 0.6b.
+
+**Switching is already supported and needs no migration**, verified live against both models
+on one memory file: change `LOCI_EMBED_MODEL`, every fact embedded by the other model becomes
+pending again, and the next pass re-embeds at the new dimension. Vectors of different lengths
+are never compared — `cosine` returns 0.0 on a length mismatch, and `pending-facts` excludes
+by model before that can arise.
 
 ## 5. Failure modes
 
