@@ -1258,6 +1258,68 @@
       (when (str/blank? prompt) {:error "empty prompt"})
       {:job (start-job! #(research! st space prompt))}))
 
+(defn lineage-sources
+  "Every id a recall scoped to `space` is allowed to see: the notebook itself,
+   the ids of its cells, and the same for each notebook it spawned and each
+   notebook merged into it — transitively.
+
+   `recall`'s filter takes a set of ids rather than one notebook id because
+   `loci.memory` holds no store and must not: the half that can walk the
+   substrate does the walk, the half that recalls takes the answer. This
+   function is that walk, and it lives here for the same reason.
+
+   Both the notebook and its cells are in the set because a distilled fact
+   records `:source {:obj <the doc it came from> :space <the notebook>}` — the
+   notebook id alone already matches everything `distill!` writes, and the cell
+   ids additionally catch a fact whose source names only an object.
+
+   Of the reasons `nb/links` reports, only `spawned` and `merged-from` are
+   lineage:
+
+     spawned      o's :spawned-by names this notebook — a child. In scope.
+     merged-from  o's id is in this notebook's :merged-from — folded in here.
+                  In scope: its facts were recorded before the merge existed
+                  and there is nowhere else for them to live.
+     spawned-by   the parent. NOT in scope — walking up reaches every sibling
+                  through the shared parent, which is the leak a scope exists
+                  to stop.
+     merged       a notebook THIS one was folded into. Also upward, also out.
+     shares       two notebooks holding the same object. Not an edge to walk —
+                  though note the consequence of taking cells: if the shared
+                  object is a cell HERE, a fact distilled from it is in scope,
+                  because it is a fact about a document sitting in this
+                  notebook. What does not come with it is the other notebook —
+                  not its other cells, not its descendants, and not a fact
+                  recorded against it with no object (what `ask!` writes).
+     derived      one's cell was computed from the other's. Same reasoning.
+
+   Both kept edges are followed transitively: spawning because a deep dive of a
+   deep dive is still descent, and merged-from the same way because a notebook
+   that absorbed another absorbed whatever that one had absorbed. `seen` bounds
+   the walk, so a cycle in the merge graph terminates rather than hanging.
+
+   Cost: one `nb/links` per notebook in scope, and `nb/links` scans every object
+   — so this is O(notebooks in scope × objects), not one 0.200 ms call. Measured
+   on a synthetic 240-object store: 0.6 ms for a leaf, 5.4 ms for a ten-deep
+   chain. Kept anyway, because reusing `nb/links` means “spawned” and
+   “merged-from” have exactly one definition and the scope follows it, and
+   because this runs on a search the user typed and waits on — the same request
+   spends 20–50 ms embedding the query.
+
+   Assumes `space` is a notebook; callers check first (`notebook-or-error`)."
+  [st space]
+  (loop [queue [space], seen #{}, out #{}]
+    (if-let [id (first queue)]
+      (if (seen id)
+        (recur (subvec queue 1) seen out)
+        (let [cells (keep :ref (nb/cells-of (sub/object st id)))
+              kids  (keep (fn [{:keys [id reasons]}]
+                            (when (some (comp #{"spawned" "merged-from"} :type) reasons)
+                              id))
+                          (:connected (nb/links st id)))]
+          (recur (into (subvec queue 1) kids) (conj seen id) (into (conj out id) cells))))
+      out)))
+
 (defn memory-payload
   "The memory pane: every fact newest-first, or the ranked answer to a query.
 
@@ -1272,18 +1334,51 @@
    `:awaiting` is how many facts have no vector for the configured model, and
    `:embedding` is that model or nil. Both, because either alone lies: with no
    embedder configured every fact is awaiting one forever, and a count with no
-   model beside it reads like a backlog rather than an unconfigured feature."
-  [m q]
-  (let [hits (if (seq q)
-               (mold/recall m q {:k 20 :semantic? true})
-               (mem/all-facts m))]
-    (cond-> {:facts     (mapv #(dissoc % :vec) hits)
-             :awaiting  (count (mem/pending-facts m))
-             :embedding (when (embed/embedding-configured?) (embed/embed-model))}
-      ;; recall marks itself degraded when it asked the embedder something and
-      ;; did not get an answer; saying so is cheaper than a pane that silently
-      ;; shows fewer results than it did yesterday.
-      (:degraded (meta hits)) (assoc :degraded (:degraded (meta hits))))))
+   model beside it reads like a backlog rather than an unconfigured feature.
+
+   `scope` is nil or `{:space id :sources #{id …}}` from `lineage-sources`. Nil
+   is the whole memory and the response is exactly what it has always been —
+   same keys, same `recall` opts — because every caller that exists today passes
+   no scope and none of them asked for a new field."
+  ([m q] (memory-payload m q nil))
+  ([m q scope]
+   (let [opts (cond-> {:k 20 :semantic? true}
+                scope (assoc :filter {:sources (:sources scope)}))
+         hits (cond
+                (seq q) (mold/recall m q opts)
+                ;; No query is a browse, and `all-facts` takes no filter, so the
+                ;; scope is applied here by the same rule recall applies it by.
+                ;; Returning the whole memory for `?space=…` with an empty `q`
+                ;; would be a scoped request answered with unscoped facts.
+                scope   (filterv #(mem/in-sources? (:sources scope) %) (mem/all-facts m))
+                :else   (mem/all-facts m))]
+     (cond-> {:facts     (mapv #(dissoc % :vec) hits)
+              :awaiting  (count (mem/pending-facts m))
+              :embedding (when (embed/embedding-configured?) (embed/embed-model))}
+       ;; recall marks itself degraded when it asked the embedder something and
+       ;; did not get an answer; saying so is cheaper than a pane that silently
+       ;; shows fewer results than it did yesterday.
+       (:degraded (meta hits)) (assoc :degraded (:degraded (meta hits)))
+       ;; A scoped answer says it was scoped. Without this an empty `:facts` is
+       ;; ambiguous between "nothing is remembered here" and "nothing is
+       ;; remembered at all", and the reading that invites is a fallback to the
+       ;; whole memory — the one thing a scope exists to prevent.
+       scope (assoc :scope {:space   (:space scope)
+                            :sources (count (:sources scope))
+                            :empty   (empty? hits)})))))
+
+(defn memory-request
+  "/api/memory — the pane, optionally scoped to one notebook's lineage.
+
+   `?space=` narrows recall to `lineage-sources`; absent or blank it is the
+   whole memory, unchanged. A `space` that is not a notebook is an **error**,
+   not an empty list: `?space=space:typo` answered with `{:facts []}` reads as
+   “nothing was remembered here”, and someone would believe it."
+  [st m q space]
+  (if (str/blank? space)
+    (memory-payload m q)
+    (or (notebook-or-error st space)
+        (memory-payload m q {:space space :sources (lineage-sources st space)}))))
 
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
@@ -1328,7 +1423,7 @@
                                                {:job (start-job! #(suggest-tags! st space))}
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
-      (= uri "/api/memory")  (json-resp (memory-payload @mem/memory (params "q")))
+      (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]

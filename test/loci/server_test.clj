@@ -1446,3 +1446,172 @@
     (is (= [["chips" {:k 8}]] @seen))
     (is (not (:semantic? (second (first @seen))))
         "and the keystroke path does not — it must stay exactly as fast as it was")))
+
+;; ============================================================================
+;; memory scoped to one notebook's lineage (/api/memory?space=…)
+;; ============================================================================
+
+(defn- put-space!
+  "A notebook holding one doc cell, plus whatever lineage keys the case needs."
+  [st id title doc-id doc-text extra]
+  (sub/commit! st {:op :put :id doc-id
+                   :value {:id doc-id :kind :doc :title (str title " findings") :value doc-text}})
+  (sub/commit! st {:op :put :id id
+                   :value {:id id :kind :space :title title
+                           :value (merge {:intent title :cells [{:ref doc-id}]} extra)}}))
+
+(defn- lineage-fixture
+  "A substrate whose shape covers every reason `nb/links` can report:
+
+     space:semis   the root
+       space:kid     spawned-by semis          — descent
+         space:gk      spawned-by kid          — descent, one more hop
+     space:other   unrelated
+     space:mix     merged-from [semis other]   — absorbed both
+     space:peer    shares find:semis-1 as a cell of its own
+
+   Every notebook holds one doc cell, and every fact below is recorded the way
+   `distill!` records one: `:source {:obj <doc> :space <notebook>}`."
+  []
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:semis" "Semis" "find:semis-1" "chips fabs" {})
+    (put-space! st "space:kid"   "Kid"   "find:kid-1"   "chips euv"
+                {:spawned-by {:space "space:semis" :prompt "go deeper"}})
+    (put-space! st "space:gk"    "GKid"  "find:gk-1"    "chips litho"
+                {:spawned-by {:space "space:kid" :prompt "deeper still"}})
+    (put-space! st "space:other" "Other" "find:other-1" "chips unrelated" {})
+    (put-space! st "space:mix"   "Mix"   "find:mix-1"   "chips merged"
+                {:merged-from ["space:semis" "space:other"]})
+    (sub/commit! st {:op :put :id "space:peer"
+                     :value {:id "space:peer" :kind :space :title "Peer"
+                             :value {:intent "peer" :cells [{:ref "find:semis-1"}]}}})
+    st))
+
+(defn- lineage-memory
+  "One fact per notebook, all of them lexically matching \"chips\" so the
+   *filter* is the only thing that can separate them."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[nb obj txt] [["space:semis" "find:semis-1" "chips are fabricated in Taiwan."]
+                          ["space:kid"   "find:kid-1"   "chips need EUV lithography."]
+                          ["space:gk"    "find:gk-1"    "chips shrink with each node."]
+                          ["space:other" "find:other-1" "chips are unrelated here."]
+                          ["space:mix"   "find:mix-1"   "chips were merged together."]
+                          ["space:peer"  "find:peer-1"  "chips seen by a peer notebook."]]]
+      (mold/remember m txt {:source {:obj obj :space nb}}))
+    m))
+
+(defn- scoped-facts
+  "The fact strings /api/memory returns for `q` under `space`, with no embedder
+   configured anywhere — `:semantic? true` degrades to lexical, so this test
+   opens no socket and passes offline."
+  [st m q space]
+  (let [{:keys [env file]} (embed-env {})]
+    (with-redefs [embed/env env embed/from-file file]
+      (let [p (srv/memory-request st m q space)]
+        (assoc p :fact-set (set (map :fact (:facts p))))))))
+
+(deftest memory-scoped-to-a-notebook-sees-its-lineage-and-nothing-else
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    ;; descent, transitively: the notebook, its child, and its child's child
+    (is (= #{"chips are fabricated in Taiwan." "chips need EUV lithography."
+             "chips shrink with each node."}
+           (:fact-set (scoped-facts st m "chips" "space:semis")))
+        "spawned is lineage and it is transitive; nothing else is")
+    ;; upward is not lineage — from the child you do not see the parent
+    (is (= #{"chips need EUV lithography." "chips shrink with each node."}
+           (:fact-set (scoped-facts st m "chips" "space:kid")))
+        "spawned-by is the parent, and following it would reach every sibling")
+    ;; a merge absorbs both sides' facts
+    (is (= #{"chips were merged together." "chips are fabricated in Taiwan."
+             "chips need EUV lithography." "chips shrink with each node."
+             "chips are unrelated here."}
+           (:fact-set (scoped-facts st m "chips" "space:mix")))
+        "merged-from brings in what was folded in — and its descent with it")
+    ;; …but the merge is downstream of semis, so semis does not gain the mix
+    (is (not (contains? (:fact-set (scoped-facts st m "chips" "space:semis"))
+                        "chips were merged together."))
+        "merged is upward: a notebook this one was folded into is not its lineage")
+    ;; A shared cell brings the facts distilled FROM THAT CELL and nothing else.
+    ;; space:peer holds find:semis-1 as one of its own cells, so the fact whose
+    ;; :source :obj is find:semis-1 is in peer's scope — it is a fact about a
+    ;; document sitting in peer. What peer does NOT get is the rest of semis:
+    ;; not its child notebooks, and not a fact recorded against semis with no
+    ;; object (which is what `ask!` writes).
+    (is (= #{"chips seen by a peer notebook." "chips are fabricated in Taiwan."}
+           (:fact-set (scoped-facts st m "chips" "space:peer")))
+        "a shared cell is in scope; the notebook that shares it is not")
+    (mold/remember m "chips policy discussed with no document." {:source {:space "space:semis"}})
+    (is (not (contains? (:fact-set (scoped-facts st m "chips" "space:peer"))
+                        "chips policy discussed with no document."))
+        "sharing one cell does not make peer a descendant of semis")
+    (is (not (contains? (:fact-set (scoped-facts st m "chips" "space:semis"))
+                        "chips seen by a peer notebook.")))))
+
+(deftest a-scope-that-holds-no-matching-fact-returns-empty-and-says-so
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    ;; "unrelated" matches exactly one fact, and it lives in space:other
+    (let [p (scoped-facts st m "unrelated" "space:other")]
+      (is (= #{"chips are unrelated here."} (:fact-set p))))
+    (let [p (scoped-facts st m "unrelated" "space:semis")]
+      (is (= [] (:facts p))
+          "a scoped recall that matches nothing in scope answers with nothing — it does NOT fall back to the whole memory")
+      (is (= "space:semis" (get-in p [:scope :space])))
+      (is (true? (get-in p [:scope :empty]))
+          "and it says the emptiness is the scope's, not the memory's")
+      (is (pos? (get-in p [:scope :sources]))
+          "the eligible set was non-empty, so this is 'nothing here', not 'nothing to look at'"))))
+
+(deftest a-scoped-browse-with-no-query-is-scoped-too
+  ;; all-facts takes no filter, so this is the path most likely to leak
+  (let [st (lineage-fixture)
+        m  (lineage-memory)
+        p  (scoped-facts st m nil "space:kid")]
+    (is (= #{"chips need EUV lithography." "chips shrink with each node."} (:fact-set p)))
+    (is (= 6 (count (mem/all-facts m))) "…out of six remembered")))
+
+(deftest an-unknown-or-non-notebook-scope-is-an-error-not-an-empty-answer
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    (is (= {:error "not a notebook: space:typo"} (srv/memory-request st m "chips" "space:typo")))
+    (is (= {:error "not a notebook: find:semis-1"} (srv/memory-request st m "chips" "find:semis-1"))
+        "a doc is not a notebook; answering [] would read as 'nothing remembered here'")))
+
+(deftest without-a-space-the-response-is-exactly-what-it-was
+  (let [st (lineage-fixture)
+        m  (lineage-memory)
+        {:keys [env file]} (embed-env {})
+        ;; :score is dropped before comparing because it decays against
+        ;; System/currentTimeMillis — two calls a millisecond apart differ in
+        ;; the 8th decimal place and always did. Everything else, including the
+        ;; ORDER of the facts, must match exactly.
+        norm #(update % :facts (fn [fs] (mapv (fn [f] (dissoc f :score)) fs)))]
+    (with-redefs [embed/env env embed/from-file file]
+      (doseq [q [nil "chips"], space [nil ""]]
+        (is (= (norm (srv/memory-payload m q)) (norm (srv/memory-request st m q space)))
+            (str "q=" (pr-str q) " space=" (pr-str space) ": same map, key for key"))
+        (is (= (keys (srv/memory-payload m q)) (keys (srv/memory-request st m q space))))
+        (is (nil? (:scope (srv/memory-request st m q space)))
+            "and no new key appears on the unscoped response"))))
+  ;; and recall is still asked for exactly the opts it was asked for before
+  (let [seen (atom [])]
+    (srv/memory-request (sub/fresh-store) (recall-spy seen) "chips" nil)
+    (is (= [["chips" {:k 20 :semantic? true}]] @seen)
+        "no :filter key at all when nothing asked for a scope")))
+
+(deftest lineage-sources-names-notebooks-and-their-cells
+  (let [st (lineage-fixture)]
+    (is (= #{"space:semis" "find:semis-1" "space:kid" "find:kid-1" "space:gk" "find:gk-1"}
+           (srv/lineage-sources st "space:semis"))
+        "the notebook and its cells, then the same for each descendant — a fact's :source names both")
+    (is (= #{"space:peer" "find:semis-1"} (srv/lineage-sources st "space:peer")))))
+
+(deftest a-merge-cycle-terminates
+  ;; :merged-from is data, and nothing in the substrate forbids two notebooks
+  ;; naming each other. The walk must stop rather than hang the request.
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:a" "A" "doc:a" "a" {:merged-from ["space:b"]})
+    (put-space! st "space:b" "B" "doc:b" "b" {:merged-from ["space:a"]})
+    (is (= #{"space:a" "doc:a" "space:b" "doc:b"} (srv/lineage-sources st "space:a")))))

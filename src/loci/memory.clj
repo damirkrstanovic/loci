@@ -542,7 +542,7 @@
    pointed at the part of the list where the order is still in doubt."
   20)
 
-(defn- source-ids
+(defn source-ids
   "The ids a fact's `:source` names. The server records `{:obj … :space …}`, so
    a fact belongs to both its object and its notebook and either can scope it."
   [f]
@@ -551,6 +551,16 @@
       (map? s)  (into #{} (remove nil?) [(:obj s) (:space s)])
       (some? s) #{s}
       :else     #{})))
+
+(defn in-sources?
+  "Whether `f` was recorded against one of `sources`.
+
+   Public because the memory pane browses without a query — `all-facts`, not
+   `recall` — and a scoped browse must be narrowed by exactly the rule a scoped
+   query is narrowed by. Two copies of “what a `:source` names” would drift, and
+   the one that drifted would be the one showing facts a scope excluded."
+  [sources f]
+  (boolean (some sources (source-ids f))))
 
 (defn- scoped
   "The facts a query is allowed to see. `{:filter {:sources #{…}}}` narrows to
@@ -567,7 +577,7 @@
    scope exists to prevent."
   [facts opts]
   (if-let [sources (get-in opts [:filter :sources])]
-    (filterv #(some sources (source-ids %)) facts)
+    (filterv #(in-sources? sources %) facts)
     (vec facts)))
 
 (defn- semantic-ranking
