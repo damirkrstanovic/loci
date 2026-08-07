@@ -62,6 +62,119 @@
     (is (= 3 (count (sub/history st))))
     (is (= [{:text "hi"}] (get-in (sub/object st "space:n") [:value :cells])))))
 
+;; ---------------------------------------------------------------------------
+;; concurrent cell operations
+;;
+;; `notebook-op!` reads a notebook's whole cell vector, computes the new one and
+;; writes the whole thing back — the read-modify-write `append-cell-event`
+;; stopped doing after 24 concurrent appends left 6 cells. Every event lands;
+;; what is lost is content, because each writer computed its vector from a read
+;; taken before the others committed.
+;; ---------------------------------------------------------------------------
+
+(def ^:private cell-seeds
+  (mapv (fn [i] {:text (str "seed-" i)}) (range 24)))
+
+(def ^:private cell-op-mix
+  "The op mix, chosen so that the cell COUNT and the fate of every appended cell
+   follow from the ops alone, not from the order they happen to serialise in:
+
+     add-text   +1, carrying a text nothing else writes
+     move       a permutation inside [0,4) — count-neutral
+     edit-text  idx in [4,8) — count-neutral, and every cell here is a text cell
+                so `cell-op`'s type guard never turns it into a no-op
+     remove     idx 0 — exactly -1
+
+   24 seeds and 4 removes means the vector never falls below 20, so no index
+   used here is ever out of range: every op really applies rather than falling
+   through `cell-op`'s totality. And an appended cell lands at index >= 19 and
+   drops at most 4 as removes shift it down, while moves reach only [0,4) — so
+   nothing that was added can be moved, edited or removed away by this mix."
+  (vec (concat (for [i (range 12)] {:op "add-text" :text (str "add-" i)})
+               (for [i (range 4)]  {:op "move" :idx i :to (- 3 i)})
+               (for [i (range 4)]  {:op "edit-text" :idx (+ 4 i) :text (str "edit-" i)})
+               (repeat 4 {:op "remove" :idx 0}))))
+
+(defn- cell-ops-together!
+  "Fire every op at one notebook from its own thread, released together. The
+   latch is what makes them collide: started threads alone would mostly run one
+   after another."
+  [st space ops]
+  (let [latch (java.util.concurrent.CountDownLatch. 1)
+        ths   (mapv (fn [op] (Thread. (fn []
+                                        (.await latch)
+                                        (srv/notebook-op! st (assoc op :space space)))))
+                    ops)]
+    (doseq [t ths] (.start t))
+    (.countDown latch)
+    (doseq [t ths] (.join t))
+    (nb/cells-of (sub/object st space))))
+
+(deftest concurrent-cell-ops-lose-no-cell
+  (let [st       (sub/fresh-store)
+        ops      cell-op-mix
+        adds     (set (keep :text (filter #(= "add-text" (:op %)) ops)))
+        edits    (set (keep :text (filter #(= "edit-text" (:op %)) ops)))
+        universe (into (set (map :text cell-seeds)) (concat adds edits))
+        expected (- (+ (count cell-seeds) (count adds)) 4)]   ; seeds + adds - removes
+    (sub/commit! st {:op :put :id "space:n"
+                     :value {:id "space:n" :kind :space :title "N"
+                             :value {:intent "i" :cells cell-seeds}}})
+    (let [final (cell-ops-together! st "space:n" ops)
+          texts (mapv :text final)]
+      (is (= expected (count final))
+          (str "no cell lost: " (count final) " cells survived of " expected))
+      (is (every? (set texts) adds)
+          "every concurrently appended cell is still there")
+      (is (= (count texts) (count (set texts)))
+          "and no op was applied twice")
+      (is (every? universe texts)
+          "no phantom cell: everything present was written by a seed or an op")
+      ;; Deliberately NOT asserted, because it is genuinely not guaranteed:
+      ;; the final ORDER (concurrent reorders conflict, and the winner is
+      ;; whichever serialised last), and WHICH cell an index-addressed op landed
+      ;; on — a `remove` at index 0 removes whatever the reorders left there.
+      ;; That is last-writer-wins on intent, which is a design question. Losing a
+      ;; cell is not; that is the defect, and it is what the assertions above
+      ;; pin down. For the same reason the `edit-` texts are not all required to
+      ;; survive: two edits at different indices can land on the same cell once
+      ;; a remove has shifted it, and then the later one legitimately wins.
+      )))
+
+(deftest editing-two-notebooks-does-not-serialise
+  ;; The lock is per notebook. If a later simplification collapses it to one
+  ;; global monitor, this hangs: the fast notebook's edit would wait behind an
+  ;; unrelated notebook's. Held open by a latch rather than a sleep, so the
+  ;; happy path costs nothing and the failing path is a timeout, not a guess.
+  (let [st      (sub/fresh-store)
+        entered (java.util.concurrent.CountDownLatch. 1)
+        release (java.util.concurrent.CountDownLatch. 1)
+        done    (promise)
+        secs    java.util.concurrent.TimeUnit/SECONDS
+        real    nb/cell-op]
+    (doseq [id ["space:slow" "space:fast"]]
+      (sub/commit! st {:op :put :id id
+                       :value {:id id :kind :space :title id :value {:cells []}}}))
+    (with-redefs [nb/cell-op (fn [cells body]
+                               ;; block INSIDE the critical section, only for one notebook
+                               (when (= "space:slow" (:space body))
+                                 (.countDown entered)
+                                 (.await release 10 secs))
+                               (real cells body))]
+      (let [slow (Thread. #(srv/notebook-op! st {:space "space:slow" :op "add-text" :text "s"}))
+            fast (Thread. #(do (srv/notebook-op! st {:space "space:fast" :op "add-text" :text "f"})
+                               (deliver done true)))]
+        (.start slow)
+        (is (.await entered 10 secs) "the slow notebook's op reached the critical section")
+        (.start fast)
+        (is (true? (deref done 5000 false))
+            "an edit to a different notebook must not wait on the first")
+        (.countDown release)
+        (.join slow)
+        (.join fast)
+        (is (= [{:text "s"}] (nb/cells-of (sub/object st "space:slow"))))
+        (is (= [{:text "f"}] (nb/cells-of (sub/object st "space:fast"))))))))
+
 (deftest edit-rejects-missing-id
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "doc:a" :value {:id "doc:a" :kind :doc :title "A" :value "x"}})

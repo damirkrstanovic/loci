@@ -407,26 +407,58 @@
                               ink))))
         {:state (state-payload st) :tag-colors (tag-colors st)}))))
 
+;; One monitor per notebook id, interned here. Per notebook and not one global
+;; lock so that editing two notebooks never serialises — the shell can have
+;; several open, and a person reordering cells in one must not wait on a
+;; research job's cells landing in another.
+;;
+;; The map only grows: an id's monitor is never released, because releasing it
+;; would need a second lock to make "look up or create" atomic against "throw
+;; away", and there is nothing to gain — an empty Object per notebook ever
+;; edited, a few tens of bytes each, in a store that holds the notebooks
+;; themselves in RAM.
+(defonce ^:private notebook-locks (atom {}))
+
+(defn- notebook-lock [space]
+  (or (@notebook-locks space)
+      ;; the swap! may retry and discard a spare Object; the monitor everyone
+      ;; ends up with is the one in the map that swap! actually published
+      (get (swap! notebook-locks #(cond-> % (not (% space)) (assoc space (Object.))))
+           space)))
+
 (defn notebook-op! [st {:keys [space] :as body}]
-  (let [o (sub/object st space)]
-    (cond
-      (not (= :space (:kind o)))
-      {:error (str "not a notebook: " space)}
-      :else
-      (let [cells  (nb/cells-of o)
-            cells' (nb/cell-op cells body)]
-        ;; This is the whole-vector rewrite `append-cell-event` stopped doing,
-        ;; and it races the same way: two of these at once and one is lost.
-        ;; Left as is on purpose — reorder and delete have no commutative
-        ;; apply-time form the way append does, so two concurrent reorders
-        ;; genuinely conflict and picking a winner is a design question rather
-        ;; than a bug fix. It is also far less exposed: these come from a person
-        ;; clicking, not from agent jobs running in parallel.
-        ;;
-        ;; unknown op / stale idx fall through unchanged — don't commit a phantom event
-        (when (not= cells cells')
-          (sub/commit! st (nb/set-cells-event space cells')))
-        {:state (state-payload st) :notebook (notebook-payload st space)}))))
+  (if (not= :space (:kind (sub/object st space)))
+    {:error (str "not a notebook: " space)}
+    (do
+      ;; Read-modify-write of the whole cell vector, serialised by a lock.
+      ;;
+      ;; Unlike appending, reorder and delete have no commutative apply-time
+      ;; form: two concurrent reorders genuinely conflict, so there is no
+      ;; `:append`-shaped event whose effect the substrate could compute at
+      ;; apply time. A lock is the right answer instead of a new op *because of
+      ;; where these come from* — a person clicking one cell control at a time,
+      ;; not agent jobs running in parallel. Contention is therefore negligible
+      ;; and throughput is not the concern; correctness is. Measured before this
+      ;; lock: 24 concurrent cell ops on one notebook left a notebook reflecting
+      ;; one of them, with 11 of 12 appended cells gone.
+      ;;
+      ;; What the lock buys is that the second op reads the first op's result:
+      ;; last-writer-wins on *intent* (whose reorder survives is still whoever
+      ;; serialised last), but no cell is lost, which was the actual defect.
+      ;;
+      ;; It serialises within one JVM only — `locking` is a monitor, not a
+      ;; distributed lock. loci is a single process, so that is the whole scope
+      ;; of the problem; a second server against the same store would still race.
+      ;;
+      ;; Nothing but the read and the commit is inside: the payloads are built
+      ;; after it, and no agent call or other I/O may move in.
+      (locking (notebook-lock space)
+        (let [cells  (nb/cells-of (sub/object st space))
+              cells' (nb/cell-op cells body)]
+          ;; unknown op / stale idx fall through unchanged — don't commit a phantom event
+          (when (not= cells cells')
+            (sub/commit! st (nb/set-cells-event space cells')))))
+      {:state (state-payload st) :notebook (notebook-payload st space)})))
 
 ;; ---- writes (every one a substrate event) ----
 (defn edit! [st id value]
