@@ -1347,17 +1347,42 @@
 
 (deftest llm-key-is-not-named-after-a-vendor-you-may-not-use
   ;; someone pointing loci at their own llama server should not have to file
-  ;; its token under DEEPSEEK_API_KEY — but everyone who already did keeps working.
-  (is (= "neutral" (resolved #'agent/api-key
-                             {"LOCI_LLM_API_KEY" "neutral" "DEEPSEEK_API_KEY" "vendor"}
-                             {".deepseek-key" "from-file"}))
-      "LOCI_LLM_API_KEY wins")
-  (is (= "vendor" (resolved #'agent/api-key {"DEEPSEEK_API_KEY" "vendor"} {".deepseek-key" "from-file"}))
-      "DEEPSEEK_API_KEY still works untouched")
-  (is (= "from-file" (resolved #'agent/api-key {} {".deepseek-key" "from-file"}))
-      "and so does .deepseek-key")
+  ;; its token under DEEPSEEK_API_KEY or in a file named .deepseek-key — but
+  ;; everyone who already did keeps working. The whole chain, in order:
+  ;; LOCI_LLM_API_KEY → DEEPSEEK_API_KEY → .llm-key → .deepseek-key.
+  (let [all-four {"LOCI_LLM_API_KEY" "neutral-env" "DEEPSEEK_API_KEY" "vendor-env"}
+        both-files {".llm-key" "neutral-file" ".deepseek-key" "vendor-file"}]
+    (is (= "neutral-env" (resolved #'agent/api-key all-four both-files))
+        "LOCI_LLM_API_KEY wins over everything")
+    (is (= "vendor-env" (resolved #'agent/api-key {"DEEPSEEK_API_KEY" "vendor-env"} both-files))
+        "DEEPSEEK_API_KEY still works untouched, and still beats both files")
+    (is (= "neutral-file" (resolved #'agent/api-key {} both-files))
+        ".llm-key is the vendor-neutral file, and wins over .deepseek-key")
+    (is (= "vendor-file" (resolved #'agent/api-key {} {".deepseek-key" "vendor-file"}))
+        "and .deepseek-key alone still resolves, so no setup that predates .llm-key changes"))
   (is (nil? (resolved #'agent/api-key {} {}))
       "nothing configured resolves to nothing — request throws, it does not guess"))
+
+(deftest a-blank-key-at-any-step-falls-through-rather-than-shadowing-the-next
+  ;; "" is truthy in Clojure, so without `non-blank` at every step an empty
+  ;; LOCI_LLM_API_KEY= in a loci.env — which is exactly what loci.env.example
+  ;; ships — would shadow a perfectly good DEEPSEEK_API_KEY or key file below
+  ;; it. An empty file is the same hazard: `touch .llm-key` must not hide
+  ;; .deepseek-key. Each step is checked against the one immediately after it.
+  (is (= "vendor-env" (resolved #'agent/api-key
+                                {"LOCI_LLM_API_KEY" "" "DEEPSEEK_API_KEY" "vendor-env"}
+                                {".llm-key" "neutral-file" ".deepseek-key" "vendor-file"}))
+      "blank LOCI_LLM_API_KEY falls through to DEEPSEEK_API_KEY")
+  (is (= "neutral-file" (resolved #'agent/api-key
+                                  {"LOCI_LLM_API_KEY" "  " "DEEPSEEK_API_KEY" "\t"}
+                                  {".llm-key" "neutral-file" ".deepseek-key" "vendor-file"}))
+      "blank DEEPSEEK_API_KEY falls through to .llm-key")
+  (is (= "vendor-file" (resolved #'agent/api-key {} {".llm-key" "" ".deepseek-key" "vendor-file"}))
+      "a blank .llm-key falls through to .deepseek-key")
+  (is (nil? (resolved #'agent/api-key
+                      {"LOCI_LLM_API_KEY" "" "DEEPSEEK_API_KEY" " "}
+                      {".llm-key" "  " ".deepseek-key" "\n"}))
+      "all four blank is no key at all — the honest error fires, nothing is guessed"))
 
 (deftest a-blank-llm-value-is-unset-not-a-configured-empty-string
   ;; loci.env.example ships `LOCI_LLM_API_KEY=` empty, and "" is truthy in

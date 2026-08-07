@@ -10,7 +10,7 @@
    working directory, then a default:
 
      LOCI_LLM_ENDPOINT → .llm-endpoint → https://api.deepseek.com/chat/completions
-     LOCI_LLM_API_KEY  → DEEPSEEK_API_KEY → .deepseek-key (gitignored)
+     LOCI_LLM_API_KEY  → DEEPSEEK_API_KEY → .llm-key → .deepseek-key (both gitignored)
      DEEPSEEK_MODEL    → .deepseek-model → deepseek-v4-flash
 
    The endpoint is a full URL, path included, so any OpenAI-compatible
@@ -54,16 +54,21 @@
 
 (defn- api-key []
   ;; LOCI_LLM_API_KEY first: a token for your own server should not have to be
-  ;; filed under a vendor you are not using. The DeepSeek names still resolve,
-  ;; so every setup that predates this keeps working with nothing changed.
+  ;; filed under a vendor you are not using. `.llm-key` is the same argument for
+  ;; the file half of the chain, which used to end at `.deepseek-key` — the
+  ;; endpoint already had `.llm-endpoint`, so this only closes the gap. Both
+  ;; DeepSeek names still resolve, after the neutral ones, so every setup that
+  ;; predates this keeps working with nothing changed.
   (or (non-blank (env "LOCI_LLM_API_KEY")) (non-blank (env "DEEPSEEK_API_KEY"))
-      (non-blank (from-file ".deepseek-key"))))
+      (non-blank (from-file ".llm-key")) (non-blank (from-file ".deepseek-key"))))
 
 (defn request
   "POST to the configured LLM; return the assistant message map {:content .. :tool_calls ..}."
   [messages & {:keys [json? tools]}]
   (let [key (or (api-key)
-                (throw (ex-info "no LLM key (LOCI_LLM_API_KEY / DEEPSEEK_API_KEY / .deepseek-key)" {})))
+                (throw (ex-info (str "no LLM key (LOCI_LLM_API_KEY / DEEPSEEK_API_KEY / "
+                                     ".llm-key / .deepseek-key)")
+                                {})))
         resp @(hc/post (endpoint)
                 {:timeout 60000
                  :headers {"Authorization" (str "Bearer " key) "Content-Type" "application/json"}

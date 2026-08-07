@@ -112,7 +112,7 @@ deliberately keeps them out of the build context:
 | variable | falls back to | then to |
 |---|---|---|
 | `LOCI_LLM_ENDPOINT` | `.llm-endpoint` | `https://api.deepseek.com/chat/completions` |
-| `LOCI_LLM_API_KEY` | `DEEPSEEK_API_KEY`, then `.deepseek-key` | *unset — the agent refuses with "no LLM key"* |
+| `LOCI_LLM_API_KEY` | `DEEPSEEK_API_KEY`, then `.llm-key`, then `.deepseek-key` | *unset — the agent refuses with "no LLM key"* |
 | `DEEPSEEK_MODEL` | `.deepseek-model` | `deepseek-v4-flash` |
 | `SEARCH_API_KEY` / `TAVILY_API_KEY` | `.tavily-key` | *unset — research falls back to no web search* |
 | `LOCI_EMBED_ENDPOINT` | `.embed-endpoint` | *unset — semantic recall is off; recall stays lexical* |
@@ -137,7 +137,11 @@ clojure -M:serve
 `DEEPSEEK_MODEL` names the model on **whichever** server is configured; the variable name
 is historical, kept so existing setups keep working with nothing changed. For the same
 reason `DEEPSEEK_API_KEY` and `.deepseek-key` still resolve — `LOCI_LLM_API_KEY` just wins,
-so a token for your own server need not be filed under a vendor you are not using.
+so a token for your own server need not be filed under a vendor you are not using. The file
+half of that chain is neutral too: `.llm-key` resolves before `.deepseek-key`, the way
+`.llm-endpoint` already did for the endpoint. A **blank** value at any of the four steps
+counts as unset and falls through to the next, so an empty `LOCI_LLM_API_KEY=` or a
+`touch`ed `.llm-key` cannot shadow a key that is actually set below it.
 
 `DEEPSEEK_MODEL` is also the one that fails quietly. A missing key is refused out loud, but
 a missing model is not: the container simply runs `deepseek-v4-flash`, which is very likely

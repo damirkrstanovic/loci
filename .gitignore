@@ -7,6 +7,7 @@ target/
 data/
 .deepseek-model
 .llm-endpoint
+.llm-key
 .embed-endpoint
 .embed-model
 .rerank-endpoint
