@@ -133,16 +133,75 @@ provenance), `:strength` sums, `:entities` union, `:ts` takes the newer, and the
 fact's id and text are recorded on the survivor as `:merged-from` — so a merge is auditable
 and reversible. Nothing is silently destroyed.
 
-**The threshold is calibrated, not chosen.** Measured during brainstorming:
-`embed-qwen3-0.6b` scores **0.471 cosine between two entirely unrelated sentences**, so its
-similarity scale is compressed and a borrowed default like 0.85 is meaningless. Calibration
-is a step in the plan, not an afterthought: embed all real facts, compute the full pairwise
-cosine distribution, and pick a threshold above the unrelated mass — reporting the actual
-histogram. **Err high.** A wrong merge folds two distinct facts together, and while
-`:merged-from` makes it recoverable, it degrades recall until someone notices.
+**The threshold was calibrated, not chosen.** Run 2026-08-07 against the real corpus: 80
+unique facts from `data/memory.edn` (84 lines, last-wins by id), embedded with
+`embed-qwen3-0.6b`, all 3,160 pairs scored. Vectors come back **L2-normalised (norm 1.0)**,
+so cosine is a plain dot product.
 
-**Merge ships behind the calibration, in its own step.** If the distribution turns out not to
-separate cleanly, merge does not ship and semantic recall still does.
+| | cosine |
+|---|---|
+| min | 0.065 |
+| median | 0.298 |
+| mean | 0.337 |
+| p90 | 0.543 |
+| p95 | 0.612 |
+| p99 | 0.741 |
+| p99.5 | 0.794 |
+| max | 0.954 |
+
+**The classes overlap, and that decides the threshold.** Reading the top pairs by hand:
+everything at **≥ 0.85 is a genuine restatement** — eight pairs, e.g. *"TSMC controls ~70% of
+global foundry revenue and >90% of sub-7nm advanced chips, all produced in Taiwan"* against
+the same sentence without the last clause (0.954), and *"Low-income countries are
+disproportionately concentrated in tropical regions near the equator"* against *"Low-income
+countries cluster near the equator"* (0.925).
+
+Below that the band 0.82–0.84 is **mixed**, which is why no threshold separates the classes
+perfectly:
+
+- 0.838 and 0.832 are true duplicates (the latitude–income gradient naming; East Asia
+  spanning four income groups) — these would be **missed**
+- **0.829 is a false positive**: *"The orbital period of a planet increases with its distance
+  from the Sun, following Kepler's Third Law"* against *"Kepler's Third Law states that the
+  square of a planet's orbital period is proportional to the cube of its semi-major axis."*
+  Related, but the second states the law and the first states an observation. Merging them
+  would lose the law's formulation.
+
+**Threshold: 0.85.** It merges 8 pairs of 3,160 with zero false merges in the sample, and
+misses two true duplicates. That is the trade the spec asked for — a miss costs one redundant
+fact, a wrong merge silently destroys a distinct one. Recalibrate whenever the embedding
+model changes; the numbers above are meaningless for a different model, which is exactly why
+`:model` is stored per fact.
+
+**Merge ships behind the calibration, in its own step.** The distribution separates well
+enough at 0.85 that it can proceed.
+
+### 5.2 What the retrieval is actually worth, measured
+
+Same run, comparing exact cosine against word-overlap on queries chosen to share no
+vocabulary with the target fact:
+
+| query | semantic top hit | lexical top hit |
+|---|---|---|
+| "why are poor nations hot" | *Low-income countries cluster near the equator* (0.660) | *Directed Self-Assembly (DSA)…* — matched on "are" |
+| "where is chip manufacturing concentrated" | *TSMC's foundry concentration in Taiwan is the single most important chokepoint* (0.641) | a different TSMC fact, on 3 shared words |
+| "which world is slowest to circle the sun" | *outer planets take much longer to orbit* (0.724) | **Mercury — the fastest planet**, on 4 shared words |
+
+The third is the case for this whole phase: word overlap returned the semantically **opposite**
+answer, confidently.
+
+**Rerank earns its place, with one caveat.** Over four queries with known targets, reranking
+the embedder's top 8 moved two from MISS to HIT (*"which planet takes longest to orbit"* →
+Neptune's fact rather than the general "outer planets" one; *"where are the most advanced
+chips made"* → the fact naming Taiwan), kept one HIT, and left one MISS. It reorders
+aggressively — the embedder's #1 landed at position 2–4 every time — which is the point:
+it picks the *specific* fact over the *topical* one.
+
+The caveat: on the unusual phrasing *"which world is slowest to circle the sun"* it ranked
+Mercury above Neptune, i.e. exactly wrong. It returns raw logits (0.687 down to −11.04), not
+probabilities, so a score threshold would need its own calibration. This is why rerank is
+applied to the *fused* candidate set rather than trusted alone, and never in the keystroke
+path.
 
 ## 5. Failure modes
 
