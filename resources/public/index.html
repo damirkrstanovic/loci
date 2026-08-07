@@ -680,7 +680,12 @@ function startTags(i){
         // new ink AND replaces #inkpickhost with an empty one — the picker is
         // gone without being closed, and cannot be left behind twice. It has to
         // run after applyState, which is what puts the new ink in STATE.tagColors.
-        applyState(r.state); draw(); renderTagStrip();
+        //
+        // The strip needs no repaint here: this editor only exists in focus mode
+        // (.world.cards .p-body is display:none), renderTagStrip() returns at its
+        // first line unless mode==='overview', and every road back to the overview
+        // runs layout(), whose first statement is renderTagStrip(). Same at #tagSave.
+        applyState(r.state); draw();
       }));
     }));
     const add=()=>{ const v=b.querySelector('#tagIn').value.trim().toLowerCase();
@@ -692,7 +697,7 @@ function startTags(i){
       if(TIME){ showToast('time mode — ↩ now to edit'); return; }
       let r; try{ r=await API.tags(sp.id,tags); }catch(e){ showToast('tags: network error'); return; }
       if(r.error){ showToast(r.error); return; }
-      applyState(r.state); renderBody(i); renderTagStrip();
+      applyState(r.state); renderBody(i);
       showToast('Tags saved (reversible)', undo);
     });
     b.querySelector('#tagAsk').addEventListener('click',async()=>{
