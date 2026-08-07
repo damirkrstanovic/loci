@@ -176,6 +176,96 @@ test('the overview scrolls rather than shrinking below reading size', async () =
   });
 });
 
+// A notebook you are looking at must not move because you created a different
+// one. layout() used to pack each cluster into whichever column was shortest
+// *right now*, so a cluster's column depended on every cluster placed before
+// it. Measured on the real 35-notebook corpus, creating one unrelated notebook
+// moved space:pub-pop from x=72 to x=569 — a full column across the screen.
+//
+// The 16-notebook fixture does not perturb on its own, so this test builds the
+// perturbation. Both of the defect's causes are reproduced:
+//
+//   * a cluster growing taller, which re-routes every cluster packed after it —
+//     driven by real writes through /api/connect. That is the only route that
+//     creates a notebook without calling the model (server.clj new-space! goes
+//     through agent/plan-space, which needs a key and a network); what it
+//     creates carries :merged-from, so it nests under its first parent.
+//   * a new notebook arriving at an arbitrary index, because /api/state's
+//     :spaces comes from a hash map and is therefore not creation order
+//     (measured at position 1 of 35 on a real store). No route creates a plain
+//     top-level notebook without a model, so that one is spliced into the
+//     payload here; applyState, rebuild and layout are the real ones.
+const PERTURB = [
+  ['connect', { a: 'space:cosmos', b: 'space:world' }],
+  ['splice', 1],
+  ['connect', { a: 'space:finance', b: 'space:sales' }],
+  ['splice', 4],
+  ['connect', { a: 'space:world', b: 'space:finance' }],
+  ['splice', 7],
+];
+
+// layout() writes each card's position as an INLINE transform, which beats any
+// stylesheet rule — so read the inline style. A class-counting assertion in
+// this file once passed straight through a shipped no-op for exactly that reason.
+const columnX = (page) => page.evaluate(() => {
+  const o = {};
+  STATE.spaces.forEach((s, k) => {
+    const m = panels[k].style.transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px/);
+    if (m) o[s.id] = { x: Math.round(+m[1]), y: Math.round(+m[2]) };
+  });
+  return o;
+});
+
+const perturb = (page, [kind, arg]) => page.evaluate(async ([kind, arg]) => {
+  if (kind === 'connect') {
+    const r = await fetch('/api/connect', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(arg) });
+    const j = await r.json();
+    if (j.error) throw new Error('/api/connect refused: ' + j.error);
+  } else {
+    window.__spliced = (window.__spliced || []).concat(arg);
+  }
+  const s = await (await fetch('/api/state')).json();
+  // Clone a real top-level notebook rather than inventing one, so every field
+  // the shell reads is present; drop the parent links so the clone is a ROOT.
+  (window.__spliced || []).forEach((at, n) => {
+    const src = s.spaces.find(sp => !sp['spawned-by'] && !(sp['merged-from'] || []).length);
+    const fresh = { ...src, id: 'space:probe-' + n, title: 'Stability probe ' + n,
+                    intent: 'a notebook created while you were looking elsewhere' };
+    delete fresh['spawned-by']; delete fresh['merged-from'];
+    s.spaces.splice(Math.min(at, s.spaces.length), 0, fresh);
+  });
+  applyState(s); rebuild(); overview();
+}, [kind, arg]);
+
+test('creating a notebook never moves the ones already on screen', async () => {
+  await withPage(browser, 'columns-stay-put', async (page) => {
+    await bootedShell(page, server.url);
+    await inOverview(page);
+    const before = await columnX(page);
+
+    for (const step of PERTURB) { await perturb(page, step); await settle(page); }
+    const after = await columnX(page);
+
+    // Guard against a vacuous pass: the perturbation has to have actually
+    // rearranged the overview. If notebooks stopped arriving, or nothing below
+    // them shifted, this test would certify a layout it never disturbed.
+    const survivors = Object.keys(before).filter(id => after[id]);
+    assert.equal(survivors.length, Object.keys(before).length,
+      'the fixture lost a notebook — the perturbation did more than create');
+    assert.ok(Object.keys(after).length >= Object.keys(before).length + PERTURB.length,
+      `only ${Object.keys(after).length - Object.keys(before).length} notebooks arrived ` +
+      `out of ${PERTURB.length} — the perturbation did not take`);
+    assert.ok(survivors.some(id => after[id].y !== before[id].y),
+      'not one card moved vertically, so the packing was never re-run — this test proves nothing');
+
+    const moved = survivors.filter(id => after[id].x !== before[id].x);
+    assert.deepStrictEqual(moved, [],
+      'these notebooks changed column when unrelated ones were created: ' +
+      moved.map(id => `${id} ${before[id].x}->${after[id].x}`).join(', '));
+  });
+});
+
 test('a focused child says where it sits, and the parent link works', async () => {
   await withPage(browser, 'structure-line', async (page) => {
     await bootedShell(page, server.url);

@@ -1186,6 +1186,21 @@ function clusterTree(){
 }
 
 // ---------------- layout (focus / overview zoom) ----------------
+// A root cluster keeps the column it is already in. Packing each one into
+// whichever column was shortest RIGHT NOW made a cluster's column depend on
+// every cluster placed before it, so creating one notebook could move a
+// different one a full column across the screen — measured on a 35-notebook
+// corpus, space:pub-pop went from x=72 to x=569 when an unrelated notebook was
+// created. Two things perturbed the packing order: /api/state's :spaces comes
+// from a hash map, so a new notebook lands at an arbitrary index rather than
+// last; and any cluster growing taller re-routed every cluster after it.
+// A root with no column yet still takes the shortest one — only the
+// re-deciding was wrong.
+//
+// The cost is balance: nothing here ever re-balances, so the columns drift
+// apart as notebooks accumulate. That is the trade — a still overview that is
+// somewhat uneven beats a balanced one that moves under you.
+let colOf={};   // root id -> column index
 function layout(){
   const vw=innerWidth, vh=innerHeight, top=124;
   // before anything is placed: the strip is a row of the page, not something
@@ -1227,9 +1242,15 @@ function layout(){
     const kidH=n=>{ const p=panels[n.i];
       p.style.width=KW+'px'; p.classList.add('kid');
       return Math.max(66, p.querySelector('.p-head').scrollHeight+3); };
-    // pack each cluster into whichever column is currently shortest — measured
-    // as it is placed, so no height needs predicting
+    // pack each cluster into the column it already has, or — for one that has
+    // none yet — into whichever is currently shortest, measured as it is
+    // placed, so no height needs predicting
     const colY=[padTop,padTop,padTop], spines=[];
+    // ids that are no longer notebooks would otherwise pile up for the life of
+    // the page. The prune is for size only: a stale entry is never consulted,
+    // because only current roots are looked up.
+    const live=new Set(STATE.spaces.map(sp=>sp.id));
+    Object.keys(colOf).forEach(id=>{ if(!live.has(id)) delete colOf[id]; });
     const place=(n,x,y,w,h)=>{
       const p=panels[n.i];
       p.style.width=w+'px'; p.style.height=h+'px';
@@ -1239,7 +1260,13 @@ function layout(){
       return y+h*s;
     };
     roots.forEach(r=>{
-      const c=colY.indexOf(Math.min(...colY));
+      // clusterTree's nodes are {i,sp,kids} with sp===STATE.spaces[i]
+      const id=r.sp.id;
+      // the c>=colY.length arm only matters if the column count ever shrinks —
+      // it is a hard-coded 3 today (see colW above), so it is a guard, not a
+      // live path; it keeps a remembered index from pointing off the end.
+      let c=colOf[id];
+      if(c===undefined||c>=colY.length){ c=colY.indexOf(Math.min(...colY)); colOf[id]=c; }
       const x=padX+c*(colW+COLGAP);
       const top0=colY[c];
       let y=place(r,x,top0,PW,PH)+KGAP;
