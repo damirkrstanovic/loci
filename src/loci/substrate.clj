@@ -100,6 +100,26 @@
 (defmethod apply-event :put     [st {:keys [id value]}] (assoc-in st [:objects id] value))
 (defmethod apply-event :assoc   [st {:keys [id path value]}] (assoc-in st (into [:objects id] path) value))
 (defmethod apply-event :delete  [st {:keys [id]}] (update st :objects dissoc id))
+;; Appending is computed HERE, at apply time, not when the event was built. The
+;; old form read the whole cell vector and emitted a whole new one, so two
+;; concurrent appends each wrote their own idea of the whole and one was lost —
+;; measured, 24 concurrent appends left 6 cells. Deciding the effect at apply
+;; time means it is decided wherever the event is already ordered: inside
+;; DatalevinStore's commit lock, or in the fold over an EDN log the append to
+;; the log vector has itself ordered. Never in a read taken before the race.
+;;
+;; The effect depends only on the event and the prior state, which is what this
+;; multimethod's docstring demands: `object-at` folds only the events that
+;; touched one id, so a method that read anything else would answer a wrong
+;; past rather than an error.
+;;
+;; :seed is used only when the path is ABSENT, which is how a legacy notebook
+;; (:members, no :cells) gets normalized without a separate racing write. Two
+;; writers that both saw it absent carry the same seed, so whichever lands first
+;; seeds it and the second simply appends.
+(defmethod apply-event :append  [st {:keys [id path value seed]}]
+  (update-in st (into [:objects id] path)
+             (fn [cur] (conj (vec (or cur seed)) value))))
 ;; a transaction — several sub-events committed atomically as ONE undoable step
 (defmethod apply-event :tx      [st {:keys [events]}] (reduce apply-event st events))
 (defmethod apply-event :default [st _] st)

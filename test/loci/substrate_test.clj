@@ -252,6 +252,87 @@
       (is (= [] (get-in (sub/object s "s") [:value :cells])) label)
       (close s))))
 
+;; ---------------------------------------------------------------------------
+;; :append — the op whose effect is computed at APPLY time
+;;
+;; That is the whole point (the read-modify-write lands inside commit!'s lock),
+;; and it is also the risk: an op whose effect depended on anything but the
+;; event and the prior state would make a replay disagree with the live fold,
+;; and `as-of` / `object-at` would answer a wrong past rather than an error.
+;; ---------------------------------------------------------------------------
+
+(deftest append-replays-to-the-cells-it-showed-live
+  (with-flavours [label open reopen close]
+    (let [s    (open)
+          seen (atom [])
+          look #(get-in (sub/object s "s") [:value :cells])]
+      (sub/commit! s {:op :put :id "s" :value {:id "s" :kind :space :value {:cells []}}})
+      (swap! seen conj (look))
+      (doseq [r ["a" "b" "c"]]
+        (sub/commit! s {:op :append :id "s" :path [:value :cells] :value {:ref r}})
+        (swap! seen conj (look)))
+      (is (= [[] [{:ref "a"}] [{:ref "a"} {:ref "b"}] [{:ref "a"} {:ref "b"} {:ref "c"}]]
+             @seen)
+          label)
+      ;; every prefix, re-folded now, equals what the store showed at the time
+      (doseq [n (range 1 5)]
+        (is (= (@seen (dec n)) (get-in (sub/as-of s n) [:objects "s" :value :cells]))
+            (str label " as-of " n)))
+      (is (= (sub/state s) (sub/materialize (sub/history s))) label)
+      ;; and it survives the write path: pr-str/read on the EDN log, nippy on
+      ;; Datalevin. A store reopened from disk folds to the same present.
+      (let [s2 (reopen s)]
+        (is (= :append (:op (nth (sub/history s2) 1))) label)
+        (is (= [{:ref "a"} {:ref "b"} {:ref "c"}] (get-in (sub/object s2 "s") [:value :cells]))
+            label)
+        (is (= (sub/state s) (sub/state s2)) label)
+        (close s2)))))
+
+(deftest append-seeds-an-absent-path-once
+  ;; :seed exists for the legacy notebook (:members, no :cells): it normalizes
+  ;; the old shape without a separate racing write. Used ONLY when the path is
+  ;; absent, so a second writer carrying the same seed just appends.
+  (with-flavours [label open _ close]
+    (let [s (open)]
+      (sub/commit! s {:op :put :id "s" :value {:id "s" :kind :space :value {:members ["a"]}}})
+      (sub/commit! s {:op :append :id "s" :path [:value :cells]
+                      :value {:ref "b"} :seed [{:ref "a"}]})
+      (sub/commit! s {:op :append :id "s" :path [:value :cells]
+                      :value {:ref "c"} :seed [{:ref "a"}]})
+      (is (= [{:ref "a"} {:ref "b"} {:ref "c"}] (get-in (sub/object s "s") [:value :cells])) label)
+      ;; undoing the seeding append takes :cells away again, back to :members
+      (sub/undo! s) (sub/undo! s)
+      (is (nil? (get-in (sub/object s "s") [:value :cells])) label)
+      (is (= ["a"] (get-in (sub/object s "s") [:value :members])) label)
+      (close s))))
+
+(deftest concurrent-appends-survive-both-durable-stores
+  ;; the durable half of the race: 24 threads released together, then the store
+  ;; reopened from disk. Order is asserted only as a set — PersistentStore
+  ;; writes its file outside the swap!, so under concurrency its file order and
+  ;; its RAM order need not agree. What must not vary is that all 24 are there.
+  (with-flavours [label open reopen close]
+    (let [s (open)
+          n 24]
+      (sub/commit! s {:op :put :id "s" :value {:id "s" :kind :space :value {:cells []}}})
+      (let [latch (java.util.concurrent.CountDownLatch. 1)
+            ths   (mapv (fn [i] (Thread. (fn [] (.await latch)
+                                           (sub/commit! s {:op :append :id "s"
+                                                           :path [:value :cells]
+                                                           :value {:ref (str "o" i)}}))))
+                        (range n))]
+        (doseq [t ths] (.start t))
+        (.countDown latch)
+        (doseq [t ths] (.join t)))
+      (let [refs (mapv :ref (get-in (sub/object s "s") [:value :cells]))]
+        (is (= n (count refs)) (str label " — every concurrent append survives"))
+        (is (= n (count (set refs))) (str label " — none duplicated")))
+      (let [s2   (reopen s)
+            refs (mapv :ref (get-in (sub/object s2 "s") [:value :cells]))]
+        (is (= (set (map #(str "o" %) (range n))) (set refs))
+            (str label " — and all of them are durable"))
+        (close s2)))))
+
 (deftest both-stores-keep-state-equal-to-their-log
   ;; the invariant a cached fold can break and a re-fold cannot: what `state`
   ;; returns must be what re-folding the whole log returns. PersistentStore

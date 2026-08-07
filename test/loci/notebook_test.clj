@@ -34,6 +34,90 @@
     (is (= cells (nb/cell-op cells {:op "edit-text" :idx nil :text "x"})))
     (is (= cells (nb/cell-op cells {:op "move" :idx 0 :to nil})))))
 
+;; ---------------------------------------------------------------------------
+;; appending a cell — the race, and the legacy trap the fix has to survive
+;;
+;; `append-cell-event` used to read the whole cell vector and emit a whole new
+;; one, so two concurrent appends each wrote their own idea of the whole and one
+;; was lost: measured, 24 concurrent appends left 6 cells. Reachable today from
+;; a research job and a flow step landing cells in the same notebook.
+;; ---------------------------------------------------------------------------
+
+(defn- appended-refs
+  "Fire `n` appends at one notebook from `n` threads released together, then
+   return the notebook's refs. The latch is what makes them collide: started
+   threads alone would mostly run one after another."
+  [st space-id n prefix]
+  (let [latch (java.util.concurrent.CountDownLatch. 1)
+        ths   (mapv (fn [i]
+                      (Thread. (fn []
+                                 (.await latch)
+                                 (sub/commit! st (nb/append-cell-event
+                                                  st space-id {:ref (str prefix i)})))))
+                    (range n))]
+    (doseq [t ths] (.start t))
+    (.countDown latch)
+    (doseq [t ths] (.join t))
+    (mapv :ref (nb/cells-of (sub/object st space-id)))))
+
+(deftest concurrent-appends-do-not-lose-cells
+  (let [st (sub/fresh-store)
+        n  24]
+    (sub/commit! st {:op :put :id "space:t"
+                     :value {:id "space:t" :kind :space :title "T"
+                             :value {:intent "i" :cells []}}})
+    (let [refs (appended-refs st "space:t" n "obj-")]
+      (is (= n (count refs)) "every concurrently appended cell survives")
+      (is (= n (count (set refs))) "and none is duplicated"))))
+
+(deftest appending-to-a-legacy-notebook-keeps-its-members
+  ;; `cells-of` falls back to :members when a space has no :cells, so appending
+  ;; straight to [:value :cells] would create a one-element vector and orphan
+  ;; every member. The browser harness carries a comment about being bitten by
+  ;; exactly this.
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:old"
+                     :value {:id "space:old" :kind :space :title "Old"
+                             :value {:intent "i" :members ["a" "b" "c"]}}})   ; no :cells
+    (sub/commit! st (nb/append-cell-event st "space:old" {:ref "d"}))
+    (is (= ["a" "b" "c" "d"] (mapv :ref (nb/cells-of (sub/object st "space:old")))))))
+
+(deftest concurrent-appends-to-a-legacy-notebook-keep-everything
+  ;; the nastiest case: every writer sees :cells absent, so every one carries a
+  ;; seed. Whichever lands first seeds; the rest must simply append.
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:old"
+                     :value {:id "space:old" :kind :space :title "Old"
+                             :value {:intent "i" :members ["a" "b"]}}})
+    (let [refs (appended-refs st "space:old" 8 "n")]
+      (is (= ["a" "b"] (take 2 refs)) "the members are still there, still first")
+      (is (= 10 (count refs)) "and all eight new cells landed")
+      (is (= 10 (count (set refs))) "with the seed applied once, not once per writer"))))
+
+(deftest undoing-an-append-removes-exactly-that-cell
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:t"
+                     :value {:id "space:t" :kind :space :title "T"
+                             :value {:intent "i" :cells [{:text "kept"}]}}})
+    (sub/commit! st (nb/append-cell-event st "space:t" {:ref "a"}))
+    (sub/commit! st (nb/append-cell-event st "space:t" {:ref "b"}))
+    (is (= [{:text "kept"} {:ref "a"} {:ref "b"}] (nb/cells-of (sub/object st "space:t"))))
+    (sub/undo! st)
+    (is (= [{:text "kept"} {:ref "a"}] (nb/cells-of (sub/object st "space:t"))))
+    (sub/undo! st)
+    (is (= [{:text "kept"}] (nb/cells-of (sub/object st "space:t"))))))
+
+(deftest undoing-the-seeding-append-leaves-the-legacy-members
+  ;; the append that normalizes :members into :cells must undo back to a
+  ;; notebook that still reads as its three members, not an empty one
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:old"
+                     :value {:id "space:old" :kind :space :title "Old"
+                             :value {:intent "i" :members ["a" "b" "c"]}}})
+    (sub/commit! st (nb/append-cell-event st "space:old" {:ref "d"}))
+    (sub/undo! st)
+    (is (= ["a" "b" "c"] (mapv :ref (nb/cells-of (sub/object st "space:old")))))))
+
 (deftest links-reasons
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "X" :value [{:a 1}]}})

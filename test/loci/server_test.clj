@@ -246,6 +246,17 @@
       (is (str/includes? (:label (second events)) "(+1)"))     ; tx aggregates
       (is (str/includes? (:label (nth events 2)) "doc:n")))))  ; delete labels the id
 
+(deftest append-events-are-labelled-by-their-notebook
+  ;; :append is not one of the shapes `case` used to know, and the default
+  ;; label is the bare op name — the ⏱ scrubber would have read "append"
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:n"
+                     :value {:id "space:n" :kind :space :title "Cosmos" :value {:cells []}}})
+    (sub/commit! st (nb/append-cell-event st "space:n" {:text "hello"}))
+    (let [{:keys [events]} (srv/events-payload st)]
+      (is (= "append" (:op (second events))))
+      (is (str/includes? (:label (second events)) "Cosmos")))))
+
 (deftest fn-apply-stamps-params
   (let [st (store-with-table)
         r  (srv/fn-apply! st "tbl:t" "lib:top" {:by "revenue" :n "1" :order "desc"} "space:n")]

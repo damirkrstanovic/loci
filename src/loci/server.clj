@@ -61,7 +61,9 @@
 (defn- event-label [objs {:keys [op id events]}]
   (case op
     :put    (str "＋ " (title-of objs id))
-    :assoc  (str "✎ " (title-of objs id))
+    ;; :append edits one object the way :assoc does — without this it would fall
+    ;; to the default and the ⏱ scrubber would read "append" with no title
+    (:assoc :append) (str "✎ " (title-of objs id))
     :delete (str "✕ " (or id "object"))
     :tx     (str (event-label objs (first events))
                  (when (> (count events) 1) (str " (+" (dec (count events)) ")")))
@@ -412,6 +414,14 @@
       :else
       (let [cells  (nb/cells-of o)
             cells' (nb/cell-op cells body)]
+        ;; This is the whole-vector rewrite `append-cell-event` stopped doing,
+        ;; and it races the same way: two of these at once and one is lost.
+        ;; Left as is on purpose — reorder and delete have no commutative
+        ;; apply-time form the way append does, so two concurrent reorders
+        ;; genuinely conflict and picking a winner is a design question rather
+        ;; than a bug fix. It is also far less exposed: these come from a person
+        ;; clicking, not from agent jobs running in parallel.
+        ;;
         ;; unknown op / stale idx fall through unchanged — don't commit a phantom event
         (when (not= cells cells')
           (sub/commit! st (nb/set-cells-event space cells')))

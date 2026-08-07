@@ -4,8 +4,9 @@
    Data is never copied into a cell; re-molding a cell is changing its :view.
 
    Legacy {:members [id …]} normalizes to ref cells on read; all writes write
-   :cells. Every mutation is ONE substrate event (the full new :cells vector),
-   hence undoable.
+   :cells. Every mutation is ONE substrate event, hence undoable — appending is
+   an `:append`, whose effect the substrate computes at apply time, while the
+   edit/move/delete path still carries the full new vector (`set-cells-event`).
 
    Links between notebooks are COMPUTED here, never stored: shared refs,
    spawn edges (:spawned-by), and derivation lineage (:from/:via)."
@@ -49,9 +50,15 @@
   {:op :assoc :id space-id :path [:value :cells] :value (vec cells)})
 
 (defn append-cell-event
-  "Event appending one cell to a notebook (normalizes legacy :members)."
+  "Event appending one cell to a notebook. The new cell vector is computed when
+   the event is APPLIED, not here, so two concurrent appends cannot overwrite
+   each other — this used to emit the whole new vector, and 24 concurrent
+   appends left 6 cells. :seed carries the normalized legacy :members and is
+   read only if :cells is still absent when the event lands."
   [st space-id cell]
-  (set-cells-event space-id (conj (cells-of (sub/object st space-id)) cell)))
+  (let [o (sub/object st space-id)]
+    (cond-> {:op :append :id space-id :path [:value :cells] :value cell}
+      (nil? (get-in o [:value :cells])) (assoc :seed (cells-of o)))))
 
 (defn links
   "Connectedness for one notebook: {:connected [{:id :title :reasons […]}]
