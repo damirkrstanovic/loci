@@ -44,6 +44,41 @@ npm install            # once; pulls playwright-core, downloads no browser
 npm run test:browser
 ```
 
+### Packaged
+
+```bash
+# a single jar that runs from anywhere
+clojure -T:build uber
+java -jar target/loci-standalone.jar          # PORT and LOCI_DATA are honoured
+
+# or in a container, with the substrate on a volume
+docker build -t loci .
+docker run -p 7777:7777 -v loci-data:/data loci
+```
+
+The jar carries `Enable-Native-Access: ALL-UNNAMED` in its manifest, standing in
+for the `--enable-native-access=ALL-UNNAMED` that `deps.edn` supplies per-alias
+and that a bare `java -jar` has no alias to get. It is not what makes Datalevin
+work: measured on JDK 26, LMDB opens without it and merely warns that a
+restricted method was called. What the attribute buys is a quiet startup now,
+and a jar that keeps running when a future JDK blocks restricted native access
+instead of warning about it. (The JDK honours it only for `java -jar` — launched
+as `java -cp loci-standalone.jar loci.server` it is ignored, and the warnings
+come back.)
+
+`LOCI_DATA` defaults to a **relative** `data/`, so a jar launched from elsewhere
+starts an empty substrate rather than finding yours — the startup line prints
+which directory it opened, for exactly that reason. The image declares
+`VOLUME /data`, so even an unmounted `docker run` keeps its substrate across
+`docker restart`; but that anonymous volume belongs to the container, and
+replacing the container (or `--rm`) starts again from the seed. Mount a named
+volume to keep a substrate that outlives it.
+
+Both API keys are read from `DEEPSEEK_API_KEY` and `SEARCH_API_KEY`/`TAVILY_API_KEY`
+before falling back to files in the working directory; pass them with `-e` rather
+than baking them into an image. `.dockerignore` keeps the repo's own `.deepseek-key`
+and `.tavily-key` out of the build context for the same reason.
+
 `clojure -M:serve` persists its state under `data/` — the substrate is a
 Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
 `data/memory.edn`. Delete that directory to reset to a clean slate. A pre-2026-08

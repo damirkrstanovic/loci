@@ -1,0 +1,13 @@
+# A security boundary, not an optimisation: .deepseek-key and .tavily-key are
+# real (gitignored) secrets in the repo root, and anything the build context
+# carries can be baked into a layer that survives docker push.
+data/
+target/
+node_modules/
+.git/
+.cpcache/
+.clerk/
+.deepseek-key
+.deepseek-model
+.tavily-key
+test/browser/failures/
