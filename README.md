@@ -84,6 +84,12 @@ deliberately keeps them out of the build context:
 | `LOCI_LLM_API_KEY` | `DEEPSEEK_API_KEY`, then `.deepseek-key` | *unset — the agent refuses with "no LLM key"* |
 | `DEEPSEEK_MODEL` | `.deepseek-model` | `deepseek-v4-flash` |
 | `SEARCH_API_KEY` / `TAVILY_API_KEY` | `.tavily-key` | *unset — research falls back to no web search* |
+| `LOCI_EMBED_ENDPOINT` | `.embed-endpoint` | *unset — semantic recall is off; recall stays lexical* |
+| `LOCI_EMBED_MODEL` | `.embed-model` | `embed-qwen3-0.6b` |
+| `LOCI_EMBED_API_KEY` | `LOCI_LLM_API_KEY` | *unset — sent with no `Authorization` header* |
+| `LOCI_RERANK_ENDPOINT` | `.rerank-endpoint` | *unset — rerank is skipped* |
+| `LOCI_RERANK_MODEL` | `.rerank-model` | `rerank-bge-m3` |
+| `LOCI_RERANK_API_KEY` | `LOCI_EMBED_API_KEY`, then `LOCI_LLM_API_KEY` | *unset — no header* |
 | `LOCI_DATA` | — | a **relative** `data/` |
 | `PORT` | — | `7777` |
 
@@ -105,6 +111,21 @@ so a token for your own server need not be filed under a vendor you are not usin
 `DEEPSEEK_MODEL` is also the one that fails quietly. A missing key is refused out loud, but
 a missing model is not: the container simply runs `deepseek-v4-flash`, which is very likely
 not the model your endpoint serves. Pass it whenever you pass the key.
+
+**The embedder takes its own token, and that is the point rather than a nicety.** The obvious
+deployment is a hosted chat model beside a local embedder — two operators, two credentials —
+so `LOCI_EMBED_API_KEY` need not be filed under the chat provider. `LOCI_LLM_API_KEY` remains
+the single-provider shortcut, and rerank falls back to the embed key because it is usually
+the same box. An unset key means the request carries **no** `Authorization` header rather
+than an empty one: a llama.cpp started without `--api-key` rejects an empty bearer, which
+would turn "no key needed" into a 401 that reads like a wrong key. For the same reason an
+*empty* value counts as unset — `LOCI_EMBED_ENDPOINT=` in a `loci.env` leaves semantic recall
+off rather than aiming loci at an empty URL. The two endpoints are optional independently of
+each other: with embed but no rerank, fusion runs and rerank is skipped.
+
+Semantic recall is landing in phases, and these six variables are the first of them: today
+they resolve and nothing else — the retriever that consumes them comes next, so setting them
+does not yet change what `recall` returns.
 
 Configuration goes in **`loci.env`** — gitignored, and excluded from the build context, so
 it is never baked into a layer:
