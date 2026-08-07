@@ -18,7 +18,14 @@
    call the embedder at all, so a fact is recorded whether or not an embedder
    exists; `embed-pending!` sweeps afterwards and is resumable, because a fact
    that failed simply still has no :vec. Nothing here starts on require —
-   `start-embed-worker!` is explicit and `stop-embed-worker!` undoes it."
+   `start-embed-worker!` is explicit and `stop-embed-worker!` undoes it.
+
+   The same worker then merges what the vectors say is the same fact
+   (`merge-similar!`), at a threshold that belongs to **one** embedding model
+   and is refused for a model nobody has measured. The older fact survives and
+   the absorbed one's id and text land on it as :merged-from, so a merge is
+   auditable and reversible; the absorbed id keeps a tombstone in the log, which
+   is what stops it being reissued to a different fact later."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.set :as set]
@@ -82,25 +89,49 @@
 
 (def ^:private id-pattern #"mem-(\d+)")
 
+(defn- id-ordinal
+  "The <n> of a mem-<n> id, or nil for an id in any other shape."
+  [id]
+  (when-let [[_ n] (re-matches id-pattern (str id))] (parse-long n)))
+
 (defn- next-id
   "One past the largest id ever issued — not (inc (count …)).
 
    Counting is collision-free only while nothing is ever deleted. Delete mem-2
    of three facts and the count is 2, so the next remember mints mem-3 and
    overwrites a *different, still-live* fact: same id, last line wins, the
-   original text gone with no error anywhere. The semantic merge in the design's
-   §4 deletes the absorbed fact, so this stops being hypothetical there.
+   original text gone with no error anywhere. The semantic merge below deletes
+   the absorbed fact, so this is no longer hypothetical — which is why the
+   absorbed fact leaves a tombstone in the map rather than vanishing from it.
+   `facts` here is the whole map, tombstones included, and must stay that way.
 
    An id that is not mem-<n> contributes nothing to the maximum rather than
    throwing; there are none today, and a hand-edited log should not brick
    remembering."
   [facts]
   (str "mem-"
-       (inc (reduce (fn [hi id]
-                      (if-let [[_ n] (re-matches id-pattern (str id))]
-                        (max hi (parse-long n))
-                        hi))
-                    0 (keys facts)))))
+       (inc (reduce (fn [hi id] (max hi (or (id-ordinal id) 0))) 0 (keys facts)))))
+
+;; ----------------------------------------------------------------------------
+;; tombstones — how an absorbed fact stops being a fact
+;; ----------------------------------------------------------------------------
+
+(defn- merged-away?
+  "True for a record the semantic merge absorbed into another one.
+
+   The log is append-only and last-wins by :id, so a merge cannot remove a line;
+   it appends a final record for the absorbed id carrying `:merged-into`. That
+   record stays in the map — `next-id` counts it, so the id is never reissued —
+   and every reader of the facts filters it out through `live`."
+  [f]
+  (some? (:merged-into f)))
+
+(defn- live
+  "The records that are facts: everything the merge has not absorbed. Every path
+   that reads the map goes through this, because a tombstone still carries the
+   absorbed text and anything scanning texts would otherwise match it."
+  [facts]
+  (remove merged-away? facts))
 
 ;; ----------------------------------------------------------------------------
 ;; embedding — after the write, never during it
@@ -230,10 +261,201 @@
            :pending  (count (pending-facts m model))
            :model    model})))))
 
+;; ----------------------------------------------------------------------------
+;; semantic merge — after a pass, in the worker, never on the write path
+;; ----------------------------------------------------------------------------
+
+(def merge-thresholds
+  "Cosine at or above which two facts are taken to be the same fact — **per
+   embedding model**, because a threshold belongs to the space that produced the
+   numbers and does not travel to another one.
+
+   Measured 2026-08-07 over the 80 facts in the author's memory, all pairs
+   scored, the top pairs read and labelled by hand (the spec's §5.1.1). The
+   global distributions of the two models are nearly identical — median 0.298
+   against 0.291, p99 0.741 both — which is exactly what makes carrying a number
+   across look safe. The tail is what moved: one pair of genuinely *distinct*
+   facts, Kepler's Third Law stated against an observation the law explains,
+   scored 0.829 under the 0.6b and 0.868 under the 4b. A 0.85 calibrated on the
+   first and reused on the second merges them and destroys the law's
+   formulation, and nothing anywhere reports that it happened.
+
+   These two numbers were chosen deliberately above what `loci.calibrate`'s
+   `suggest-threshold` returns on the same labelled pairs (~0.835 for the 0.6b).
+   Only the top pairs were labelled, so the 0.83–0.85 band is unexamined; the
+   table is the authority and is not recomputed from the labels.
+
+   A model that is not a key here has no threshold, and `merge-similar!` refuses
+   rather than borrowing the nearest one. `embed-bge-m3` is the live example: it
+   is in use and it is uncalibrated. An unmerged corpus is redundant; a wrongly
+   merged one has lost something."
+  {"embed-qwen3-0.6b" 0.85
+   "embed-qwen3-4b"   0.88})
+
+(defn merge-threshold
+  "The calibrated merge threshold for `model`, or nil when there is none.
+
+   nil is the answer to \"what should I use for a model nobody measured\", and
+   every caller has to handle it. Re-measure with `loci.calibrate/calibrate!`
+   and add the result here."
+  [model]
+  (get merge-thresholds model))
+
+(defn- older
+  "Whichever of `a` and `b` survives a merge: the older by `:ts`.
+
+   The survivor holds the provenance — it is the fact the `:source` was recorded
+   against, and the one whose id anything outside memory may already refer to.
+   A tie is broken by id ordinal so that the choice is deterministic rather than
+   an accident of map iteration; a non-mem id sorts last and then by string."
+  [a b]
+  (let [k (fn [f] [(:ts f 0) (or (id-ordinal (:id f)) Long/MAX_VALUE) (str (:id f))])]
+    (if (neg? (compare (k a) (k b))) a b)))
+
+(defn- absorb
+  "The survivor as it stands after taking `gone` into itself.
+
+   `:fact` is deliberately *not* touched. The survivor's vector describes the
+   survivor's text, and rewriting the text here would leave a vector pointing at
+   a sentence that is no longer stored — the same mismatch `remember` drops a
+   vector to avoid.
+
+   `:merged-from` carries the absorbed fact whole, minus its embedding: id and
+   text so the merge is auditable and reversible, `:strength`, `:entities` and
+   `:source` so what was folded in can be told apart from what was already
+   there. The absorbed fact's own `:merged-from` comes along, or a chain of
+   merges would drop everything but the last step."
+  [survivor gone]
+  (-> survivor
+      (assoc :ts (max (:ts survivor 0) (:ts gone 0)))
+      (assoc :strength (+ (:strength survivor 1) (:strength gone 1)))
+      (assoc :entities (vec (distinct (concat (:entities survivor) (:entities gone)))))
+      (assoc :merged-from (-> (vec (:merged-from survivor))
+                              (conj (dissoc gone :vec :model :dim :merged-from))
+                              (into (:merged-from gone))))))
+
+(defn- apply-merge!
+  "Fold `gone` into `keep` in the atom and append both records. Returns true
+   when it happened.
+
+   The guard is `store-vector!`'s: both facts must still be exactly the ones
+   that were scored. A reinforcement that landed while the pass was computing
+   cosines may have rewritten either text, and the vectors that justified this
+   merge describe the texts as they were. Rather than merge on stale evidence it
+   declines, and the next pass — over the new text, with a fresh vector —
+   decides again.
+
+   Two appends, not a rewrite: the survivor's updated record, and the absorbed
+   id's tombstone. Reload is last-wins by :id, so this is the same mechanism
+   reinforcement and embedding already use."
+  [{:keys [!facts file]} keep gone]
+  (let [kid (:id keep)
+        gid (:id gone)
+        [before after]
+        (swap-vals! !facts
+                    (fn [fs]
+                      (let [k (get fs kid)
+                            g (get fs gid)]
+                        (if (and k g
+                                 (= (:fact k) (:fact keep))
+                                 (= (:fact g) (:fact gone))
+                                 (not (merged-away? k))
+                                 (not (merged-away? g)))
+                          (-> fs
+                              (assoc kid (absorb k g))
+                              ;; the tombstone keeps the text so a person reading
+                              ;; the log sees what was absorbed and where it
+                              ;; went; the survivor's :merged-from is what makes
+                              ;; it recoverable in memory
+                              (assoc gid {:id gid :fact (:fact g) :ts (:ts g)
+                                          :merged-into kid}))
+                          fs))))]
+    (when-not (identical? before after)
+      (append-line! file (get after kid))
+      (append-line! file (get after gid))
+      true)))
+
+(defn merge-similar!
+  "Merge the facts whose vectors say they are the same fact. Returns
+
+     {:merged n :considered n :model \"…\" :threshold t :pairs [{…}]}
+     {:merged 0 :considered n :model \"…\" :refused \"…\"}   no calibrated threshold
+
+   and never throws.
+
+   **It refuses a model it has no measured threshold for**, warns once, and
+   merges nothing — it does not fall back to the nearest number in the table and
+   it does not guess. See `merge-thresholds` for what that would cost.
+
+   Only facts carrying a vector stamped with `model` are considered, so two
+   embedding spaces are never compared: cosine across them still returns a
+   number that sorts, and at these thresholds it would sort into a merge. Facts
+   awaiting an embedding are simply not in the pass and are reconsidered once
+   they have one. Two vectors of different length — which under one model name
+   would mean the log has been hand-edited — score 0.0 in `loci.embed/cosine`
+   and so cannot reach any threshold; this fails closed rather than refusing,
+   because there is nothing here to destroy by declining to merge.
+
+   Pairs are applied highest score first, and a fact absorbed in this pass takes
+   no further part in it: if A absorbs B and B also scored above the threshold
+   against C, C is left for the next pass, where it is compared against A — the
+   survivor, whose text and vector are unchanged. Merging along a chain inside
+   one pass would depend on the order the pairs happened to be visited.
+
+   O(n²) cosines per call, on the worker's interval and on no request path.
+   Measured 2026-08-07 at 1024 dimensions, every pair scored and none merged:
+   80 facts (3,160 pairs) 38 ms, 500 facts (124,750 pairs) 1.5 s. At 15-second
+   intervals that second figure is a tenth of a core spent re-deciding what was
+   already decided, so somewhere in the low thousands of facts this needs to
+   compare only what has changed — a smaller interval is not the fix."
+  ([m] (merge-similar! m (embed/embed-model)))
+  ([m model]
+   (let [facts (filterv #(not (awaiting? % model)) (mold/all-facts m))]
+     (if-let [t (merge-threshold model)]
+       (let [v     (vec (sort-by (juxt :ts :id) facts))
+             n     (count v)
+             above (->> (for [i (range n)
+                              j (range (inc i) n)
+                              :let [a (nth v i)
+                                    b (nth v j)
+                                    c (embed/cosine (:vec a) (:vec b))]
+                              :when (>= c t)]
+                          {:score c :a a :b b})
+                        (sort-by (juxt (comp - :score) (comp :id :a) (comp :id :b)))
+                        vec)
+             r     (reduce (fn [acc {:keys [score a b]}]
+                             (if (or (contains? (:gone acc) (:id a))
+                                     (contains? (:gone acc) (:id b)))
+                               acc
+                               (let [keep (older a b)
+                                     gone (if (identical? keep a) b a)]
+                                 (if (apply-merge! m keep gone)
+                                   (-> acc
+                                       (update :gone conj (:id gone))
+                                       (update :pairs conj {:survivor (:id keep)
+                                                            :absorbed (:id gone)
+                                                            :score    score}))
+                                   acc))))
+                           {:gone #{} :pairs []} above)]
+         {:merged     (count (:gone r))
+          :considered n
+          :model      model
+          :threshold  t
+          :pairs      (:pairs r)})
+       (let [msg (str "no merge threshold is calibrated for the embedding model \"" model
+                      "\", so nothing is merged — a threshold belongs to one model and the "
+                      "nearest number from another one would merge facts that are not the "
+                      "same fact. Calibrated: "
+                      (str/join ", " (sort (keys merge-thresholds)))
+                      ". Measure this model with loci.calibrate and add it to "
+                      "loci.memory/merge-thresholds.")]
+         (warn-once! msg)
+         {:merged 0 :considered (count facts) :model model :refused msg})))))
+
 (defn start-embed-worker!
   "Start one background thread that runs `embed-pending!` on `m` every
-   `:interval-ms` (default 15 s) until stopped. Returns a handle to pass to
-   `stop-embed-worker!`.
+   `:interval-ms` (default 15 s), then `merge-similar!` when that pass
+   succeeded, until stopped. Returns a handle to pass to `stop-embed-worker!`.
 
    Explicit on purpose. Requiring this namespace starts nothing: a namespace
    that spawns on load leaves a thread behind in every process that merely read
@@ -242,7 +464,13 @@
    It polls rather than being woken by `remember`, so `remember` holds no
    reference to the worker at all — there is nothing there for a later edit to
    make it wait on. A pass with nothing pending makes no HTTP request, so the
-   idle cost is a scan of the facts.
+   idle cost is a scan of the facts and the merge's cosines.
+
+   **Merge only follows a pass that worked.** An embedder that is off or not
+   answering leaves part of the corpus without vectors, and merging the part
+   that has them is deciding on evidence that is missing for the rest. The cost
+   of waiting is that a corpus stays redundant until the embedder is back, which
+   is the cheap error.
 
    The thread is a daemon: a worker parked in a 30-second request must not be
    what keeps the JVM alive."
@@ -253,7 +481,9 @@
          t    (Thread. ^Runnable
                        (fn []
                          (while @run?
-                           (try (embed-pending! m)
+                           (try (let [r (embed-pending! m)]
+                                  (when-not (or (:off r) (:error r))
+                                    (merge-similar! m)))
                                 (catch Throwable e
                                   (warn-once! (str "the embedding worker threw: " e))))
                            (when @run?
@@ -444,8 +674,11 @@
   ;; file append, and `embed-pending!` catches up afterwards.
   (remember [_ fact opts]
     (let [ft  (tokens fact)
+          ;; `live`, not every record: a tombstone still carries the absorbed
+          ;; text, and reinforcing one would put a merged-away fact back into
+          ;; circulation under an id the merge already accounted for.
           dup (some (fn [f] (when (>= (jaccard ft (tokens (:fact f))) 0.6) f))
-                    (vals @!facts))
+                    (live (vals @!facts)))
           rec (if dup
                 (cond-> (-> dup
                             (assoc :fact fact :ts (System/currentTimeMillis))
@@ -483,7 +716,7 @@
     (let [now        (System/currentTimeMillis)
           k          (or (:k opts) 6)
           qt         (tokens query)
-          candidates (scoped (vals @!facts) opts)
+          candidates (scoped (live (vals @!facts)) opts)
           ;; today's scorer, unchanged, over the eligible facts
           lex        (->> candidates
                           (map #(assoc % :score (score qt now %)))
@@ -526,7 +759,7 @@
                    (take k)
                    vec
                    (#(with-meta % (merge {:semantic :ok} st))))))))))
-  (all-facts [_] (->> (vals @!facts) (sort-by :ts >) vec)))
+  (all-facts [_] (->> (vals @!facts) live (sort-by :ts >) vec)))
 
 (defn file-memory
   ([] (file-memory (str (sub/data-dir) "/memory.edn")))
