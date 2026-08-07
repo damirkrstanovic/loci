@@ -62,13 +62,24 @@ Following the pattern `LOCI_LLM_ENDPOINT` already established:
 |---|---|---|
 | `LOCI_EMBED_ENDPOINT` | `.embed-endpoint` | *unset — semantic recall is off* |
 | `LOCI_EMBED_MODEL` | `.embed-model` | `embed-qwen3-0.6b` |
+| `LOCI_EMBED_API_KEY` | `LOCI_LLM_API_KEY` | *unset — sent without an Authorization header* |
 | `LOCI_RERANK_ENDPOINT` | `.rerank-endpoint` | *unset — rerank is skipped* |
 | `LOCI_RERANK_MODEL` | `.rerank-model` | `rerank-bge-m3` |
+| `LOCI_RERANK_API_KEY` | `LOCI_EMBED_API_KEY`, then `LOCI_LLM_API_KEY` | *unset — no header* |
 
-The key is `LOCI_LLM_API_KEY`, already resolved. **Both endpoints are optional and
-independently so**: with neither, loci behaves exactly as it does today; with embed but no
-rerank, fusion runs and rerank is skipped. Degrading is reported in `/api/memory`, never
-hidden.
+**The embedder gets its own token, and this is the point rather than a nicety.** The obvious
+deployment is a hosted chat model and a local embedder — DeepSeek plus `lizard10.local` —
+and those are two different credentials against two different operators. Falling back to
+`LOCI_LLM_API_KEY` keeps the single-provider case to one variable; rerank falls back to the
+embed key because they are usually the same box.
+
+An unset key means the request is sent with **no** `Authorization` header, not with an empty
+one. A local llama.cpp started without `--api-key` rejects an empty bearer, so sending one
+would turn "no key needed" into a 401 that reads like a wrong key.
+
+**Both endpoints are optional and independently so**: with neither, loci behaves exactly as
+it does today; with embed but no rerank, fusion runs and rerank is skipped. Degrading is
+reported in `/api/memory`, never hidden.
 
 ## 2. Storage
 
