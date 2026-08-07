@@ -74,6 +74,37 @@ which directory it opened, for exactly that reason. The image declares
 replacing the container (or `--rm`) starts again from the seed. Mount a named
 volume to keep a substrate that outlives it.
 
+The container runs as an unprivileged `loci` (uid 999), not root. `/data` is
+chowned to it *before* `VOLUME` is declared, which is what makes a freshly
+created volume inherit that ownership — verified by committing an event through
+`POST /api/connect` inside the container and finding it still there after
+`docker restart`. A `HEALTHCHECK` asks `/api/state` for a 200, so a healthy
+container means the JVM is up *and* LMDB opened. It uses bash's `/dev/tcp`
+rather than curl, which this base image does not have and which is not worth
+installing to check a port; the cost is that it reads the status line only, not
+the body. `start-period` is 45 s — measured cold starts on this machine ranged
+from about 3 s to 13.6 s, and the margin is deliberate.
+
+**The jar in the image is not portable.** The Dockerfile builds it with
+`clojure -T:build uber :slim true`, which excludes the native libraries for
+every platform but linux-x86_64: Datalevin ships linux-arm64, macosx-arm64 and
+windows-x86_64 alongside it, zstd-jni ships 18 architectures and JNA 24.
+Measured 2026-08-07: 51 files, 80.7 MB → 63.9 MB of jar, 445 MB → 428 MB of
+image. That is a smaller saving than the uncompressed `unzip -l` sizes
+(44.9 MB) suggest, because the jar stores them deflated — 17.0 MB compressed is
+what actually leaves.
+Nothing checks the platform at runtime — a slim jar on arm64 or macOS fails
+when Datalevin first loads libdtlv, not at startup — so the manifest records
+which kind it is:
+
+```bash
+unzip -p target/loci-standalone.jar META-INF/MANIFEST.MF | grep Loci-Platform
+# Loci-Platform: linux-x86_64   (slim)   or   Loci-Platform: any   (portable)
+```
+
+Plain `clojure -T:build uber` still builds the portable jar, and that is the
+default; only the Dockerfile opts in.
+
 **Configuration is read from the environment first, then from files in the working
 directory** — and a container has neither of those files, because `.dockerignore`
 deliberately keeps them out of the build context:
