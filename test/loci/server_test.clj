@@ -1245,6 +1245,22 @@
   (is (nil? (resolved #'agent/api-key {} {}))
       "nothing configured resolves to nothing — request throws, it does not guess"))
 
+(deftest a-blank-llm-value-is-unset-not-a-configured-empty-string
+  ;; loci.env.example ships `LOCI_LLM_API_KEY=` empty, and "" is truthy in
+  ;; Clojure — so an empty key resolved to "" and the request went out as
+  ;; `Authorization: Bearer `, which a llama.cpp started without --api-key
+  ;; rejects. The honest "no LLM key" error never fired and the user saw a 401
+  ;; that reads like a wrong key.
+  (is (nil? (resolved #'agent/api-key {"LOCI_LLM_API_KEY" ""} {}))
+      "an empty key is no key, so request throws the honest error")
+  (is (= "vendor" (resolved #'agent/api-key {"LOCI_LLM_API_KEY" "   " "DEEPSEEK_API_KEY" "vendor"} {}))
+      "a blank value falls through to the next source rather than shadowing it")
+  (is (= "https://api.deepseek.com/chat/completions"
+         (resolved #'agent/endpoint {"LOCI_LLM_ENDPOINT" ""} {}))
+      "an empty endpoint is not a configured empty URL")
+  (is (= "deepseek-v4-flash" (resolved #'agent/model {"DEEPSEEK_MODEL" "  "} {}))
+      "and a blank model does not become the model name"))
+
 (deftest llm-model-still-reads-env-then-file-then-default
   ;; DEEPSEEK_MODEL now names the model on WHATEVER server is configured; the
   ;; variable name is historical, and its resolution order must not have moved.

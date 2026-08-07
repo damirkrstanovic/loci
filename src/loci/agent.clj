@@ -31,21 +31,33 @@
   [k]
   (System/getenv k))
 
+;; A set-but-empty variable is unset. `loci.env.example` ships
+;; `LOCI_LLM_API_KEY=` with no value, and "" is truthy in Clojure — so an empty
+;; key resolved to "" and the request went out as `Authorization: Bearer `,
+;; which a llama.cpp started without --api-key rejects. The honest "no LLM key"
+;; error never fired, and what the user saw was a 401 that reads like a wrong
+;; key. Applied at each site rather than inside `env`, because with-redefs
+;; replaces `env` wholesale and would redefine the check away in the very tests
+;; meant to prove it.
+(defn- non-blank [s] (when-not (str/blank? s) s))
+
 ;; Endpoint, key and model all resolve per call rather than at load. `endpoint`
 ;; used to be a `def`: frozen when the namespace was first required, so it could
 ;; be neither pointed elsewhere nor reached by a test.
 (defn- endpoint []
-  (or (env "LOCI_LLM_ENDPOINT") (from-file ".llm-endpoint")
+  (or (non-blank (env "LOCI_LLM_ENDPOINT")) (non-blank (from-file ".llm-endpoint"))
       "https://api.deepseek.com/chat/completions"))
 
 (defn- model []
-  (or (env "DEEPSEEK_MODEL") (from-file ".deepseek-model") "deepseek-v4-flash"))
+  (or (non-blank (env "DEEPSEEK_MODEL")) (non-blank (from-file ".deepseek-model"))
+      "deepseek-v4-flash"))
 
 (defn- api-key []
   ;; LOCI_LLM_API_KEY first: a token for your own server should not have to be
   ;; filed under a vendor you are not using. The DeepSeek names still resolve,
   ;; so every setup that predates this keeps working with nothing changed.
-  (or (env "LOCI_LLM_API_KEY") (env "DEEPSEEK_API_KEY") (from-file ".deepseek-key")))
+  (or (non-blank (env "LOCI_LLM_API_KEY")) (non-blank (env "DEEPSEEK_API_KEY"))
+      (non-blank (from-file ".deepseek-key"))))
 
 (defn request
   "POST to the configured LLM; return the assistant message map {:content .. :tool_calls ..}."
