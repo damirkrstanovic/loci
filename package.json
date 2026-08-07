@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:browser": "node --test 'test/browser/**/*.test.mjs'"
+    "test:browser": "node --test --test-isolation=none 'test/browser/**/*.test.mjs'"
   },
   "engines": {
     "node": ">=22"

@@ -5,7 +5,13 @@ import assert from 'node:assert/strict';
 import { startServer, launchBrowser, withPage, bootedShell } from './harness.mjs';
 
 let server, browser;
-before(async () => { server = await startServer(); browser = await launchBrowser(); });
+// Its own server, and so its own substrate. Every other browser file now shares one,
+// but the stability test below creates three real notebooks through /api/connect, and
+// those outlive it: run against the shared server, tags.test.mjs then counts a corpus
+// of 19 and fails its "2/14 split" and "1 of 16" assertions (measured, both of them).
+// Leaving that to file ordering would make the suite order-dependent, so this file
+// pays a second cold JVM instead. Setup only — no assertion in this file changes.
+before(async () => { server = await startServer({ fresh: true }); browser = await launchBrowser(); });
 after(async () => { await browser?.close(); await server?.stop(); });
 
 // The shell boots in focus mode, so overview() starts a .5s transform

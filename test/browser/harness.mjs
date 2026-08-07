@@ -111,7 +111,7 @@ function installCleanup() {
   process.on('SIGHUP', () => { reap(); process.exit(129); });
 }
 
-export async function startServer() {
+async function bootServer() {
   installCleanup();
   const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
   const rec = { pid: null, dir };
@@ -148,6 +148,51 @@ export async function startServer() {
   };
 }
 
+// One server for the whole run. `npm run test:browser` passes --test-isolation=none,
+// so node loads every test file into one process and this memo spans the suite: six
+// cold JVMs become two — overview.test.mjs opts out, and says there why. A cold one
+// costs 13.6s from spawn to a live /api/state, measured on an idle machine.
+//
+// This buys resources, not wall time, and the next person to touch it should know
+// that before "fixing" it: measured here the suite takes 104–122s over six parallel
+// worker processes and 121–135s in one serial process. Node was already running the
+// six files concurrently, and --test-isolation=none gives that up. What it does buy
+// is two JVMs and one browser instead of six of each — so the suite stops needing six
+// cores not to thrash, and a reported test duration becomes the test's own work
+// instead of a measure of contention (one read 84.5s under the old layout).
+//
+// Refcounted, not "whoever calls stop() first kills it": node runs every file's root
+// `after` hook, and each one stops the server it was handed. Only the last release
+// reaps. Run one file on its own — `node --test test/browser/tags.test.mjs` — and the
+// count is 1, so that path behaves exactly as it did before.
+//
+// `{ fresh: true }` opts out into a private server and a private substrate.
+let sharedServer = null, serverUsers = 0;
+export async function startServer({ fresh = false } = {}) {
+  if (fresh) return bootServer();
+  serverUsers++;
+  sharedServer ??= bootServer().then(s => ({
+    url: s.url,
+    serverLog: s.serverLog,
+    async stop() { if (--serverUsers === 0) { sharedServer = null; await s.stop(); } },
+  }));
+  return sharedServer;
+}
+
+// One browser too, on the same refcount, for the same reason — a chromium launch
+// per file is pure overhead. newPage() opens a fresh context each time, so pages
+// stay as isolated from each other as they were when every file had its own browser.
+let sharedBrowser = null, browserUsers = 0;
+export async function launchBrowser() {
+  browserUsers++;
+  sharedBrowser ??= chromium.launch({ executablePath: browserPath() });
+  const b = await sharedBrowser;
+  return {
+    newPage: (...a) => b.newPage(...a),
+    async close() { if (--browserUsers === 0) { sharedBrowser = null; await b.close(); } },
+  };
+}
+
 // A browser that is already on disk. Never download one from a test.
 function browserPath() {
   // $PLAYWRIGHT_CHROMIUM is an override, not a hint: falling through to the cache
@@ -173,8 +218,6 @@ function browserPath() {
   }
   throw new Error(`no chromium found. Set $PLAYWRIGHT_CHROMIUM. Tried:\n  ${tried.join('\n  ')}`);
 }
-
-export const launchBrowser = () => chromium.launch({ executablePath: browserPath() });
 
 // A page that reports what went wrong, with a picture.
 export async function withPage(browser, name, fn) {
