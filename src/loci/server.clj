@@ -18,7 +18,13 @@
             [loci.notebook :as nb]
             [loci.substrate :as sub]
             [loci.tools :as tools]
-            [loci.viewspec :as vs]))
+            [loci.viewspec :as vs])
+  ;; :gen-class is what makes `java -jar` possible at all. AOT alone emits
+  ;; loci/server$_main.class but no class *named* loci.server, so the uberjar's
+  ;; Main-Class points at nothing and the jar dies with ClassNotFoundException
+  ;; before a line of loci runs. `clojure -M:serve` never noticed because it
+  ;; loads the namespace instead of a class.
+  (:gen-class))
 
 (defn store [] @c/store)
 
@@ -1262,8 +1268,13 @@
 (defonce server (atom nil))
 
 (defn -main [& _]
-  (let [port 7777]
+  ;; PORT because that is what every container runtime sets. The data directory is
+  ;; printed because a packaged loci defaults to a RELATIVE "data" — launched from
+  ;; the wrong place it silently starts an empty substrate instead of yours, and a
+  ;; line of output is the difference between noticing and not.
+  (let [port (or (some-> (System/getenv "PORT") Integer/parseInt) 7777)
+        dir  (sub/data-dir)]
     (reset! server (http/run-server #'handler {:port port}))
-    (println (str "loci shell on http://localhost:" port "  (substrate: "
-                  (count (sub/history (store))) " events)"))
+    (println (str "loci shell on http://localhost:" port
+                  "  (substrate: " dir ", " (count (sub/history (store))) " events)"))
     @(promise)))

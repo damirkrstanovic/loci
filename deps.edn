@@ -35,4 +35,8 @@
   :start {:extra-paths ["dev" "notebooks"]
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
           :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
-          :exec-fn     user/start}}}
+          :exec-fn     user/start}
+
+  ;; the uberjar:  clojure -T:build uber   ->  target/loci-standalone.jar
+  :build {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.5"}}
+          :ns-default build}}}
