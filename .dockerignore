@@ -11,3 +11,6 @@ node_modules/
 .deepseek-model
 .tavily-key
 test/browser/failures/
+loci.env
+.env
+compose.yaml

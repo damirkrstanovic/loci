@@ -1,0 +1,28 @@
+# docker compose up
+#
+# Configuration lives in `loci.env` (gitignored, never in the build context).
+# Copy `loci.env.example` to `loci.env` and fill it in. Keeping it out of this
+# file means a key never lands in a committed file, in shell history, or in
+# `docker inspect` output shared with someone else.
+services:
+  loci:
+    build: .
+    image: loci
+    env_file:
+      # required:false so `docker compose up` still works with no keys at all —
+      # loci degrades honestly then, refusing agent work rather than pretending
+      - path: loci.env
+        required: false
+    ports:
+      # The container always listens on 7777. Do NOT set PORT in loci.env: it
+      # would move the listener without moving this mapping, and the result is a
+      # container that looks healthy and answers nothing.
+      - "7777:7777"
+    volumes:
+      # named, so the substrate outlives the container — an anonymous volume
+      # survives `docker restart` but dies with the container it belongs to
+      - loci-data:/data
+    restart: unless-stopped
+
+volumes:
+  loci-data:

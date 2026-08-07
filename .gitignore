@@ -8,3 +8,7 @@ data/
 .deepseek-model
 node_modules/
 test/browser/failures/
+
+# real configuration; loci.env.example is the committed template
+loci.env
+.env

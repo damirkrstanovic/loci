@@ -74,10 +74,37 @@ which directory it opened, for exactly that reason. The image declares
 replacing the container (or `--rm`) starts again from the seed. Mount a named
 volume to keep a substrate that outlives it.
 
-Both API keys are read from `DEEPSEEK_API_KEY` and `SEARCH_API_KEY`/`TAVILY_API_KEY`
-before falling back to files in the working directory; pass them with `-e` rather
-than baking them into an image. `.dockerignore` keeps the repo's own `.deepseek-key`
-and `.tavily-key` out of the build context for the same reason.
+**Configuration is read from the environment first, then from files in the working
+directory** — and a container has neither of those files, because `.dockerignore`
+deliberately keeps them out of the build context:
+
+| variable | falls back to | then to |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | `.deepseek-key` | *unset — the agent refuses with "no DeepSeek key"* |
+| `DEEPSEEK_MODEL` | `.deepseek-model` | `deepseek-v4-flash` |
+| `SEARCH_API_KEY` / `TAVILY_API_KEY` | `.tavily-key` | *unset — research falls back to no web search* |
+| `LOCI_DATA` | — | a **relative** `data/` |
+| `PORT` | — | `7777` |
+
+`DEEPSEEK_MODEL` is the one that fails quietly. A missing key is refused out loud, but a
+missing model is not: the container simply runs `deepseek-v4-flash`, which is very likely
+not the model your `.deepseek-model` names. Pass it whenever you pass the key.
+
+Configuration goes in **`loci.env`** — gitignored, and excluded from the build context, so
+it is never baked into a layer:
+
+```bash
+cp loci.env.example loci.env      # then fill in the key
+docker compose up
+
+# the same file without compose
+docker run -p 7777:7777 -v loci-data:/data --env-file loci.env loci
+```
+
+Never bake a key into an image: a layer that carries one survives `docker push` and every
+tag built from it. And do not put `PORT` in `loci.env` — it would move the listener inside
+the container without moving the published mapping, leaving something that looks healthy
+and answers nothing.
 
 `clojure -M:serve` persists its state under `data/` — the substrate is a
 Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
