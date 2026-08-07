@@ -12,6 +12,7 @@
             [org.httpkit.server :as http]
             [loci.agent :as agent]
             [loci.content :as c]
+            [loci.embed :as embed]
             [loci.fnlib :as fnlib]
             [loci.memory :as mem]
             [loci.mold :as mold]
@@ -773,8 +774,14 @@
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
 ;; distill! writes new memory AFTER a flow — async, best-effort, never undone.
+;; :semantic? true here and NOT in leap-payload. This runs once per agent flow,
+;; in front of an LLM call that takes seconds — a 20–50 ms query embedding buys
+;; the agent facts it phrased differently the first time. /api/leap runs on every
+;; keystroke and pays that same 20–50 ms for every character typed, which is why
+;; recall's default is lexical and the two callers differ.
 (defn- remembered-context [prompt]
-  (let [facts (try (mold/recall @mem/memory prompt {:k 6}) (catch Exception _ nil))]
+  (let [facts (try (mold/recall @mem/memory prompt {:k 6 :semantic? true})
+                   (catch Exception _ nil))]
     (when (seq facts)
       (str "\n\nREMEMBERED (distilled from earlier work — cite as ⌾ id when it shapes your answer):\n"
            (str/join "\n" (map #(str "- " (:fact %) " (⌾ "
@@ -1219,6 +1226,33 @@
       (when (str/blank? prompt) {:error "empty prompt"})
       {:job (start-job! #(research! st space prompt))}))
 
+(defn memory-payload
+  "The memory pane: every fact newest-first, or the ranked answer to a query.
+
+   `:semantic? true` because this is a search the user typed and then waited
+   for — the opposite of /api/leap, which calls recall on every keystroke and
+   must not spend a network round trip doing it.
+
+   `:vec` is dropped on the way out. A fact's embedding is ~1024 floats, about
+   20 KB as JSON, and the pane shows text — sending them would turn this
+   response into megabytes for nothing.
+
+   `:awaiting` is how many facts have no vector for the configured model, and
+   `:embedding` is that model or nil. Both, because either alone lies: with no
+   embedder configured every fact is awaiting one forever, and a count with no
+   model beside it reads like a backlog rather than an unconfigured feature."
+  [m q]
+  (let [hits (if (seq q)
+               (mold/recall m q {:k 20 :semantic? true})
+               (mem/all-facts m))]
+    (cond-> {:facts     (mapv #(dissoc % :vec) hits)
+             :awaiting  (count (mem/pending-facts m))
+             :embedding (when (embed/embedding-configured?) (embed/embed-model))}
+      ;; recall marks itself degraded when it asked the embedder something and
+      ;; did not get an answer; saying so is cheaper than a pane that silently
+      ;; shows fewer results than it did yesterday.
+      (:degraded (meta hits)) (assoc :degraded (:degraded (meta hits))))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -1262,14 +1296,7 @@
                                                {:job (start-job! #(suggest-tags! st space))}
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
-      ;; :vec is dropped on the way out. A fact's embedding is ~1024 floats —
-      ;; about 20 KB as JSON — and the memory pane shows text, so sending them
-      ;; would turn this response into megabytes for nothing.
-      (= uri "/api/memory")  (json-resp {:facts (mapv #(dissoc % :vec)
-                                                      (let [qq (params "q")]
-                                                        (if (seq qq)
-                                                          (mold/recall @mem/memory qq {:k 20})
-                                                          (mem/all-facts @mem/memory))))})
+      (= uri "/api/memory")  (json-resp (memory-payload @mem/memory (params "q")))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
@@ -1291,4 +1318,18 @@
     (reset! server (http/run-server #'handler {:port port}))
     (println (str "loci shell on http://localhost:" port
                   "  (substrate: " dir ", " (count (sub/history (store))) " events)"))
+    ;; The embedding backfill, started HERE and nowhere else. loci.memory spawns
+    ;; nothing on require, so a test or a REPL that loads it leaves no thread
+    ;; behind; a server process is the one place that wants a timer.
+    ;;
+    ;; With no embedder configured there is nothing to start and nothing to
+    ;; apologise for — recall is lexical, which is what it was before any of this
+    ;; existed — so it says so instead of starting a thread that would wake every
+    ;; fifteen seconds to discover it has no endpoint. The endpoint itself is not
+    ;; printed: it is a URL a user set, and a URL can carry credentials.
+    (if (embed/embedding-configured?)
+      (do (mem/start-embed-worker! @mem/memory)
+          (println (str "  semantic recall: " (embed/embed-model) ", "
+                        (count (mem/pending-facts @mem/memory)) " fact(s) awaiting embedding")))
+      (println "  semantic recall: off (no LOCI_EMBED_ENDPOINT) — recall is lexical"))
     @(promise)))

@@ -4,9 +4,10 @@
 
    A fact is {:id :fact :entities :source :ts :strength}, and once embedded it
    also carries {:vec :model :dim}. remember reinforces near-duplicates instead
-   of duplicating; recall fuses keyword, entity, recency and strength signals.
-   This is the agent's domain: revisable and decaying — deliberately NOT the
-   substrate, and never touched by undo.
+   of duplicating; recall fuses keyword, entity, recency and strength signals,
+   and — when asked for it with `:semantic? true` — cosine against the query's
+   embedding, by reciprocal rank. This is the agent's domain: revisable and
+   decaying — deliberately NOT the substrate, and never touched by undo.
 
    Persistence is an append-only EDN-lines file; reinforcement appends the
    updated fact under the same :id and load is last-wins by :id. **Embedding is
@@ -43,14 +44,28 @@
   [ts now]
   (/ 1.0 (+ 1.0 (/ (max 0 (- now ts)) (* 30.0 86400000.0)))))
 
-(defn- score [qt now f]
+(defn- relevance
+  "How well `f` matches the query tokens, before recency and strength: 0.6 of the
+   keyword overlap plus 0.4 of the entity overlap, in [0, 1].
+
+   Split out of `score` so the two halves can be applied at different moments.
+   Fusion ranks by this and multiplies by `weight` once at the end; multiplying
+   inside the ranking too would decay every fused fact twice."
+  [qt f]
   (let [kw  (jaccard qt (tokens (:fact f)))
         es  (set (map str/lower-case (:entities f)))
         ent (if (empty? es) 0.0
                 (/ (count (set/intersection qt es)) (double (count es))))]
-    (* (+ (* 0.6 kw) (* 0.4 ent))
-       (decay (:ts f) now)
-       (+ 1.0 (* 0.25 (dec (:strength f 1)))))))
+    (+ (* 0.6 kw) (* 0.4 ent))))
+
+(defn- weight
+  "Recency times the strength bonus — the part of a fact's score that has nothing
+   to do with the query. Applied exactly once on every path."
+  [now f]
+  (* (decay (:ts f) now)
+     (+ 1.0 (* 0.25 (dec (:strength f 1))))))
+
+(defn- score [qt now f] (* (relevance qt f) (weight now f)))
 
 (defn- append-line! [file rec]
   (io/make-parents (io/file file))
@@ -265,6 +280,162 @@
   (not (.isAlive thread)))
 
 ;; ----------------------------------------------------------------------------
+;; recall — words, meaning, and the fusion of the two
+;; ----------------------------------------------------------------------------
+
+(def ^:private rrf-damping
+  "The 60 in 1/(60 + rank) — reciprocal rank fusion's damping constant.
+
+   **Not tuned here.** It is the value the original RRF paper used and that
+   every implementation since has copied, and tuning it is not something that
+   can be done by reading: it needs a set of queries with known-right facts to
+   score against, which loci does not have. What it controls is how much rank 1
+   is worth over rank 10 — at 60 that is 1/61 against 1/70, a 13% edge, so a
+   fact both retrievers place in their top ten beats a fact only one of them
+   places first. A smaller constant makes each retriever's own first place
+   harder to outvote; a larger one flattens everything toward a plain vote
+   count."
+  60)
+
+(def ^:private per-retriever-limit
+  "How deep each retriever's ranking reaches into the fused set.
+
+   The semantic side needs a bound and the lexical side does not: every embedded
+   fact has *some* cosine against any query, so unbounded it would nominate the
+   entire memory and every fact would come back with a nonzero score. A fact
+   that ranks fiftieth by meaning and matched no words is not a recall hit."
+  50)
+
+(def ^:private rerank-window
+  "How many of the fused head the reranker is shown. A reranker reads every
+   document against the query — it is the expensive, accurate step — so it is
+   pointed at the part of the list where the order is still in doubt."
+  20)
+
+(defn- source-ids
+  "The ids a fact's `:source` names. The server records `{:obj … :space …}`, so
+   a fact belongs to both its object and its notebook and either can scope it."
+  [f]
+  (let [s (:source f)]
+    (cond
+      (map? s)  (into #{} (remove nil?) [(:obj s) (:space s)])
+      (some? s) #{s}
+      :else     #{})))
+
+(defn- scoped
+  "The facts a query is allowed to see. `{:filter {:sources #{…}}}` narrows to
+   facts recorded against one of those ids; no `:sources` key means no filter.
+
+   `loci.memory` takes ids rather than a notebook id on purpose — it holds no
+   store and cannot walk the substrate's links, and giving it one would put the
+   record half inside the recall half. The caller that has the store does the
+   traversal and passes the result.
+
+   **An empty set is an empty result.** The caller asked for the facts belonging
+   to a scope that owns none; answering with the whole memory instead would be a
+   scoped recall quietly returning unscoped facts, which is the one failure a
+   scope exists to prevent."
+  [facts opts]
+  (if-let [sources (get-in opts [:filter :sources])]
+    (filterv #(some sources (source-ids %)) facts)
+    (vec facts)))
+
+(defn- semantic-ranking
+  "Facts ordered by cosine against the query's embedding, best first. Returns
+
+     {:ranking [fact …]}   the embedder answered
+     {:off true}           no embedding endpoint configured
+     {:error \"…\"}          there is one and it did not answer
+
+   Facts embedded under a different model are not in the ranking: two embedding
+   spaces are not comparable and cosine across them still returns a number that
+   sorts. They stay in `pending-facts`, which is what the memory pane counts, so
+   they are reported as awaiting rather than silently dropped.
+
+   Only a positive cosine ranks. `cosine` returns 0.0 for a pair it cannot
+   compare at all — a length mismatch, a zero vector — and those must not enter
+   the ranking ahead of a fact that genuinely scored low."
+  [query facts]
+  (let [model    (embed/embed-model)
+        eligible (filterv #(not (awaiting? % model)) facts)]
+    (cond
+      (not (embed/embedding-configured?)) {:off true}
+      ;; Nothing to compare a query vector against, so do not spend the round
+      ;; trip to make one. This is the state of a fresh memory and of one whose
+      ;; model just changed.
+      (empty? eligible) {:ranking []}
+      :else
+      (let [r (embed/embed-texts [query])]
+        (cond
+          (:off r)   {:off true}
+          (:error r) {:error (:error r)}
+          :else
+          (let [qv (first (:vectors r))]
+            {:ranking (->> eligible
+                           (keep (fn [f] (let [c (embed/cosine qv (:vec f))]
+                                           (when (pos? c) [c f]))))
+                           (sort-by (fn [[c f]] [(- c) (:id f)]))
+                           (take per-retriever-limit)
+                           (mapv second))}))))))
+
+(defn- fuse
+  "Reciprocal rank fusion of `rankings` — a map of retriever → ordered facts.
+
+   A fact at rank r in a ranking contributes 1/(rrf-damping + r), summed across
+   the retrievers that ranked it. **Rank, not score**: the lexical scorer's 0.15
+   and a cosine of 0.71 are not on the same scale, and no normalisation makes
+   them one. RRF only ever compares a retriever's output to itself, which is why
+   adding a retriever cannot corrupt the others' contributions.
+
+   Each fused fact carries `:via` — the retrievers that ranked it — in the fixed
+   order [:lexical :semantic], so the value is deterministic and a caller can
+   read it as provenance rather than as an accident of map ordering."
+  [rankings]
+  (->> rankings
+       (reduce (fn [m [via ranked]]
+                 (reduce (fn [m [i f]]
+                           (-> m
+                               (update-in [(:id f) :score] (fnil + 0.0)
+                                          (/ 1.0 (+ rrf-damping (inc i))))
+                               (update-in [(:id f) :via] (fnil conj #{}) via)
+                               (assoc-in [(:id f) :fact] f)))
+                         m (map-indexed vector ranked)))
+               {})
+       (mapv (fn [[_ {:keys [score via fact]}]]
+               (assoc fact :score score :via (filterv via [:lexical :semantic]))))))
+
+(defn- rerank-head
+  "Let the reranker order the head of the fused list. Returns `[hits status]`.
+
+   The window keeps its own fused scores as a multiset and hands them back out
+   in the reranker's order. So the reranker decides the order *within* the
+   window and cannot push a fact below one that was never in it — it reorders
+   the head, it does not rescore the tail into it.
+
+   `:rerank` carries the model's raw score for provenance. It is a logit, not a
+   probability (rerank-bge-m3 measured 0.687 down to −11.04), so nothing here
+   thresholds on it and a negative one is an ordinary low-relevance answer.
+
+   A reranker that omits a document leaves it in the window, after everything
+   the reranker did rank and without a `:rerank` key."
+  [query hits]
+  (let [window (vec (take rerank-window hits))
+        r      (embed/rerank query (mapv :fact window))]
+    (if-not (vector? r)
+      [hits (if (:off r) {:rerank :off}
+                {:rerank :error :degraded (str "rerank is degraded: " (:error r))})]
+      (let [order  (mapv :index r)
+            idxs   (into order (remove (set order) (range (count window))))
+            scores (vec (sort > (map :score window)))
+            by-idx (into {} (map (juxt :index :score)) r)]
+        [(into (mapv (fn [pos i]
+                       (cond-> (assoc (nth window i) :score (nth scores pos))
+                         (by-idx i) (assoc :rerank (by-idx i))))
+                     (range (count idxs)) idxs)
+               (drop rerank-window hits))
+         {:rerank :ok}]))))
+
+;; ----------------------------------------------------------------------------
 
 (defrecord FileMemory [!facts file]
   mold/Recall
@@ -294,14 +465,67 @@
       (append-line! file rec)
       (swap! !facts assoc (:id rec) rec)
       :ok))
+  ;; opts: {:k 6 :semantic? false :rerank? false :filter {:sources #{id …}}}
+  ;;
+  ;; :semantic? is false by DEFAULT and that is the whole shape of this function.
+  ;; /api/leap calls recall on every keystroke, and embedding a query is a 20–50
+  ;; ms network round trip — an opt-out would make every keystroke wait on a
+  ;; model server. The callers that want meaning (the agent's remembered-context,
+  ;; the memory pane's search) ask for it.
+  ;;
+  ;; Returns a vector of facts, each with :score and :via, with metadata saying
+  ;; what actually ran: {:semantic :skipped|:off|:ok|:error, :rerank …,
+  ;; :degraded "…"}. Metadata rather than a wrapper map because every existing
+  ;; caller takes the sequence, and a caller that does not care about degradation
+  ;; should not have to unwrap for it — but nothing is hidden: something asked
+  ;; for that did not work always leaves :degraded behind.
   (recall [_ query opts]
-    (let [qt (tokens query) now (System/currentTimeMillis) k (or (:k opts) 6)]
-      (->> (vals @!facts)
-           (map #(assoc % :score (score qt now %)))
-           (filter #(pos? (:score %)))
-           (sort-by :score >)
-           (take k)
-           vec)))
+    (let [now        (System/currentTimeMillis)
+          k          (or (:k opts) 6)
+          qt         (tokens query)
+          candidates (scoped (vals @!facts) opts)
+          ;; today's scorer, unchanged, over the eligible facts
+          lex        (->> candidates
+                          (map #(assoc % :score (score qt now %)))
+                          (filter #(pos? (:score %)))
+                          (sort-by :score >)
+                          vec)
+          ;; One retriever has nothing to fuse with. Running RRF over a single
+          ;; ranking would replace the scorer's relevance with its rank and throw
+          ;; away how *well* each fact matched, so whenever the semantic half did
+          ;; not run — not asked for, not configured, not answering, nothing
+          ;; embedded yet — the answer is exactly what it was before any of this
+          ;; existed.
+          only-lex   (fn [m] (with-meta (mapv #(assoc % :via [:lexical]) (take k lex)) m))]
+      (if-not (:semantic? opts)
+        (only-lex {:semantic :skipped})
+        (let [sem (semantic-ranking query candidates)]
+          (cond
+            (:off sem)              (only-lex {:semantic :off})
+            (:error sem)            (only-lex {:semantic :error
+                                               :degraded (str "semantic recall is degraded: "
+                                                              (:error sem))})
+            (empty? (:ranking sem)) (only-lex {:semantic :ok})
+            :else
+            ;; sorted before rerank-head, not after: "the top 20" has to mean the
+            ;; top 20, and `fuse` returns whatever order the accumulator's map
+            ;; iterates in.
+            (let [f (->> (fuse {:lexical  (take per-retriever-limit lex)
+                                :semantic (:ranking sem)})
+                         (sort-by (juxt (comp - :score) :id))
+                         vec)
+                  ;; rerank is consulted only here: it reorders a fused list, and
+                  ;; the lexical-only path above is deliberately untouched.
+                  [f st] (if (:rerank? opts) (rerank-head query f) [f nil])]
+              (->> f
+                   ;; decay and the strength bonus land once, on the fused score,
+                   ;; so "this keeps coming up" still counts for something after
+                   ;; both retrievers have had their say
+                   (map #(assoc % :score (* (:score %) (weight now %))))
+                   (sort-by (juxt (comp - :score) :id))
+                   (take k)
+                   vec
+                   (#(with-meta % (merge {:semantic :ok} st))))))))))
   (all-facts [_] (->> (vals @!facts) (sort-by :ts >) vec)))
 
 (defn file-memory

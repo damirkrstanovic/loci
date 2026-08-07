@@ -78,7 +78,15 @@
    vector + graph + keyword + temporal signals — this stub does naive substring
    scoring so the shape exists while the engine is undecided."
   (remember [this fact opts] "store a fact (string) with metadata; returns :ok")
-  (recall   [this query opts] "return ranked [{:fact :score :meta}...] for a query")
+  (recall   [this query opts]
+    "return ranked [{:fact :score :via …} …] for a query.
+
+     opts an engine may honour: :k how many, :semantic? whether to spend a
+     network round trip embedding the query (**false by default** — /api/leap
+     calls this on every keystroke), :rerank? whether to let a reranker order
+     the head, :filter {:sources #{id …}} to narrow to facts recorded against
+     those ids. An engine that ignores an opt still answers; NaiveRecall below
+     ignores all of them, which is why it is a stub and not a store.")
   (all-facts [this]
     "every stored fact, newest first — the browsable memory pane.
 

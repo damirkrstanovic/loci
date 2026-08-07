@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.agent :as agent]
+            [loci.embed :as embed]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -1268,3 +1269,67 @@
                                  {".deepseek-model" "file-thing"})))
   (is (= "file-thing" (resolved #'agent/model {} {".deepseek-model" "file-thing"})))
   (is (= "deepseek-v4-flash" (resolved #'agent/model {} {}))))
+
+;; ============================================================================
+;; the memory pane, and which callers pay for meaning
+;; ============================================================================
+
+(defn- embed-env
+  "loci.embed's resolvers seeing exactly `env` and no files. Nothing here opens
+   a socket — every assertion below is about the *shape* of a payload."
+  [env]
+  {:env #(get env %) :file (constantly nil)})
+
+(deftest the-memory-pane-reports-what-awaits-an-embedding-and-never-ships-a-vector
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "Outreach recovers about 22% of downgrades." {:entities ["retention"]})
+    (mold/remember m "Neptune takes 165 years to orbit the Sun." {})
+    ;; one fact given a vector directly: the pane's job is to report the state of
+    ;; the store, not to produce it, so this needs no embedder and no network
+    (swap! (:!facts m) update "mem-1" assoc :vec (vec (repeat 1024 0.01)) :model "m" :dim 1024)
+
+    (let [{:keys [env file]} (embed-env {})]
+      (with-redefs [embed/env env embed/from-file file]
+        (let [p (srv/memory-payload m nil)]
+          (is (= 2 (count (:facts p))))
+          (is (nil? (:embedding p)))
+          (is (= 2 (:awaiting p))
+              "with no embedder configured every fact awaits one forever — reported next to a nil model, so it reads as an unconfigured feature and not as a backlog"))))
+
+    (let [{:keys [env file]} (embed-env {"LOCI_EMBED_ENDPOINT" "http://127.0.0.1:9/v1/embeddings"
+                                         "LOCI_EMBED_MODEL"    "m"})]
+      (with-redefs [embed/env env embed/from-file file]
+        (let [p (srv/memory-payload m nil)]
+          (is (= "m" (:embedding p)))
+          (is (= 1 (:awaiting p)) "the embedded one awaits nothing")
+          (is (every? #(nil? (:vec %)) (:facts p))
+              "and no vector goes out — ~1024 floats is about 20 KB of JSON per fact, and the pane shows text"))))))
+
+(defn- recall-spy
+  "A Recall that answers nothing and writes down what it was asked.
+
+   A `with-redefs` of `mold/recall` would not see these calls at all: the
+   compiler turns a protocol call into a cached callsite that goes straight to
+   the implementing class, so rebinding the var intercepts nothing. Both payload
+   functions take the memory as an argument, so handing them one is both simpler
+   and closer to what actually happens."
+  [seen]
+  (reify mold/Recall
+    (remember  [_ _ _] :ok)
+    (all-facts [_] [])
+    (recall    [_ q opts] (swap! seen conj [q opts]) [])))
+
+(deftest the-pane-searches-by-meaning-and-the-keystroke-path-does-not
+  ;; The single most expensive decision in hybrid recall, asserted at the two
+  ;; call sites that differ. /api/leap runs on every keystroke; embedding a query
+  ;; is a 20–50 ms network round trip.
+  (let [seen (atom [])
+        m    (recall-spy seen)]
+    (srv/memory-payload m "chips")
+    (is (= [["chips" {:k 20 :semantic? true}]] @seen)
+        "a search the user typed and is waiting for asks for meaning")
+    (reset! seen [])
+    (srv/leap-payload (sub/fresh-store) m "chips")
+    (is (= [["chips" {:k 8}]] @seen))
+    (is (not (:semantic? (second (first @seen))))
+        "and the keystroke path does not — it must stay exactly as fast as it was")))
