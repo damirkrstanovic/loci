@@ -1262,10 +1262,14 @@
                                                {:job (start-job! #(suggest-tags! st space))}
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
-      (= uri "/api/memory")  (json-resp {:facts (let [qq (params "q")]
-                                                  (if (seq qq)
-                                                    (mold/recall @mem/memory qq {:k 20})
-                                                    (mem/all-facts @mem/memory)))})
+      ;; :vec is dropped on the way out. A fact's embedding is ~1024 floats —
+      ;; about 20 KB as JSON — and the memory pane shows text, so sending them
+      ;; would turn this response into megabytes for nothing.
+      (= uri "/api/memory")  (json-resp {:facts (mapv #(dissoc % :vec)
+                                                      (let [qq (params "q")]
+                                                        (if (seq qq)
+                                                          (mold/recall @mem/memory qq {:k 20})
+                                                          (mem/all-facts @mem/memory))))})
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]

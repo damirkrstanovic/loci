@@ -78,13 +78,21 @@
    vector + graph + keyword + temporal signals — this stub does naive substring
    scoring so the shape exists while the engine is undecided."
   (remember [this fact opts] "store a fact (string) with metadata; returns :ok")
-  (recall   [this query opts] "return ranked [{:fact :score :meta}...] for a query"))
+  (recall   [this query opts] "return ranked [{:fact :score :meta}...] for a query")
+  (all-facts [this]
+    "every stored fact, newest first — the browsable memory pane.
+
+     On the protocol rather than reaching into an implementation's atom,
+     because a store that keeps its facts on disk has no atom to deref."))
 
 (defrecord NaiveRecall [store]
   Recall
   (remember [_ fact opts]
     (swap! store conj {:fact fact :meta (or opts {})})
     :ok)
+  ;; conj on a vector appends, so newest is last; reversed to match the
+  ;; protocol's "newest first". These facts carry no :ts to sort by.
+  (all-facts [_] (vec (reverse @store)))
   (recall [_ query _opts]
     (let [q (str/lower-case (str query))]
       (->> @store
