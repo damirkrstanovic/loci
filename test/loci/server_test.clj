@@ -1188,3 +1188,56 @@
       (srv/run-suggestions! st "space:hub" [(first three-proposals)] "new"))
     (let [kid (first (spawned-kids st))]
       (is (= ["semiconductors"] (mapv :tag (get-in kid [:value :tags])))))))
+
+;; ---- where the model lives: endpoint, key and model are resolved, not frozen ----
+;; The wire format is OpenAI's, so any server that speaks POST /v1/chat/completions
+;; will do — including one on your own hardware. These tests exercise the
+;; RESOLUTION ORDER only; nothing here touches the network.
+;;
+;; `agent/env` is the seam they bind. System/getenv is a Java static method and
+;; with-redefs cannot reach it, so a test written directly against it would pass
+;; or fail for reasons that have nothing to do with the resolver.
+
+(defn- resolved
+  "Call one of the agent's private resolvers under a fixed environment and a
+   fixed set of working-directory files."
+  [resolver env files]
+  (with-redefs [agent/env #(get env %) agent/from-file #(get files %)]
+    (resolver)))
+
+(deftest llm-endpoint-defaults-to-deepseek
+  ;; back-compat: an existing checkout sets none of this, and must not move.
+  (is (= "https://api.deepseek.com/chat/completions"
+         (resolved #'agent/endpoint {} {}))))
+
+(deftest llm-endpoint-reads-env-then-file-then-default
+  (is (= "http://from-env:8080/v1/chat/completions"
+         (resolved #'agent/endpoint
+                   {"LOCI_LLM_ENDPOINT" "http://from-env:8080/v1/chat/completions"}
+                   {".llm-endpoint" "http://from-file:8080/v1/chat/completions"}))
+      "the environment wins over the file")
+  (is (= "http://from-file:8080/v1/chat/completions"
+         (resolved #'agent/endpoint {} {".llm-endpoint" "http://from-file:8080/v1/chat/completions"}))
+      "the file wins over the default"))
+
+(deftest llm-key-is-not-named-after-a-vendor-you-may-not-use
+  ;; someone pointing loci at their own llama server should not have to file
+  ;; its token under DEEPSEEK_API_KEY — but everyone who already did keeps working.
+  (is (= "neutral" (resolved #'agent/api-key
+                             {"LOCI_LLM_API_KEY" "neutral" "DEEPSEEK_API_KEY" "vendor"}
+                             {".deepseek-key" "from-file"}))
+      "LOCI_LLM_API_KEY wins")
+  (is (= "vendor" (resolved #'agent/api-key {"DEEPSEEK_API_KEY" "vendor"} {".deepseek-key" "from-file"}))
+      "DEEPSEEK_API_KEY still works untouched")
+  (is (= "from-file" (resolved #'agent/api-key {} {".deepseek-key" "from-file"}))
+      "and so does .deepseek-key")
+  (is (nil? (resolved #'agent/api-key {} {}))
+      "nothing configured resolves to nothing — request throws, it does not guess"))
+
+(deftest llm-model-still-reads-env-then-file-then-default
+  ;; DEEPSEEK_MODEL now names the model on WHATEVER server is configured; the
+  ;; variable name is historical, and its resolution order must not have moved.
+  (is (= "local-thing" (resolved #'agent/model {"DEEPSEEK_MODEL" "local-thing"}
+                                 {".deepseek-model" "file-thing"})))
+  (is (= "file-thing" (resolved #'agent/model {} {".deepseek-model" "file-thing"})))
+  (is (= "deepseek-v4-flash" (resolved #'agent/model {} {}))))

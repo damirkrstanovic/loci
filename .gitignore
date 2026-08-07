@@ -6,6 +6,7 @@ target/
 .superpowers/
 data/
 .deepseek-model
+.llm-endpoint
 node_modules/
 test/browser/failures/
 

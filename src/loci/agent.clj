@@ -1,42 +1,66 @@
 (ns loci.agent
-  "The assistance layer — a DeepSeek (OpenAI-compatible) client.
+  "The assistance layer — an OpenAI-compatible chat client, DeepSeek by default.
 
    Two uses, both Raskin-honest: the agent only ever *proposes*. For molding it
    emits a declarative view-spec our deterministic interpreter executes; for
    delegation it drafts text that lands as a reversible substrate object. The
    probabilistic model never touches the substrate's rules directly.
 
-   Key is read from .deepseek-key (gitignored) or DEEPSEEK_API_KEY.
-   Model defaults to deepseek-v4-flash (the V4 name of what deepseek-chat
-   routed to); override via DEEPSEEK_MODEL or a .deepseek-model file."
+   Endpoint, key and model each read the environment first, then a file in the
+   working directory, then a default:
+
+     LOCI_LLM_ENDPOINT → .llm-endpoint → https://api.deepseek.com/chat/completions
+     LOCI_LLM_API_KEY  → DEEPSEEK_API_KEY → .deepseek-key (gitignored)
+     DEEPSEEK_MODEL    → .deepseek-model → deepseek-v4-flash
+
+   The endpoint is a full URL, path included, so any OpenAI-compatible
+   chat-completions endpoint will do — including one on your own hardware.
+   deepseek-v4-flash is the V4 name of what deepseek-chat used to route to.
+   DEEPSEEK_MODEL names the model on whichever server is configured; the
+   variable name is historical, kept so existing setups keep working."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [org.httpkit.client :as hc]))
 
-(def ^:private endpoint "https://api.deepseek.com/chat/completions")
-
 (defn- from-file [path] (let [f (io/file path)] (when (.exists f) (str/trim (slurp f)))))
 
+(defn- env
+  "One indirection over System/getenv. It is a Java static, which with-redefs
+   cannot reach, so without this seam the resolution order below is untestable."
+  [k]
+  (System/getenv k))
+
+;; Endpoint, key and model all resolve per call rather than at load. `endpoint`
+;; used to be a `def`: frozen when the namespace was first required, so it could
+;; be neither pointed elsewhere nor reached by a test.
+(defn- endpoint []
+  (or (env "LOCI_LLM_ENDPOINT") (from-file ".llm-endpoint")
+      "https://api.deepseek.com/chat/completions"))
+
 (defn- model []
-  (or (System/getenv "DEEPSEEK_MODEL") (from-file ".deepseek-model") "deepseek-v4-flash"))
+  (or (env "DEEPSEEK_MODEL") (from-file ".deepseek-model") "deepseek-v4-flash"))
 
 (defn- api-key []
-  (or (System/getenv "DEEPSEEK_API_KEY") (from-file ".deepseek-key")))
+  ;; LOCI_LLM_API_KEY first: a token for your own server should not have to be
+  ;; filed under a vendor you are not using. The DeepSeek names still resolve,
+  ;; so every setup that predates this keeps working with nothing changed.
+  (or (env "LOCI_LLM_API_KEY") (env "DEEPSEEK_API_KEY") (from-file ".deepseek-key")))
 
 (defn request
-  "POST to DeepSeek; return the assistant message map {:content .. :tool_calls ..}."
+  "POST to the configured LLM; return the assistant message map {:content .. :tool_calls ..}."
   [messages & {:keys [json? tools]}]
-  (let [key (or (api-key) (throw (ex-info "no DeepSeek key (.deepseek-key / DEEPSEEK_API_KEY)" {})))
-        resp @(hc/post endpoint
+  (let [key (or (api-key)
+                (throw (ex-info "no LLM key (LOCI_LLM_API_KEY / DEEPSEEK_API_KEY / .deepseek-key)" {})))
+        resp @(hc/post (endpoint)
                 {:timeout 60000
                  :headers {"Authorization" (str "Bearer " key) "Content-Type" "application/json"}
                  :body (json/write-str (cond-> {:model (model) :messages messages :temperature 0.2}
                                          json? (assoc :response_format {:type "json_object"})
                                          tools (assoc :tools tools)))})]
-    (when-let [e (:error resp)] (throw (ex-info (str "DeepSeek request failed: " e) {})))
+    (when-let [e (:error resp)] (throw (ex-info (str "LLM request failed: " e) {})))
     (let [body (json/read-str (:body resp) :key-fn keyword)]
-      (when (:error body) (throw (ex-info (str "DeepSeek error: " (get-in body [:error :message])) {})))
+      (when (:error body) (throw (ex-info (str "LLM error: " (get-in body [:error :message])) {})))
       (-> body :choices first :message))))
 
 (defn chat

@@ -80,15 +80,31 @@ deliberately keeps them out of the build context:
 
 | variable | falls back to | then to |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | `.deepseek-key` | *unset — the agent refuses with "no DeepSeek key"* |
+| `LOCI_LLM_ENDPOINT` | `.llm-endpoint` | `https://api.deepseek.com/chat/completions` |
+| `LOCI_LLM_API_KEY` | `DEEPSEEK_API_KEY`, then `.deepseek-key` | *unset — the agent refuses with "no LLM key"* |
 | `DEEPSEEK_MODEL` | `.deepseek-model` | `deepseek-v4-flash` |
 | `SEARCH_API_KEY` / `TAVILY_API_KEY` | `.tavily-key` | *unset — research falls back to no web search* |
 | `LOCI_DATA` | — | a **relative** `data/` |
 | `PORT` | — | `7777` |
 
-`DEEPSEEK_MODEL` is the one that fails quietly. A missing key is refused out loud, but a
-missing model is not: the container simply runs `deepseek-v4-flash`, which is very likely
-not the model your `.deepseek-model` names. Pass it whenever you pass the key.
+**Any server that speaks OpenAI's `POST /v1/chat/completions` works** — llama.cpp,
+vLLM, Ollama, LM Studio, a gateway — so loci can run entirely on your own hardware:
+
+```bash
+LOCI_LLM_ENDPOINT=http://your-box:8080/v1/chat/completions \
+LOCI_LLM_API_KEY=whatever-your-server-wants \
+DEEPSEEK_MODEL=the-model-your-server-serves \
+clojure -M:serve
+```
+
+`DEEPSEEK_MODEL` names the model on **whichever** server is configured; the variable name
+is historical, kept so existing setups keep working with nothing changed. For the same
+reason `DEEPSEEK_API_KEY` and `.deepseek-key` still resolve — `LOCI_LLM_API_KEY` just wins,
+so a token for your own server need not be filed under a vendor you are not using.
+
+`DEEPSEEK_MODEL` is also the one that fails quietly. A missing key is refused out loud, but
+a missing model is not: the container simply runs `deepseek-v4-flash`, which is very likely
+not the model your endpoint serves. Pass it whenever you pass the key.
 
 Configuration goes in **`loci.env`** — gitignored, and excluded from the build context, so
 it is never baked into a layer:
