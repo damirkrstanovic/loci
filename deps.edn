@@ -27,6 +27,14 @@
   :migrate {:main-opts ["-m" "loci.migrate"]
             :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
 
+  ;; re-measure the merge threshold after changing LOCI_EMBED_MODEL — a
+  ;; threshold belongs to one embedding model and does not travel:
+  ;;   clojure -M:calibrate path/to/memory.edn
+  ;; The path is required; there is no default, so this cannot be pointed at
+  ;; your real memory by accident. It reads and never writes.
+  :calibrate {:main-opts ["-m" "loci.calibrate"]
+              :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+
   ;; Clerk notebook (the earlier render target). Both reach the substrate
   ;; through notebooks/loci.clj, so both need the native-access flag too.
   :dev   {:extra-paths ["dev" "notebooks"]

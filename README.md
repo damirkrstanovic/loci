@@ -123,9 +123,69 @@ would turn "no key needed" into a 401 that reads like a wrong key. For the same 
 off rather than aiming loci at an empty URL. The two endpoints are optional independently of
 each other: with embed but no rerank, fusion runs and rerank is skipped.
 
-Semantic recall is landing in phases, and these six variables are the first of them: today
-they resolve and nothing else — the retriever that consumes them comes next, so setting them
-does not yet change what `recall` returns.
+Semantic recall is landing in phases. With an embed endpoint configured, facts are embedded
+by a background worker and `recall` fuses cosine with the lexical signals; **semantic merge —
+collapsing two facts whose vectors are close enough to be the same fact — is the next phase
+and is not implemented yet.** The threshold it will merge above is already measured, and the
+warning below is about that number rather than about code you can run today.
+
+**Change `LOCI_EMBED_MODEL` and the merge threshold has to be re-measured.** This is the one
+setting that does not take care of itself, so it is worth reading before you change it.
+
+That threshold is a property of **one embedding model** and is not portable to another.
+Switching models needs no migration — every fact embedded by the old model becomes pending
+again and the next background pass re-embeds it at the new dimension, verified live across
+both Qwen models on one memory file — but **the threshold does not follow the re-embedding.**
+Nothing breaks, nothing warns, and a number that was right yesterday is quietly wrong today.
+
+Measured 2026-08-07 on the same 80 facts:
+
+| model | dim | threshold |
+|---|---|---|
+| `embed-qwen3-0.6b` | 1024 | 0.85 |
+| `embed-qwen3-4b` | 2560 | 0.88 |
+| `embed-bge-m3` | 1024 | *uncalibrated* |
+
+The *global* distributions of the two Qwen models are almost identical — median 0.291 against
+0.298, p99 identical at 0.741 — which is exactly what makes carrying the number over feel
+safe. **The tail is what moved.** Two genuinely distinct facts, *"The orbital period of a
+planet increases with its distance from the Sun, following Kepler's Third Law"* and
+*"Kepler's Third Law states that the square of a planet's orbital period is proportional to
+the cube of its semi-major axis"*, scored **0.829** under the 0.6b and **0.868** under the 4B.
+Under the 0.6b's 0.85 they stay apart; carry that 0.85 to the 4B and they merge, the law's
+formulation is gone, and the only trace is a `:merged-from` on the fact that survived.
+
+**The rule merge follows, therefore:** never a threshold as a constant. It looks the
+configured model up in that table, and for a model that is **not** in it — `embed-bge-m3`
+included — it **refuses to merge and says so**: no fallback to the nearest number, no guess,
+nothing merged. An unmerged memory is merely redundant; a wrongly merged one has lost
+something.
+
+To re-measure, against your own memory file and with the new model configured:
+
+```bash
+LOCI_EMBED_MODEL=your-new-model clojure -M:calibrate data/memory.edn
+```
+
+The path is required and has no default, so a calibration run cannot be aimed at your real
+memory by accident. It reads and never writes. What comes back is the percentile table over
+every pair and the highest-scoring pairs **with their texts** — because the step that decides
+the threshold is you reading those pairs and saying, for each, whether the two are the same
+fact. Scores alone cannot tell you; the whole failure above is two sentences about Kepler's
+Third Law that a cosine cannot separate. Pass your verdicts back from a REPL and it puts the
+number above every pair you called distinct:
+
+```clojure
+(loci.calibrate/calibrate! "data/memory.edn"
+  {:labels {#{"mem-12" "mem-40"} :duplicate
+            #{"mem-3"  "mem-71"} :distinct}})
+```
+
+It errs high on purpose. The two classes overlap — under the 0.6b, true duplicates at 0.838
+and 0.832 sat *above* the false Kepler pair at 0.829 — so no threshold separates them and one
+of the two errors has to be chosen. A missed duplicate costs one redundant fact. A wrong
+merge destroys a distinct one silently. So the suggestion clears every pair you labelled
+distinct, reports how many duplicates that cost, and names them.
 
 Configuration goes in **`loci.env`** — gitignored, and excluded from the build context, so
 it is never baked into a layer:
