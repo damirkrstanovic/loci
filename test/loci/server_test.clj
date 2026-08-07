@@ -1640,3 +1640,118 @@
     (put-space! st "space:a" "A" "doc:a" "a" {:merged-from ["space:b"]})
     (put-space! st "space:b" "B" "doc:b" "b" {:merged-from ["space:a"]})
     (is (= #{"space:a" "doc:a" "space:b" "doc:b"} (srv/lineage-sources st "space:a")))))
+
+;; ============================================================================
+;; what the AGENT is told it remembers — the same lineage scope, on ✦ Ask,
+;; ✎ Draft, 🔍 Research and ✧ Suggest
+;; ============================================================================
+
+(defn- remembered
+  "`remembered-context` with `m` standing in for the server's memory singleton.
+
+   The stand-in goes in by rebinding the `mem/memory` DELAY — swapping the
+   receiver — and never by redefining `mold/recall`. `recall` is a protocol
+   method: the compiler turns the call into a cached callsite straight to the
+   implementing class, so a `with-redefs` of it is silently ignored and the test
+   passes green while observing nothing. `mem/memory` is an ordinary var deref,
+   so rebinding it is seen, and the real `data/memory.edn` delay is never forced.
+
+   No embedder is configured, so `:semantic? true` degrades to lexical and this
+   opens no socket."
+  [st m prompt space]
+  (let [{:keys [env file]} (embed-env {})]
+    (with-redefs [embed/env env embed/from-file file
+                  mem/memory (delay m)]
+      (#'srv/remembered-context st prompt space))))
+
+(deftest the-agent-remembers-within-this-notebook-and-its-lineage
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    ;; a fact learned in an unrelated notebook is not offered here
+    (let [ctx (remembered st m "chips" "space:other")]
+      (is (str/includes? ctx "chips are unrelated here.")
+          "what this notebook itself learned is still offered")
+      (is (not (str/includes? ctx "chips are fabricated in Taiwan."))
+          "a fact from an unrelated notebook must not reach the agent's instructions")
+      (is (not (str/includes? ctx "chips need EUV lithography."))))
+    ;; the hub is offered what its deep dives found, transitively
+    (let [ctx (remembered st m "chips" "space:semis")]
+      (is (str/includes? ctx "chips need EUV lithography.") "the child's finding")
+      (is (str/includes? ctx "chips shrink with each node.") "and the child's child's")
+      (is (not (str/includes? ctx "chips are unrelated here."))))))
+
+(deftest the-scope-runs-DOWN-the-lineage-and-not-up
+  ;; NOTE FOR THE READER OF THE PLAN: the plan's Step 2 says "lineage runs both
+  ;; ways — a fact recorded in the hub is offered to the child". It does not,
+  ;; and it must not. `lineage-sources` deliberately refuses to follow
+  ;; `spawned-by` upward (see its docstring), because the parent's other
+  ;; children hang off that same edge and one hop up is every sibling. The
+  ;; plan's own Step 6 names the upward walk as the sabotage that must break a
+  ;; test — this is that test.
+  (let [st (lineage-fixture)
+        m  (lineage-memory)
+        ctx (remembered st m "chips" "space:kid")]
+    (is (str/includes? ctx "chips need EUV lithography.") "its own")
+    (is (str/includes? ctx "chips shrink with each node.") "and its descendants'")
+    (is (not (str/includes? ctx "chips are fabricated in Taiwan."))
+        "but not its parent's — walking up would reach every sibling through the shared parent")
+    (is (not (str/includes? ctx "chips are unrelated here."))
+        "and certainly not a sibling's, which is what walking up would deliver")))
+
+(deftest a-brand-new-notebook-brings-no-remembered-context
+  ;; a normal state, not an error: nothing has been learned here yet, so the
+  ;; system prompt simply has no REMEMBERED block
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    (sub/commit! st {:op :put :id "space:new"
+                     :value {:id "space:new" :kind :space :title "New"
+                             :value {:intent "just made" :cells []}}})
+    (is (nil? (remembered st m "chips" "space:new"))
+        "no facts in scope → nil, and the caller's `str` adds nothing")
+    (is (seq (mem/all-facts m)) "…while memory itself is full of matching facts")))
+
+(deftest with-no-notebook-at-all-memory-stays-global
+  ;; `ask!` falls back to the whole workspace for its DOCUMENT context when
+  ;; `space` is nil; memory matches that rule rather than inventing a second one
+  (let [st (lineage-fixture)
+        m  (lineage-memory)
+        ctx (remembered st m "chips" nil)]
+    (is (str/includes? ctx "chips are fabricated in Taiwan."))
+    (is (str/includes? ctx "chips are unrelated here.")
+        "with no notebook to scope to, an unrelated notebook's fact IS eligible")
+    (is (str/includes? ctx "chips seen by a peer notebook."))))
+
+(deftest the-remembered-block-still-carries-its-citations
+  (let [st (lineage-fixture)
+        m  (lineage-memory)
+        ctx (remembered st m "chips" "space:kid")]
+    (is (str/starts-with? ctx "\n\nREMEMBERED (distilled from earlier work"))
+    (is (str/includes? ctx "chips need EUV lithography. (⌾ find:kid-1)")
+        "the ⌾ citation is the object the fact came from, unchanged")
+    (is (str/includes? ctx "chips shrink with each node. (⌾ find:gk-1)"))))
+
+(deftest all-four-agent-flows-recall-inside-the-lineage
+  ;; ✦ Ask, ✎ Draft, 🔍 Research, ✧ Suggest — every call site, one spy.
+  ;; The model is stubbed everywhere; nothing here opens a socket.
+  ;;
+  ;; A FRESH store per flow: ✎ Draft and 🔍 Research each append a cell to the
+  ;; notebook, which legitimately widens the next call's scope. Reusing one
+  ;; store would compare each flow against a stale expectation.
+  (let [want {:k 6 :semantic? true
+              :filter {:sources (srv/lineage-sources (lineage-fixture) "space:kid")}}
+        opts (fn [f]
+               (let [st   (lineage-fixture)
+                     seen (atom [])]
+                 (with-redefs [mem/memory (delay (recall-spy seen))
+                               loci.server/distill! (fn [& _] nil)
+                               agent/chat-tools (fn [& _] "drafted")
+                               agent/propose-subtopics (fn [& _] [])]
+                   (f st))
+                 (mapv second @seen)))]
+    (is (= [want] (opts #(srv/ask! % "chips" "space:kid"))) "✦ Ask")
+    (is (= [want] (opts #(srv/delegate! % "space:kid"))) "✎ Draft")
+    (is (= [want] (opts #(srv/research! % "space:kid" "chips"))) "🔍 Research")
+    (is (= [want] (opts #(srv/suggest! % "space:kid"))) "✧ Suggest")
+    ;; and with no notebook, ✦ Ask asks for no filter at all
+    (is (= [{:k 6 :semantic? true}] (opts #(srv/ask! % "chips" nil)))
+        "space nil → no :filter key, exactly as before this change")))

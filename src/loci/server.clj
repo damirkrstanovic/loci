@@ -803,6 +803,75 @@
            (table-digest v) "\nsample rows: " (json/write-str (vec (take 3 v))))
       :else "")))
 
+(defn lineage-sources
+  "Every id a recall scoped to `space` is allowed to see: the notebook itself,
+   the ids of its cells, and the same for each notebook it spawned and each
+   notebook merged into it — transitively.
+
+   `recall`'s filter takes a set of ids rather than one notebook id because
+   `loci.memory` holds no store and must not: the half that can walk the
+   substrate does the walk, the half that recalls takes the answer. This
+   function is that walk, and it lives here for the same reason.
+
+   Both the notebook and its cells are in the set because a distilled fact
+   records `:source {:obj <the doc it came from> :space <the notebook>}` — the
+   notebook id alone already matches everything `distill!` writes, and the cell
+   ids additionally catch a fact whose source names only an object.
+
+   Of the reasons `nb/links` reports, only `spawned` and `merged-from` are
+   lineage:
+
+     spawned      o's :spawned-by names this notebook — a child. In scope.
+     merged-from  o's id is in this notebook's :merged-from — folded in here.
+                  In scope: its facts were recorded before the merge existed
+                  and there is nowhere else for them to live.
+     spawned-by   the parent. NOT in scope — walking up reaches every sibling
+                  through the shared parent, which is the leak a scope exists
+                  to stop.
+     merged       a notebook THIS one was folded into. Also upward, also out.
+     shares       two notebooks holding the same object. Not an edge to walk —
+                  though note the consequence of taking cells: if the shared
+                  object is a cell HERE, a fact distilled from it is in scope,
+                  because it is a fact about a document sitting in this
+                  notebook. What does not come with it is the other notebook —
+                  not its other cells, not its descendants, and not a fact
+                  recorded against it with no object (what `ask!` writes).
+     derived      one's cell was computed from the other's. Same reasoning.
+
+   Both kept edges are followed transitively: spawning because a deep dive of a
+   deep dive is still descent, and merged-from the same way because a notebook
+   that absorbed another absorbed whatever that one had absorbed. `seen` bounds
+   the walk, so a cycle in the merge graph terminates rather than hanging.
+
+   Cost: one `nb/links` per notebook in scope, and `nb/links` scans every object
+   — so this is O(notebooks in scope × objects), not one 0.200 ms call. Measured
+   on a synthetic 240-object store: 0.6 ms for a leaf, 5.4 ms for a ten-deep
+   chain. Kept anyway, because reusing `nb/links` means “spawned” and
+   “merged-from” have exactly one definition and the scope follows it, and
+   because this runs on a search the user typed and waits on — the same request
+   spends 20–50 ms embedding the query.
+
+   Written for a notebook. `/api/memory?space=` checks with `notebook-or-error`
+   first; `remembered-context` does not, because `ask!` takes whatever id the
+   shell has open. An id that is not a notebook is not an error here — it has no
+   cells and `nb/links` finds no edge to it, so the walk returns `#{that id}`
+   and the recall comes back empty. Narrow, never leaky.
+
+   Defined above `remembered-context` because that is its first caller; the
+   `/api/memory` caller is far below."
+  [st space]
+  (loop [queue [space], seen #{}, out #{}]
+    (if-let [id (first queue)]
+      (if (seen id)
+        (recur (subvec queue 1) seen out)
+        (let [cells (keep :ref (nb/cells-of (sub/object st id)))
+              kids  (keep (fn [{:keys [id reasons]}]
+                            (when (some (comp #{"spawned" "merged-from"} :type) reasons)
+                              id))
+                          (:connected (nb/links st id)))]
+          (recur (into (subvec queue 1) kids) (conj seen id) (into (conj out id) cells))))
+      out)))
+
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
 ;; distill! writes new memory AFTER a flow — async, best-effort, never undone.
@@ -811,8 +880,35 @@
 ;; the agent facts it phrased differently the first time. /api/leap runs on every
 ;; keystroke and pays that same 20–50 ms for every character typed, which is why
 ;; recall's default is lexical and the two callers differ.
-(defn- remembered-context [prompt]
-  (let [facts (try (mold/recall @mem/memory prompt {:k 6 :semantic? true})
+(defn- remembered-context
+  "What the agent already learned, cited, and scoped to the notebook you are
+   standing in — its cells, what it spawned transitively, and what was merged
+   into it (`lineage-sources`).
+
+   `recall` applies `:filter` BEFORE both retrievers, so a scoped recall cannot
+   leak a fact by meaning either. Nothing is re-filtered here.
+
+   `space` nil is the whole memory, because `ask!` below already falls back to
+   the whole workspace for its DOCUMENT context in exactly that case — memory
+   matches that rule rather than inventing a second one. The `and space
+   (sub/object st space)` test is `ask!`'s, character for character, so the two
+   halves of one system prompt can never disagree about whether there is a
+   notebook.
+
+   A notebook with nothing in scope yet gets nil — no REMEMBERED block at all.
+   That is what a brand-new notebook looks like, and it is a normal state.
+
+   The cost of the scope, decided 2026-08-08 and not overstated: notebooks that
+   share a SUBJECT but not a LINEAGE go blind to each other. On the live corpus
+   `space:semis` and its six deep-dive children are one lineage holding 56 of
+   80 facts, but `Serbia — open economic data` and `World economies — output
+   and prices` are separate roots, so neither will offer the other anything.
+   Lineage is what the substrate computes; subject is what tags record."
+  [st prompt space]
+  (let [opts (cond-> {:k 6 :semantic? true}
+               (and space (sub/object st space))
+               (assoc :filter {:sources (lineage-sources st space)}))
+        facts (try (mold/recall @mem/memory prompt opts)
                    (catch Exception _ nil))]
     (when (seq facts)
       (str "\n\nREMEMBERED (distilled from earlier work — cite as ⌾ id when it shapes your answer):\n"
@@ -869,7 +965,7 @@
                        "If the data doesn't say, say so plainly. Be concise, markdown.\n\n"
                        "DOCS:\n" (str/join "\n\n" (map obj-digest texty))
                        "\n\nTABLES (query these by id):\n" catalog
-                       (remembered-context prompt))
+                       (remembered-context st prompt space))
           tool-fn (fn [nm a]
                     (if (and allowed (= nm "query_table") (not (allowed (:table_id a))))
                       {:error "that table is not in this space"}
@@ -928,7 +1024,7 @@
                  "for this workspace space. Use query_table for any exact figure — never guess. Cite object ids.\n\n"
                  "Space: " (:title sp) ". Intent: " (get-in sp [:value :intent]) ".\n\n"
                  "DOCS:\n" (str/join "\n\n" (map obj-digest texty)) "\n\nTABLES (query by id):\n" catalog
-                 (remembered-context (str (:title sp) " " (get-in sp [:value :intent]))))
+                 (remembered-context st (str (:title sp) " " (get-in sp [:value :intent])) space))
         tool-fn (fn [nm a] (if (and (= nm "query_table") (not (allowed (:table_id a))))
                              {:error "that table is not in this space"}
                              (tools/dispatch st nm a)))
@@ -981,7 +1077,7 @@
                    "NOT reproduce the table in your note: write only a 2-3 bullet summary of what the data "
                    "shows and a final '## Sources' section. If there is nothing tabular, write a normal "
                    "markdown findings note instead. Be specific.\n\n" context
-                   (remembered-context prompt))
+                   (remembered-context st prompt space))
           run-once (fn [] (agent/chat-tools [{:role "system" :content sys} {:role "user" :content prompt}]
                                             tools/specs tf))
           ;; the tool loop occasionally returns an empty final message —
@@ -1023,7 +1119,7 @@
         {:error (str "not a notebook: " space)}
         (let [digest (str (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
                                (map obj-digest) (str/join "\n"))
-                          (remembered-context (str (:title sp) " " (get-in sp [:value :intent]))))]
+                          (remembered-context st (str (:title sp) " " (get-in sp [:value :intent])) space))]
           {:proposals (vec (take 3 (agent/propose-subtopics
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
     (catch Exception e {:error (.getMessage e)})))
@@ -1257,68 +1353,6 @@
   (or (notebook-or-error st space)
       (when (str/blank? prompt) {:error "empty prompt"})
       {:job (start-job! #(research! st space prompt))}))
-
-(defn lineage-sources
-  "Every id a recall scoped to `space` is allowed to see: the notebook itself,
-   the ids of its cells, and the same for each notebook it spawned and each
-   notebook merged into it — transitively.
-
-   `recall`'s filter takes a set of ids rather than one notebook id because
-   `loci.memory` holds no store and must not: the half that can walk the
-   substrate does the walk, the half that recalls takes the answer. This
-   function is that walk, and it lives here for the same reason.
-
-   Both the notebook and its cells are in the set because a distilled fact
-   records `:source {:obj <the doc it came from> :space <the notebook>}` — the
-   notebook id alone already matches everything `distill!` writes, and the cell
-   ids additionally catch a fact whose source names only an object.
-
-   Of the reasons `nb/links` reports, only `spawned` and `merged-from` are
-   lineage:
-
-     spawned      o's :spawned-by names this notebook — a child. In scope.
-     merged-from  o's id is in this notebook's :merged-from — folded in here.
-                  In scope: its facts were recorded before the merge existed
-                  and there is nowhere else for them to live.
-     spawned-by   the parent. NOT in scope — walking up reaches every sibling
-                  through the shared parent, which is the leak a scope exists
-                  to stop.
-     merged       a notebook THIS one was folded into. Also upward, also out.
-     shares       two notebooks holding the same object. Not an edge to walk —
-                  though note the consequence of taking cells: if the shared
-                  object is a cell HERE, a fact distilled from it is in scope,
-                  because it is a fact about a document sitting in this
-                  notebook. What does not come with it is the other notebook —
-                  not its other cells, not its descendants, and not a fact
-                  recorded against it with no object (what `ask!` writes).
-     derived      one's cell was computed from the other's. Same reasoning.
-
-   Both kept edges are followed transitively: spawning because a deep dive of a
-   deep dive is still descent, and merged-from the same way because a notebook
-   that absorbed another absorbed whatever that one had absorbed. `seen` bounds
-   the walk, so a cycle in the merge graph terminates rather than hanging.
-
-   Cost: one `nb/links` per notebook in scope, and `nb/links` scans every object
-   — so this is O(notebooks in scope × objects), not one 0.200 ms call. Measured
-   on a synthetic 240-object store: 0.6 ms for a leaf, 5.4 ms for a ten-deep
-   chain. Kept anyway, because reusing `nb/links` means “spawned” and
-   “merged-from” have exactly one definition and the scope follows it, and
-   because this runs on a search the user typed and waits on — the same request
-   spends 20–50 ms embedding the query.
-
-   Assumes `space` is a notebook; callers check first (`notebook-or-error`)."
-  [st space]
-  (loop [queue [space], seen #{}, out #{}]
-    (if-let [id (first queue)]
-      (if (seen id)
-        (recur (subvec queue 1) seen out)
-        (let [cells (keep :ref (nb/cells-of (sub/object st id)))
-              kids  (keep (fn [{:keys [id reasons]}]
-                            (when (some (comp #{"spawned" "merged-from"} :type) reasons)
-                              id))
-                          (:connected (nb/links st id)))]
-          (recur (into (subvec queue 1) kids) (conj seen id) (into (conj out id) cells))))
-      out)))
 
 (defn memory-payload
   "The memory pane: every fact newest-first, or the ranked answer to a query.
