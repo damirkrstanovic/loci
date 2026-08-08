@@ -265,6 +265,35 @@ by model before that can arise.
 | reranker unreachable | fusion result returned unranked by it, marked as such |
 | model changed | old-model facts drop out of the semantic half, appear in "awaiting"; backfill re-embeds |
 | worker dies mid-sweep | backfill is resumable — it selects facts lacking `:vec` for the current model |
+| **embedder down while facts accumulate** | **merge pauses for the whole outage; duplicates build up; the next successful pass embeds the backlog and then merges. Self-healing.** See below. |
+
+### 5.1 Merge pauses for the length of an embedder outage
+
+`start-embed-worker!` runs `embed-pending!` every 15 s and `merge-similar!` **only when that
+pass succeeded**. So while the embedder is off or not answering, no merging happens at all —
+including over facts that already carry vectors and could be compared without it.
+
+**Why, and why this is the cheap error.** During an outage some facts have vectors and some do
+not. Merging only the ones that do is deciding on evidence that is missing for the rest: a new
+fact duplicating an old one is invisible, so some duplicates fold and others do not, and which
+fact survives depends on which happened to be embedded first. Merge deletes — auditably, via
+`:merged-from`, but a wrong fold is permanent in a way a missed fold is not. A redundant corpus
+repairs itself on the next good pass; a wrongly merged one does not.
+
+**What the user sees.** Nothing while the embedder is up. During an outage, memory keeps
+recording facts normally — `remember` never waits on the embedder — and duplicates accumulate
+for the length of the outage only. Recall meanwhile returns `k` facts of which several may be
+rewordings of one thing, and `:strength` does not accumulate over them, so the idea that keeps
+recurring ranks *lower* than it should rather than higher. Both effects end when the embedder
+returns.
+
+**Permanently unconfigured is the case that does not self-heal**, and it is the one worth
+noticing: memory never deduplicates at all. That is what the memory pane's status line reports
+(`no embedder configured — recall is by words only`), so it is visible rather than inferred.
+
+**Considered and rejected:** merging whatever is already vectorised during an outage. It buys
+fresher dedup across a temporary condition and costs partial-evidence merges that are
+permanent. Recorded here so the trade is a decision on the record rather than an accident.
 
 ## 6. Testing
 
