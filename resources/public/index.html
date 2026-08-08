@@ -277,6 +277,16 @@
   .memfact{border:1px solid var(--line);border-radius:9px;padding:9px 12px;margin-bottom:9px}
   .memfact .src{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:4px}
   .memfact .dots{color:var(--accent);letter-spacing:2px}
+  /* what the memory layer is doing, in the same mono/muted register as .src */
+  .memstat{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:-6px 0 12px}
+  .memfact .mergedtoggle{cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent-line)}
+  .memfact .mergedlist{margin-top:6px;padding-left:9px;border-left:1px solid var(--line-2);
+                       font-family:var(--mono);font-size:10.5px;color:var(--muted);line-height:1.6}
+  /* the toggle sets [hidden]; the UA rule for it is display:none and nothing
+     above declares display on .mergedlist, but say it here so a later rule that
+     does cannot quietly turn the toggle into a no-op */
+  .memfact .mergedlist[hidden]{display:none}
+  .memfact .mergedlist .mid{color:var(--faint)}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -1742,21 +1752,84 @@ async function openFunctions(){
 document.getElementById('fnBtn').addEventListener('click',openFunctions);
 // the agent's memory — browsable, searchable, cited. Revisable and decaying;
 // undo never touches it (that's the record/recall split, visible).
+
+// One line under the search field, always present — not a badge that shows up
+// when something breaks, so "everything is fine" is something you can read
+// rather than infer from an absence. Switching to an uncalibrated embedding
+// model otherwise stops deduplication with one line on stderr at boot and
+// nothing in the app that ever says so again.
+//
+// A number and a model name always appear together: "12 awaiting" with no model
+// beside it reads like a backlog, when with no embedder configured it means the
+// feature is off and every fact awaits one forever. So the unconfigured line
+// carries no count.
+//
+// `total` is the size of the whole memory, or null when this response is not the
+// whole memory — a query answers with the top 20 hits, and "12 of 20 awaiting"
+// would be a claim about the memory made out of a page of results.
+function memoryStatus(res,total){
+  const model=res.embedding, awaiting=res.awaiting||0, detail=[];
+  let text;
+  // `degraded` is ABSENT when healthy rather than present-and-empty, and is read
+  // in exactly this one place — `if (p.degraded)` here and `if ('degraded' in p)`
+  // somewhere else is the pair that disagrees. It exists only when an embedder
+  // was asked something and did not answer, so it never means "unconfigured".
+  if(!model) text='no embedder configured — recall is by words only';
+  else if(res.degraded){ text='embedder unreachable — showing word matches only'; detail.push(res.degraded); }
+  else if(awaiting) text=model+' · '+awaiting+(total===null?'':' of '+total)+' awaiting embedding';
+  else text=model+' · '+(total===null?'all facts embedded':total+' fact'+(total===1?'':'s')+', all embedded');
+  // Merge state is orthogonal to embedding state, so it is a clause on whichever
+  // of the four lines applies — but only on a refusal. `{off:true}` is the
+  // missing embedder, which the first line has already said, and one cause said
+  // twice is noise. `:merge` carries no model name of its own; the model is
+  // `:embedding`, and a refusal can only happen when one is configured.
+  if(res.merge&&res.merge.refused){
+    text+=' · merge paused: '+model+' has no calibrated threshold';
+    detail.push(res.merge.refused);
+  }
+  // the server's own words, on hover: they name the calibrated models and how to
+  // measure a new one, which is more than a status line should be spending
+  return {text,detail:detail.join('\n\n')};
+}
+// `words`, `meaning` or `words + meaning` — which retrievers ranked this fact.
+// Called only when there is a query: a browse ranks nothing, so nothing was
+// found by anything, and a marker there would be decoration pretending to be
+// information.
+function viaLabel(via){
+  const v=via||[], parts=[];
+  if(v.includes('lexical')) parts.push('words');
+  if(v.includes('semantic')) parts.push('meaning');
+  return parts.join(' + ');
+}
 async function openMemory(qstr){
   const res=await API.memory(qstr||'');
   const facts=res.facts||[];
+  // only an unscoped browse returns the whole memory; anything else is a page of it
+  const total=(qstr||res.scope)?null:facts.length;
+  const st=memoryStatus(res,total);
   let h='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
     '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">MEMORY</span>'+
     '<span class="q">'+facts.length+' remembered fact'+(facts.length===1?'':'s')+(qstr?' for “<b>'+esc(qstr)+'</b>”':'')+'</span></div>'+
-    '<div class="modal-b"><input id="memq" placeholder="search memory…" value="'+esc(qstr||'')+'" style="width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;margin-bottom:12px">';
+    '<div class="modal-b"><input id="memq" placeholder="search memory…" value="'+esc(qstr||'')+'" style="width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;margin-bottom:12px">'+
+    '<div class="memstat"'+(st.detail?' title="'+esc(st.detail)+'"':'')+'>'+esc(st.text)+'</div>';
   if(!facts.length) h+='<div style="color:var(--muted);font-size:13px">Nothing yet — memory fills as the agent researches, drafts and answers.</div>';
-  facts.forEach(f=>{
+  facts.forEach((f,i)=>{
     const age=Math.round((Date.now()-f.ts)/86400000);
+    // a merge is inspectable in the pane, not only by reading data/memory.edn —
+    // the only way a wrong one ever becomes visible, which is what makes an
+    // erring-high threshold auditable rather than merely careful
+    const absorbed=f['merged-from']||[];
+    const via=qstr?viaLabel(f.via):'';
     h+='<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div>'+
-      '<div class="src"><span class="dots">'+'●'.repeat(Math.min(5,f.strength||1))+'</span> · '+
+      '<div class="src"><span class="dots">'+'●'.repeat(Math.min(5,f.strength||1))+'</span>'+
+      (absorbed.length?' <span class="mergedtoggle" data-merged="'+i+'">+'+absorbed.length+' merged</span>':'')+' · '+
       (f.source&&f.source.obj?'<span class="ghostchip" data-open="'+esc(f.source.obj)+'">⌾ '+esc(f.source.obj)+'</span>'
                              :'⌾ '+esc((f.source&&f.source.space)||'workspace'))+
-      ' · '+(age<1?'today':age+'d ago')+(f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+'</div></div>';
+      ' · '+(age<1?'today':age+'d ago')+(f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
+      (via?' · '+via:'')+'</div>'+
+      (absorbed.length?'<div class="mergedlist" id="merged-'+i+'" hidden>'+
+        absorbed.map(a=>'<div>'+esc(a.fact)+' <span class="mid">'+esc(a.id)+'</span></div>').join('')+'</div>':'')+
+      '</div>';
   });
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
     '<span style="font-size:11.5px;color:var(--muted)">the agent’s recall — revisable, never undone</span></div></div>';
@@ -1766,6 +1839,10 @@ async function openMemory(qstr){
   mq.focus();
   mq.addEventListener('keydown',e=>{ if(e.key==='Enter') openMemory(mq.value.trim()); });
   modal.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>{ closeModal(); openObject(el.dataset.open); }));
+  modal.querySelectorAll('[data-merged]').forEach(el=>el.addEventListener('click',()=>{
+    const list=modal.querySelector('#merged-'+el.dataset.merged);
+    if(list) list.hidden=!list.hidden;
+  }));
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
 modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
