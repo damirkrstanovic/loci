@@ -103,6 +103,9 @@
   .res.verb .ic{border:1px solid var(--accent);background:var(--accent);color:#eef6f2}
   .res.space .ic{border:1px solid var(--ink);background:var(--ink);color:var(--paper)}
   .res .title{font-size:14px} .res .gp{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--faint)}
+  /* a `by meaning` note ("degraded", "n awaiting") is a statement about the
+     search rather than a result: no pointer, because act() ignores it */
+  .res.note{cursor:default} .res.note .title{color:var(--faint);font-size:13px}
 
   .world{position:fixed;inset:0;z-index:10}
   /* the grouped overview is taller than the screen past ~20 notebooks; the
@@ -311,6 +314,10 @@ const API = {
   object: (id,at) => fetch('/api/object/'+encodeURIComponent(id)+(at!=null?'?at='+at:'')).then(r=>r.json()),
   mold: (id,view,at) => fetch('/api/mold?id='+encodeURIComponent(id)+'&view='+encodeURIComponent(view)+(at!=null?'&at='+at:'')).then(r=>r.json()),
   leap: q => fetch('/api/leap?q='+encodeURIComponent(q)).then(r=>r.json()),
+  // the keystroke path is `leap`; `leapDeep` is the same endpoint asked to also
+  // search by meaning, which costs an embedding round trip and so is fired on a
+  // pause, never on a key. Same flat array back, with `by meaning` rows added.
+  leapDeep: q => fetch('/api/leap?q='+encodeURIComponent(q)+'&deep=1').then(r=>r.json()),
   undo: () => fetch('/api/undo').then(r=>r.json()),
   edit: (id,value) => POST('/api/edit',{id,value}),
   delegate: space => POST('/api/delegate',{space}),
@@ -1471,9 +1478,80 @@ function scrollToFirstMatch(){
 }
 
 // ---------------- LEAP ----------------
+// Two requests, one list. Every keystroke asks the lexical /api/leap and draws
+// the answer, exactly as it always has. ~250 ms after you stop typing — and on
+// Enter — a second request with `deep=1` comes back with a `by meaning` group
+// that is MERGED into what is already on screen.
+//
+// The deep answer is slower by an embedding round trip, so the race is the
+// defect to design against, not to hope past: it must never redraw the lexical
+// half, and an answer for a query the box has moved on from must never land on
+// top of a newer one. So both responses are checked against the input's CURRENT
+// value before anything renders, `leapQ` records which query the drawn list
+// belongs to, and the deep rows are kept WITH the query they answer rather than
+// merged blind — if they beat their own lexical half home they wait for it
+// instead of attaching themselves to the previous query's list.
+const DEEP_GROUP='by meaning';
+const DEEP_PAUSE=250;
+let leapQ=null;         // the query `leapEntries` is the answer to
+let leapEntries=[];     // the lexical rows, as /api/leap returned them
+let leapDeep=null;      // {q, rows} — the `by meaning` rows and their query
+let deepTimer=null;
+
+// `by meaning` sits after the lexical content and before the view verbs, which
+// is where a ?deep=1 response itself puts it: it is content, and the verbs stay
+// where the hands already know they are.
+function withDeep(entries){
+  const rows=(leapDeep&&leapDeep.q===leapQ)?leapDeep.rows:[];
+  if(!rows.length) return entries;
+  // The server already drops a semantic hit on an object the lexical pass
+  // found; this only keeps that true if the two responses read the substrate at
+  // different moments. Notes have no object behind them and are never dropped.
+  const seen=new Set(entries.map(e=>e.id));
+  const add=rows.filter(e=>e.note||!seen.has(e.id));
+  if(!add.length) return entries;
+  const k=entries.findIndex(e=>e.group==='viewer');
+  return k<0?entries.concat(add):entries.slice(0,k).concat(add,entries.slice(k));
+}
+// identity is no good across a rebuild — the ask/filter/new rows are made fresh
+// every time — so a row is recognised by what it says it is
+const rowKey=r=>r?r.group+' '+r.id+' '+(r.label||''):null;
+
 async function renderLeap(){
   const qv=q.value.trim();
   const entries=await API.leap(qv);
+  if(q.value.trim()!==qv) return;   // a later keystroke has already asked; this answer is behind the box
+  leapQ=qv; leapEntries=entries;
+  composeLeap(false);
+}
+
+// Fired on the pause and on Enter, never on a keystroke.
+function scheduleDeep(){
+  clearTimeout(deepTimer);
+  deepTimer=setTimeout(()=>deepen(q.value.trim()), DEEP_PAUSE);
+}
+async function deepen(qv){
+  clearTimeout(deepTimer);
+  // "" has no meaning to search by, and the past is not what a present-tense
+  // vector answers about — the server refuses the first, and this refuses both.
+  if(!qv||TIME) return;
+  let entries; try{ entries=await API.leapDeep(qv); }catch(err){ return; }  // an extra: a failure leaves the list alone
+  if(!Array.isArray(entries)) return;                                       // nor does an error body become a row
+  // Two checks, and neither is spare. This one drops an answer the box has
+  // already moved past, so a slow one cannot displace the fresh one in hand;
+  // the stash below is keyed by its query, so rows are only ever drawn beside
+  // the lexical list they belong to. A test covers each.
+  if(q.value.trim()!==qv) return;
+  leapDeep={q:qv, rows:entries.filter(e=>e.group===DEEP_GROUP)};
+  if(leapQ===qv) composeLeap(true);
+}
+
+// keepSel: hold the cursor on the row it was on. A merge happens while you are
+// looking at the list and inserts rows above the verbs, so without this the
+// selection would quietly slide onto a different result.
+function composeLeap(keepSel){
+  const qv=leapQ, entries=withDeep(leapEntries);
+  const was=keepSel?rowKey(filtered[sel]):null;
   filtered = qv
     ? [{id:'__ask__',label:'Ask the agent: “'+qv+'”',group:'ask',prompt:qv}]
         .concat(entries, [{id:'__new__',label:'New space (agent): “'+qv+'”',group:'create',prompt:qv}])
@@ -1491,18 +1569,27 @@ async function renderLeap(){
   // below the .results 46vh fold, which is precisely the burial this verb exists
   // to undo. Ask keeps the top slot; from 25 notebooks, "show me fewer" is next.
   if(mode==='overview'&&!TIME&&qv){
-    const n=notebooksMatching(entries).size;
+    // leapEntries, not the merged list: clicking this row re-runs the LEXICAL
+    // query and filters on that, so counting semantic hits here would advertise
+    // a number the filter then does not apply.
+    const n=notebooksMatching(leapEntries).size;
     filtered.splice(1,0,{id:'__filter__', group:'filter',
       label:'⊟ Filter the overview: “'+qv+'” · '+n+' of '+STATE.spaces.length});
   }
+  if(was){ const i=filtered.findIndex(r=>rowKey(r)===was); if(i>=0) sel=i; }
   if(sel>=filtered.length) sel=0;
   if(!filtered.length){ results.innerHTML='<div class="group">no match</div>'; return; }
   let h='',last=null,flat=0;
-  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions'};
+  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions','by meaning':'By meaning'};
   filtered.forEach(e=>{ const grp=gname[e.group]||'Content';
     if(grp!==last){h+='<div class="group">'+grp+'</div>';last=grp;}
-    const i=flat++; const cls=(e.group==='space')?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask'||e.group==='filter')?'verb':'';
-    const ic=e.group==='ask'?'✦':e.group==='space'?'▢':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    const i=flat++;
+    // a semantic hit carries the KIND of the object it found, so a notebook
+    // found by meaning wears a notebook's mark — and act() enters it rather
+    // than opening it as a document. The group header says how it was found.
+    const sp=e.group==='space'||(e.group===DEEP_GROUP&&e.kind==='space');
+    const cls=e.note?'note':sp?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask'||e.group==='filter')?'verb':'';
+    const ic=e.note?'⋯':sp?'▢':e.group==='ask'?'✦':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
     h+='<div class="res '+cls+(i===sel?' sel':'')+'" data-i="'+i+'"><span class="ic">'+ic+'</span>'+
        '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(e.id)+'</span></div>'; });
   results.innerHTML=h;
@@ -1518,6 +1605,9 @@ function paintSel(){
   });
 }
 async function act(){ const e=filtered[sel]; if(!e) return;
+  // a `by meaning` note is a statement about the search — "degraded", "n chunks
+  // awaiting" — and `__deep__` is not an id anything can open. Nothing acts on it.
+  if(e.note) return;
   if(e.connect){                       // ⧉ non-destructive merge of two notebooks
     let r; try{ r=await API.connect(STATE.spaces[focusIdx].id, e.connect); }catch(err){ showToast('connect: network error'); return; }
     if(r.error){ showToast(r.error); return; }
@@ -1548,6 +1638,12 @@ async function act(){ const e=filtered[sel]; if(!e) return;
   else if(e.group==='viewer'){ /* a view-verb: no-op until applied to a selection */ closeLeap(); }
   else if(e.group==='memory'){ const qq=q.value.trim(); closeLeap(); openMemory(qq); }
   else if(e.group==='prose'){ const i=STATE.spaces.findIndex(s=>s.id===e.id); if(i>=0) enter(i); }
+  // A semantic hit is not one kind of thing: it points at whatever object its
+  // chunk came from. openObject on a notebook would open a notebook as a
+  // document, so the kind the server sends decides which gesture this is.
+  else if(e.group===DEEP_GROUP){
+    if(e.kind==='space'){ const i=STATE.spaces.findIndex(s=>s.id===e.id); if(i>=0) enter(i); }
+    else openObject(e.id); }
   else { openObject(e.id); } }
 async function createSpace(prompt){
   closeLeap();
@@ -1692,13 +1788,22 @@ async function keepNote(){
   showToast('Kept as a note in '+sp.title+' — reversible', undo);
 }
 function openLeap(){ cmd.classList.add('live'); renderLeap(); }
-function closeLeap(){ cmd.classList.remove('live'); q.value=''; q.blur(); }
+// a closed palette is owed nothing: cancel the pending deep query and forget
+// the rows it fetched, so re-opening starts from the lexical list again
+function closeLeap(){ cmd.classList.remove('live'); q.value=''; q.blur();
+  clearTimeout(deepTimer); leapDeep=null; }
 q.addEventListener('focus',()=>{ if(TIME){ q.blur(); showToast('time mode — ↩ now to search'); return; } openLeap(); });
-q.addEventListener('input',()=>{sel=0;renderLeap();});
+// the lexical request goes out on the key; the deep one only if the keys stop
+q.addEventListener('input',()=>{sel=0;renderLeap();scheduleDeep();});
 q.addEventListener('keydown',e=>{
   if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,filtered.length-1);paintSel();}
   else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paintSel();}
-  else if(e.key==='Enter'){e.preventDefault();act();}
+  // Enter searches by meaning NOW instead of waiting out the pause, and then
+  // acts. Be clear about what that is worth: every act() that acts closes the
+  // palette, which empties the box, and the staleness check then drops the deep
+  // answer — as the spec says it should. What it buys is the row that does NOT
+  // act, the `__deep__` note, where Enter is "ask again" and the answer lands.
+  else if(e.key==='Enter'){e.preventDefault();deepen(q.value.trim());act();}
   else if(e.key==='Escape'){ if(q.value){q.value='';renderLeap();} else {closeLeap(); if(mode==='focus') overview();} }
 });
 addEventListener('keydown',e=>{
