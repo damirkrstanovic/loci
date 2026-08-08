@@ -11,6 +11,7 @@
             [sci.core :as sci]
             [org.httpkit.server :as http]
             [loci.agent :as agent]
+            [loci.chunks :as ch]
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.fnlib :as fnlib]
@@ -180,52 +181,197 @@
         {:id id :title (:title o) :kind (name (:kind m)) :view (when (:view m) (kw->str (:view m)))
          :label (:label m) :rendered (:rendered m) :alternatives (alternatives st o)}))))
 
+;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
+;;
+;; Everything below runs for `?deep=1` and for nothing else. The keystroke path
+;; must make ZERO embedding requests — a 20–50 ms round trip between a key and a
+;; redraw is the thing this whole design is split in half to prevent — so the
+;; only caller of `deep-entries` is the `:deep?` branch of `leap-payload`, and
+;; there is a test that watches a stubbed embedder receive nothing.
+
+(def ^:private group-cap
+  "How many hits one LEAP group shows. Shared by the lexical groups and the
+   semantic one, so \"capped like the others\" is the same number rather than
+   two numbers that agree today."
+  8)
+
+(def ^:private deep-group
+  "The group name a semantic hit arrives under. Its own group on purpose: a
+   result that matched no word you typed is visibly a different kind of answer
+   rather than a mystery."
+  "by meaning")
+
+(defn- ell [s n]
+  (let [s (str/replace (str s) "\n" " ")]
+    (if (> (count s) n) (str (subs s 0 n) "…") s)))
+
+(defn- deep-note
+  "A row in the `by meaning` group that is a statement, not a hit.
+
+   The response is a flat list of rows — that is what the keystroke path returns
+   and `?deep=1` must return the same shape, otherwise \"deep with no embedder
+   returns exactly what deep absent returns\" could not hold. So the two things
+   the spec's failure table asks the group to report (that it is degraded, and
+   how many chunks await) are rows, marked `:note true` and carrying the pseudo-id
+   `__deep__` in the same convention the memory group's `__memory__` already
+   uses. A note is never something to open."
+  [label extra]
+  (merge {:id "__deep__" :label label :group deep-group :note true} extra))
+
+(defn- best-per-object
+  "The first chunk seen for each object, from a sequence already in the order
+   you want. One row per document: a hit opens the document, so two fragments of
+   it are one result, not two."
+  [chunks]
+  (:out (reduce (fn [{:keys [seen out] :as acc} c]
+                  (if (seen (:object c))
+                    acc
+                    {:seen (conj seen (:object c)) :out (conj out c)}))
+                {:seen #{} :out []} chunks)))
+
+(defn- deep-entries
+  "The `by meaning` group: the query embedded once, scored by exact cosine
+   against every embedded chunk, best first, one row per object.
+
+   **Exact cosine, no index.** 101 chunks over the EDN rollback and ~150–170 over
+   the live corpus, where chunking per heading gives more than the design's
+   projected 94. Measured 2026-08-08 at 1024 dims: 0.028 ms per cosine, 2.8 ms
+   for 101 of them, 5.8 ms for the whole scored-and-sorted scan, 7.8 ms at 202
+   chunks. The design's 0.61 ms does NOT reproduce against `embed/cosine` over
+   stored vectors — it is ten times that — and the conclusion is unchanged
+   anyway: the embedding round trip this scan waits on is 20–50 ms, so an ANN
+   index would shave single-digit milliseconds off a request that is already off
+   the keystroke path. Revisit past a few thousand chunks, not before.
+
+   **No rerank.** It is a further 50–100 ms round trip on top of the embedding,
+   and LEAP is a navigation gesture rather than a research answer.
+
+   **Not scoped** — not by notebook, not by tag, not by lineage. Recall is scoped
+   to a notebook's trunk because the agent should reason from what this line of
+   enquiry learned; LEAP is the opposite act, the one gesture that must reach
+   everything, so that decision deliberately does not carry over.
+
+   `already` is the set of ids the lexical groups returned. A chunk on an object
+   already found by substring is dropped, so this group shows what substring
+   search could NOT find rather than repeating it."
+  [st cs q already touched]
+  (let [r (embed/embed-texts [q])]
+    (cond
+      ;; Nothing configured: `?deep=1` is byte-identical to `deep` absent. A note
+      ;; here would itself be a difference, and the spec calls that
+      ;; non-negotiable. `embed-texts` answers `:off` without making a request.
+      (:off r) []
+
+      ;; Asked and not answered. Today's response plus an honest marker — not an
+      ;; error, not an empty page. The message is ours, not the embedder's URL:
+      ;; a URL a user set can carry credentials, and this one goes to a browser.
+      (:error r)
+      [(deep-note "search by meaning is unavailable — the embedder is not answering"
+                  {:degraded (:error r)})]
+
+      :else
+      (let [model (:model r)          ; the CONFIGURED name, which is what sweep! stamped
+            qv    (first (:vectors r))
+            objs  (sub/objects st)
+            hits  (->> (ch/embedded cs model)
+                       ;; `embedded` has already dropped retired chunks; this
+                       ;; also drops a chunk whose object went away since the
+                       ;; last sweep, which would otherwise open nothing.
+                       (keep (fn [c]
+                               (when-let [o (and (not (already (:object c)))
+                                                 (get objs (:object c)))]
+                                 (assoc c :score (embed/cosine qv (:vec c)) :obj o))))
+                       ;; Not a relevance threshold — one of those would need
+                       ;; calibrating per model, which is why loci.memory refuses
+                       ;; to merge on an uncalibrated one. Cosine ≤ 0 is the
+                       ;; degenerate case: no shared direction at all, or a
+                       ;; length mismatch, for which `cosine` returns 0.0.
+                       (filter #(pos? (:score %)))
+                       ;; id breaks ties, so the order is total and two identical
+                       ;; scores do not sort by whatever the map handed back
+                       (sort-by (juxt (comp - :score) :id))
+                       best-per-object
+                       (take group-cap)
+                       (mapv (fn [c]
+                               (let [o (:obj c)]
+                                 {:id      (:object c)   ; the OBJECT, never the chunk:
+                                  ;; a result opens the document, not a fragment of it
+                                  :label   (str (or (:title o) (:object c)) " · " (ell (:text c) 70))
+                                  :group   deep-group
+                                  :kind    (name (:kind o))
+                                  :score   (:score c)
+                                  :touched (touched (:object c) 0)}))))
+            ;; Against the substrate, not the file, so a chunks.edn that was
+            ;; never built reports every chunk it implies rather than "0 awaiting"
+            ;; over an empty group. ~170 on the live corpus before a first sweep.
+            ;;
+            ;; It re-chunks and re-hashes the whole substrate to answer: measured
+            ;; 4.2 ms over 101 chunks / 82 events, which is affordable HERE and
+            ;; nowhere else. It is one of the reasons this function may only ever
+            ;; be reached by ?deep=1.
+            awaiting (count (ch/pending st cs model))]
+        (cond-> hits
+          (pos? awaiting)
+          (conj (deep-note (str awaiting " chunk(s) awaiting embedding") {:awaiting awaiting})))))))
+
 (defn leap-payload
   "ONE incremental search across everything: objects, notebook prose, doc
    bodies, memory facts, view verbs. Content groups only appear once there's
-   a query; each group is capped so it stays incremental-fast."
-  [st mem q]
-  (let [q    (str/lower-case (or q ""))
-        hit? (fn [& ss] (str/includes? (str/lower-case (str/join " " (map str ss))) q))
-        ell  (fn [s n] (let [s (str/replace (str s) "\n" " ")]
-                         (if (> (count s) n) (str (subs s 0 n) "…") s)))
-        snip (fn [text] (let [i (or (str/index-of (str/lower-case text) q) 0)]
-                          (ell (subs text (max 0 (- i 20))) 70)))
-        touched (last-touched st)
-        ;; recency BEFORE the cap: taking "the first 8 encountered" dropped
-        ;; results by whatever order the objects happened to enumerate in
-        recent  (fn [e] (or (:touched e) 0))
-        cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
-                           (sort-by recent >) (take 8) vec))
-        objs  (->> (sub/objects st) vals
-                   (remove #(#{:viewspec :applet :fn :palette} (:kind %)))
-                   (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))
-                   (map (fn [o] {:id (:id o) :label (:title o) :group (name (:kind o))})))
-        verbs (->> @mold/registry
-                   (map (fn [v] {:id (kw->str (:id v)) :label (str "view as " (:label v)) :group "viewer"}))
-                   (filter #(or (= q "") (hit? (:label %) (:id %)))))
-        prose (when (seq q)
-                (for [o (nb/notebooks st), c (nb/cells-of o)
-                      :when (and (:text c) (hit? (:text c)))]
-                  {:id (:id o) :label (str (:title o) " · " (snip (:text c))) :group "prose"}))
-        intext (when (seq q)
-                 (for [o (vals (sub/objects st))
-                       :when (and (= :doc (:kind o)) (string? (:value o))
-                                  (hit? (:value o)) (not (hit? (:title o) (:id o))))]
-                   {:id (:id o) :label (str (:title o) " · …" (snip (:value o))) :group "in text"}))
-        made  (when (seq q)
-                (for [o (vals (sub/objects st))
-                      :when (and (#{:applet :viewspec :fn} (:kind o))
-                                 (hit? (:title o) (:id o) (get-in o [:value :label])))]
-                  {:id (:id o)
-                   :label (str (or (get-in o [:value :label]) (:title o))
-                               " · on " (or (get-in o [:value :target]) (get-in o [:value :source]) "?"))
-                   :group "views & functions"
-                   :target (or (get-in o [:value :target]) (get-in o [:value :source]))}))
-        mems (when (seq q)
-               (map (fn [f] {:id "__memory__" :label (:fact f) :group "memory"})
-                    (mold/recall mem q {:k 8})))]
-    (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap mems) verbs))))
+   a query; each group is capped so it stays incremental-fast.
+
+   The three-argument form is the keystroke path and is lexical, exactly as it
+   has always been. `{:deep? true :chunks cs}` adds the `by meaning` group on top
+   of — never instead of — everything the lexical pass found; it is what
+   `?deep=1` calls, on a pause and on Enter, and it is the ONLY form that embeds
+   anything."
+  ([st mem q] (leap-payload st mem q nil))
+  ([st mem q {:keys [deep? chunks]}]
+    (let [q    (str/lower-case (or q ""))
+          hit? (fn [& ss] (str/includes? (str/lower-case (str/join " " (map str ss))) q))
+          snip (fn [text] (let [i (or (str/index-of (str/lower-case text) q) 0)]
+                            (ell (subs text (max 0 (- i 20))) 70)))
+          touched (last-touched st)
+          ;; recency BEFORE the cap: taking "the first 8 encountered" dropped
+          ;; results by whatever order the objects happened to enumerate in
+          recent  (fn [e] (or (:touched e) 0))
+          cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
+                             (sort-by recent >) (take group-cap) vec))
+          objs  (->> (sub/objects st) vals
+                     (remove #(#{:viewspec :applet :fn :palette} (:kind %)))
+                     (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))
+                     (map (fn [o] {:id (:id o) :label (:title o) :group (name (:kind o))})))
+          verbs (->> @mold/registry
+                     (map (fn [v] {:id (kw->str (:id v)) :label (str "view as " (:label v)) :group "viewer"}))
+                     (filter #(or (= q "") (hit? (:label %) (:id %)))))
+          prose (when (seq q)
+                  (for [o (nb/notebooks st), c (nb/cells-of o)
+                        :when (and (:text c) (hit? (:text c)))]
+                    {:id (:id o) :label (str (:title o) " · " (snip (:text c))) :group "prose"}))
+          intext (when (seq q)
+                   (for [o (vals (sub/objects st))
+                         :when (and (= :doc (:kind o)) (string? (:value o))
+                                    (hit? (:value o)) (not (hit? (:title o) (:id o))))]
+                     {:id (:id o) :label (str (:title o) " · …" (snip (:value o))) :group "in text"}))
+          made  (when (seq q)
+                  (for [o (vals (sub/objects st))
+                        :when (and (#{:applet :viewspec :fn} (:kind o))
+                                   (hit? (:title o) (:id o) (get-in o [:value :label])))]
+                    {:id (:id o)
+                     :label (str (or (get-in o [:value :label]) (:title o))
+                                 " · on " (or (get-in o [:value :target]) (get-in o [:value :source]) "?"))
+                     :group "views & functions"
+                     :target (or (get-in o [:value :target]) (get-in o [:value :source]))}))
+          mems (when (seq q)
+                 (map (fn [f] {:id "__memory__" :label (:fact f) :group "memory"})
+                      (mold/recall mem q {:k 8})))
+          lex  (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap mems)))
+          ;; An empty query embeds nothing even with ?deep=1: there is no meaning
+          ;; in "" to search by, and asking would be a request per opened palette.
+          deep (when (and deep? chunks (seq q))
+                 (deep-entries st chunks q (set (map :id lex)) touched))]
+      ;; `by meaning` sits after the lexical content and before the view verbs —
+      ;; it is content, and the verbs stay where the hands already know they are.
+      (vec (concat lex deep verbs)))))
 
 ;; ---- notebook payload: cells hydrated (each ref molded by its chosen view),
 ;; rail links and also-in chips computed fresh every time ----
@@ -1490,7 +1636,13 @@
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
       (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) (params "id") (params "view")))
       (= uri "/api/events")  (json-resp (events-payload st))
-      (= uri "/api/leap")    (json-resp (leap-payload st @mem/memory (params "q")))
+      ;; `?deep=1` is the pause/Enter request, and the ONLY one that embeds. The
+      ;; chunk singleton is forced here rather than in the params map so a
+      ;; keystroke never resolves the data directory or reads chunks.edn.
+      (= uri "/api/leap")    (json-resp (if (#{"1" "true" "yes"} (params "deep"))
+                                          (leap-payload st @mem/memory (params "q")
+                                                        {:deep? true :chunks @ch/chunks})
+                                          (leap-payload st @mem/memory (params "q"))))
       (= uri "/api/undo")    (do (sub/undo! st) (json-resp (state-payload st)))
       (= uri "/api/edit")    (let [{:keys [id value]} (body-json req)] (json-resp (edit! st id value)))
       (= uri "/api/delegate")(let [{:keys [space]} (body-json req)] (json-resp (delegate! st space)))
@@ -1535,6 +1687,70 @@
 
 (defonce server (atom nil))
 
+;; ---- the background chunk sweep ----
+;;
+;; **Why this thread lives here and not in loci.chunks or loci.memory.**
+;;
+;; It could have gone in three places, and two of them are wrong:
+;;
+;; · *extend `mem/start-embed-worker!`* — that worker would then need the
+;;   substrate and the chunk store, and `loci.memory` would have to require
+;;   `loci.substrate` and `loci.chunks` to schedule work it knows nothing about.
+;;   Memory is a store of facts; making it the scheduler for a different store is
+;;   an inversion that gets worse with the third thing that needs a tick.
+;;
+;; · *fold both passes into one thread here* — one timer, but `start-embed-worker!`
+;;   also carries the rule that merge only follows a pass that WORKED, which is
+;;   tested where it lives. Re-implementing it here to save a thread would copy a
+;;   subtle rule into a second place for it to drift from.
+;;
+;; So: `loci.chunks` stays what its docstring says it is — a library whose
+;; `sweep!` a server, a worker or a test calls — and the scheduling lives at the
+;; one layer that already knows about both stores and already starts threads.
+;; Both are started from `-main` under the SAME `embedding-configured?` guard, so
+;; either both run or neither does and startup says which.
+;;
+;; Nothing starts on require; nothing here blocks a write (`sweep!` never touches
+;; the write path, and a commit never waits on it); and a pass that fails leaves
+;; its chunks pending for the next one.
+(defn start-chunk-sweep!
+  "Run `ch/sweep!` over `st`/`cs` every `:interval-ms` (default 15 s, matching
+   the memory worker) on one daemon thread. Returns a handle for
+   `stop-chunk-sweep!`.
+
+   Daemon, because a sweep parked in a 30-second embedder request must not be
+   what keeps the JVM alive. The `catch` is belt-and-braces — `sweep!` returns
+   its failures as values and documents that it never throws — but a background
+   thread that dies silently would stop embedding for the life of the process."
+  ([st cs] (start-chunk-sweep! st cs {}))
+  ([st cs {:keys [interval-ms] :or {interval-ms 15000}}]
+   (let [wake (java.util.concurrent.ArrayBlockingQueue. 1)
+         run? (atom true)
+         t    (Thread. ^Runnable
+                       (fn []
+                         (while @run?
+                           (try (ch/sweep! st cs)
+                                (catch Throwable e
+                                  (binding [*out* *err*]
+                                    (println "loci.server: the chunk sweep threw:" e))))
+                           (when @run?
+                             (try (.poll wake interval-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+                                  (catch InterruptedException _ nil)))))
+                       "loci-chunk-sweep")]
+     (.setDaemon t true)
+     (.start t)
+     {:thread t :wake wake :run? run?})))
+
+(defn stop-chunk-sweep!
+  "Stop a sweep started by `start-chunk-sweep!`. Returns true once its thread has
+   died; false means it is still finishing a request, which can legitimately be a
+   30-second timeout, not that it is stuck."
+  [{:keys [^Thread thread ^java.util.concurrent.ArrayBlockingQueue wake run?]}]
+  (reset! run? false)
+  (.offer wake :stop)
+  (.join thread 2000)
+  (not (.isAlive thread)))
+
 (defn -main [& _]
   ;; PORT because that is what every container runtime sets. The data directory is
   ;; printed because a packaged loci defaults to a RELATIVE "data" — launched from
@@ -1556,7 +1772,12 @@
     ;; printed: it is a URL a user set, and a URL can carry credentials.
     (if (embed/embedding-configured?)
       (do (mem/start-embed-worker! @mem/memory)
+          (start-chunk-sweep! (store) @ch/chunks)
           (println (str "  semantic recall: " (embed/embed-model) ", "
-                        (count (mem/pending-facts @mem/memory)) " fact(s) awaiting embedding")))
-      (println "  semantic recall: off (no LOCI_EMBED_ENDPOINT) — recall is lexical"))
+                        (count (mem/pending-facts @mem/memory)) " fact(s) awaiting embedding"))
+          ;; Counted against the substrate, so a first run — or a deleted
+          ;; chunks.edn — honestly says "170 awaiting" instead of nothing at all.
+          (println (str "  LEAP by meaning: "
+                        (count (ch/pending (store) @ch/chunks)) " chunk(s) awaiting embedding")))
+      (println "  semantic recall: off (no LOCI_EMBED_ENDPOINT) — recall and LEAP are lexical"))
     @(promise)))
