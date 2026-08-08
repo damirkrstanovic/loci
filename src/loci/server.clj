@@ -336,9 +336,62 @@
   (vec (concat (mapv (fn [[vid lbl]] [(kw->str vid) lbl]) (:alternatives (mold/mold (:value o))))
                (mapv (fn [v] [(:id v) (get-in v [:value :label])]) (dynamic-views st (:id o))))))
 
-(defn mold-payload [st id view]
+(defn mold-payload
+  "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
+   every `:ref` cell of a notebook payload is built out of.
+
+   **`m` is the memory — or a delay of one — and is FORCED ONLY on the entity
+   branch.** All seven call sites hand it `mem/memory` UNDEREFERENCED, which is
+   why five of them can: `notebook-payload`, `edit!`, `describe!`, `make-view!`
+   and `compute-clj!` have no memory of their own, and molding a doc, a table, a
+   flow or an applet through them must not be the thing that opens
+   `data/memory.edn`. The alternative the plan named — `@mem/memory` at all seven
+   — was rejected on the test seam it opens: it makes `(edit! st \"doc:a\" \"y\")`
+   in `edit-rejects-missing-id`, an assertion with nothing to say about memory,
+   force the singleton against the user's real data directory, and every future
+   test of those five functions after it.
+
+   Be precise about what guards that. `server_test`'s `no-memory` is a delay that
+   throws, and it catches the calls a test makes to THIS function directly — nine
+   tests, measured, when the force is hoisted out of the branch. It cannot see
+   through `edit!`, which passes `mem/memory` itself and would simply succeed
+   against the real file. That path is held shut by the shape of the code and by
+   nothing else.
+
+   `clojure.core/force` is identity on anything that is not a delay, so a caller
+   already holding a memory — every entity test, and anything that would rather
+   read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
+   pass it."
+  [st m id view]
   (let [o (sub/object st id)]
     (cond
+      ;; an ENTITY — no viewers, the shell draws the same page it draws before
+      ;; materialization, out of the same payload. A `mold/mold` viewer could not
+      ;; be this page: a viewer's `:render` only ever receives `(:value o)`,
+      ;; which here is `{:name "tsmc"}`, and has no way to reach the memory the
+      ;; facts live in. So this is the `:flow` mechanism — "no viewers, the shell
+      ;; renders it itself" — and for the same reason.
+      ;;
+      ;; `entity-payload` is handed THIS `st`, which under `?at=` is a frozen
+      ;; store: the source chips are the objects that existed at that point, and
+      ;; reading the live store here for them while everything else read the
+      ;; frozen one is the one thing that would be wrong. The facts are today's
+      ;; either way — the memory has no time dimension and `undo!` never touches
+      ;; a fact, so there is no past set to read. That is the memory's design,
+      ;; not an omission here.
+      ;;
+      ;; The branch is on the KIND and never on whether the name looks usable. A
+      ;; guard would be a second normalization living outside `ent/normalize`,
+      ;; and it would disagree with it — `str/blank?` is false for a lone U+00A0,
+      ;; which `ent/normalize` trims to nothing. An object carrying no usable
+      ;; name therefore renders `entity-payload`'s own `{:error …}`, which is the
+      ;; shape `GET /api/entity?name=` already answers a nameless request with:
+      ;; one renderer handles it on both surfaces rather than growing a case that
+      ;; exists only here.
+      (= :entity (:kind o))
+      (let [p (entity-payload st (force m) (get-in o [:value :name]))]
+        {:id id :title (:title o) :kind "entity" :view nil :label "entity"
+         :rendered p :alternatives []})
       ;; a flow — no viewers, the shell renders the live checklist itself
       (= :flow (:kind o))
       {:id id :title (:title o) :kind "flow" :view nil :label "flow"
@@ -517,7 +570,20 @@
           cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
                              (sort-by recent >) (take group-cap) vec))
           objs  (->> (sub/objects st) vals
-                     (remove #(#{:viewspec :applet :fn :palette} (:kind %)))
+                     ;; `:entity` is dropped HERE and deliberately not from
+                     ;; `state-payload`, and the asymmetry is a decision rather
+                     ;; than an oversight. The two lists answer different
+                     ;; questions. `state-payload` is *what exists*: it feeds
+                     ;; `STATE.objects`, out of which the shell draws every
+                     ;; notebook member — and a materialized entity is a member
+                     ;; of the very notebook `materialize-entity!` mints for it,
+                     ;; so dropping it there would draw that notebook's one cell
+                     ;; as a grey `ent:1 · ?`. LEAP is *what to offer you as a
+                     ;; destination*, and there the subject group's row already
+                     ;; is that destination: emitting this one too would put one
+                     ;; subject under two headings, which is the collision the
+                     ;; design split the groups to avoid.
+                     (remove #(#{:entity :viewspec :applet :fn :palette} (:kind %)))
                      (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))
                      (map (fn [o] {:id (:id o) :label (:title o) :group (name (:kind o))})))
           verbs (->> @mold/registry
@@ -567,7 +633,7 @@
                                 :also-in (get also-in (:ref c))
                                 :from (:from (sub/object st (:ref c)))
                                 :via  (:via (sub/object st (:ref c)))}
-                               (mold-payload st (:ref c) (:view c)))
+                               (mold-payload st mem/memory (:ref c) (:view c)))
                         :else {:i i :type "missing" :ref (:ref c)}))
                     (nb/cells-of o)))]
     {:id id :title (:title o) :intent (get-in o [:value :intent])
@@ -791,7 +857,7 @@
   (if-not (and id (sub/object st id))
     {:error (str "no such object: " id)}
     (do (sub/commit! st {:op :assoc :id id :path [:value] :value value})
-        {:state (state-payload st) :object (mold-payload st id nil)})))
+        {:state (state-payload st) :object (mold-payload st mem/memory id nil)})))
 
 ;; (1) molding-by-description — the agent emits a view-spec stored as a
 ;; reversible object; it then appears in the object's "view this as…" menu.
@@ -806,7 +872,7 @@
               vobj {:id vid :kind :viewspec :title (str "view: " (:label spec))
                     :value {:target id :label (or (:label spec) prompt) :spec spec}}]
           (sub/commit! st {:op :put :id vid :value vobj})
-          (assoc (mold-payload st id vid) :events (count (sub/history st))))))
+          (assoc (mold-payload st mem/memory id vid) :events (count (sub/history st))))))
     (catch Exception e {:error (.getMessage e)})))
 
 ;; (1b) molding-by-CODE — the agent writes a self-contained JS applet that runs
@@ -827,7 +893,7 @@
                     :value {:target id :code code
                             :label (str "▶ " (if (> (count p) 26) (str (subs p 0 26) "…") p))}}]
           (sub/commit! st {:op :put :id vid :value vobj})
-          (assoc (mold-payload st id vid) :events (count (sub/history st))))))
+          (assoc (mold-payload st mem/memory id vid) :events (count (sub/history st))))))
     (catch Exception e {:error (.getMessage e)})))
 
 ;; (1d) function-as-substrate-object, BACKEND flavour — the agent writes a pure
@@ -887,7 +953,7 @@
                         (and space (space? st space))
                         (conj (nb/append-cell-event st space {:ref nid})))]
               (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid :object (mold-payload st nid nil)})))))
+              {:state (state-payload st) :openId nid :object (mold-payload st mem/memory nid nil)})))))
     (catch Exception e {:error (str "compute failed: " (.getMessage e))})))
 
 ;; the functions living in the substrate, with their code — an inspector for the
@@ -2162,7 +2228,8 @@
       (= uri "/")            {:status 200 :headers {"Content-Type" "text/html; charset=utf-8"}
                               :body (slurp (io/resource "public/index.html"))}
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
-      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) (params "id") (params "view")))
+      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) mem/memory
+                                                     (params "id") (params "view")))
       (= uri "/api/events")  (json-resp (events-payload st))
       ;; `?deep=1` is the pause/Enter request, and the ONLY one that embeds. The
       ;; chunk singleton is forced here rather than in the params map so a
@@ -2217,7 +2284,7 @@
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
                                   (json-resp (suggest-run-start! st space items destination)))
       (str/starts-with? uri "/api/object/")
-      (json-resp (mold-payload (store-at st (params "at"))
+      (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
       :else {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})))
 

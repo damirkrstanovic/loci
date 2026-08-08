@@ -16,6 +16,25 @@
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))
 
+(def ^:private no-memory
+  "The memory `mold-payload` must not open — a delay that throws if it is forced.
+
+   `mold-payload` takes a memory because a `:kind :entity` object's page IS
+   `entity-payload`'s answer, and it forces that argument on the entity branch
+   and on no other. Every object molded with this one is a doc, a table or a
+   flow, so passing a poison delay costs nothing to write and turns \"it happens
+   not to need the memory\" into an assertion: hoist the force out of the branch
+   and these stop rendering and start throwing.
+
+   It is also HALF the reason the in-process callers may pass `mem/memory`
+   undereferenced, and only half — say which half. Hoisting the force catches
+   nine tests through this def. It does not catch `(srv/edit! st \"doc:a\" \"y\")`
+   below, which reaches `mold-payload` through `edit!` and so would force the
+   real `mem/memory`, read the user's `data/memory.edn` and pass. That is the
+   seam the laziness exists for and the seam no test can watch; this one watches
+   the other."
+  (delay (throw (ex-info "mold-payload forced the memory to render a non-entity" {}))))
+
 (deftest leap-searches-everything
   (let [st (sub/fresh-store)
         m  (mem/file-memory (tmpfile))]
@@ -669,7 +688,7 @@
   (let [st (flow-store)]
     (is (:error (srv/flow-start! st "nope" "g")))                  ; not a notebook → sync error
     (let [fid (srv/flow-create! st "space:f" "g" [{:verb "draft" :args {} :note "" :status "pending"}])
-          m   (srv/mold-payload st fid nil)]
+          m   (srv/mold-payload st no-memory fid nil)]
       (is (= "flow" (:kind m)))
       (is (= "g" (get-in m [:rendered :goal]))))))
 
@@ -702,12 +721,12 @@
   (let [st (gappy-store)]
     (doseq [v ["table/rows" "table/summary" "table/cards" "table/pivot"
                "table/bar" "table/hist"]]
-      (is (some? (:rendered (srv/mold-payload st "tbl:gappy" v)))
+      (is (some? (:rendered (srv/mold-payload st no-memory "tbl:gappy" v)))
           (str v " threw or rendered nothing on a table with gaps")))))
 
 (deftest aggregates-ignore-gaps-rather-than-counting-them
   (let [st (gappy-store)
-        summ (:rendered (srv/mold-payload st "tbl:gappy" "table/summary"))
+        summ (:rendered (srv/mold-payload st no-memory "tbl:gappy" "table/summary"))
         gdp  (first (filter #(= "gdp" (:column %)) summ))]
     (is (= 3 (:n gdp)) "n must count the values that exist, not the rows")
     (is (= 60.0 (:sum gdp)))
@@ -722,7 +741,7 @@
                      :value {:id "tbl:lead" :kind :table :title "Leading gap"
                              :value [{:name "A" :score ""} {:name "B" :score 5.0}
                                      {:name "C" :score 7.0}]}})
-    (let [summ (:rendered (srv/mold-payload st "tbl:lead" "table/summary"))]
+    (let [summ (:rendered (srv/mold-payload st no-memory "tbl:lead" "table/summary"))]
       (is (= ["score"] (mapv :column summ)))
       (is (= 12.0 (:sum (first summ)))))))
 
@@ -735,7 +754,7 @@
 ;; to come from what the column MEANS.
 
 (defn- charted [st id]
-  (:rendered (srv/mold-payload st id "table/bar")))
+  (:rendered (srv/mold-payload st no-memory id "table/bar")))
 
 (deftest bar-prefers-a-quantity-over-a-rate-whatever-the-key-order
   (let [st (sub/fresh-store)
@@ -789,7 +808,7 @@
                 :age_65_plus_pct 12.0 :note "x"})]
     (sub/commit! st {:op :put :id "tbl:pop"
                      :value {:id "tbl:pop" :kind :table :title "Pop" :value (vec rows)}})
-    (let [c (:rendered (srv/mold-payload st "tbl:pop" "table/bar"))]
+    (let [c (:rendered (srv/mold-payload st no-memory "tbl:pop" "table/bar"))]
       (is (= "population" (:y c)) (str "charted " (:y c)))
       (is (= "sum" (:agg c))))))
 
@@ -3060,3 +3079,181 @@
       (is (= (:spaceId r) (:spaceId again))))
     (is (= "no entity name given" (:error (post! {}))) "a body with no name is a message, never a 500")
     (is (= "no entity name given" (:error (post! {:name "   "}))))))
+
+;; ============================================================================
+;; the entity object's page — one payload, two surfaces
+;; ============================================================================
+
+(deftest a-materialized-entity-molds-to-its-own-page
+  ;; §4 of the design: once materialized, "the page is that object's page —
+  ;; moldable, undoable, a citizen like any other". A `mold/mold` viewer cannot
+  ;; be that page — a viewer's `:render` only ever receives `(:value o)`, which
+  ;; here is `{:name "tsmc"}`, and has no way to reach the memory the facts live
+  ;; in. So `mold-payload` branches on the kind and says "no viewers, the shell
+  ;; renders this itself", exactly as it already does for `:flow`.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        eid (:entity (srv/materialize-entity! st "tsmc"))
+        ;; a viewspec aimed at the entity, so `(alternatives st o)` would return
+        ;; something. Without it the `:alternatives` assertion below cannot fail
+        ;; — no built-in viewer's `pred` accepts `{:name "tsmc"}` and there are
+        ;; no dynamic views, so `alternatives` and the literal `[]` agree even
+        ;; when the branch hands back the wrong one.
+        _   (sub/commit! st {:op :put :id "view:ent-1"
+                             :value {:id "view:ent-1" :kind :viewspec :title "view: as a card"
+                                     :value {:target eid :label "as a card" :spec {}}}})
+        p   (srv/mold-payload st m eid nil)]
+    (is (= eid (:id p)))
+    (is (= "entity" (:kind p)) "its own branch, and not whatever `mold/mold` makes of `{:name \"tsmc\"}`")
+    (is (nil? (:view p)))
+    (is (= [] (:alternatives p))
+        "and nothing to view it as, even with a view-spec aimed at it: a subject has one page")
+    (let [r (:rendered p)]
+      (is (= "tsmc" (:name r)))
+      (is (= 4 (:count r)) "every live fact carrying the name")
+      (is (= tsmc-ranked (mapv :fact (:facts r))) "ranked, and ranked exactly as the modal ranks them")
+      (is (= #{"doc:fab" "doc:az" "space:semis" "space:az"} (set (map :id (:sources r))))
+          "the objects and notebooks the facts came from — `doc:gone` dropped, as it has no object")
+      (is (= eid (:object r))
+          "…and the page carries the id of the object whose page it is, which is what tells the shell not to offer materialization again"))))
+
+(deftest the-object-page-and-the-modal-are-one-payload
+  ;; The claim the whole task exists to make. Two renderers would drift, and the
+  ;; drift would be invisible until somebody materialized something and the page
+  ;; they had been reading changed under them.
+  ;;
+  ;; `but-scores` on both sides, because an exact `=` here would be flaky by
+  ;; construction and not by luck: `weight` multiplies relevance by
+  ;; `decay(ts, now)` with `now` read afresh inside each `recall`, so two calls a
+  ;; millisecond apart differ in the eleventh decimal place. What is under test
+  ;; is that the two surfaces answer the same PAGE — same keys, same facts, same
+  ;; order, same counts, same sources — not that a float computed twice off two
+  ;; readings of the clock agrees with itself.
+  (let [st   (entity-fixture)
+        m    (entity-memory)
+        eid  (:entity (srv/materialize-entity! st "tsmc"))
+        get! (fn [uri qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri uri :query-string qs}))
+                                :key-fn keyword)))
+        modal (but-scores (get! "/api/entity" "name=tsmc"))
+        page  (but-scores (:rendered (get! "/api/mold" (str "id=" eid))))]
+    (is (= modal page)
+        "key for key, through the two URLs the shell actually calls")
+    ;; the two comparisons above and below are not the same test. JSON flattens
+    ;; a set and a vector to the same array and a keyword to its name, so an
+    ;; in-process `=` is the one that would catch `:rendered` being assembled
+    ;; rather than passed through.
+    (is (= (but-scores (srv/entity-payload st m "tsmc"))
+           (but-scores (:rendered (srv/mold-payload st m eid nil))))
+        "and in process, where a set and a vector are still different things")
+    ;; without these, two empty maps would agree and the test would certify it
+    (is (= 4 (:count page)))
+    (is (= 4 (count (:facts page))))
+    (is (seq (:sources page)))))
+
+(deftest a-past-entity-page-reads-todays-facts-and-that-days-objects
+  ;; `?at=` hands `mold-payload` a frozen store. Memory has no time dimension
+  ;; and `undo!` never touches a fact, so there is no past set of facts to read;
+  ;; what the frozen store must still govern is everything the page reads out of
+  ;; the SUBSTRATE — the source chips especially. Reading the live store for the
+  ;; object while reading the frozen one for everything else is the specific
+  ;; mistake this pins.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        eid (:entity (srv/materialize-entity! st "tsmc"))
+        n   (count (sub/history st))]
+    ;; a source arrives AFTER the point we freeze at — and so does a fact
+    (sub/commit! st {:op :put :id "doc:gone"
+                     :value {:id "doc:gone" :kind :doc :title "The missing memo" :value "…"}})
+    ;; word-disjoint from every fact in `entity-rows`, or `remember` reinforces
+    ;; an existing one at a 0.6 jaccard instead of adding this
+    (mold/remember m "quarry lantern zither mulberry drawbridge"
+                   {:entities ["TSMC"] :source {:obj "doc:fab"}})
+    (let [now  (:rendered (srv/mold-payload st m eid nil))
+          past (:rendered (srv/mold-payload (srv/store-at st (str n)) m eid nil))]
+      (is (some #(= "doc:gone" (:id %)) (:sources now))
+          "live, the memo is an object and its chip has a name on it")
+      (is (not-any? #(= "doc:gone" (:id %)) (:sources past))
+          "frozen a commit earlier it is not an object yet, so the chip is dropped — the source list came from the store it was handed")
+      ;; the fact half, and phrased so it can actually fail: a fact remembered
+      ;; after the freeze must still be on the past page. `(= facts facts)`
+      ;; would have passed under every sabotage of this file, including the two
+      ;; that delete the branch outright, because nil equals nil.
+      (is (= 5 (:count now) (:count past))
+          "the fact recorded after the freeze is on BOTH pages: the memory has no time dimension and `undo!` never touches a fact, so there is no past set to read")
+      (is (contains? (set (mapv :fact (:facts past))) "quarry lantern zither mulberry drawbridge")
+          "…named, and not merely counted"))))
+
+(deftest an-entity-object-with-no-usable-name-molds-to-the-error-the-modal-gets
+  ;; A hand-committed, migrated or half-restored object. The branch is on the
+  ;; KIND, as `:flow`'s is, and never on whether the name looks usable — a guard
+  ;; here would be a second normalization living outside `ent/normalize`, and it
+  ;; would disagree with it: `str/blank?` is false for a lone U+00A0, which
+  ;; `ent/normalize` trims to nothing.
+  ;;
+  ;; So the page is `entity-payload`'s own answer for a nameless request, which
+  ;; is the shape `GET /api/entity?name=` already hands the modal. Task 8 writes
+  ;; ONE renderer that handles it, rather than a case that exists only here.
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    ;; the middle one is a lone non-breaking space, spelled as an escape so it
+    ;; reads as one \u2014 pasted, it looks exactly like a space. It is also the case
+    ;; a `str/blank?` guard on this branch would get wrong: `str/blank?` is
+    ;; FALSE for U+00A0, which `ent/normalize` trims to nothing.
+    (doseq [[id nm] [["ent:blank" "   "] ["ent:nbsp" "\u00a0"] ["ent:missing" nil]]]
+      (sub/commit! st {:op :put :id id
+                       :value {:id id :kind :entity :title "?" :value (when nm {:name nm})}})
+      (let [p (srv/mold-payload st m id nil)]
+        (is (= "entity" (:kind p)) (str id " must still mold as an entity"))
+        (is (= {:error "no entity name given"} (:rendered p))
+            (str id " — the same error shape /api/entity answers a nameless request with"))))))
+
+(deftest molding-a-doc-a-table-and-a-flow-is-what-it-always-was
+  ;; The arity changed on every caller, so one of each surviving shape is pinned
+  ;; here. `no-memory` is the second half: it throws if forced, so this also
+  ;; asserts that the memory argument is consulted on the entity branch and
+  ;; nowhere else.
+  (let [st (entity-fixture)]
+    (sub/commit! st {:op :put :id "tbl:t"
+                     :value {:id "tbl:t" :kind :table :title "T" :value [{:a 1} {:a 2}]}})
+    (sub/commit! st {:op :put :id "doc:d"
+                     :value {:id "doc:d" :kind :doc :title "D" :value "# Heading\n\nbody text"}})
+    (sub/commit! st {:op :put :id "flow:f"
+                     :value {:id "flow:f" :kind :flow :title "F" :value {:goal "g" :steps []}}})
+    (let [mold (fn [id] (srv/mold-payload st no-memory id nil))
+          d (mold "doc:d") t (mold "tbl:t") f (mold "flow:f")]
+      (is (= ["text" "doc/raw" "# Heading\n\nbody text"] [(:kind d) (:view d) (:rendered d)]))
+      (is (= ["table" "table/rows" [{:a 1} {:a 2}]] [(:kind t) (:view t) (:rendered t)]))
+      (is (seq (:alternatives t)) "a table still offers its other viewers")
+      (is (= ["flow" nil {:goal "g" :steps []} []]
+             [(:kind f) (:view f) (:rendered f) (:alternatives f)])))))
+
+(deftest leap-does-not-offer-a-materialized-entity-under-its-own-kind
+  ;; The object scan drops `:entity`, because Task 7's subject group is already
+  ;; the destination for a subject and the same name under two headings is the
+  ;; collision the design split the groups to avoid. The positive half — that it
+  ;; gets exactly one row, under "subject" — belongs to Task 7, which is what
+  ;; creates that row.
+  ;;
+  ;; NOT the same decision as `state-payload`, which keeps entity objects: that
+  ;; payload is *what exists* and feeds `STATE.objects`, out of which the shell
+  ;; draws each notebook member — and a materialized entity is a member of the
+  ;; very notebook materialization mints for it.
+  (let [st (entity-fixture)]
+    (sub/commit! st {:op :put :id "doc:teardown"
+                     :value {:id "doc:teardown" :kind :doc :title "TSMC teardown" :value "…"}})
+    (let [m    (entity-memory)
+          r    (srv/materialize-entity! st "tsmc")
+          eid  (:entity r)
+          rows (srv/leap-payload st m "tsmc")]
+      ;; the controls come first: an empty result would satisfy every assertion
+      ;; below it, and this fixture is built so that it cannot be empty
+      (is (some #(= "doc:teardown" (:id %)) rows)
+          "the object scan is alive — a doc whose title carries the name is still offered")
+      (is (some #(and (= (:spaceId r) (:id %)) (= "space" (:group %))) rows)
+          "…and so is the notebook the materialization minted, which IS where a subject sends you")
+      (is (empty? (filter #(= "entity" (:group %)) rows))
+          "no row is grouped `entity`")
+      (is (empty? (filter #(= eid (:id %)) rows))
+          "…and the object itself is offered by no group at all"))))
