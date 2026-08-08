@@ -3257,3 +3257,197 @@
           "no row is grouped `entity`")
       (is (empty? (filter #(= eid (:id %)) rows))
           "…and the object itself is offered by no group at all"))))
+
+;; ============================================================================
+;; LEAP's subject group — a subject is a place, and its own kind of place
+;; ============================================================================
+
+(defn- subject-rows
+  "The `subject` group out of a LEAP payload, in payload order."
+  [rows]
+  (filterv #(= "subject" (:group %)) rows))
+
+(deftest leap-takes-you-to-a-subject-and-not-only-to-a-document
+  ;; Design §3: "Typing a subject takes you to its place, alongside notebooks
+  ;; and objects." The document below exists so the assertions have a control —
+  ;; an object row that matches the same query proves the subject row is an
+  ;; ADDITION to the lexical pass and not a replacement for it.
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    (sub/commit! st {:op :put :id "doc:teardown"
+                     :value {:id "doc:teardown" :kind :doc :title "TSMC teardown" :value "…"}})
+    (let [rows (srv/leap-payload st m "tsmc")
+          subs (subject-rows rows)]
+      (is (some #(= "doc:teardown" (:id %)) rows)
+          "control: the object scan still answers, so an empty payload cannot pass this test")
+      (is (= [{:id "subject:tsmc" :label "tsmc" :group "subject" :name "tsmc"
+               :count 4 :touched 0}]
+             subs)
+          "one row: the name is the label, the live facts behind it are the count, and `subject:` is a pseudo-id no object ever wore")
+      ;; `[false]` and not `(not (contains? …))`: `(contains? nil :object)` is
+      ;; false, so the negative spelling would pass over an EMPTY group and
+      ;; certify a subject row that was never built
+      (is (= [false] (mapv #(contains? % :object) subs))
+          "no `:object` KEY at all — not a nil one. The shell decides on presence, and `{:object nil}` is a different answer to \"has this been materialized\" than an absent key")
+      ;; where it sits, which is a decision and not an accident: a subject is a
+      ;; place you go to, a memory hit is text you read. Both indices are
+      ;; asserted non-negative, or an absent subject group would score -1 and
+      ;; sort before everything — passing loudest exactly when it is missing.
+      (let [gs (mapv :group rows)
+            i  (.indexOf ^java.util.List gs "subject")
+            j  (.indexOf ^java.util.List gs "memory")]
+        (is (and (nat-int? i) (nat-int? j) (< i j))
+            (str "the subject group is offered before the memory group — at " i " and " j))))))
+
+(deftest a-name-with-one-fact-behind-it-is-not-yet-a-place
+  ;; The whole reason `promoted` exists: 68 of 104 names on the measured corpus
+  ;; carry exactly one fact, and a LEAP list made of every extracted string is
+  ;; two-thirds noise. `arizona` is still a name the index knows and `ent/detect`
+  ;; still matches it for recall — it is just not somewhere to go yet.
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        rows (srv/leap-payload st m "arizona")]
+    (is (some #(= "doc:az" (:id %)) rows)
+        "control: `Arizona plans` is a document and the query plainly finds things")
+    (is (= 1 (count (get (ent/index (mem/all-facts m)) "arizona")))
+        "…and `arizona` is a name the index knows, with exactly one fact behind it")
+    (is (empty? (subject-rows rows))
+        "one live fact is a name, not a subject")))
+
+(deftest a-materialized-subject-carries-its-object-and-never-demotes
+  ;; One fact, and a place regardless: materializing is yours, not the evidence's,
+  ;; so nothing that happens to the corpus takes the destination away again.
+  (let [st (materialize! (entity-fixture) "ent:az" "arizona" "The Arizona build")
+        m  (entity-memory)
+        subs (subject-rows (srv/leap-payload st m "arizona"))
+        row  (first subs)]
+    (is (= 1 (count subs)))
+    (is (= "ent:az" (:object row))
+        "`:object` on the row, so the shell has ONE thing to decide on rather than two")
+    (is (= 1 (:count row))
+        "one fact — the count is what the evidence says, and the row is here anyway")
+    (is (= "subject:arizona" (:id row))
+        "the row is still the SUBJECT's, not the object's: the object is where it takes you, not what it is")
+    (is (= 0 (:touched row))
+        "`cap` looks up `subject:arizona`, which no event ever touched — not `ent:az`, which this fixture's `:put` did")))
+
+(deftest a-materialized-subject-is-one-subject-plus-the-notebook-about-it
+  ;; The other half of `leap-does-not-offer-a-materialized-entity-under-its-own-kind`.
+  ;;
+  ;; TWO rows read `tsmc` after materialization, and both are correct: the
+  ;; subject, which is its facts, and the notebook `materialize-entity!` minted,
+  ;; which is its cells. Design §3 splits the groups precisely because "entity
+  ;; names can collide with object titles" — a subject and a document with the
+  ;; same name are two different places to go, and the group heading is what says
+  ;; which is which. What must NOT appear is a third row for the entity object
+  ;; itself, because the subject row is already that destination.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        r   (srv/materialize-entity! st "tsmc")
+        eid (:entity r)
+        sid (:spaceId r)
+        rows (srv/leap-payload st m "tsmc")
+        subs (subject-rows rows)]
+    (is (= 1 (count subs)) "exactly one subject row")
+    (is (= "tsmc" (:label (first subs))))
+    (is (= eid (:object (first subs))) "…pointing at the object that was minted")
+    (is (empty? (filter #(= eid (:id %)) rows))
+        "and NO row for the entity object itself, in any group — the subject row is where it takes you")
+    (is (= 1 (count (filter #(and (= sid (:id %)) (= "space" (:group %))) rows)))
+        "the notebook about it is offered, once, under `space` — a different destination, deliberately not suppressed")))
+
+(deftest an-empty-query-offers-no-subjects
+  ;; Like every other content group. Without the `(seq q)` guard `str/includes?`
+  ;; against "" is true of every name, so an opened palette would list every
+  ;; promoted subject in the corpus before a key is pressed — and would walk the
+  ;; whole memory to build the list.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "tsmc" "TSMC")
+        m  (entity-memory)
+        rows (srv/leap-payload st m "")]
+    (is (some #(= "doc:fab" (:id %)) rows)
+        "control: an empty query still lists the objects, so this payload is not empty")
+    (is (empty? (subject-rows rows))
+        "…and offers no subjects, materialized or not")))
+
+(defn- many-subjects-memory
+  "`n` promoted names sharing one substring — two word-disjoint facts each.
+
+   Two facts because one is below the promotion threshold and would leave the
+   name out of the group entirely. Word-disjoint for `bulk-entity-memory`'s
+   reason: `remember` reinforces an existing fact rather than adding one when
+   their token sets overlap by 0.6 or more, and two facts that collapsed into one
+   would silently unpromote the name and leave the cap with nothing to cut."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n), j [0 1]]
+      (mold/remember m (str "alpha" i "x" j " beta" i "x" j " gamma" i "x" j " delta" i "x" j)
+                     {:entities [(format "zorp%02d" i)] :source {:obj "doc:bulk"}}))
+    m))
+
+(deftest the-subject-group-is-capped-and-alphabetical-under-the-cap
+  ;; Twelve against a `group-cap` of eight, so the cap has four names to cut and
+  ;; the assertion can actually fail. Zero-padded so alphabetical and numerical
+  ;; order are the same and the expectation reads as one.
+  (let [st   (sub/fresh-store)
+        m    (many-subjects-memory 12)
+        idx  (ent/index (mem/all-facts m))
+        subs (subject-rows (srv/leap-payload st m "zorp"))]
+    (is (= 12 (count (ent/promoted idx #{})))
+        "control: twelve names are promoted — two facts each, none of them reinforced away")
+    (is (= 8 (count subs))
+        "capped at `group-cap`, like every other group")
+    (is (= ["zorp00" "zorp01" "zorp02" "zorp03" "zorp04" "zorp05" "zorp06" "zorp07"]
+           (mapv :label subs))
+        "alphabetical, and the cap takes the first eight of THAT order: `promoted` answers a set in hash order, the group sorts it, and `cap`'s `sort-by :touched` is stable over rows whose `:touched` is 0 to a name")))
+
+(defrecord CountingStore [inner !n]
+  ;; Every read delegates; `objects` also counts. A spy and not a stub — the
+  ;; payload under it is the real one, so a miscount cannot hide behind an
+  ;; answer nothing checked.
+  sub/Store
+  (commit! [_ event] (sub/commit! inner event))
+  (state   [_]       (sub/state inner))
+  (objects [_]       (swap! !n inc) (sub/objects inner))
+  (object  [_ id]    (sub/object inner id))
+  (history [_]       (sub/history inner))
+  (undo!   [_]       (sub/undo! inner))
+  (as-of   [_ n]     (sub/as-of inner n)))
+
+(deftest the-subject-group-builds-one-objects-map-and-not-one-per-name
+  ;; `entity-object` per promoted name and `materialized-names` beside it is N+1
+  ;; whole objects maps **on a keystroke** — and N is every name the query
+  ;; matched, not the eight `cap` keeps, because the row is built before the cap
+  ;; sees it. Measured on an EDN store, the group alone: 36 names over 900
+  ;; objects, 16.2 ms naive against 0.80 ms shared; 360 names over 900 objects,
+  ;; 122 ms against 1.7 ms.
+  ;;
+  ;; Nothing about the payload's CONTENT notices, which is why this is asserted
+  ;; on the store instead: one store, two memories, and the number of objects
+  ;; maps built must not move when the number of subjects does. A count pinned
+  ;; to a literal would instead break every time an unrelated line in
+  ;; `leap-payload` read the store, and would say nothing about this.
+  (let [st  (sub/fresh-store)
+        n3  (atom 0)
+        n12 (atom 0)
+        m3  (many-subjects-memory 3)
+        m12 (many-subjects-memory 12)]
+    (is (= 3 (count (subject-rows (srv/leap-payload st m3 "zorp"))))
+        "control: three subjects match…")
+    (is (= 8 (count (subject-rows (srv/leap-payload st m12 "zorp"))))
+        "…and twelve do, capped to eight — four times the rows built")
+    (srv/leap-payload (->CountingStore st n3) m3 "zorp")
+    (srv/leap-payload (->CountingStore st n12) m12 "zorp")
+    (is (pos? @n3) "control: the spy is wired in and the payload does read the store")
+    (is (= @n3 @n12)
+        (str "the same number of objects maps either way — " @n3 " and " @n12))))
+
+(deftest a-subject-is-matched-the-way-every-other-group-is-matched
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        labels (fn [q] (mapv :label (subject-rows (srv/leap-payload st m q))))]
+    (is (= ["tsmc"] (labels "TSMC"))
+        "`leap-payload` lower-cases the query and `ent/normalize` lower-cased the names, so the two sides meet")
+    (is (= ["taiwan" "taiwan semiconductor manufacturing"] (labels "taiwan"))
+        "a SUBSTRING match, not a prefix and not an exact one — and alphabetical between the two")
+    (is (= [] (labels " tsmc "))
+        "a query with surrounding space finds nothing here — exactly as it finds nothing in any other group, because `leap-payload` lower-cases `q` and deliberately does not trim it, and the shell trims before it asks")))

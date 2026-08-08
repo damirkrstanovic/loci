@@ -549,8 +549,8 @@
 
 (defn leap-payload
   "ONE incremental search across everything: objects, notebook prose, doc
-   bodies, memory facts, view verbs. Content groups only appear once there's
-   a query; each group is capped so it stays incremental-fast.
+   bodies, subjects, memory facts, view verbs. Content groups only appear once
+   there's a query; each group is capped so it stays incremental-fast.
 
    The three-argument form is the keystroke path and is lexical, exactly as it
    has always been. `{:deep? true :chunks cs}` adds the `by meaning` group on top
@@ -569,7 +569,26 @@
           recent  (fn [e] (or (:touched e) 0))
           cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
                              (sort-by recent >) (take group-cap) vec))
-          objs  (->> (sub/objects st) vals
+          ;; ONE materialization, shared with the subject group below.
+          ;;
+          ;; `materialized-names` and `entity-object` each rebuild the whole
+          ;; objects map, so the plain reading of the subject group —
+          ;; `entity-object` per promoted name — is N+1 of them **on every
+          ;; keystroke**, and N is every name the query matched, not the eight
+          ;; that survive `cap`: the row is built before the cap sees it.
+          ;; Measured on an EDN store (`objects` re-folds the whole log there),
+          ;; the group alone, naive against shared:
+          ;;
+          ;;   36 names,  42 objects     1.35 ms  →  0.27 ms
+          ;;   36 names, 900 objects    16.22 ms  →  0.80 ms
+          ;;  360 names, 900 objects   121.98 ms  →  1.66 ms
+          ;;
+          ;; Datalevin — production — makes `objects` an in-RAM map lookup and
+          ;; so removes the fold, but not the shape: `entity-objects` still
+          ;; walks every object to build its index, and N of those is still
+          ;; 0.36 ms × N at 900 objects. One map, once, is the fix in both.
+          objm  (sub/objects st)
+          objs  (->> objm vals
                      ;; `:entity` is dropped HERE and deliberately not from
                      ;; `state-payload`, and the asymmetry is a decision rather
                      ;; than an oversight. The two lists answer different
@@ -607,10 +626,92 @@
                                  " · on " (or (get-in o [:value :target]) (get-in o [:value :source]) "?"))
                      :group "views & functions"
                      :target (or (get-in o [:value :target]) (get-in o [:value :source]))}))
+          ;; The subject group — promoted entities only. A name with one fact
+          ;; behind it is still matched by `ent/detect` for recall, but it is not
+          ;; yet a place, and 68 of 104 names on the measured corpus have exactly
+          ;; one fact: a group made of every extracted string would be
+          ;; two-thirds noise on the one surface that must stay scannable.
+          ;;
+          ;; **Its own group, not merged into the objects.** Entity names collide
+          ;; with object titles by construction — `materialize-entity!` titles the
+          ;; notebook it mints with the entity's own name — and a subject and a
+          ;; document that read the same are two different places to go. Two rows
+          ;; under two headings is the answer; one row that guesses which you
+          ;; meant is not, and suppressing either would hide a destination.
+          ;;
+          ;; `:object` rides on the row when the entity is materialized, so the
+          ;; shell has ONE thing to decide on rather than two. The KEY is absent
+          ;; when it is not — `{:object nil}` reads as an answer where no key
+          ;; reads as "not yet", and JSON gives the shell no third state.
+          ;;
+          ;; `mem` is this function's memory ARGUMENT and `mem/` is the
+          ;; `loci.memory` alias. Both are correct and both appear on the next
+          ;; line: a qualified symbol resolves through the ns aliases and is
+          ;; never shadowed by a local.
+          ;;
+          ;; The id is `subject:<name>` and never the object's, even when there
+          ;; is one. It is what the row IS, not where it takes you: `cap` looks
+          ;; recency up by `:id`, and handing it `ent:1` would let a materialized
+          ;; subject outrank the rest of the group by an event that touched the
+          ;; object rather than by anything about the subject. Nothing ever
+          ;; touches a `subject:` id, so every row here scores 0, `sort-by` is
+          ;; stable, and the alphabetical order survives the cap.
+          ;;
+          ;; **Cost, because this runs on every keystroke.** `ent/index` walks
+          ;; every live fact, and it is the second such walk in this function —
+          ;; `recall` builds its own `ent/df-map` a few lines down. Measured
+          ;; (mean of 200, EDN store, throwaway memory):
+          ;;
+          ;;    80 facts / 104 names    group 0.18 ms   leap-payload 1.06 ms
+          ;;   800 facts / 1040 names   group 1.48 ms   leap-payload 7.25 ms
+          ;;
+          ;; Fine at both, and not fine forever: at 800 facts the whole payload
+          ;; is 7 ms of which `recall` is 5.5, so the ceiling this approaches is
+          ;; the memory layer's and not this group's. Sharing one index between
+          ;; the two would mean handing `loci.memory` a pre-built projection
+          ;; instead of a fact sequence — the same trade `entity-payload` and
+          ;; `remembered-context` both declined. Revisit when a keystroke costs
+          ;; ~16 ms, which is a frame; at today's growth that is a few thousand
+          ;; facts away, and the fix is one index passed down, not a cache.
+          subs (when (seq q)
+                 (let [idx   (ent/index (mem/all-facts mem))
+                       ments (entity-objects objm)]
+                   (->> (ent/promoted idx (keys ments))
+                        ;; `q` is already lower-cased and `ent/normalize`
+                        ;; lower-cased every name, so this compares like with
+                        ;; like. It does NOT trim — no group here does, and the
+                        ;; shell trims before it asks.
+                        ;;
+                        ;; The two lower-casings are NOT the same function,
+                        ;; and this is the one comparison in the payload where
+                        ;; that shows. `q`'s is `str/lower-case`, under the
+                        ;; JVM's default locale; a name's was `ent/normalize`'s
+                        ;; `Locale/ROOT`. They agree on every input but a dotted
+                        ;; `I` under a Turkish locale, where `IBM` typed into
+                        ;; the box becomes `ıbm` while the name stays `ibm` — a
+                        ;; subject you cannot reach by typing its own name. The
+                        ;; object scan has no such gap: it lower-cases both
+                        ;; sides with the same function, so it errs twice in the
+                        ;; same direction and still matches.
+                        ;;
+                        ;; Not patched here. The honest fix is `Locale/ROOT` for
+                        ;; the whole payload's `q`, and a second casing rule
+                        ;; living in this group is exactly what `ent/normalize`
+                        ;; argues against.
+                        (filter #(str/includes? % q))
+                        sort
+                        (map (fn [n]
+                               (let [o (get ments n)]
+                                 (cond-> {:id (str "subject:" n) :label n
+                                          :group "subject" :name n
+                                          :count (count (get idx n #{}))}
+                                   o (assoc :object (:id o)))))))))
           mems (when (seq q)
                  (map (fn [f] {:id "__memory__" :label (:fact f) :group "memory"})
                       (mold/recall mem q {:k 8})))
-          lex  (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap mems)))
+          ;; subjects before memory: a subject is a place you go to and a memory
+          ;; hit is text you read, and the one that is a destination goes first.
+          lex  (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap subs) (cap mems)))
           ;; An empty query embeds nothing even with ?deep=1: there is no meaning
           ;; in "" to search by, and asking would be a request per opened palette.
           deep (when (and deep? chunks (seq q))
