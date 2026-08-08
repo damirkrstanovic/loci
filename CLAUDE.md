@@ -22,12 +22,35 @@ So: ask reviewers to **measure and report actual numbers**, and ask implementers
 their tests fail when the bug is reintroduced**. A test that passes either way is worse than
 no test, because it certifies.
 
+## Answer the question that was asked — ask before measuring
+
+When the ask is "compare X and Y", "look at Z", "what do you think about W", the deliverable
+is **the reasoning**: read the code, read the docs, say what you found and what it means.
+Do the minimum the question requires.
+
+**Do not start a benchmark, a spike, or a measurement campaign to support an answer.** On
+2026-08-08 a "Datahike vs Datalevin" question became an unrequested 38-minute background
+benchmark over 3,000 synthetic events. It yielded exactly one correction that mattered; the
+rest was side-quest, and the actual answer arrived late and in pieces.
+
+So: if something would run for minutes — a benchmark, a long test campaign, a multi-agent
+fan-out, a spike against a second implementation — **say what it would measure, say roughly
+what it would cost, and wait to be told yes.**
+
+This does not weaken the rule below. "Verify by measuring" governs **changes to the code**:
+when you have written something, prove it works and prove the test bites. It is not a licence
+to go measure things nobody asked about.
+
 ## Never write to `data/`
 
 `data/` is the user's real substrate — live notebooks, research, agent flows. It has already
 survived one silent-truncation bug that destroyed 31 events.
 
 - Scratch servers get a throwaway `LOCI_DATA`, never the repo's `data/`
+- **A live REPL counts as a scratch server.** `clojure -M:nrepl` (what ClojureMCP starts) is
+  one `(loci.dlv/datalevin-store)` or `@loci.memory/memory` away from opening the real store,
+  and an agent evaluating forms has no sandbox around it. Export a throwaway `LOCI_DATA`
+  before evaluating anything that opens a store, and never deref `loci.memory/memory`
 - Verify against a **copy** when a running server holds the store open
 - Check `md5sum data/substrate.edn` before and after any risky work
 - `data/substrate.edn` is the frozen rollback of the pre-Datalevin log; leave it alone

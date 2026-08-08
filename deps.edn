@@ -35,6 +35,15 @@
   :calibrate {:main-opts ["-m" "loci.calibrate"]
               :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
 
+  ;; an nREPL for editor/agent tooling (ClojureMCP starts this itself via
+  ;; :start-nrepl-cmd). Deliberately WITHOUT :extra-paths ["dev"] — a REPL that
+  ;; loads user.clj is one keystroke from serving Clerk over the real notebooks.
+  ;; Native access because anything worth evaluating here reaches loci.dlv.
+  ;;   clojure -M:nrepl
+  :nrepl {:extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}}
+          :main-opts  ["-m" "nrepl.cmdline" "--port" "7888"]
+          :jvm-opts   ["--enable-native-access=ALL-UNNAMED"]}
+
   ;; Clerk notebook (the earlier render target). Both reach the substrate
   ;; through notebooks/loci.clj, so both need the native-access flag too.
   :dev   {:extra-paths ["dev" "notebooks"]
