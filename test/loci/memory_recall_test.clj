@@ -298,6 +298,129 @@
                                                     :filter {:sources #{"space:sky"}}}))
                 "scoped elsewhere, it does not — the filter is applied before either retriever")))))))
 
+;; ---- subject: the union, and what a name is worth ----
+
+(def ^:private mendev  "Areelu Vorlesh masterminds a crusade against Mendev.")
+(def ^:private euv     "EUV scanners ship from Veldhoven to Hsinchu and to Chandler.")
+(def ^:private rapidus "Rapidus targets two-nanometre production by 2027.")
+
+(defn- ubiquity-memory
+  "Seven facts shaped like the measured corpus: two that name `asml` (2 live
+   facts) and six that name `taiwan` and `united states` (6 each).
+
+   `euv` and `rapidus` both match the query token `asml` on the entity half and
+   NEITHER of them contains the word — so the keyword half is 0 for both and the
+   only thing that can order them is what their *other* entities are worth.
+   `euv`'s other two names are everywhere in this corpus; `rapidus`'s other name
+   is nowhere else. That is the whole experiment.
+
+   The five fillers score 0 and never appear: no shared word, no shared name."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m euv {:entities ["asml" "taiwan" "united states"]
+                          :source   {:obj "find:euv-1" :space "space:euv"}})
+    (mold/remember m rapidus {:entities ["asml" "rapidus"]
+                              :source   {:obj "find:rap-1" :space "space:rapidus"}})
+    (doseq [t ["Export controls tightened again in October."
+               "A defence pact was signed last spring."
+               "Tourism recovered to pre-pandemic levels."
+               "Undersea cables were repaired within a week."
+               "Currency reserves grew by nine percent."]]
+      (mold/remember m t {:entities ["taiwan" "united states"]
+                          :source   {:space "space:filler"}}))
+    m))
+
+(deftest a-fact-that-shares-a-subject-is-reachable-without-sharing-a-lineage
+  (let [m (remember-all! (mem/file-memory (tmpfile)))
+        q "inflation orbit taiwan"
+        r (set (facts-of (mold/recall m q {:k 5 :filter {:sources  #{"space:sky"}
+                                                         :entities #{"tsmc"}}})))]
+    (is (contains? r taiwan)
+        "the semis fact is in no lineage of space:sky and answers anyway — it carries tsmc")
+    (is (not (contains? r serbia))
+        "and the fact that shares neither the lineage nor the subject stays out")
+    (is (contains? r neptune)
+        "the union does not REPLACE lineage: space:sky's own fact carries no tsmc and is still here")
+    (is (= #{taiwan neptune} r)
+        "and those two are the whole answer — the union widens the scope, it does not remove it")
+
+    (testing "an empty :sources with no :entities is still an empty result"
+      (is (= [] (mold/recall m q {:k 5 :filter {:sources #{}}}))
+          "the scope owns nothing, and the whole memory is not the answer to that"))
+
+    (testing "an empty :sources beside an :entities set is that entities set"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:sources  #{}
+                                                                :entities #{"tsmc"}}})))
+          "a caller whose lineage is empty can still ask about a subject"))))
+
+(deftest a-multi-word-subject-scores-where-a-query-token-never-could
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m mendev {:entities ["wrath of the righteous"]
+                             :source   {:obj "doc:wotr" :space "space:games"}})
+    (is (= [] (facts-of (mold/recall m "what about the ending" {:k 5})))
+        "not one word of the query is in the fact, and `wrath of the righteous` is not a token")
+    (let [r (mold/recall m "what about the ending" {:k 5 :subjects #{"wrath of the righteous"}})]
+      (is (= [mendev] (facts-of r))
+          "named as a subject it scores — this is the half of the scorer that finds a fact by what it is about")
+      ;; `(:score … 0)` rather than a bare lookup: when this regresses the hit is
+      ;; absent, and a missing fact should read as a score of zero rather than
+      ;; throwing an NPE over the assertion that was about to say so.
+      (is (pos? (:score (first r) 0))))
+    (is (= [mendev] (facts-of (mold/recall m "what about the ending"
+                                           {:k 5 :subjects #{"  Wrath of the   Righteous "}})))
+        "and the subject set is normalized on the way in, so a caller's casing cannot make it miss")))
+
+(deftest a-fact-s-own-names-are-normalized-the-way-every-other-entity-name-is
+  ;; The distiller writes `:entities` and nothing ever rewrites them, so a padded
+  ;; or oddly-cased name is what is actually on disk. Both new paths look a fact's
+  ;; names up against normalized ones — the filter's set, and the df map's keys —
+  ;; and a name keyed one way and compared the other misses in silence: the fact
+  ;; simply never scores, and a weight of 1.0 quietly calls it the rarest name
+  ;; there is.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "Veldhoven ships scanners." {:entities ["  ASML  "]
+                                                  :source   {:space "space:euv"}})
+    (is (= ["Veldhoven ships scanners."] (facts-of (mold/recall m "asml" {:k 5})))
+        "the scorer matches the query token against the normalized name, not the stored one")
+    (is (= ["Veldhoven ships scanners."]
+           (facts-of (mold/recall m "asml" {:k 5 :filter {:sources #{} :entities #{"asml"}}})))
+        "and so does the scope filter — otherwise a subject union silently skips its own facts")))
+
+(deftest a-name-everything-carries-is-worth-less-than-a-name-two-facts-carry
+  (let [m (ubiquity-memory)]
+    (is (= 7 (count (mold/all-facts m)))
+        "seven distinct facts — nothing was reinforced into anything else")
+    (is (= [euv rapidus] (facts-of (mold/recall m "asml" {:k 10})))
+        (str "both match `asml` on the entity half and neither on the words. `euv` also names "
+             "taiwan and united states, 6 facts each; `rapidus` also names rapidus, 1 fact. "
+             "Counting names equally makes it 1-of-3 against 1-of-2 and puts rapidus FIRST; "
+             "weighting each name by 1/df makes it 0.60 against 0.33. A rare name a fact does "
+             "not match is evidence it is about something else; a ubiquitous one is not."))))
+
+(deftest document-frequency-is-global-and-not-the-scope-s
+  (let [m (ubiquity-memory)]
+    (is (= [euv rapidus]
+           (facts-of (mold/recall m "asml" {:k 10 :filter {:sources #{"space:euv" "space:rapidus"}}})))
+        (str "the same two facts, now alone inside a scope. Counted over the CANDIDATES, "
+             "taiwan and united states occur once each in here and look as rare as rapidus — "
+             "the ordering inverts and `united states` is an anchor again inside the one "
+             "notebook that talks about it. df is counted over every live fact."))))
+
+(deftest an-ordinary-query-scores-exactly-what-it-scored-before
+  (let [m (remember-all! (mem/file-memory (tmpfile)))]
+    (let [r (mold/recall m "inflation orbit taiwan" {:k 5})]
+      (is (= [taiwan neptune serbia] (facts-of r))
+          "one word of the query in each fact, and the ranking is the jaccard of each against it")
+      (is (< (Math/abs (- 0.075 (:score (first r)))) 1e-4)
+          (str "0.6 × jaccard(3 query tokens, 6 fact tokens sharing one) = 0.6 × 1/8, "
+               "entity half 0 — the scorer's own arithmetic: " (:score (first r)))))
+    (let [r (mold/recall m "tsmc" {:k 5})]
+      (is (= [taiwan] (facts-of r)))
+      (is (< (Math/abs (- 0.5 (:score (first r)))) 1e-4)
+          (str "0.6 × 1/6 for the word plus 0.4 × 1 for the only entity there is, and with every "
+               "name equally frequent the weighted entity half is the plain fraction it replaced: "
+               (:score (first r)))))))
+
 ;; ---- degradation ----
 
 (deftest an-unreachable-embedder-degrades-recall-to-words-and-says-so

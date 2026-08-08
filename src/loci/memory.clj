@@ -34,6 +34,7 @@
             [clojure.set :as set]
             [clojure.string :as str]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.mold :as mold]
             [loci.substrate :as sub])
   (:import [java.util.concurrent ArrayBlockingQueue TimeUnit]))
@@ -55,17 +56,44 @@
   (/ 1.0 (+ 1.0 (/ (max 0 (- now ts)) (* 30.0 86400000.0)))))
 
 (defn- relevance
-  "How well `f` matches the query tokens, before recency and strength: 0.6 of the
+  "How well `f` matches the query, before recency and strength: 0.6 of the
    keyword overlap plus 0.4 of the entity overlap, in [0, 1].
 
    Split out of `score` so the two halves can be applied at different moments.
    Fusion ranks by this and multiplies by `weight` once at the end; multiplying
-   inside the ranking too would decay every fused fact twice."
-  [qt f]
+   inside the ranking too would decay every fused fact twice.
+
+   The entity half is weighted by **inverse document frequency**: each name
+   counts 1/(live facts carrying it), so `united states` — 6 facts across three
+   unrelated subjects on the measured corpus — stops acting as an anchor and a
+   name mentioned twice dominates. The weighting is a ratio *within one fact*,
+   so what it really governs is dilution: a fact that matches a rare name and
+   otherwise mentions only ubiquitous ones keeps almost all of its entity score,
+   while a fact that matches the ubiquitous one and otherwise names something
+   rare loses most of it — which is the right reading, because a rare name a
+   fact does NOT match is evidence the fact is about something else.
+
+   With every name equally frequent this is exactly the fraction it replaced
+   (`|qt ∩ es| / |es|`, since a common factor cancels out of numerator and
+   denominator), which is why nothing else had to move. An empty `es` gives a
+   zero total and scores 0.0, exactly as the explicit `(empty? es)` branch did.
+
+   Names are normalized through `ent/normalize` rather than merely lowercased,
+   because `dfm`'s keys are, and a name keyed one way and looked up the other
+   would silently weigh 1.0 — \"as rare as anything gets\" — for every fact whose
+   distiller left it padded or non-breaking-spaced.
+
+   A fact's entities are matched against the query tokens AND the subject set.
+   The subject set is what carries a multi-word name: `qt` is single words, so
+   `wrath of the righteous` could never match a token and the fact it identifies
+   would score 0 on the half that exists to find it."
+  [qt subjects dfm f]
   (let [kw  (jaccard qt (tokens (:fact f)))
-        es  (set (map str/lower-case (:entities f)))
-        ent (if (empty? es) 0.0
-                (/ (count (set/intersection qt es)) (double (count es))))]
+        es  (set (map ent/normalize (:entities f)))
+        w   (fn [e] (/ 1.0 (double (max 1 (get dfm e 1)))))
+        tot (reduce + 0.0 (map w es))
+        hit (set/intersection es (set/union qt (set subjects)))
+        ent (if (pos? tot) (/ (reduce + 0.0 (map w hit)) tot) 0.0)]
     (+ (* 0.6 kw) (* 0.4 ent))))
 
 (defn- weight
@@ -75,7 +103,7 @@
   (* (decay (:ts f) now)
      (+ 1.0 (* 0.25 (dec (:strength f 1))))))
 
-(defn- score [qt now f] (* (relevance qt f) (weight now f)))
+(defn- score [qt subjects dfm now f] (* (relevance qt subjects dfm f) (weight now f)))
 
 (defn- append-line! [file rec]
   (io/make-parents (io/file file))
@@ -820,23 +848,40 @@
   [sources f]
   (boolean (some sources (source-ids f))))
 
+(defn- shares-entity?
+  "Whether `f` carries one of `names` — already-normalized entity names.
+   Normalizing here rather than at the caller because a fact's `:entities` are
+   stored exactly as the distiller wrote them and are never rewritten."
+  [names f]
+  (boolean (some names (map ent/normalize (:entities f)))))
+
 (defn- scoped
-  "The facts a query is allowed to see. `{:filter {:sources #{…}}}` narrows to
-   facts recorded against one of those ids; no `:sources` key means no filter.
+  "The facts a query is allowed to see.
+
+   `{:filter {:sources #{…}}}` narrows to facts recorded against one of those
+   ids; `:entities` widens that back out to facts sharing a subject, and the two
+   are a UNION — dropping lineage would stop a deep-dive child inheriting its
+   parent's facts, an immediate regression. No `:filter` at all is no filter.
 
    `loci.memory` takes ids rather than a notebook id on purpose — it holds no
    store and cannot walk the substrate's links, and giving it one would put the
    record half inside the recall half. The caller that has the store does the
    traversal and passes the result.
 
-   **An empty set is an empty result.** The caller asked for the facts belonging
-   to a scope that owns none; answering with the whole memory instead would be a
-   scoped recall quietly returning unscoped facts, which is the one failure a
-   scope exists to prevent."
+   **An empty `:sources` set is still an empty result** (with no `:entities`
+   beside it): the caller asked for the facts belonging to a scope that owns
+   none, and answering with the whole memory is the one failure a scope exists
+   to prevent. That survives here because an empty set is truthy in Clojure and
+   `(in-sources? #{} f)` is false for every fact — so do NOT \"tidy\" the
+   `(and sources …)` into a `seq` check, which would turn the empty scope back
+   into no scope at all."
   [facts opts]
-  (if-let [sources (get-in opts [:filter :sources])]
-    (filterv #(in-sources? sources %) facts)
-    (vec facts)))
+  (let [{:keys [sources entities]} (:filter opts)]
+    (if (or sources entities)
+      (filterv (fn [f] (or (and sources (in-sources? sources f))
+                           (and entities (shares-entity? entities f))))
+               facts)
+      (vec facts))))
 
 (defn- semantic-ranking
   "Facts ordered by cosine against the query's embedding, best first. Returns
@@ -966,7 +1011,8 @@
       (append-line! file rec)
       (swap! !facts assoc (:id rec) rec)
       :ok))
-  ;; opts: {:k 6 :semantic? false :rerank? false :filter {:sources #{id …}}}
+  ;; opts: {:k 6 :semantic? false :rerank? false :subjects #{name …}
+  ;;        :filter {:sources #{id …} :entities #{name …}}}
   ;;
   ;; :semantic? is false by DEFAULT and that is the whole shape of this function.
   ;; /api/leap calls recall on every keystroke, and embedding a query is a 20–50
@@ -984,10 +1030,16 @@
     (let [now        (System/currentTimeMillis)
           k          (or (:k opts) 6)
           qt         (tokens query)
-          candidates (scoped (live (vals @!facts)) opts)
-          ;; today's scorer, unchanged, over the eligible facts
+          all        (live (vals @!facts))
+          ;; df over ALL live facts, never over `candidates` — see ent/df-map.
+          ;; Counted inside a scope, the names that scope is *about* look rare
+          ;; there and go straight back to being anchors.
+          dfm        (ent/df-map all)
+          subjects   (into #{} (map ent/normalize) (:subjects opts))
+          candidates (scoped all opts)
+          ;; the scorer over the eligible facts
           lex        (->> candidates
-                          (map #(assoc % :score (score qt now %)))
+                          (map #(assoc % :score (score qt subjects dfm now %)))
                           (filter #(pos? (:score %)))
                           (sort-by :score >)
                           vec)
