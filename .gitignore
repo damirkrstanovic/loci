@@ -15,6 +15,9 @@ data/
 node_modules/
 test/browser/failures/
 
+# nREPL writes this on start (clojure -M:nrepl, and whatever ClojureMCP boots)
+.nrepl-port
+
 # real configuration; loci.env.example is the committed template
 loci.env
 .env
