@@ -37,6 +37,27 @@ const FLOW_FIXTURE = `
                                                   {:ref "flow:test"})}]}))
 `;
 
+// A research note of the shape `research!` saves: prose then a `## Sources`
+// list of BARE urls. Molded :text by doc/raw and drawn through mdToHtml, so it
+// is the end-to-end wiring the clickable-URL test pins. Appended through
+// nb/cells-of for the same reason as above.
+const SOURCES_FIXTURE = `
+(let [st  @c/store
+      doc (str "A short fixture note, of the shape research! saves.\\n"
+               "\\n"
+               "## Sources\\n"
+               "\\n"
+               "- https://example.org/fixture/one\\n"
+               "- https://example.org/fixture/search?q=one&two=2\\n"
+               "- https://example.org/fixture/three.\\n")]
+  (sub/commit! st {:op :tx :events
+                   [{:op :put :id "doc:sources"
+                     :value {:id "doc:sources" :kind :doc :title "Sources — fixture" :value doc}}
+                    {:op :assoc :id "space:cosmos" :path [:value :cells]
+                     :value (conj (nb/cells-of (sub/object st "space:cosmos"))
+                                  {:ref "doc:sources"})}]}))
+`;
+
 // A parent with two children, one of which has a child of its own — the
 // overview's clustering is only meaningful against a real tree, and the
 // deterministic seed contains none.
@@ -75,6 +96,7 @@ const SERVER_MAIN = `
 (require '[loci.server :as srv] '[loci.content :as c] '[loci.substrate :as sub]
          '[loci.notebook :as nb] 'org.httpkit.server)
 ${FLOW_FIXTURE}
+${SOURCES_FIXTURE}
 ${FAMILY_FIXTURE}
 ${TAG_FIXTURE}
 (let [s (org.httpkit.server/run-server (var loci.server/handler)
