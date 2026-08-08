@@ -287,6 +287,12 @@
      does cannot quietly turn the toggle into a no-op */
   .memfact .mergedlist[hidden]{display:none}
   .memfact .mergedlist .mid{color:var(--faint)}
+  /* undoing a merge is an act, not a disclosure like .mergedtoggle beside it, so
+     it is a real button — focusable and reachable without a pointer */
+  .memfact .mergedlist .unmerge{font:inherit;font-size:10.5px;color:var(--accent);background:none;
+                       border:1px solid var(--accent-line);border-radius:5px;padding:0 5px;cursor:pointer}
+  .memfact .mergedlist .unmerge:hover{background:var(--accent-wash,transparent)}
+  .memfact .mergedlist .unmerge[disabled]{opacity:.5;cursor:default}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -344,6 +350,9 @@ const API = {
   events: () => fetch('/api/events').then(r=>r.json()),
   notebookOp: body => POST('/api/notebook', body),
   memory: q => fetch('/api/memory'+(q?'?q='+encodeURIComponent(q):'')).then(r=>r.json()),
+  // answers with the two records, NOT a pane payload — it carries no q and no
+  // space, so the caller refetches /api/memory with whatever it was showing
+  memoryUnmerge: (survivor,absorbed) => POST('/api/memory-unmerge',{survivor,absorbed}),
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -1764,9 +1773,13 @@ document.getElementById('fnBtn').addEventListener('click',openFunctions);
 // feature is off and every fact awaits one forever. So the unconfigured line
 // carries no count.
 //
-// `total` is the size of the whole memory, or null when this response is not the
-// whole memory — a query answers with the top 20 hits, and "12 of 20 awaiting"
-// would be a claim about the memory made out of a page of results.
+// `total` is the size of the whole memory — the payload's `total`, which the
+// server computes over every live fact independently of `?q=` and `?space=`. It
+// is NOT `facts.length`: a query answers with the ranked top 20, so a page-
+// derived denominator would say "12 of 20 awaiting", a claim about the memory
+// made out of a page of results. null when the response carries no total at all,
+// and then the line says what it knows and no denominator — an unknown 80 is
+// better left unsaid than replaced with the 20 that happens to be on screen.
 function memoryStatus(res,total){
   const model=res.embedding, awaiting=res.awaiting||0, detail=[];
   let text;
@@ -1804,8 +1817,9 @@ function viaLabel(via){
 async function openMemory(qstr){
   const res=await API.memory(qstr||'');
   const facts=res.facts||[];
-  // only an unscoped browse returns the whole memory; anything else is a page of it
-  const total=(qstr||res.scope)?null:facts.length;
+  // the memory's own count, from the payload — never facts.length, which under a
+  // query is the top 20 and under a scope is one notebook's slice
+  const total=(typeof res.total==='number')?res.total:null;
   const st=memoryStatus(res,total);
   let h='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
     '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">MEMORY</span>'+
@@ -1827,8 +1841,13 @@ async function openMemory(qstr){
                              :'⌾ '+esc((f.source&&f.source.space)||'workspace'))+
       ' · '+(age<1?'today':age+'d ago')+(f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
       (via?' · '+via:'')+'</div>'+
+      // …and undoable per entry, which is what makes reading it worth doing: a
+      // merge you can see but not undo is a report, not a control. The survivor
+      // and the absorbed id both travel on the button, because the endpoint
+      // needs the pair and refuses anything else.
       (absorbed.length?'<div class="mergedlist" id="merged-'+i+'" hidden>'+
-        absorbed.map(a=>'<div>'+esc(a.fact)+' <span class="mid">'+esc(a.id)+'</span></div>').join('')+'</div>':'')+
+        absorbed.map(a=>'<div>'+esc(a.fact)+' <span class="mid">'+esc(a.id)+'</span> '+
+          '<button type="button" class="unmerge" data-survivor="'+esc(f.id)+'" data-absorbed="'+esc(a.id)+'">unmerge</button></div>').join('')+'</div>':'')+
       '</div>';
   });
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
@@ -1842,6 +1861,22 @@ async function openMemory(qstr){
   modal.querySelectorAll('[data-merged]').forEach(el=>el.addEventListener('click',()=>{
     const list=modal.querySelector('#merged-'+el.dataset.merged);
     if(list) list.hidden=!list.hidden;
+  }));
+  // The response is the two records and nothing else — no facts, no q, no scope
+  // — so it cannot be rendered as a pane and must not be patched into one. The
+  // pane refetches with the query it was already showing, and `awaiting` goes UP
+  // by one there, because the restored fact has no vector until the next sweep.
+  modal.querySelectorAll('.unmerge').forEach(el=>el.addEventListener('click',async ()=>{
+    el.disabled=true;                       // one merge cannot be undone twice
+    let res;
+    try{ res=await API.memoryUnmerge(el.dataset.survivor, el.dataset.absorbed); }
+    catch(e){ el.disabled=false; showToast('unmerge: network error'); return; }
+    // a refusal is 200 with {error}: the pane keeps what it is showing and says
+    // the server's own sentence, rather than re-rendering as if it had worked
+    if(res.error){ el.disabled=false; showToast('unmerge: '+res.error); return; }
+    await openMemory(qstr||'');
+    showToast(((res.restored&&res.restored.id)||el.dataset.absorbed)+
+              ' is a fact again — awaiting an embedding');
   }));
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));

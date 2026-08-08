@@ -1583,6 +1583,15 @@
    embedder configured every fact is awaiting one forever, and a count with no
    model beside it reads like a backlog rather than an unconfigured feature.
 
+   `:total` is how many **live** facts the memory holds — independent of `q` and
+   of `scope`, which is the whole point of it. `:facts` under a query is the
+   ranked top 20, so a denominator taken from the page would say \"12 of 20
+   awaiting\": a claim about the memory made out of a page of results, and one
+   that shrinks as the page does. The pane's status line is a statement about the
+   memory, so the number in it has to come from the memory. Tombstones are not
+   counted, because `all-facts` filters them and a fact absorbed by a merge is
+   not a fact anyone can be shown.
+
    `:merge` is `mem/merge-status` — always present, always a map, one of
    `{:threshold t}`, `{:refused \"…\"}` or `{:off true}`. Without it a switch to
    an uncalibrated embedding model stops deduplication with one line on stderr
@@ -1604,15 +1613,20 @@
   ([m q scope]
    (let [opts (cond-> {:k 20 :semantic? true}
                 scope (assoc :filter {:sources (:sources scope)}))
+         ;; every live fact, read once and used for both `:total` and the browse
+         ;; branches below — not per branch, so `:total` cannot drift into being
+         ;; a count of whatever this particular request happened to return
+         all  (mem/all-facts m)
          hits (cond
                 (seq q) (mold/recall m q opts)
                 ;; No query is a browse, and `all-facts` takes no filter, so the
                 ;; scope is applied here by the same rule recall applies it by.
                 ;; Returning the whole memory for `?space=…` with an empty `q`
                 ;; would be a scoped request answered with unscoped facts.
-                scope   (filterv #(mem/in-sources? (:sources scope) %) (mem/all-facts m))
-                :else   (mem/all-facts m))]
+                scope   (filterv #(mem/in-sources? (:sources scope) %) all)
+                :else   all)]
      (cond-> {:facts     (mapv #(dissoc % :vec) hits)
+              :total     (count all)
               :awaiting  (count (mem/pending-facts m))
               :embedding (when (embed/embedding-configured?) (embed/embed-model))
               :merge     (mem/merge-status)}

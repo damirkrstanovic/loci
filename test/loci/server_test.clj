@@ -1537,15 +1537,44 @@
                                        "LOCI_EMBED_MODEL"    "embed-qwen3-4b"})]
     (with-redefs [embed/env env embed/from-file file]
       (let [p (srv/memory-payload m "Neptune")]
-        (is (= #{:facts :awaiting :embedding :merge} (set (keys p)))
-            "the three keys it has always had, plus :merge — and nothing else")
+        (is (= #{:facts :total :awaiting :embedding :merge} (set (keys p)))
+            "the three keys it has always had, plus :merge and :total — and nothing else")
         (is (not (contains? p :degraded))
             "absent, not nil and not false")
         (is (= 0 (:awaiting p)))
         (is (= "embed-qwen3-4b" (:embedding p)))
         (is (= [(dissoc neptune :vec)] (mapv #(dissoc % :score :via) (:facts p)))
             "and the facts are untouched apart from the vector that never ships")
+        (is (= 1 (:total p)))
         (is (= {:threshold 0.88} (:merge p)))))))
+
+(deftest the-total-is-the-memorys-size-and-not-the-pages
+  ;; The status line reads "12 of 80 awaiting". The 80 has to be the memory, so
+  ;; it cannot be read off `:facts` — which under a query is the ranked top 20,
+  ;; and under a scope is one notebook's slice.
+  (let [m (mem/file-memory (tmpfile))]
+    ;; 25 facts, so `:k 20` genuinely truncates and a page-derived total would
+    ;; differ from the memory's by five. Every sentence shares exactly one token
+    ;; with every other — "neptune", so all 25 rank for the query — and is
+    ;; otherwise disjoint, because `remember` REINFORCES a near-duplicate at
+    ;; jaccard 0.6 instead of adding it, and 25 variations on one sentence would
+    ;; quietly be one fact.
+    (doseq [i (range 25)]
+      (mold/remember m (str "Neptune alpha" i " beta" i " gamma" i " delta" i ".") {}))
+    (is (= 25 (count (mem/all-facts m)))
+        "the fixture is 25 distinct facts, not one fact reinforced 25 times")
+    (let [{:keys [env file]} (embed-env {})]
+      (with-redefs [embed/env env embed/from-file file]
+        (let [browse (srv/memory-payload m nil)
+              found  (srv/memory-payload m "Neptune")]
+          (is (= 25 (:total browse)) "a browse returns all 25 and says 25")
+          (is (= 20 (count (:facts found)))
+              "the query is answered with the top 20 — the page really is smaller")
+          (is (= 25 (:total found))
+              "…and the total is still the memory's 25, not the page's 20")
+          ;; the pair of numbers the status line is made of, on the same response
+          (is (= 25 (:awaiting found))
+              "with no embedder every fact awaits one — 25 of 25, both from the memory"))))))
 
 (deftest the-payload-says-whether-merging-runs
   (let [payload-under (fn [env-map]
@@ -1662,6 +1691,22 @@
     (is (string? (:error (srv/memory-unmerge! m "mem-1" nil))) "a missing absorbed id")
     (is (string? (:error (srv/memory-unmerge! m "" ""))))
     (is (= 1 (count (mem/all-facts m))) "and none of that changed the memory")))
+
+(deftest the-panes-total-counts-live-facts-and-not-tombstones
+  ;; A merge does not delete: it appends a record carrying :merged-into for the
+  ;; absorbed id. Counting the raw map would say the memory grew by absorbing
+  ;; something into itself. And the pane's own note: after an unmerge the count
+  ;; goes UP, because a fact came back.
+  (let [m (merged-memory)
+        {:keys [env file]} (embed-env {})]
+    (with-redefs [embed/env env embed/from-file file]
+      (is (= 1 (:total (srv/memory-payload m nil)))
+          "two records in the file, one of them a tombstone: one live fact")
+      (srv/memory-unmerge! m "mem-1" "mem-2")
+      (let [p (srv/memory-payload m nil)]
+        (is (= 2 (:total p))
+            "after the unmerge the restored fact is counted, because it is one again")
+        (is (= 2 (count (:facts p))))))))
 
 ;; ============================================================================
 ;; memory scoped to one notebook's lineage (/api/memory?space=…)
@@ -1824,6 +1869,22 @@
            (:fact-set p))
         "itself, its descendant, and its parent — the trunk, browsed the same way it is recalled")
     (is (= 6 (count (mem/all-facts m))) "…out of six remembered")))
+
+(deftest a-scope-narrows-the-facts-and-never-the-total
+  ;; `:total` is what the status line's denominator is made of, and that line is
+  ;; a statement about the memory. A scoped pane showing three facts out of six
+  ;; still awaits embeddings for six.
+  (let [st (lineage-fixture)
+        m  (lineage-memory)]
+    (doseq [[q label] [["chips" "under a query"] [nil "browsing"]]]
+      (let [scoped (scoped-facts st m q "space:kid")
+            whole  (scoped-facts st m q nil)]
+        (is (= 3 (count (:facts scoped))) (str label ": space:kid's trunk is three of the six"))
+        (is (= 6 (:total scoped))
+            (str label ": but the memory holds six, and that is what the total says"))
+        (is (= (:total whole) (:total scoped))
+            (str label ": so scoping the pane cannot change the denominator"))
+        (is (= (count (mem/all-facts m)) (:total scoped)))))))
 
 (deftest an-unknown-or-non-notebook-scope-is-an-error-not-an-empty-answer
   (let [st (lineage-fixture)
