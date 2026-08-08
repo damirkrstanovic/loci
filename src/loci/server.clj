@@ -1641,6 +1641,44 @@
     (or (notebook-or-error st space)
         (memory-payload m q {:space space :sources (lineage-sources st space)}))))
 
+(defn memory-unmerge!
+  "POST /api/memory-unmerge — undo one merge.
+
+   Request `{\"survivor\": \"mem-1\", \"absorbed\": \"mem-2\"}`; both are fact ids
+   and both are required. Answers 200 with either
+
+     {\"survivor\": {…fact…}, \"restored\": {…fact…}}
+     {\"error\": \"…\"}
+
+   the two records as they now stand, and **no `vec` on either** — for the reason
+   `memory-payload` drops them, ~1024 floats per fact against a pane that shows
+   text. The survivor's `merged-from` is what it is *after* the split, so a
+   caller can re-render the `+N merged` list from this answer alone; `no-merge`
+   is a set of ids, which JSON carries as an array.
+
+   The two records rather than a whole pane payload, because the pane has a query
+   and possibly a scope that this request does not carry, and answering a scoped
+   pane with the unscoped memory is the one mistake a scope exists to prevent.
+   The caller refetches `/api/memory` with whatever it was already showing —
+   where `awaiting` will have gone up by one, since the restored fact has no
+   vector until the next sweep.
+
+   A refusal is `{:error \"…\"}` at HTTP 200, the shape every other not-allowed
+   answer in this file uses. `mem/unmerge!` returns its refusals as values and
+   this adds no way to throw: a missing id is a message, not a 500."
+  [m survivor absorbed]
+  (let [sid (str survivor)
+        aid (str absorbed)]
+    (cond
+      (str/blank? sid) {:error "unmerge needs a survivor id"}
+      (str/blank? aid) {:error "unmerge needs an absorbed id"}
+      :else
+      (let [r (mem/unmerge! m sid aid)]
+        (if (:error r)
+          r
+          {:survivor (dissoc (:survivor r) :vec)
+           :restored (dissoc (:restored r) :vec)})))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -1691,6 +1729,8 @@
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
+      (= uri "/api/memory-unmerge")(let [{:keys [survivor absorbed]} (body-json req)]
+                                     (json-resp (memory-unmerge! @mem/memory survivor absorbed)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]

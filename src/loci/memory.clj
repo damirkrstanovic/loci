@@ -25,7 +25,10 @@
    and is refused for a model nobody has measured. The older fact survives and
    the absorbed one's id and text land on it as :merged-from, so a merge is
    auditable and reversible; the absorbed id keeps a tombstone in the log, which
-   is what stops it being reissued to a different fact later."
+   is what stops it being reissued to a different fact later. `unmerge!` is that
+   reversal, and it records `:no-merge` on both facts so that the next sweep —
+   which re-embeds the restored fact and finds the same cosine — does not fold
+   them straight back."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.set :as set]
@@ -358,6 +361,37 @@
   (let [k (fn [f] [(:ts f 0) (or (id-ordinal (:id f)) Long/MAX_VALUE) (str (:id f))])]
     (if (neg? (compare (k a) (k b))) a b)))
 
+(defn- no-merge?
+  "True when `a` and `b` have been split apart by hand (`unmerge!`) and must not
+   be merged again.
+
+   **The representation is a set of ids under `:no-merge` on BOTH facts**, and
+   this reads the union of the two directions. On both rather than on one side
+   with a directional lookup, for three reasons:
+
+   · the pass compares an unordered pair, so a one-sided record has to be looked
+     up in both directions anyway — and then *which* side holds it becomes a
+     convention every call site must keep agreeing on;
+   · either record can lose its place in the comparison. A reworded fact drops
+     its vector; a fact can be absorbed by a third one and become a tombstone.
+     With the pair written on both, whichever record is still live still carries
+     the refusal;
+   · it is where a person will look. The fact someone opens to ask \"why is this
+     not merging\" is as likely to be the one that was split out as the one it
+     was split out of.
+
+   The cost is one duplicated id per split pair, and duplication is only a
+   hazard when the two copies can disagree. They cannot say different things
+   here: this predicate ORs them, so a lost copy weakens nothing and neither
+   copy can assert a merge.
+
+   `absorb` carries the union onto the survivor, so a refusal outlives a later
+   merge of either side — see the comment there for why that is the behaviour
+   and not an accident."
+  [a b]
+  (or (contains? (:no-merge a) (:id b))
+      (contains? (:no-merge b) (:id a))))
+
 (defn- absorb
   "The survivor as it stands after taking `gone` into itself.
 
@@ -372,13 +406,25 @@
    there. The absorbed fact's own `:merged-from` comes along, or a chain of
    merges would drop everything but the last step."
   [survivor gone]
-  (-> survivor
-      (assoc :ts (max (:ts survivor 0) (:ts gone 0)))
-      (assoc :strength (+ (:strength survivor 1) (:strength gone 1)))
-      (assoc :entities (vec (distinct (concat (:entities survivor) (:entities gone)))))
-      (assoc :merged-from (-> (vec (:merged-from survivor))
-                              (conj (dissoc gone :vec :model :dim :merged-from))
-                              (into (:merged-from gone))))))
+  ;; **A refusal to re-merge is inherited.** If B was split out of A by hand and
+  ;; A is later absorbed by C, then C now carries A's text and A's identity, and
+  ;; letting B fold into C would undo the split through a side door one merge
+  ;; later. The consistency argument is the threshold's own: C and A were judged
+  ;; the same fact, and B was judged *not* the same fact as A, so B is not the
+  ;; same fact as C. The cost is a set of ids that is never expired and can
+  ;; therefore suppress a pair the person never spoke about; the cost of the
+  ;; other choice is the gesture itself, silently, on the next pass.
+  (let [no-merge (into (set (:no-merge survivor)) (:no-merge gone))]
+    (cond-> (-> survivor
+                (assoc :ts (max (:ts survivor 0) (:ts gone 0)))
+                (assoc :strength (+ (:strength survivor 1) (:strength gone 1)))
+                (assoc :entities (vec (distinct (concat (:entities survivor) (:entities gone)))))
+                (assoc :merged-from (-> (vec (:merged-from survivor))
+                                        (conj (dissoc gone :vec :model :dim :merged-from))
+                                        (into (:merged-from gone)))))
+      ;; written only when there is something to write, so an ordinary merge
+      ;; does not put an empty set on every survivor in the log
+      (seq no-merge) (assoc :no-merge no-merge))))
 
 (defn- apply-merge!
   "Fold `gone` into `keep` in the atom and append both records. Returns true
@@ -406,7 +452,14 @@
                                  (= (:fact k) (:fact keep))
                                  (= (:fact g) (:fact gone))
                                  (not (merged-away? k))
-                                 (not (merged-away? g)))
+                                 (not (merged-away? g))
+                                 ;; re-read here, not only where the pair was
+                                 ;; scored: a refusal can land *after* the
+                                 ;; cosines were computed. Either someone
+                                 ;; unmerged the pair while the pass was
+                                 ;; running, or an earlier merge in this same
+                                 ;; pass carried one onto this survivor.
+                                 (not (no-merge? k g)))
                           (-> fs
                               (assoc kid (absorb k g))
                               ;; the tombstone keeps the text so a person reading
@@ -448,6 +501,12 @@
    survivor, whose text and vector are unchanged. Merging along a chain inside
    one pass would depend on the order the pairs happened to be visited.
 
+   **A pair `unmerge!` split apart is not a candidate**, at any cosine, in this
+   pass or any later one — see `no-merge?`. Without that this function would
+   undo every unmerge within one worker interval: the restored fact has no
+   vector, the next sweep gives it one, and the cosine that merged the pair is
+   still exactly what it was.
+
    O(n²) cosines per call, on the worker's interval and on no request path.
    Measured 2026-08-07 at 1024 dimensions, every pair scored and none merged:
    80 facts (3,160 pairs) 38 ms, 500 facts (124,750 pairs) 1.5 s. At 15-second
@@ -463,8 +522,12 @@
              above (->> (for [i (range n)
                               j (range (inc i) n)
                               :let [a (nth v i)
-                                    b (nth v j)
-                                    c (embed/cosine (:vec a) (:vec b))]
+                                    b (nth v j)]
+                              ;; before the cosine, not after: a pair someone
+                              ;; unmerged is not a candidate at any score, and
+                              ;; there is nothing to learn from scoring it
+                              :when (not (no-merge? a b))
+                              :let [c (embed/cosine (:vec a) (:vec b))]
                               :when (>= c t)]
                           {:score c :a a :b b})
                         (sort-by (juxt (comp - :score) (comp :id :a) (comp :id :b)))
@@ -491,6 +554,161 @@
        (let [msg (no-threshold-message model)]
          (warn-once! msg)
          {:merged 0 :considered (count facts) :model model :refused msg})))))
+
+;; ----------------------------------------------------------------------------
+;; unmerge — putting an absorbed fact back, and having it stay back
+;; ----------------------------------------------------------------------------
+
+(defn- merged-entry
+  "The `:merged-from` entry `survivor` holds for `id`, or nil."
+  [survivor id]
+  (first (filter #(= id (:id %)) (:merged-from survivor))))
+
+(defn- unmerge-refusal
+  "Why `absorbed-id` cannot be split back out of `survivor-id`, as a sentence a
+   person can act on — or nil when it can.
+
+   A sentence rather than a keyword because the only caller is an endpoint whose
+   only reader is a person, and \"not in :merged-from\" has three quite different
+   causes that want three different next moves."
+  [facts survivor-id absorbed-id]
+  (let [s (get facts survivor-id)
+        t (get facts absorbed-id)]
+    (cond
+      (nil? s)
+      (str "there is no fact " survivor-id " to unmerge anything from")
+
+      (merged-away? s)
+      (str survivor-id " is not a fact any more — it was itself absorbed into "
+           (:merged-into s) ", which is where its merged facts went. Unmerge from there.")
+
+      (nil? (merged-entry s absorbed-id))
+      (str survivor-id " did not absorb " absorbed-id
+           (if-let [ids (seq (map :id (:merged-from s)))]
+             (str "; it holds " (str/join ", " ids))
+             "; it holds no merged facts at all"))
+
+      ;; Only reachable through a hand-edited log — a merge leaves a tombstone
+      ;; under the absorbed id — but the write below is `assoc`, so if it ever is
+      ;; reachable it overwrites a live fact with a different one under its id.
+      ;; That is the exact failure `next-id`'s tombstones exist to prevent.
+      (and t (not (merged-away? t)))
+      (str absorbed-id " is already a live fact, so restoring it would overwrite one")
+
+      :else nil)))
+
+(defn unmerge!
+  "Split `absorbed-id` back out of `survivor-id`. Returns
+
+     {:survivor {…} :restored {…}}   the two records as they now stand
+     {:error \"…\"}                    that pair is not a merge this survivor made
+
+   and never throws.
+
+   What comes back is what `absorb` stored — the absorbed fact minus its
+   embedding — so its text, `:strength`, `:entities` and `:source` are restored
+   exactly. Three things are **not** restored, and none of them can be:
+
+   · **No `:vec`.** A merge stores none: a vector is ~1024 floats and is
+     re-derivable from the text. So the restored fact is pending and the next
+     sweep embeds it — which is precisely why `:no-merge` has to exist. The
+     sweep hands it back the same vector, the pass finds the same cosine, and
+     without the refusal the merge is reapplied inside one worker interval and
+     this function does nothing at all.
+
+   · **The survivor's `:ts`.** `absorb` overwrote it with the newer of the two
+     and nothing anywhere stored the old one. It keeps the merged value, so a
+     survivor reads as more recently seen than it was, and recency is a
+     multiplier in `recall` — this makes it rank slightly high, forever. The
+     restored fact's own `:ts` *is* stored and does come back, with one
+     qualification: it is its `:ts` at the moment of that merge, so a fact that
+     had already absorbed something was already carrying the newer timestamp of
+     the earlier merge. The loss compounds along a chain. The alternative is to
+     invent a number, and a plausible invented timestamp is worse than a real
+     one that is too new, because nothing downstream can tell it is invented.
+
+   · **The survivor's `:entities`.** `absorb` unions them and a union is not
+     invertible: subtracting the absorbed fact's entities would delete the ones
+     the survivor already had. They are left alone, so a survivor can keep an
+     entity that only the absorbed fact ever justified.
+
+   `:strength` is decremented by the absorbed fact's and floored at 1. The floor
+   is not decoration: a chain double-counts. When A absorbs B and C then absorbs
+   A, C's entry for A carries a strength that already includes B's, and B has an
+   entry of its own on C — so unmerging both subtracts B's strength twice. A
+   strength of 0 would turn `weight`'s \"it keeps coming up\" bonus into a
+   penalty, and a negative one would invert the ranking.
+
+   A restored fact comes back **without** a `:merged-from` of its own, even if it
+   had absorbed something before it was itself absorbed: `absorb` hoisted those
+   entries onto the outer survivor, and that is where they still are. So in a
+   chain the innermost fact stays recoverable — from the outer survivor, not from
+   the one just restored. Any `:no-merge` the fact carried at the time does come
+   back with it, so an older split is not quietly reopened by restoring a newer
+   one.
+
+   Two appends, like every other write here: the survivor's updated record, and
+   the absorbed id's record without its `:merged-into`. Reload is last-wins by
+   id, so the restored line replaces the tombstone. The id is not *reissued* —
+   it is given back to the one fact it always named, which is why this does not
+   reopen what `next-id` warns about.
+
+   Only `merge-similar!` honours `:no-merge`. `remember`'s duplicate check is a
+   different rule over different evidence (jaccard over tokens, not cosine) and
+   an unmerge does not change it: the same sentence remembered again still
+   reinforces whichever live fact its words overlap."
+  [{:keys [!facts file]} survivor-id absorbed-id]
+  (if-let [refusal (unmerge-refusal @!facts survivor-id absorbed-id)]
+    {:error refusal}
+    (let [[before after]
+          (swap-vals! !facts
+                      (fn [fs]
+                        ;; the same check again, inside the swap, on the map the
+                        ;; write will actually land on — a second unmerge of this
+                        ;; pair, or a merge that moved the survivor, may have
+                        ;; landed since the read above
+                        (if (unmerge-refusal fs survivor-id absorbed-id)
+                          fs
+                          (let [s     (get fs survivor-id)
+                                entry (merged-entry s absorbed-id)
+                                held  (filterv #(not= absorbed-id (:id %)) (:merged-from s))
+                                s'    (-> s
+                                          (update :strength #(max 1 (- (or % 1) (:strength entry 1))))
+                                          (update :no-merge (fnil conj #{}) absorbed-id))
+                                s'    (if (seq held)
+                                        (assoc s' :merged-from held)
+                                        ;; dropped rather than left as [], so a
+                                        ;; survivor that holds nothing does not
+                                        ;; read as one that holds an empty list
+                                        (dissoc s' :merged-from))
+                                back  (-> entry
+                                          ;; taken whole rather than rebuilt
+                                          ;; field by field, so a field added to
+                                          ;; a fact later is restored without
+                                          ;; touching this code. What is removed
+                                          ;; is only what would make it not a
+                                          ;; fact: :merged-into is what a
+                                          ;; tombstone *is*, and an embedding on
+                                          ;; an entry (which `absorb` never
+                                          ;; writes) could only describe some
+                                          ;; other text.
+                                          (dissoc :merged-into :vec :model :dim)
+                                          ;; :ts is on the entry for every log
+                                          ;; this code wrote; the fallbacks are
+                                          ;; for a hand-edited one, and prefer a
+                                          ;; real timestamp that is too new over
+                                          ;; a 0 that decays the fact to nothing
+                                          (assoc :ts (or (:ts entry) (:ts (get fs absorbed-id)) (:ts s 0)))
+                                          (update :no-merge (fnil conj #{}) survivor-id))]
+                            (assoc fs survivor-id s' absorbed-id back)))))]
+      (if (identical? before after)
+        {:error (str "unmerging " absorbed-id " from " survivor-id
+                     " was refused: the memory changed while it was being applied")}
+        (let [s (get after survivor-id)
+              r (get after absorbed-id)]
+          (append-line! file s)
+          (append-line! file r)
+          {:survivor s :restored r})))))
 
 (defn start-embed-worker!
   "Start one background thread that runs `embed-pending!` on `m` every

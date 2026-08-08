@@ -1,5 +1,7 @@
 (ns loci.server-test
-  (:require [clojure.string :as str]
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.agent :as agent]
             [loci.embed :as embed]
@@ -1609,6 +1611,57 @@
       (is (= warned @@#'mem/!warned)
           "the once-only refusal warning was not consumed by a page load")
       (is (= "" (str err)) "nor printed into a request"))))
+
+;; ============================================================================
+;; POST /api/memory-unmerge — the gesture that undoes one merge
+;; ============================================================================
+
+(defn- merged-memory
+  "A throwaway memory holding exactly the state a merge leaves behind: a
+   survivor carrying one `:merged-from` entry, and the absorbed id as a
+   tombstone.
+
+   Written as records rather than produced by a merge pass on purpose — this is
+   about the endpoint's shape, and `loci.memory-merge-test` is where the pass
+   itself is tested. Nothing here needs an embedder, so there is no vector on
+   the absorbed side and the survivor's is a stand-in for one."
+  []
+  (let [path (tmpfile)]
+    (io/make-parents (io/file path))
+    (spit path (str/join "\n"
+                         [(pr-str {:id "mem-1" :fact "TSMC makes most sub-7nm chips." :entities ["tsmc"]
+                                   :source {:obj "obj-1"} :ts 2000 :strength 5
+                                   :vec [1.0 0.0] :model "embed-qwen3-0.6b" :dim 2
+                                   :merged-from [{:id "mem-2" :fact "Most advanced chips are TSMC's."
+                                                  :entities ["taiwan"] :source {:obj "obj-9"}
+                                                  :ts 2000 :strength 2}]})
+                          (pr-str {:id "mem-2" :fact "Most advanced chips are TSMC's."
+                                   :ts 2000 :merged-into "mem-1"})
+                          ""]))
+    (mem/file-memory path)))
+
+(deftest the-unmerge-endpoint-answers-with-both-records-and-no-vector
+  (let [m (merged-memory)
+        r (srv/memory-unmerge! m "mem-1" "mem-2")]
+    (is (= "mem-1" (:id (:survivor r))))
+    (is (= "mem-2" (:id (:restored r))))
+    (is (= "Most advanced chips are TSMC's." (:fact (:restored r))))
+    (is (= 3 (:strength (:survivor r))) "5 - the 2 it absorbed")
+    (is (nil? (:vec (:survivor r)))
+        "no embedding goes out, for the reason memory-payload drops them: ~1024 floats per fact")
+    (is (nil? (:vec (:restored r))))
+    (is (= 2 (count (mem/all-facts m))) "and the memory itself now holds two facts")
+    (is (string? (json/write-str r))
+        "the response serialises — :no-merge is a set, and a set that data.json refused would 500")))
+
+(deftest the-unmerge-endpoint-refuses-rather-than-throwing
+  (let [m (merged-memory)]
+    (is (string? (:error (srv/memory-unmerge! m "mem-1" "mem-404")))
+        "an id the survivor never absorbed")
+    (is (string? (:error (srv/memory-unmerge! m nil "mem-2"))) "a missing survivor")
+    (is (string? (:error (srv/memory-unmerge! m "mem-1" nil))) "a missing absorbed id")
+    (is (string? (:error (srv/memory-unmerge! m "" ""))))
+    (is (= 1 (count (mem/all-facts m))) "and none of that changed the memory")))
 
 ;; ============================================================================
 ;; memory scoped to one notebook's lineage (/api/memory?space=…)
