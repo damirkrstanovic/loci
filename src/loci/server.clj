@@ -1485,17 +1485,29 @@
       {:state (state-payload st) :openId nid})
     (catch Exception e {:error (.getMessage e)})))
 
-(defn- next-id
-  "Mint '<prefix>N' with N = 1 + the highest existing numeric suffix across the
-   WHOLE store. Counting a notebook's refs collides after a cell remove — a
-   removed ref lowers the count while the object lives on."
-  [st prefix]
-  (let [n (->> (keys (sub/objects st))
+(defn- next-id-in
+  "`next-id` over an objects map already in hand.
+
+   Split out for the caller that mints TWO ids before one commit
+   (`materialize-entity!`). On the EDN stores `sub/objects` re-folds the whole
+   event log, so minting twice from the store folds it twice — measured at 3003
+   events: `sub/objects` alone 0.717 ms, one `next-id` 1.135 ms, two 2.334 ms.
+   That work sat inside a monitor, which is the one place where halving it is
+   worth a three-line split."
+  [objm prefix]
+  (let [n (->> (keys objm)
                (keep #(when (str/starts-with? % prefix)
                         (try (Long/parseLong (subs % (count prefix)))
                              (catch Exception _ nil))))
                (reduce max 0))]
     (str prefix (inc n))))
+
+(defn- next-id
+  "Mint '<prefix>N' with N = 1 + the highest existing numeric suffix across the
+   WHOLE store. Counting a notebook's refs collides after a cell remove — a
+   removed ref lowers the count while the object lives on."
+  [st prefix]
+  (next-id-in (sub/objects st) prefix))
 
 ;; ---- materializing an entity: the one action on the entity page ----
 ;;
@@ -1503,18 +1515,23 @@
 ;; deliberately so. What is serialised here is not one entity's cell vector but
 ;; `next-id`, a read of the WHOLE store's keys: a per-name lock would let two
 ;; different names mint the same `ent:1` and the second `:put` would silently
-;; replace the first — one object for two names, and a user taken to a notebook
-;; about somebody else's subject. Measured before this lock: 8 concurrent
-;; materializations of 8 different names left 3, 3 and 4 entity objects over
-;; three runs — 8 commits every time, each one overwriting the last, so the log
-;; says the work happened and the world says it did not. Measured on the EDN
-;; store, where `commit!` is one `swap!`; Datalevin's takes a lock and writes,
-;; which only widens the window.
+;; replace the first. Measured before this lock, over ten rounds: 8 concurrent
+;; materializations of 8 different names left **1 to 3** entity objects, and 32
+;; left 8 to 11 — 8 commits every time, each one overwriting the last, so the
+;; log says the work happened and the world says it did not. The second half of
+;; that measurement is the one to keep in mind: the notebook ids collide too, so
+;; several callers were handed the SAME notebook and a user asking about one
+;; subject is walked into another's. With the lock: 8 of 8 over ten rounds, 32
+;; of 32 over five.
 ;;
 ;; It also makes "materializing twice mints nothing" true rather than nearly
 ;; true. Check-then-commit is a read-modify-write, and two clicks on one name
-;; are a plain TOCTOU race without it; two objects for one name is exactly what
-;; `entity-objects` calls a coin toss.
+;; are a plain TOCTOU race without it — measured, 4 to 7 phantom commits and
+;; **two objects for one name**, which is exactly what `entity-objects` calls a
+;; coin toss. With the lock, one object and one commit every round.
+;;
+;; Both figures are from the EDN store, where `commit!` is one `swap!`;
+;; Datalevin's takes a lock and writes to LMDB, which only widens the window.
 ;;
 ;; Contention is one click on a modal against another click on a modal, so there
 ;; is nothing to gain by being clever here and a whole class of loss by being
@@ -1524,18 +1541,41 @@
 (defonce ^:private materialize-lock (Object.))
 
 (defn- about-notebook
-  "The id of the notebook that is about `eid` — one whose cells reference it — or
-   nil, out of an objects map already in hand.
+  "The id of the notebook that is about the entity `eid`, named `nm` — one whose
+   cells reference it — or nil, out of an objects map already in hand.
 
-   **The lexicographically least id wins, and nil is a real answer.**
+   **A notebook titled for the entity wins; ties and the rest go to the
+   lexicographically least id; nil is a real answer.**
 
-   Least id because `vals` of an objects map is hash order: with no rule at all,
-   an entity held by two notebooks would be answered with one of them
-   arbitrarily and nothing in the log would explain which. The same rule and the
-   same reason as `entity-objects`' duplicate tie-break, and like that one it
-   deliberately does not parse the id — preferring a `space:about-` id would make
-   this the second place that believes something about how notebook ids are
-   minted.
+   The two rules answer two different questions, and it is worth keeping them
+   apart:
+
+   *The title preference is about being right.* Several notebooks holding one
+   entity is not a race — it is the ordinary consequence of adding a subject to
+   somebody else's notebook, and one of the candidates is then plainly the
+   better answer: the one this materialization made, which `materialize-entity!`
+   titles with the name. Least id alone gets that wrong the moment the entity's
+   own notebook is not the oldest — materialize `asml`, then `tsmc`, then drop
+   `tsmc` into `asml`'s notebook, and `space:about-1` beats `space:about-2` for
+   an entity it merely holds. The comparison is on the title and NOT on the id,
+   for `entity-objects`' reason: a rule that preferred a `space:about-` prefix
+   would make this the second place that believes something about how notebook
+   ids are minted.
+
+   The title is a display string, so this is a *preference* and never an
+   identity — `entity-objects` still matches on `[:value :name]` alone. Rename
+   the notebook and you lose the preference, not the entity; the answer falls
+   back to least id, which is deterministic and no longer necessarily the one
+   you wanted.
+
+   *Least id is only about being the same answer twice.* `vals` of an objects
+   map is hash order, so with no tie-break at all two equally-titled candidates
+   would be answered arbitrarily and nothing in the log would explain which.
+   That is the same purpose as `entity-objects`' tie-break but not the same
+   situation: there, a duplicate is a race artefact and either answer is equally
+   wrong, so determinism is all there is to want. Here both candidates are
+   legitimate, which is exactly why determinism alone was not enough and the
+   preference above exists.
 
    nil because an entity can genuinely have no notebook: the cell is an ordinary
    cell and can be removed, the notebook is an ordinary object and can be
@@ -1543,11 +1583,12 @@
    materialization of the same name survives. The caller ships the nil rather
    than hiding the key, so a shell can open the entity object instead of trying
    to enter nothing."
-  [objm eid]
+  [objm eid nm]
   (->> (vals objm)
-       (keep #(when (and (= :space (:kind %)) (contains? (nb/refs-of %) eid)) (:id %)))
-       sort
-       first))
+       (filter #(and (= :space (:kind %)) (contains? (nb/refs-of %) eid)))
+       (sort-by (juxt #(if (= nm (:title %)) 0 1) :id))
+       first
+       :id))
 
 (defn materialize-entity!
   "POST /api/entity-notebook {\"name\": \"tsmc\"} — the entity becomes a citizen.
@@ -1557,6 +1598,14 @@
    the gesture is reversed whole. Two `commit!`s would need two undos, and the
    state between them — a notebook about an entity that no longer exists — is one
    the shell has no way to draw and nobody asked for.
+
+   Read that precisely: `undo!` pops the LAST commit, not this one. The `:tx` is
+   what makes the gesture *atomic*; it does not make it *addressable*. Commit
+   anything at all in between and the next `undo!` takes that instead, leaving
+   the entity and its notebook standing. Measured, and true of every gesture in
+   loci that toasts with an undo — `new-space!`, `connect!`, `keep-note!` — so it
+   is the substrate's model of undo and not a shortcoming here. What the `:tx`
+   rules out is the halfway state, which is the part that was ours to prevent.
 
    **No fact is touched, and no fact learns this object's id.** A fact references
    the identity — the normalized name — so undoing this returns the entity to
@@ -1603,14 +1652,20 @@
     (if (str/blank? nm)
       {:error "no entity name given"}
       ;; Nothing but the reads and the commit is inside the monitor — the payload
-      ;; is built after it, and no agent call or other I/O may move in.
+      ;; is built after it, and no agent call and no further I/O may move in. The
+      ;; commit itself IS I/O on the production store: `DatalevinStore/commit!`
+      ;; takes its own lock and writes to LMDB before publishing, so this monitor
+      ;; holds across a disk write by construction. Nesting order is
+      ;; `materialize-lock` → dlv lock, the same direction `notebook-op!` nests,
+      ;; and dlv is innermost and never calls back into this namespace — so the
+      ;; two monitors cannot deadlock against each other.
       (let [[eid sid]
             (locking materialize-lock
               (let [objm (sub/objects st)]
                 (if-let [o (get (entity-objects objm) nm)]
-                  [(:id o) (about-notebook objm (:id o))]
-                  (let [eid  (next-id st "ent:")
-                        sid  (next-id st "space:about-")
+                  [(:id o) (about-notebook objm (:id o) nm)]
+                  (let [eid  (next-id-in objm "ent:")
+                        sid  (next-id-in objm "space:about-")
                         eobj {:id eid :kind :entity :title nm :value {:name nm}}
                         sobj {:id sid :kind :space :title nm
                               :value {:intent (str "everything about " nm)

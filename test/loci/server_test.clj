@@ -2916,15 +2916,25 @@
   (let [st  (entity-fixture)
         m   (entity-memory)
         idx (ent/index (mem/all-facts m))
-        up? (fn [] (contains? (ent/promoted idx (srv/materialized-names st)) "arizona"))]
+        up? (fn [n] (contains? (ent/promoted idx (srv/materialized-names st)) n))]
     (is (= 1 (count (get idx "arizona"))) "one fact — below the threshold on the evidence alone")
-    (is (false? (up?)) "so on the evidence alone it is not a place")
+    (is (false? (up? "arizona")) "so on the evidence alone it is not a place")
     (srv/materialize-entity! st "Arizona")
     (is (= #{"arizona"} (srv/materialized-names st)) "reported normalized, the only form `promoted` can compare")
-    (is (true? (up?)) "a materialized entity never demotes — it is yours, not the evidence's")
+    (is (true? (up? "arizona")) "a materialized entity never demotes — it is yours, not the evidence's")
     (sub/undo! st)
     (is (= #{} (srv/materialized-names st)))
-    (is (false? (up?)) "and undo returns it to being a projection: one fact, not a place")))
+    (is (false? (up? "arizona")) "and undo returns it to being a projection: one fact, not a place")
+    ;; the other half, and the one that says what "returns to a projection"
+    ;; means: undo takes away the object, never the evidence. A name that was a
+    ;; place before anyone materialized it is still one afterwards.
+    (is (= 4 (count (get idx "tsmc"))))
+    (is (true? (up? "tsmc")) "four facts — a place on its own evidence, before any object exists")
+    (srv/materialize-entity! st "TSMC")
+    (is (true? (up? "tsmc")))
+    (sub/undo! st)
+    (is (= #{} (srv/materialized-names st)) "the object is gone…")
+    (is (true? (up? "tsmc")) "…and the projection still says yes, because the facts never moved")))
 
 (deftest the-already-materialized-answer-is-honest-about-its-notebook
   (let [st  (entity-fixture)
@@ -2941,20 +2951,59 @@
       (is (nil? (:spaceId b))
           "…and null: there is no notebook about this any more, and a shell told `null` opens the entity object instead of entering nothing"))))
 
-(deftest two-notebooks-about-one-entity-answer-the-same-one-every-time
-  ;; `vals` of an objects map is hash order. With no rule the answer would name
-  ;; one of the two arbitrarily and nothing in the log would explain which — the
-  ;; same determinism `entity-objects` breaks its own duplicate tie for.
-  (let [st  (entity-fixture)
-        a   (srv/materialize-entity! st "tsmc")
-        eid (:entity a)]
-    (sub/commit! st {:op :put :id "space:aaa"
-                     :value {:id "space:aaa" :kind :space :title "Also about it"
-                             :value {:intent "i" :cells [{:ref eid}]}}})
-    (is (= "space:aaa" (:spaceId (srv/materialize-entity! st "tsmc")))
-        "the lexicographically least id, which is a rule and not an accident")
-    (is (apply = (repeatedly 5 #(:spaceId (srv/materialize-entity! st "tsmc"))))
-        "…and it is the same answer every time it is asked")))
+(deftest the-notebook-answered-is-the-one-that-is-about-this-entity
+  ;; Several notebooks holding one entity is not a race — it is what happens when
+  ;; you drop a subject into somebody else's notebook — so one candidate is
+  ;; plainly the better answer and determinism alone is not enough. Every id here
+  ;; is one this codebase really mints: least id ALONE answers `space:about-1`
+  ;; for an entity that notebook merely holds, and sends the user into asml's
+  ;; notebook when they asked about tsmc.
+  (let [st (entity-fixture)
+        a  (srv/materialize-entity! st "asml")
+        b  (srv/materialize-entity! st "tsmc")]
+    (is (= ["space:about-1" "space:about-2"] [(:spaceId a) (:spaceId b)])
+        "minted in that order, so the lower id is NOT tsmc's own — without which this test could not fail")
+    (sub/commit! st (nb/append-cell-event st (:spaceId a) {:ref (:entity b)}))
+    (is (= #{(:entity a) (:entity b)} (nb/refs-of (sub/object st (:spaceId a))))
+        "asml's notebook now holds tsmc too — an ordinary cell, added by an ordinary gesture")
+    (is (= (:spaceId b) (:spaceId (srv/materialize-entity! st "tsmc")))
+        "the notebook that is ABOUT tsmc, not the lower-id one that merely holds it")
+    (is (= (:spaceId a) (:spaceId (srv/materialize-entity! st "asml")))
+        "…and asml's own is still asml's own")
+    ;; The title is a display string. An edit to it must not re-identify the
+    ;; entity — and it does not: it costs the preference and nothing else.
+    (sub/commit! st {:op :assoc :id (:spaceId b) :path [:title] :value "TSMC — the foundry"})
+    (is (= (:entity b) (:id (srv/entity-object st "tsmc")))
+        "the entity is still reached by name, because identity is `[:value :name]` and never the title")
+    (is (= (:spaceId a) (:spaceId (srv/materialize-entity! st "tsmc")))
+        "…while the notebook answer falls back to least id: deterministic, and no longer the one you wanted")))
+
+(deftest the-notebook-answered-does-not-depend-on-the-objects-maps-order
+  ;; `vals` of an objects map is iteration order, not a rule, so `first` over it
+  ;; is not an answer. Asking the same store twice cannot show this — it is the
+  ;; same map in the same JVM and it iterates the same way every time — so the
+  ;; two candidates are handed over in both orders and the answer must not move.
+  (let [about {:id "space:about-2" :kind :space :title "tsmc"
+               :value {:intent "everything about tsmc" :cells [{:ref "ent:2"}]}}
+        holds {:id "space:about-1" :kind :space :title "asml"
+               :value {:intent "everything about asml" :cells [{:ref "ent:1"} {:ref "ent:2"}]}}
+        objm  (fn [os] (into {} (map (juxt :id identity)) os))
+        pick  #'srv/about-notebook]
+    (is (not= (mapv :id (vals (objm [about holds])))
+              (mapv :id (vals (objm [holds about]))))
+        "the two maps really do iterate differently — without this the two assertions below could not disagree, whatever the rule")
+    (is (= "space:about-2" (pick (objm [about holds]) "ent:2" "tsmc")))
+    (is (= "space:about-2" (pick (objm [holds about]) "ent:2" "tsmc"))
+        "…and the same answer from the other order")
+    ;; …and when the preference TIES — two notebooks titled for one entity, which
+    ;; is what renaming a second notebook into the name produces — least id has
+    ;; to decide. `sort-by` is stable, so with no tie-break the winner would be
+    ;; whichever the map happened to iterate first, which is the whole defect.
+    (let [twin {:id "space:new-1" :kind :space :title "tsmc"
+                :value {:intent "also about tsmc" :cells [{:ref "ent:2"}]}}]
+      (is (= "space:about-2" (pick (objm [about twin]) "ent:2" "tsmc")))
+      (is (= "space:about-2" (pick (objm [twin about]) "ent:2" "tsmc"))
+          "…decided by the tie-break and not by the iteration order"))))
 
 (deftest concurrent-materializations-mint-distinct-ids
   ;; `next-id` reads the whole store's keys and mints from the highest suffix, so
@@ -2995,6 +3044,7 @@
   ;; runtime. `c/store` is a delay behind an ordinary var, so rebinding it means
   ;; the user's Datalevin store is never opened.
   (let [st    (entity-fixture)
+        n0    (count (sub/history st))
         post! (fn [body]
                 (with-redefs [c/store (delay st)]
                   (json/read-str (:body (srv/handler
@@ -3004,7 +3054,7 @@
         r     (post! {:name "  TSMC "})]
     (is (= "tsmc" (get-in (sub/object st (:entity r)) [:value :name])))
     (is (= :space (:kind (sub/object st (:spaceId r)))))
-    (is (= (inc 4) (:events (:state r))) "the state comes back with the write in it")
+    (is (= (inc n0) (:events (:state r))) "the state comes back with the write in it")
     (let [again (post! {:name "tsmc"})]
       (is (= (:entity r) (:entity again)) "a second POST mints nothing")
       (is (= (:spaceId r) (:spaceId again))))
