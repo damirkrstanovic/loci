@@ -27,7 +27,8 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.walk :as walk]))
+            [clojure.walk :as walk]
+            [loci.config :as config]))
 
 ;; ----------------------------------------------------------------------------
 ;; readable keys — a log is only a log if it can be read back.
@@ -148,9 +149,15 @@
 ;; ----------------------------------------------------------------------------
 
 (defn data-dir
-  "Where the logs live. Overridable so demos/tests never clobber real data."
+  "Where the logs live. Overridable so demos/tests never clobber real data.
+
+   `LOCI_DATA` comes through `loci.config`, so it resolves from `loci.env` as
+   well as from the real environment. It is deliberately NOT in
+   `loci.env.example`: the value that belongs in a container is `/data`, which
+   the image already sets, and a portable config file carrying it would send a
+   `clojure -M:serve` on someone's laptop at a directory it cannot create."
   []
-  (or (System/getProperty "loci.data-dir") (System/getenv "LOCI_DATA") "data"))
+  (or (System/getProperty "loci.data-dir") (config/env "LOCI_DATA") "data"))
 
 ;; ----------------------------------------------------------------------------
 ;; …and it has to be writable, checked before anything opens a database.

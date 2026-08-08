@@ -9,6 +9,7 @@
             [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as hc]
+            [loci.config :as config]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
             [loci.viewspec :as vs]))
@@ -119,8 +120,13 @@
         {:rows rendered}))
     {:error (str "no table " table_id)}))
 
+;; Through `loci.config`, like every other configured value: `TAVILY_API_KEY` is
+;; one of the keys `loci.env.example` ships, so leaving this on System/getenv
+;; would make the one file work for `docker compose up` and, for this key alone,
+;; silently not for `clojure -M:serve` — the exact shape of bug that file was
+;; unified to remove.
 (defn- search-key []
-  (or (System/getenv "SEARCH_API_KEY") (System/getenv "TAVILY_API_KEY")
+  (or (config/env "SEARCH_API_KEY") (config/env "TAVILY_API_KEY")
       (let [f (java.io.File. ".tavily-key")] (when (.exists f) (str/trim (slurp f))))))
 (defn- do-search [_ {:keys [query]}]
   (if-let [k (search-key)]

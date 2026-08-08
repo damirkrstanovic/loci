@@ -6,8 +6,9 @@
    delegation it drafts text that lands as a reversible substrate object. The
    probabilistic model never touches the substrate's rules directly.
 
-   Endpoint, key and model each read the environment first, then a file in the
-   working directory, then a default:
+   Endpoint, key and model each read the real environment first, then `loci.env`
+   (see `loci.config` — the one file, Docker or not), then a single-value file in
+   the working directory, then a default:
 
      LOCI_LLM_ENDPOINT → .llm-endpoint → https://api.deepseek.com/chat/completions
      LOCI_LLM_API_KEY  → DEEPSEEK_API_KEY → .llm-key → .deepseek-key (both gitignored)
@@ -21,15 +22,21 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.config :as config]
             [org.httpkit.client :as hc]))
 
 (defn- from-file [path] (let [f (io/file path)] (when (.exists f) (str/trim (slurp f)))))
 
 (defn- env
-  "One indirection over System/getenv. It is a Java static, which with-redefs
-   cannot reach, so without this seam the resolution order below is untestable."
+  "One indirection over the environment. System/getenv is a Java static, which
+   with-redefs cannot reach, so without this seam the resolution order below is
+   untestable — every config test on this repo binds it.
+
+   `loci.config/env` reads the real environment first and then `loci.env`, so the
+   file that already configures `docker compose up` configures `clojure -M:serve`
+   too. Still a function here rather than an alias, because it is that seam."
   [k]
-  (System/getenv k))
+  (config/env k))
 
 ;; A set-but-empty variable is unset. `loci.env.example` ships
 ;; `LOCI_LLM_API_KEY=` with no value, and "" is truthy in Clojure — so an empty

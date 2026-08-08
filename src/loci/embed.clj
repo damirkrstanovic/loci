@@ -8,8 +8,9 @@
    those are different things a caller wants to report differently. A down
    embedder must degrade recall to what it is today, not break it.
 
-   Each configuration value reads the environment first, then a file in the
-   working directory, then a default — the order `loci.agent` already established:
+   Each configuration value reads the real environment first, then `loci.env`
+   (see `loci.config`), then a single-value file in the working directory, then a
+   default — the order `loci.agent` already established:
 
      LOCI_EMBED_ENDPOINT  → .embed-endpoint  → unset: semantic recall is off
      LOCI_EMBED_MODEL     → .embed-model     → embed-qwen3-0.6b
@@ -29,6 +30,7 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.config :as config]
             [org.httpkit.client :as hc]))
 
 ;; Copied verbatim from loci.agent, deliberately — not reimplemented. Sharing it
@@ -39,10 +41,15 @@
 (defn- from-file [path] (let [f (io/file path)] (when (.exists f) (str/trim (slurp f)))))
 
 (defn- env
-  "One indirection over System/getenv. It is a Java static, which with-redefs
-   cannot reach, so without this seam the resolution order below is untestable."
+  "One indirection over the environment. System/getenv is a Java static, which
+   with-redefs cannot reach, so without this seam the resolution order below is
+   untestable — every config test on this repo binds it.
+
+   `loci.config/env` reads the real environment first and then `loci.env`, so the
+   file that already configures `docker compose up` configures `clojure -M:serve`
+   too. Still a function here rather than an alias, because it is that seam."
   [k]
-  (System/getenv k))
+  (config/env k))
 
 (defn- non-blank
   "nil for nil, \"\" and whitespace-only — a blank value is unset, not

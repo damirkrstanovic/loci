@@ -137,9 +137,9 @@ unzip -p target/loci-standalone.jar META-INF/MANIFEST.MF | grep Loci-Platform
 Plain `clojure -T:build uber` still builds the portable jar, and that is the
 default; only the Dockerfile opts in.
 
-**Configuration is read from the environment first, then from files in the working
-directory** — and a container has neither of those files, because `.dockerignore`
-deliberately keeps them out of the build context:
+**Configuration is read from the real environment first, then from `loci.env`, then
+from the single-value files in the working directory** — and a container has none of
+those files, because `.dockerignore` deliberately keeps them out of the build context:
 
 | variable | falls back to | then to |
 |---|---|---|
@@ -155,6 +155,29 @@ deliberately keeps them out of the build context:
 | `LOCI_RERANK_API_KEY` | `LOCI_EMBED_API_KEY`, then `LOCI_LLM_API_KEY` | *unset — no header* |
 | `LOCI_DATA` | — | a **relative** `data/` |
 | `PORT` | — | `7777` |
+
+**One config file, Docker or not.** Every variable in that table is read from
+**`loci.env`** as well as from the real environment, so the file you copy from
+`loci.env.example` configures `clojure -M:serve` and `docker compose up` alike.
+It used to configure only the container — compose turns each line into a real
+environment variable, and a local run saw none of it, so the same settings had to
+be exported by hand and one of the two copies was always stale. The real
+environment still comes **first**, so `DEEPSEEK_MODEL=… clojure -M:serve`
+overrides one line for one run; in a container nothing changed at all, because
+compose has already turned the file into real variables before loci starts and
+`.dockerignore` keeps `loci.env` out of the image. A **blank** value in the file
+counts as unset and falls through — `LOCI_LLM_API_KEY=` ships that way — and a
+line that is not `KEY=VALUE` is skipped with its line number on stderr rather
+than stopping the app over one typo. (The number, not the line: a malformed line
+is exactly where a mistyped key ends up.)
+
+`LOCI_DATA` and `PORT` are the two that `loci.env.example` deliberately does not
+set, though both are honoured if you do. They are deployment facts rather than
+configuration, and the image supplies them: `ENV LOCI_DATA=/data` and
+`ENV PORT=7777` in the `Dockerfile`. `/data` in a portable config file would add
+nothing in the container and would point a `clojure -M:serve` on your own machine
+at a directory it cannot create; `PORT` in it would move the container's listener
+without moving compose's published mapping.
 
 **Any server that speaks OpenAI's `POST /v1/chat/completions` works** — llama.cpp,
 vLLM, Ollama, LM Studio, a gateway — so loci can run entirely on your own hardware:
@@ -263,12 +286,17 @@ docker compose up
 
 # the same file without compose
 docker run -p 7777:7777 -v loci-data:/data --env-file loci.env loci
+
+# and the same file with no container at all
+clojure -M:serve
 ```
 
 Never bake a key into an image: a layer that carries one survives `docker push` and every
-tag built from it. And do not put `PORT` in `loci.env` — it would move the listener inside
-the container without moving the published mapping, leaving something that looks healthy
-and answers nothing.
+tag built from it. And do not put `PORT` or `LOCI_DATA` in `loci.env` — `PORT` would move
+the listener inside the container without moving the published mapping, leaving something
+that looks healthy and answers nothing, and `LOCI_DATA=/data` is the container's path, which
+the image already sets and which a `clojure -M:serve` on your own machine would take
+literally and refuse to start over.
 
 `clojure -M:serve` persists its state under `data/` — the substrate is a
 Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at

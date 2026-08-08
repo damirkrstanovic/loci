@@ -12,6 +12,7 @@
             [org.httpkit.server :as http]
             [loci.agent :as agent]
             [loci.chunks :as ch]
+            [loci.config :as config]
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.fnlib :as fnlib]
@@ -1760,11 +1761,15 @@
   (when-let [problem (sub/data-dir-problem)]
     (binding [*out* *err*] (println problem))
     (System/exit 1))
-  ;; PORT because that is what every container runtime sets. The data directory is
-  ;; printed because a packaged loci defaults to a RELATIVE "data" — launched from
-  ;; the wrong place it silently starts an empty substrate instead of yours, and a
-  ;; line of output is the difference between noticing and not.
-  (let [port (or (some-> (System/getenv "PORT") Integer/parseInt) 7777)
+  ;; PORT because that is what every container runtime sets. Through
+  ;; `loci.config` like everything else, so that a PORT in loci.env is honoured
+  ;; rather than silently ignored by a local run while compose obeys it — the
+  ;; advice not to put it there (see loci.env.example) is about the container,
+  ;; where the published mapping would not move with the listener. The data
+  ;; directory is printed because a packaged loci defaults to a RELATIVE "data" —
+  ;; launched from the wrong place it silently starts an empty substrate instead
+  ;; of yours, and a line of output is the difference between noticing and not.
+  (let [port (or (some-> (config/env "PORT") Integer/parseInt) 7777)
         dir  (sub/data-dir)]
     (reset! server (http/run-server #'handler {:port port}))
     (println (str "loci shell on http://localhost:" port
