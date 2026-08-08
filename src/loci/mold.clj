@@ -90,9 +90,16 @@
      :filter {:sources #{id …} :entities #{name …}} to narrow to facts recorded
      against those ids OR carrying one of those names, a union: lineage is what
      a deep dive inherits, subject is what an unrelated notebook shares, and
-     neither replaces the other. An engine that ignores an opt still answers;
-     NaiveRecall below ignores all of them, which is why it is a stub and not a
-     store.")
+     neither replaces the other.
+
+     **:subjects scores, :filter {:entities} scopes.** A subject raises a fact
+     that already passed the filter; it never lets one past it. To reach another
+     notebook's facts about a subject, name it in both — in :filter to make them
+     eligible, in :subjects to make them rank — because naming it only in
+     :subjects fails silently, as a scoped recall that answers with nothing.
+
+     An engine that ignores an opt still answers; NaiveRecall below ignores all
+     of them, which is why it is a stub and not a store.")
   (all-facts [this]
     "every stored fact, newest first — the browsable memory pane.
 

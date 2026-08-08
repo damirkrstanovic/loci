@@ -351,7 +351,27 @@
     (testing "an empty :sources beside an :entities set is that entities set"
       (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:sources  #{}
                                                                 :entities #{"tsmc"}}})))
-          "a caller whose lineage is empty can still ask about a subject"))))
+          "a caller whose lineage is empty can still ask about a subject"))
+
+    (testing ":entities with no :sources key at all is a scope in its own right"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:entities #{"tsmc"}}})))
+          "the subject alone narrows — this is the shape an entity page asks in, and it is not no-filter"))
+
+    (testing "the caller's names are normalized, not taken on trust"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:entities #{"TSMC"}}})))
+          (str "`GET /api/entity?name=TSMC` must not answer with an empty page. An "
+               "un-normalized name would simply never match and the scope would look "
+               "like a corpus with no such facts in it")))
+
+    (testing ":subjects scores, :filter {:entities} scopes — and the difference is silent"
+      (is (= [] (mold/recall m "tsmc" {:k 5 :subjects #{"tsmc"}
+                                       :filter   {:sources #{"space:sky"}}}))
+          (str "the semis fact carries tsmc and is named as a subject, and it still does not "
+               "answer: a subject raises a fact that already passed the filter, it never "
+               "lets one past it"))
+      (is (= [taiwan] (facts-of (mold/recall m "tsmc" {:k 5 :filter {:sources  #{"space:sky"}
+                                                                     :entities #{"tsmc"}}})))
+          "the same name in :filter is what makes it eligible — a caller reaching out of its lineage needs both"))))
 
 (deftest a-multi-word-subject-scores-where-a-query-token-never-could
   (let [m (mem/file-memory (tmpfile))]
@@ -370,6 +390,22 @@
                                            {:k 5 :subjects #{"  Wrath of the   Righteous "}})))
         "and the subject set is normalized on the way in, so a caller's casing cannot make it miss")))
 
+(deftest a-blank-subject-is-not-a-subject-and-matches-nothing
+  ;; Task 3 builds the subject set as "entities detected in the prompt ∪ entities
+  ;; of facts already in this lineage". `ent/detect` cannot emit a blank, but the
+  ;; lineage half is raw `:entities` off facts and those come from a model — so a
+  ;; blank subject is a thing that will be asked for. It must match nothing: a
+  ;; blank that matched would match every fact the distiller left junk on.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m neptune {:entities ["neptune" nil ""]
+                              :source   {:obj "doc:neptune" :space "space:sky"}})
+    (doseq [s [#{nil} #{""} #{"   "} #{nil "" "  "}]]
+      (is (= [] (mold/recall m "unrelated words entirely" {:k 5 :subjects s}))
+          (str "a blank subject names nothing, so it raises nothing: " (pr-str s))))
+    (is (= [neptune] (facts-of (mold/recall m "unrelated words entirely"
+                                            {:k 5 :subjects #{"neptune" nil ""}})))
+        "and a real name beside the blanks still works — the blanks are dropped, not the set")))
+
 (deftest a-fact-s-own-names-are-normalized-the-way-every-other-entity-name-is
   ;; The distiller writes `:entities` and nothing ever rewrites them, so a padded
   ;; or oddly-cased name is what is actually on disk. Both new paths look a fact's
@@ -385,6 +421,23 @@
     (is (= ["Veldhoven ships scanners."]
            (facts-of (mold/recall m "asml" {:k 5 :filter {:sources #{} :entities #{"asml"}}})))
         "and so does the scope filter — otherwise a subject union silently skips its own facts")))
+
+(deftest a-blank-entity-name-is-not-the-rarest-name-there-is
+  ;; `ent/index` drops blanks, so `df-map` never keys one — and an unfiltered
+  ;; blank would therefore take the `(get dfm e 1)` default and be weighed 1.0,
+  ;; a LARGER weight than any real name. The distiller writes `:entities`
+  ;; straight off a model's JSON, so `""` and `nil` are values that arrive here.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m taiwan {:entities ["tsmc" "" nil "   "]
+                             :source   {:obj "find:semis-1" :space "space:semis"}})
+    (let [r (mold/recall m "tsmc" {:k 5})]
+      (is (= [taiwan] (facts-of r)))
+      (is (< (Math/abs (- 0.5 (:score (first r)))) 1e-4)
+          (str "0.6 × 1/6 for the word plus the full 0.4 for the one name this fact "
+               "actually has — exactly what `[\"tsmc\"]` alone scores. Left in, the three "
+               "blanks normalize to one \"\" that halves the entity half and makes this 0.3, "
+               "and at the corpus's real df for tsmc it would be 0.09 against 1.0: "
+               (:score (first r)))))))
 
 (deftest a-name-everything-carries-is-worth-less-than-a-name-two-facts-carry
   (let [m (ubiquity-memory)]

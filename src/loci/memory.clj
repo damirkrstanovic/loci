@@ -83,16 +83,36 @@
    would silently weigh 1.0 — \"as rare as anything gets\" — for every fact whose
    distiller left it padded or non-breaking-spaced.
 
-   A fact's entities are matched against the query tokens AND the subject set.
-   The subject set is what carries a multi-word name: `qt` is single words, so
-   `wrath of the righteous` could never match a token and the fact it identifies
-   would score 0 on the half that exists to find it."
-  [qt subjects dfm f]
+   **Blank names are dropped, exactly as `ent/index` drops them**, and that is
+   what makes the sentence above true rather than nearly true. `df-map` never
+   keys a blank, so a blank left in `es` would take the `(get dfm e 1)` default
+   and be weighed 1.0 — a *larger* weight than any real name, so a single `\"\"`
+   off the distiller would swamp the fact's actual subjects: at the corpus's
+   measured frequencies `[\"tsmc\" \"taiwan\" \"\"]` scores 0.08 on the entity half
+   where `[\"tsmc\" \"taiwan\"]` scores 0.33. `server.clj` stores whatever the
+   model's JSON put in `:entities`, so `\"\"` is a value that reaches here.
+   Filtering it is also what makes that `1` default *unreachable*: after this,
+   every name `es` can contain is one `df-map` indexed.
+
+   A fact's entities are matched against `qs` — the query tokens UNION the
+   subject set, built once in `recall` rather than per candidate. The subject
+   half is what carries a multi-word name: query tokens are single words, so
+   `wrath of the righteous` could never match one and the fact it identifies
+   would score 0 on the half that exists to find it. `qt` is still passed
+   separately because the keyword half is a jaccard against the tokens alone —
+   a subject is not a word the fact has to contain."
+  [qt qs dfm f]
   (let [kw  (jaccard qt (tokens (:fact f)))
-        es  (set (map ent/normalize (:entities f)))
+        es  (into #{} (comp (map ent/normalize) (remove str/blank?)) (:entities f))
+        ;; `(max 1 …)` stays although `df-map` cannot produce a value below 1:
+        ;; `dfm` is a plain map parameter, and `(/ 1.0 0.0)` in Clojure is
+        ;; Infinity rather than a throw, so a hand-built or future-derived map
+        ;; with a zero count would make `tot` Infinity and `ent` NaN — and a NaN
+        ;; score does not merely rank wrong, it makes `sort-by` inconsistent.
+        ;; A clamp on a hot path is cheaper than that failure being findable.
         w   (fn [e] (/ 1.0 (double (max 1 (get dfm e 1)))))
         tot (reduce + 0.0 (map w es))
-        hit (set/intersection es (set/union qt (set subjects)))
+        hit (set/intersection es qs)
         ent (if (pos? tot) (/ (reduce + 0.0 (map w hit)) tot) 0.0)]
     (+ (* 0.6 kw) (* 0.4 ent))))
 
@@ -103,7 +123,7 @@
   (* (decay (:ts f) now)
      (+ 1.0 (* 0.25 (dec (:strength f 1))))))
 
-(defn- score [qt subjects dfm now f] (* (relevance qt subjects dfm f) (weight now f)))
+(defn- score [qt qs dfm now f] (* (relevance qt qs dfm f) (weight now f)))
 
 (defn- append-line! [file rec]
   (io/make-parents (io/file file))
@@ -842,16 +862,33 @@
   "Whether `f` was recorded against one of `sources`.
 
    Public because the memory pane browses without a query — `all-facts`, not
-   `recall` — and a scoped browse must be narrowed by exactly the rule a scoped
-   query is narrowed by. Two copies of “what a `:source` names” would drift, and
-   the one that drifted would be the one showing facts a scope excluded."
+   `recall` — and a scoped browse must be narrowed by exactly the rule the
+   *lineage half* of a scoped query is narrowed by. Two copies of “what a
+   `:source` names” would drift, and the one that drifted would be the one
+   showing facts a scope excluded.
+
+   Only that half. `scoped` is now a union of lineage and subject, and this is
+   not the subject half and does not know about it — so a browse scoped through
+   here shows a notebook's lineage and NOT the facts a recall in that notebook
+   would also reach by shared subject. That is deliberate while the pane has no
+   way to ask for a subject; the moment it grows one, it needs the union and not
+   another call to this."
   [sources f]
   (boolean (some sources (source-ids f))))
 
 (defn- shares-entity?
-  "Whether `f` carries one of `names` — already-normalized entity names.
-   Normalizing here rather than at the caller because a fact's `:entities` are
-   stored exactly as the distiller wrote them and are never rewritten."
+  "Whether `f` carries one of `names` — normalized entity names, as `scoped`
+   normalizes them on the way in.
+
+   The fact's side is normalized here because its `:entities` are stored exactly
+   as the distiller wrote them and are never rewritten; the caller's side is
+   normalized in `scoped` rather than trusted, for the reason `ent/detect` gives
+   about its own `names`: trusting it would fail *silently* rather than loudly.
+   An un-normalized name simply never matches, so a subject scope looks like it
+   ran and returns nothing — and the caller this is being built for is
+   `GET /api/entity?name=United%20States`, where the answer to a capitalised
+   name would be an entity page with no facts on it, no error and nothing
+   degraded to notice."
   [names f]
   (boolean (some names (map ent/normalize (:entities f)))))
 
@@ -874,9 +911,17 @@
    to prevent. That survives here because an empty set is truthy in Clojure and
    `(in-sources? #{} f)` is false for every fact — so do NOT \"tidy\" the
    `(and sources …)` into a `seq` check, which would turn the empty scope back
-   into no scope at all."
+   into no scope at all. An `:entities` set that normalizes away to nothing —
+   `#{}`, or `#{\"  \"}` — answers the same way and for the same reason: the
+   caller named no subject that is one.
+
+   `:entities` is normalized and blank-filtered here rather than taken on trust,
+   so that `#{\"ASML\"}` and `#{\"asml\"}` are the same scope; see
+   `shares-entity?` for what the trusting version costs."
   [facts opts]
-  (let [{:keys [sources entities]} (:filter opts)]
+  (let [{:keys [sources entities]} (:filter opts)
+        entities (some->> entities (into #{} (comp (map ent/normalize)
+                                                   (remove str/blank?))))]
     (if (or sources entities)
       (filterv (fn [f] (or (and sources (in-sources? sources f))
                            (and entities (shares-entity? entities f))))
@@ -1014,6 +1059,14 @@
   ;; opts: {:k 6 :semantic? false :rerank? false :subjects #{name …}
   ;;        :filter {:sources #{id …} :entities #{name …}}}
   ;;
+  ;; :subjects SCORES, :filter {:entities} SCOPES, and they are separate on
+  ;; purpose. A name in :subjects raises a fact that already survived the filter;
+  ;; it cannot let a fact past one. A caller that wants an unrelated notebook's
+  ;; facts about a subject has to name it in BOTH — :filter to make it eligible,
+  ;; :subjects to make it rank. Naming it only in :subjects is the quiet failure:
+  ;; a scoped recall that answers with nothing and looks like a corpus with no
+  ;; such facts in it.
+  ;;
   ;; :semantic? is false by DEFAULT and that is the whole shape of this function.
   ;; /api/leap calls recall on every keystroke, and embedding a query is a 20–50
   ;; ms network round trip — an opt-out would make every keystroke wait on a
@@ -1035,11 +1088,20 @@
           ;; Counted inside a scope, the names that scope is *about* look rare
           ;; there and go straight back to being anchors.
           dfm        (ent/df-map all)
-          subjects   (into #{} (map ent/normalize) (:subjects opts))
+          ;; The query side of the entity half, unioned ONCE rather than per
+          ;; candidate — it is the same set for every fact scored, and rebuilding
+          ;; it 80 times a keystroke measured 1.012 → 0.849 ms. Blanks are
+          ;; filtered out of `:subjects` for the reason `relevance` drops them
+          ;; from a fact's own names: the lineage half of Task 3's subject set is
+          ;; raw `:entities` off facts, so one blank in one fact would otherwise
+          ;; be a subject that every junk-entity fact in the corpus matches.
+          subjects   (into #{} (comp (map ent/normalize) (remove str/blank?))
+                           (:subjects opts))
+          qs         (set/union qt subjects)
           candidates (scoped all opts)
           ;; the scorer over the eligible facts
           lex        (->> candidates
-                          (map #(assoc % :score (score qt subjects dfm now %)))
+                          (map #(assoc % :score (score qt qs dfm now %)))
                           (filter #(pos? (:score %)))
                           (sort-by :score >)
                           vec)
