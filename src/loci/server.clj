@@ -1752,6 +1752,14 @@
   (not (.isAlive thread)))
 
 (defn -main [& _]
+  ;; FIRST, before the store is touched — `(store)` below opens LMDB, and once
+  ;; Datalevin has failed the only thing the user sees is a stack trace that
+  ;; names neither the directory nor the uid. The check itself lives in
+  ;; loci.substrate so it can be tested; all that belongs here is the exit.
+  ;; It reports and refuses; it does not chown. See `data-dir-problem`.
+  (when-let [problem (sub/data-dir-problem)]
+    (binding [*out* *err*] (println problem))
+    (System/exit 1))
   ;; PORT because that is what every container runtime sets. The data directory is
   ;; printed because a packaged loci defaults to a RELATIVE "data" — launched from
   ;; the wrong place it silently starts an empty substrate instead of yours, and a

@@ -1,6 +1,7 @@
 (ns loci.substrate-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.dlv :as dlv]
             [loci.substrate :as sub]))
@@ -358,3 +359,159 @@
       (is (= #{"a" "b"} (set (keys (sub/objects s)))) label)
       (is (= 2 (:value (sub/object s "a"))) label)      ; the :assoc survived the undos
       (close s))))
+
+;; ---------------------------------------------------------------------------
+;; the data directory has to be writable, and saying so has to be worth reading
+;;
+;; d439bc6 made the container run as uid 10001. Docker applies the image's /data
+;; ownership only to a FRESH volume, so every volume created before that kept
+;; its root-owned files and every existing deployment died on
+;; `Fail to open database: "Permission denied"` — a Datalevin trace naming
+;; neither the path, nor the uid, nor the one-line chown that fixes it.
+;;
+;; THE TRAP IN TESTING THIS: root ignores permission bits, so under `sudo` (or
+;; in a root container, or on a filesystem that does not enforce them) a
+;; `chmod 000` directory is still writable and every negative test below passes
+;; while asserting nothing — a test that certifies. `permissions-enforced?`
+;; probes for that and the tests skip out loud instead.
+;; ---------------------------------------------------------------------------
+
+(defmacro with-tmpdir
+  "A fresh empty directory, always removed — modes restored first, since a dir
+   left at 000 cannot be listed and so cannot be cleaned up."
+  [[sym] & body]
+  `(let [root# (io/file (tmproot))
+         ~sym  root#]
+     (.mkdirs root#)
+     (try ~@body
+          (finally (chmod-r! root# "rwx------")
+                   (rm-rf root#)))))
+
+(defn- chmod!
+  [f perms]
+  (java.nio.file.Files/setPosixFilePermissions
+   (.toPath (io/file f))
+   (java.nio.file.attribute.PosixFilePermissions/fromString perms)))
+
+(defn- chmod-r! [f perms]
+  (let [f (io/file f)]
+    (when (.exists f)
+      (chmod! f perms)
+      (when (.isDirectory f) (run! #(chmod-r! % perms) (.listFiles f))))))
+
+(defn- permissions-enforced?
+  "Can this process be kept out of a `chmod 000` directory at all? Root cannot,
+   and neither can a process on a filesystem that ignores the bits. Probed by
+   attempting a real write rather than by comparing `user.name` to \"root\",
+   because the name is not the only way to hold the privilege."
+  []
+  (let [d (io/file (tmproot))]
+    (try
+      (.mkdirs d)
+      (chmod! d "---------")
+      (try (.createNewFile (io/file d "probe")) false
+           (catch Exception _ true))
+      (finally (chmod! d "rwx------") (rm-rf d)))))
+
+(defn- write-probe-ok
+  "nil when a file can be created here — the test's own copy of the check, so
+   the assertion that /data is writable does not lean on the code under test."
+  [dir]
+  (let [f (io/file dir (str "probe-" (System/nanoTime)))]
+    (try (.createNewFile f) (.delete f) nil
+         (catch Exception e (.getMessage e)))))
+
+(defn- skipped! [what]
+  (println (str "  SKIPPED " what
+                " — permission bits are not enforced for this process"
+                " (running as root?), so the assertion would hold vacuously")))
+
+(deftest writable-data-dir-is-accepted
+  (with-tmpdir [d]
+    (is (nil? (sub/data-dir-problem (str d)))
+        "an existing, writable directory is fine")))
+
+(deftest missing-data-dir-under-a-writable-parent-is-accepted
+  ;; loci creates its data directory on first run; refusing here would refuse
+  ;; every first run. Nested, because io/make-parents creates the whole chain.
+  (with-tmpdir [d]
+    (is (nil? (sub/data-dir-problem (str d "/not-yet/either"))))))
+
+(deftest unwritable-data-dir-is-refused-and-says-why
+  (with-tmpdir [d]
+    (let [dir (io/file d "substrate-home")]
+      (.mkdirs dir)
+      (chmod! dir "---------")
+      (if-not (permissions-enforced?)
+        (skipped! "unwritable-data-dir-is-refused-and-says-why")
+        (let [msg (sub/data-dir-problem (str dir))]
+          (is (string? msg) "an unwritable directory is refused")
+          (is (str/includes? (str msg) (str dir)) "the message names the path")
+          (is (str/includes? (str msg) "uid") "the message names the effective uid")
+          (is (str/includes? (str msg) "chown") "the message carries the fix"))))))
+
+(deftest missing-data-dir-under-an-unwritable-parent-is-refused
+  (with-tmpdir [d]
+    (let [parent (io/file d "locked")]
+      (.mkdirs parent)
+      (chmod! parent "---------")
+      (if-not (permissions-enforced?)
+        (skipped! "missing-data-dir-under-an-unwritable-parent-is-refused")
+        (let [msg (sub/data-dir-problem (str parent "/substrate-home"))]
+          (is (string? msg) "a directory we could not create is refused")
+          (is (str/includes? (str msg) (str parent "/substrate-home"))
+              "the message names the path that was asked for"))))))
+
+(deftest a-file-where-the-data-dir-should-be-is-refused
+  (with-tmpdir [d]
+    (let [f (io/file d "substrate-home")]
+      (spit f "not a directory")
+      (let [msg (sub/data-dir-problem (str f))]
+        (is (string? msg))
+        (is (str/includes? (str msg) "not a directory")
+            "the message says what is actually wrong")
+        (is (str/includes? (str msg) (str f)))))))
+
+(deftest the-writability-check-is-an-attempted-write
+  ;; the reason the implementation must not use java.io.File/.canWrite: it reads
+  ;; permission bits, which are not the only thing that decides. A read-only
+  ;; bind mount is the case that bit us in a container; here the cheap proof is
+  ;; that a directory whose bits say "writable" to root still refuses a write —
+  ;; so the two answers can differ, and only one of them is the truth.
+  (with-tmpdir [d]
+    (let [dir (io/file d "substrate-home")]
+      (.mkdirs dir)
+      (chmod! dir "---------")
+      (if-not (permissions-enforced?)
+        (skipped! "the-writability-check-is-an-attempted-write")
+        (do (is (false? (.canWrite dir)) "bits and reality agree here")
+            (is (some? (sub/data-dir-problem (str dir)))))))))
+
+(deftest a-writable-data-dir-with-an-unwritable-substrate-inside-is-refused
+  ;; the half-fixed volume: `chown 10001 /data` without -R leaves the store
+  ;; directory root-owned. /data probes clean, Datalevin then dies exactly the
+  ;; way this check exists to prevent — so the store directory is probed too.
+  (with-tmpdir [d]
+    (let [dir   (io/file d "substrate-home")
+          store (io/file dir "substrate")]
+      (.mkdirs store)
+      (chmod! store "---------")
+      (if-not (permissions-enforced?)
+        (skipped! "a-writable-data-dir-with-an-unwritable-substrate-inside-is-refused")
+        (do (is (nil? (write-probe-ok dir)) "the data dir itself is writable")
+            (let [msg (sub/data-dir-problem (str dir))]
+              (is (string? msg) "and it is still refused")
+              (is (str/includes? (str msg) (str store))
+                  "the message names the directory that actually failed")))))))
+
+(deftest a-missing-data-dir-is-not-judged-by-a-sibling-substrate-dir
+  ;; the store probe applies to <data-dir>/substrate, not <ancestor>/substrate.
+  ;; With the data dir absent the check walks up to the parent — and an
+  ;; unrelated, unwritable `substrate` sitting in that parent must not be
+  ;; mistaken for ours.
+  (with-tmpdir [d]
+    (let [decoy (io/file d "substrate")]
+      (.mkdirs decoy)
+      (chmod! decoy "---------")
+      (is (nil? (sub/data-dir-problem (str d "/loci-data")))
+          "a first run under a writable parent still passes"))))

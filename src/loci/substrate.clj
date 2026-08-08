@@ -152,6 +152,100 @@
   []
   (or (System/getProperty "loci.data-dir") (System/getenv "LOCI_DATA") "data"))
 
+;; ----------------------------------------------------------------------------
+;; …and it has to be writable, checked before anything opens a database.
+;;
+;; d439bc6 moved the container to uid 10001. Docker applies the image's /data
+;; ownership only to a FRESH volume — a volume created earlier keeps its
+;; root-owned files — so every existing deployment died on
+;; `Fail to open database: "Permission denied"` with a Datalevin stack trace
+;; that named neither the path, nor the uid, nor the one-line chown that fixes
+;; it. This lives here, next to `data-dir` and not inline in `-main`, because a
+;; predicate can be tested and a branch of `-main` cannot.
+;; ----------------------------------------------------------------------------
+
+(defn- effective-user
+  "uid and name of the process, best effort. UnixSystem is in `jdk.security.auth`
+   — present in the JREs we ship on, but a jlinked runtime could drop it, and a
+   missing uid must degrade the message rather than replace it with a
+   ClassNotFoundException."
+  []
+  {:name (System/getProperty "user.name")
+   :uid  (try (.getUid (com.sun.security.auth.module.UnixSystem.))
+              (catch Throwable _ nil))})
+
+(defn- write-probe
+  "nil if we can actually create a file in `dir`, else the reason we could not.
+
+   An attempted write, deliberately, and NOT `java.io.File/.canWrite`: canWrite
+   reports the permission BITS, which are not the whole answer. It ignores POSIX
+   ACLs, read-only mounts, immutable flags, SELinux and a full filesystem, and on
+   more than one filesystem it answers `true` where the write then fails. The
+   only honest test of whether a directory is writable is to write to it."
+  [^java.io.File dir]
+  (try
+    (let [probe (java.io.File/createTempFile ".loci-write-probe" nil dir)]
+      (.delete probe)                                     ; leave nothing behind
+      nil)
+    (catch Exception e (or (.getMessage e) (str e)))))
+
+(defn data-dir-problem
+  "nil when `dir` can serve as loci's data directory; otherwise one paragraph
+   naming the path, the uid we are running as, and the fix.
+
+   A directory that does not exist yet is fine as long as we could create it —
+   loci makes its data directory on first run, and refusing here would refuse
+   every first run. So the check walks up to the nearest existing ancestor and
+   asks whether THAT is writable.
+
+   It does not repair anything. Chowning would be one line, and the reason not
+   to is that this path may be a bind-mounted host directory: silently taking
+   ownership of a user's own files is a worse surprise than refusing to start."
+  ([] (data-dir-problem (data-dir)))
+  ([dir]
+   (let [asked  (io/file dir)
+         nearest (loop [c (.getAbsoluteFile asked)]
+                   (cond (nil? c)    nil
+                         (.exists c) c
+                         :else       (recur (.getParentFile c))))
+         {:keys [uid name]} (effective-user)
+         who    (cond (and uid name) (str "uid " uid " (" name ")")
+                      uid            (str "uid " uid)
+                      name           (str "user " name)
+                      :else          "an unknown user")
+         header (fn [why]
+                  (str "loci cannot use its data directory: " dir "\n"
+                       "  " why "\n"
+                       "  running as " who "\n"))
+         refusal "\nRefusing to start rather than failing later with a database error."
+         ;; the chown belongs to the ownership case only — on a path that turned
+         ;; out to be a file it would send the reader somewhere useless.
+         advice (str "\n"
+                     "  If this is a Docker volume created before loci ran as a non-root\n"
+                     "  user, its files are still owned by root. Fix it once:\n\n"
+                     "    docker run --rm -v <your-volume>:/data alpine chown -R 10001:10001 /data\n"
+                     refusal)]
+     (cond
+       (nil? nearest)
+       (str (header "no part of that path exists, not even the filesystem root") refusal)
+
+       (not (.isDirectory nearest))
+       (str (header (str nearest " is a file, not a directory")) refusal)
+
+       :else
+       ;; the data dir AND, when it is already there, the store dir inside it —
+       ;; `chown` on /data alone leaves /data/substrate root-owned, and a check
+       ;; that passed there would hand the user back the Datalevin trace it
+       ;; exists to replace. Only when `nearest` IS the data directory: if we
+       ;; walked up to an ancestor then nothing below it exists yet, and
+       ;; <ancestor>/substrate would be some other directory entirely.
+       (let [store (io/file nearest "substrate")]
+         (or (when-let [why (write-probe nearest)]
+               (str (header (str "cannot write " nearest " — " why)) advice))
+             (when (and (= nearest (.getAbsoluteFile asked)) (.isDirectory store))
+               (when-let [why (write-probe store)]
+                 (str (header (str "cannot write " store " — " why)) advice)))))))))
+
 (defn- load-events
   "Replay the log line by line. A crash mid-append can truncate the LAST line —
    salvage the prefix quietly. An unreadable line anywhere else is a bug: skip

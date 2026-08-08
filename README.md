@@ -90,7 +90,7 @@ which directory it opened, for exactly that reason. The image declares
 replacing the container (or `--rm`) starts again from the seed. Mount a named
 volume to keep a substrate that outlives it.
 
-The container runs as an unprivileged `loci` (uid 999), not root. `/data` is
+The container runs as an unprivileged `loci` (uid 10001), not root. `/data` is
 chowned to it *before* `VOLUME` is declared, which is what makes a freshly
 created volume inherit that ownership — verified by committing an event through
 `POST /api/connect` inside the container and finding it still there after
@@ -100,6 +100,22 @@ rather than curl, which this base image does not have and which is not worth
 installing to check a port; the cost is that it reads the status line only, not
 the body. `start-period` is 45 s — measured cold starts on this machine ranged
 from about 3 s to 13.6 s, and the margin is deliberate.
+
+**Upgrading a volume that predates the non-root container.** Docker seeds a
+volume's ownership from the image once, when the volume is *created*; a volume
+made while loci still ran as root keeps its root-owned files forever, and uid
+10001 cannot write them. One line fixes it, with the container stopped:
+
+```bash
+docker run --rm -v loci-data:/data alpine chown -R 10001:10001 /data
+```
+
+Use `-R`: chowning `/data` alone leaves `/data/substrate` root-owned, which
+fails in the same place. loci checks both before it opens anything and refuses
+to start with a message naming the path, the uid and that command, rather than
+handing you an LMDB permission error. It will not chown for you — the same path
+may be a bind-mounted host directory, and quietly taking ownership of your own
+files is the worse surprise.
 
 **The jar in the image is not portable.** The Dockerfile builds it with
 `clojure -T:build uber :slim true`, which excludes the native libraries for
