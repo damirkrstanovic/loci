@@ -1100,10 +1100,25 @@
           qs         (set/union qt subjects)
           candidates (scoped all opts)
           ;; the scorer over the eligible facts
+          ;; `(juxt (comp - :score) :id)` and not `:score >`, character for
+          ;; character what the fused path below already sorts by. Facts tie
+          ;; *exactly* far more often than the arithmetic suggests — a distiller
+          ;; pass writes a dozen facts in one millisecond, so `decay` is
+          ;; identical, and any two of them carrying the same single name and
+          ;; not repeating it in their text score the same to the last bit.
+          ;; `sort-by` is stable, so with no tiebreaker their order is the order
+          ;; of `(vals @!facts)`: the fact map's HASH order. Deterministic, and
+          ;; meaningless — `qq10 qq4 qq3 qq9 qq5 qq8 …` for twelve facts written
+          ;; in sequence. By `:id` it is at least a rule a reader can state.
+          ;;
+          ;; `:id` sorts lexicographically, so `mem-10` precedes `mem-2`; that
+          ;; is not insertion order and must not be read as one. It matches the
+          ;; fused path, and one arbitrary-but-stated rule on both paths beats
+          ;; two different ones.
           lex        (->> candidates
                           (map #(assoc % :score (score qt qs dfm now %)))
                           (filter #(pos? (:score %)))
-                          (sort-by :score >)
+                          (sort-by (juxt (comp - :score) :id))
                           vec)
           ;; One retriever has nothing to fuse with. Running RRF over a single
           ;; ranking would replace the scorer's relevance with its rank and throw

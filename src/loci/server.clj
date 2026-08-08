@@ -189,14 +189,24 @@
    stayed absent, through this, which would not: one payload contradicting
    itself about whether the entity has been materialized at all.
 
-   Lowest id wins a duplicate. Two objects for one name is a race and not a
-   normal state, but `vals` of an objects map is hash order, so with no rule the
-   page would name one of the two arbitrarily and nothing in the log would
-   explain which.
+   **The lexicographically least id wins a duplicate — which is not the same as
+   the first created**, and the rule is determinism, not recency. `\"ent:10\"`
+   sorts before `\"ent:2\"`, so past nine entities the survivor is not the older
+   object; do not read it as one. The id's shape is not this function's to know,
+   and parsing a numeric suffix out of it would make this the second place that
+   believes something about how entity ids are minted. What is actually needed
+   is that the answer not change between two JVMs: two objects for one name is a
+   race and not a normal state, but `vals` of an objects map is hash order, so
+   with no rule at all the page would name one of the two arbitrarily and
+   nothing in the log would explain which.
 
-   Takes the objects map, not the store: `sub/object` re-folds the whole event
-   log per lookup on both EDN stores, and `entity-payload` needs this, the
-   promotion set and every source's title out of ONE materialization."
+   Takes the objects map, not the store. On the EDN stores `sub/object` re-folds
+   the whole event log per lookup, so one materialization shared between the
+   entity lookup, the promotion set and every source's title is 1.7–3.5× cheaper
+   there; on Datalevin, which is production, `object` is a map lookup and this
+   buys nothing. It is simpler either way, and either way it is about 2% of the
+   page — the two passes over the whole memory in `entity-payload` are the
+   cost."
   [objm]
   (reduce (fn [m o]
             (let [n (ent/normalize (get-in o [:value :name]))]
@@ -249,10 +259,15 @@
    the other is the documented silent failure.
 
    `:count` is how many live facts carry the name and `:facts` is the ranked
-   page of at most `entity-fact-cap` of them. **They differ exactly when the cap
-   bites** — the candidate set is the index's own set, so nothing else can
-   separate them — which is what lets the page say \"50 of 137\" instead of
-   truncating in silence.
+   page of at most `entity-fact-cap` of them. **The cap is what normally
+   separates them** — the candidate set `recall` sees is exactly the index's own
+   set, and every fact in it scores above zero — which is what lets the page say
+   \"50 of 137\" instead of truncating in silence. One other thing can:
+   `mem/all-facts` and `mold/recall` deref the fact map independently, so a
+   `remember` landing between them is counted by one and not the other. Left
+   that way deliberately — the alternative is to hand `recall` a snapshot, which
+   would put this function inside `loci.memory`'s consistency model to make a
+   page load off by one for a moment.
 
    `:promoted` false with facts present is a real state and must render: a merge
    can push a name back below the threshold, and the page should say so rather
@@ -260,10 +275,10 @@
 
    `:sources` is in the facts' rank order — the best fact's origins first —
    deduped, with each fact's own ids sorted so nothing depends on the iteration
-   order of the set `mem/source-ids` hands back. An id with no object behind it
-   is DROPPED rather than rendered as `{:title nil}`: a fact outlives the
-   document it was distilled from, and a chip with no name on it is worse than
-   no chip. Documents and notebooks share one list because a fact's `:source`
+   order of the set `mem/source-ids` hands back. An id with **no object, or no
+   real one**, is DROPPED rather than rendered as `{:title nil}`: a fact outlives
+   the document it was distilled from, and a chip with no name on it is worse
+   than no chip. Documents and notebooks share one list because a fact's `:source`
    names both and the question the list answers — where did this come from — is
    answered by either.
 
@@ -290,9 +305,21 @@
             hits  (mold/recall m nm {:k entity-fact-cap :semantic? false
                                      :subjects #{nm} :filter {:entities #{nm}}})
             srcs  (->> hits (mapcat (comp sort mem/source-ids)) distinct
+                       ;; the guard is on `:kind`, not on the object's mere
+                       ;; presence. `apply-event` :assoc/:append against an id
+                       ;; with no prior :put materializes a husk — measured,
+                       ;; `{:note "x"}`, with neither a title nor a kind — and it
+                       ;; fails BOTH rules at once: `(name nil)` is an NPE, a 500
+                       ;; on a page load, and a husk that survived the NPE would
+                       ;; be rendered as a chip with no name on it, which is what
+                       ;; the drop below exists to prevent. One condition
+                       ;; answers both, and there is no object in this codebase
+                       ;; that legitimately lacks `:kind`: `state-payload` calls
+                       ;; `(name (:kind o))` on every one of them.
                        (keep (fn [id]
-                               (when-let [o (get objm id)]
-                                 {:id id :title (:title o) :kind (name (:kind o))})))
+                               (let [o (get objm id)]
+                                 (when-let [k (:kind o)]
+                                   {:id id :title (:title o) :kind (name k)}))))
                        vec)]
         (cond-> {:name     nm
                  :count    (count (get idx nm #{}))

@@ -2619,6 +2619,28 @@
         "in the FACTS' rank order, deduped, and with `doc:gone` — a source whose object is gone — dropped rather than rendered as a chip with no title")
     (is (not-any? #(nil? (:title %)) (:sources p)))))
 
+(deftest a-source-that-is-a-HUSK-and-not-an-object-is-dropped-not-drawn
+  ;; `apply-event` :assoc/:append against an id with no prior :put writes under
+  ;; `[:objects id]` anyway, so the store answers with `{:note "x"}` — an entry
+  ;; that is present but is not an object. It fails both of `:sources`' rules at
+  ;; once: `(name (:kind o))` on it is an NPE, which is a 500 on a page load,
+  ;; and a husk that survived would be drawn as a chip with no name on it.
+  (let [st (sub/fresh-store)
+        m  (mem/file-memory (tmpfile))]
+    (sub/commit! st {:op :put :id "doc:real"
+                     :value {:id "doc:real" :kind :doc :title "A real document" :value "…"}})
+    (sub/commit! st {:op :assoc :id "doc:husk" :path [:note] :value "x"})
+    (is (= {:note "x"} (sub/object st "doc:husk"))
+        "the husk is real — this is what the substrate actually holds, not a hypothetical")
+    ;; word-disjoint, or `remember` reinforces the second into the first at a
+    ;; 0.83 jaccard and there is only one fact to find sources for
+    (mold/remember m "zebra lantern pivot marsh" {:entities ["husk"] :source {:obj "doc:husk"}})
+    (mold/remember m "walnut cradle sundial thicket" {:entities ["husk"] :source {:obj "doc:real"}})
+    (let [p (srv/entity-payload st m "husk")]
+      (is (= 2 (:count p)) "both facts are on the page")
+      (is (= [{:id "doc:real" :title "A real document" :kind "doc"}] (:sources p))
+          "…and only the source that is an object is named"))))
+
 (deftest one-fact-is-not-a-place-yet-but-the-page-still-renders
   (let [st (entity-fixture)
         m  (entity-memory)
@@ -2727,6 +2749,29 @@
           "ONE fact and promoted: a materialized entity never demotes — it is yours, not the evidence's"))
     (is (nil? (:object (srv/entity-payload st m "taiwan")))
         "…and an entity nobody materialized still has none")))
+
+(deftest an-object-storing-a-RAW-name-is-still-that-entity
+  ;; The one thing standing between an entity object that did NOT come from
+  ;; Task 5 — hand-committed, migrated, imported, restored from an older log —
+  ;; and a payload that contradicts itself. `ent/promoted` normalizes the names
+  ;; it is handed; if `entity-objects` matched raw, the two halves of one answer
+  ;; would disagree about the same entity: `:promoted` true, through `promoted`,
+  ;; and `:object` absent, through the raw match. Nothing in the page would say
+  ;; which half was lying.
+  ;;
+  ;; Pinned precisely BECAUSE Task 5 will always write a normalized name: "Task
+  ;; 5 always writes normalized names" is the argument for deleting the
+  ;; normalization, and the objects Task 5 did not write are the ones it does
+  ;; not cover.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "  TSMC  " "TSMC")
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= "ent:tsmc" (:object p))
+        "a stored name that was never normalized still identifies the entity")
+    (is (true? (:promoted p)) "…and both halves of the payload agree that it is materialized")
+    (is (= "ent:tsmc" (:id (srv/entity-object st "tsmc"))))
+    (is (= #{"tsmc"} (srv/materialized-names st))
+        "reported normalized, which is the only form `ent/promoted` can compare")))
 
 (deftest an-entity-is-identified-by-its-name-and-never-by-its-title
   ;; The title is a display string. An edit to it must not re-identify the

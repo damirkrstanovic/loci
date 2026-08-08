@@ -505,3 +505,61 @@
             (is (= :off (:semantic (meta r))))
             (is (nil? (:degraded (meta r)))
                 "recall is exactly what it was before any of this existed")))))))
+
+;; ---- ties: the lexical path's ordering, which used to be a hash order ----
+
+(defn- tied-memory
+  "`n` facts that score EXACTLY equal against the query `\"qq\"`, in ids
+   `mem-1 … mem-n`.
+
+   Equal to the last bit, not merely close, and every term is arranged for it:
+
+   - one entity each, the same one, so the inverse-frequency entity half is
+     `w/w` = 1.0 for all of them whatever `n` is;
+   - texts sharing no token with each other or with the query, so the keyword
+     half is 0 for all of them — and so `remember`'s 0.6-jaccard reinforcement
+     never fires and there really are `n` facts;
+   - one stamped `:ts`, because `weight` multiplies by `decay(ts, now)` and two
+     facts written a millisecond apart do NOT tie. A distiller pass writing a
+     dozen facts inside one millisecond is the live shape of this; the stamp
+     only makes it reproducible.
+
+   What was left was the sort. `sort-by` is stable, so with no tiebreaker these
+   came back in the order of `(vals @!facts)` — the fact map's hash order,
+   measured as `qq10 qq4 qq3 qq9 qq5 qq8 qq0 qq11 qq7 qq1 qq6 qq2`. Deterministic
+   and meaningless."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n)]
+      (mold/remember m (str "qq" i " rr" i " ss" i " tt" i)
+                     {:entities ["qq"] :source {:obj "doc:q" :space "space:q"}}))
+    (swap! (:!facts m) update-vals #(assoc % :ts 1700000000000))
+    m))
+
+(deftest facts-that-tie-exactly-come-back-by-id-and-not-in-a-hash-order
+  (let [hits (mold/recall (tied-memory 12) "qq" {:k 20})]
+    (is (= 12 (count hits)) "no fact was reinforced away — there are twelve to order")
+    (is (= 1 (count (distinct (map :score hits))))
+        "they tie EXACTLY: one distinct score, so nothing below is really testing the scorer")
+    ;; `:id` sorts lexicographically and these ids are `mem-<n>`, so `mem-10`
+    ;; precedes `mem-2`. That is NOT insertion order and this assertion is
+    ;; written out in full rather than generated, so nobody can read it as one.
+    ;; It matches `(sort-by (juxt (comp - :score) :id))` on the fused path
+    ;; character for character, and one arbitrary-but-stated rule on both paths
+    ;; beats two different ones.
+    (is (= ["mem-1" "mem-10" "mem-11" "mem-12" "mem-2" "mem-3"
+            "mem-4" "mem-5" "mem-6" "mem-7" "mem-8" "mem-9"]
+           (mapv :id hits)))))
+
+(deftest a-tiebreaker-never-outranks-a-score
+  ;; The other half of the change, and the one that would go wrong quietly:
+  ;; `(juxt (comp - :score) :id)` must still sort by score FIRST. `mem-2` here
+  ;; says the query word and `mem-1` does not, so id order and score order are
+  ;; opposites and only one of them can be the answer.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "zz1 yy1 xx1 ww1"      {:entities ["qq"]})
+    (mold/remember m "qq is said out loud"  {:entities ["qq"]})
+    (let [hits (mold/recall m "qq" {:k 20})]
+      (is (= ["mem-2" "mem-1"] (mapv :id hits))
+          "score first, id only where the scores are equal")
+      (is (apply > (map :score hits))))))
