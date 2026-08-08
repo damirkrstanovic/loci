@@ -26,15 +26,19 @@ the record, not the recall. (A Khora sidecar can still replace it — same seam.
 
 **Recall is scoped to the notebook you are standing in.** ✦ Ask, ✎ Draft, 🔍 Research
 and ✧ Suggest are each given only what was learned in that notebook's *lineage* — the
-notebook, its cells, everything it spawned transitively, and everything merged into it.
-So a hub is told what its deep dives found, and a deep dive is not told what its siblings
-found. The trade, chosen deliberately: two notebooks about the *same subject* that were
-started separately are blind to each other, because lineage is what the substrate computes
-and subject is what tags record. A brand-new notebook is told nothing, which is a normal
-state and not an error. With no notebook open at all, recall is global — matching the
-document context, which already falls back to the whole workspace in that case.
-`GET /api/memory?q=&space=` browses that same scope, on purpose: what the pane shows you
-is what the agent is working from.
+notebook, its cells, everything it spawned transitively, everything merged into it, and
+**the trunk it grew out of**: each notebook on the path up to the root contributes its own
+id and its own cells, and nothing else. So a branch remembers what it came from, while the
+branches beside it stay invisible — going up never turns into coming back down, which is
+the one way this rule breaks. A hub is still told what all its deep dives found. Only
+`spawned-by` is followed upward; a merge is downstream of what it combined, not a trunk
+those notebooks grew out of. The trade, chosen deliberately: two notebooks about the *same
+subject* that were started separately are blind to each other, because lineage is what the
+substrate computes and subject is what tags record. A brand-new notebook is told nothing,
+which is a normal state and not an error. With no notebook open at all, recall is global —
+matching the document context, which already falls back to the whole workspace in that
+case. `GET /api/memory?q=&space=` browses that same scope, on purpose, and so it widened
+with it: what the pane shows you is what the agent is working from.
 
 ## Run
 
@@ -335,7 +339,7 @@ frontend only lays out the result.
 | `GET /api/undo` | revert the last substrate event |
 | `GET/POST /api/notebook` | a notebook's hydrated cells / one cell operation |
 | `GET /api/links?space=` | computed connectedness (shares / spawned / lineage) |
-| `GET /api/memory?q=&space=` | the agent's memory — browsable, recall-ranked; `space=` scopes it to that notebook's lineage |
+| `GET /api/memory?q=&space=` | the agent's memory — browsable, recall-ranked; `space=` scopes it to that notebook's lineage (trunk above, everything below) |
 | `POST /api/research` | agent research as a background job — returns a job id |
 | `POST /api/suggest` | the agent proposes questions (background job); writes nothing |
 | `POST /api/suggest-run` | research the questions you approved, in new notebooks or here |

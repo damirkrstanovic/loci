@@ -803,32 +803,21 @@
            (table-digest v) "\nsample rows: " (json/write-str (vec (take 3 v))))
       :else "")))
 
-(defn lineage-sources
-  "Every id a recall scoped to `space` is allowed to see: the notebook itself,
-   the ids of its cells, and the same for each notebook it spawned and each
-   notebook merged into it — transitively.
+(defn- descendant-sources
+  "DOWN. The notebook, the ids of its cells, and the same for everything it
+   spawned and everything merged into it — transitively.
 
-   `recall`'s filter takes a set of ids rather than one notebook id because
-   `loci.memory` holds no store and must not: the half that can walk the
-   substrate does the walk, the half that recalls takes the answer. This
-   function is that walk, and it lives here for the same reason.
-
-   Both the notebook and its cells are in the set because a distilled fact
-   records `:source {:obj <the doc it came from> :space <the notebook>}` — the
-   notebook id alone already matches everything `distill!` writes, and the cell
-   ids additionally catch a fact whose source names only an object.
-
-   Of the reasons `nb/links` reports, only `spawned` and `merged-from` are
-   lineage:
+   Of the reasons `nb/links` reports, only `spawned` and `merged-from` descend:
 
      spawned      o's :spawned-by names this notebook — a child. In scope.
      merged-from  o's id is in this notebook's :merged-from — folded in here.
                   In scope: its facts were recorded before the merge existed
                   and there is nowhere else for them to live.
-     spawned-by   the parent. NOT in scope — walking up reaches every sibling
-                  through the shared parent, which is the leak a scope exists
-                  to stop.
-     merged       a notebook THIS one was folded into. Also upward, also out.
+     spawned-by   the parent. Not this walk's edge — `ancestor-sources` takes
+                  it, and takes only the parent's own ids, never a re-descent.
+     merged       a notebook THIS one was folded into. Not in scope at all: a
+                  merge is downstream of its inputs, and its other inputs are
+                  siblings by another name.
      shares       two notebooks holding the same object. Not an edge to walk —
                   though note the consequence of taking cells: if the shared
                   object is a cell HERE, a fact distilled from it is in scope,
@@ -841,24 +830,7 @@
    Both kept edges are followed transitively: spawning because a deep dive of a
    deep dive is still descent, and merged-from the same way because a notebook
    that absorbed another absorbed whatever that one had absorbed. `seen` bounds
-   the walk, so a cycle in the merge graph terminates rather than hanging.
-
-   Cost: one `nb/links` per notebook in scope, and `nb/links` scans every object
-   — so this is O(notebooks in scope × objects), not one 0.200 ms call. Measured
-   on a synthetic 240-object store: 0.6 ms for a leaf, 5.4 ms for a ten-deep
-   chain. Kept anyway, because reusing `nb/links` means “spawned” and
-   “merged-from” have exactly one definition and the scope follows it, and
-   because this runs on a search the user typed and waits on — the same request
-   spends 20–50 ms embedding the query.
-
-   Written for a notebook. `/api/memory?space=` checks with `notebook-or-error`
-   first; `remembered-context` does not, because `ask!` takes whatever id the
-   shell has open. An id that is not a notebook is not an error here — it has no
-   cells and `nb/links` finds no edge to it, so the walk returns `#{that id}`
-   and the recall comes back empty. Narrow, never leaky.
-
-   Defined above `remembered-context` because that is its first caller; the
-   `/api/memory` caller is far below."
+   the walk, so a cycle in the merge graph terminates rather than hanging."
   [st space]
   (loop [queue [space], seen #{}, out #{}]
     (if-let [id (first queue)]
@@ -871,6 +843,100 @@
                           (:connected (nb/links st id)))]
           (recur (into (subvec queue 1) kids) (conj seen id) (into (conj out id) cells))))
       out)))
+
+(defn- spawned-by
+  "The notebook `id` was spawned from, or nil. Read straight off the object
+   rather than through `nb/links`, because `nb/links` answers “who is connected
+   to me” by scanning every object, and going up needs exactly one field."
+  [st id]
+  (get-in (sub/object st id) [:value :spawned-by :space]))
+
+(defn- ancestor-sources
+  "UP, and never back down. Each notebook on the path from `space` to the root
+   contributes its OWN id and its OWN cell ids — nothing else. It does not
+   contribute its other children, and this walk never calls `nb/links`, which
+   is what makes that structural rather than a promise: there is no edge here
+   that could reach a sibling.
+
+   That restraint is the whole point. One hop up `spawned-by` and then one hop
+   down lands on every sibling, which is the leak the scope exists to stop.
+
+   ONLY `:spawned-by` is followed up; `:merged-from` deliberately is not. They
+   are different relations. A spawn means “I grew out of this”, and the parent
+   existed first, so its facts are the ground this branch stands on. A merge
+   means “these were combined” — the merged notebook was created *later*, out
+   of its inputs, so from an input's point of view it is not a trunk it grew
+   out of but a container it was put into afterwards, and that container's
+   other inputs are siblings under another name. Little is lost by the choice:
+   `connect!` copies both inputs' cells into the merged notebook, so a notebook
+   spawned from a merge picks those cells up as the merge's own. What it does
+   not pick up is the input notebooks' ids — so a fact recorded against an
+   input with no object (what `ask!` writes) stays out.
+
+   `seen` bounds this walk exactly as it bounds the downward one. Nothing in
+   the substrate forbids a cycle in `:spawned-by`, and unbounded this loops
+   forever rather than failing.
+
+   An ancestor that no longer exists as an object still contributes its id: the
+   lineage was recorded, and facts recorded against it are still the trunk's.
+   It contributes no cells, and the walk stops there.
+
+   Honest consequence, same one the `shares` note above describes: an
+   ancestor's cell ids are in the set, and the filter matches a fact by `:obj`
+   OR `:space`. So a fact distilled from one of the trunk's documents is in
+   scope even if it was distilled while standing in a sibling that holds the
+   same document. That is the price of taking cells at all; it is bounded by
+   the documents the trunk actually holds."
+  [st space]
+  (loop [id (spawned-by st space), seen #{space}, out #{}]
+    (if (and id (not (seen id)))
+      (recur (spawned-by st id)
+             (conj seen id)
+             (into (conj out id) (keep :ref (nb/cells-of (sub/object st id)))))
+      out)))
+
+(defn lineage-sources
+  "Every id a recall scoped to `space` is allowed to see: this notebook and its
+   cells, everything below it (`descendant-sources`), and the own ids of every
+   notebook above it (`ancestor-sources`). A branch sees its trunk; it does not
+   see the branches beside it.
+
+   The two walks stay separate on purpose. Up and down are different relations
+   — down is transitive and takes everything it reaches, up is a single line
+   that takes only what is on it — and fusing them into one traversal is
+   precisely how this rule gets broken, because the fused version descends from
+   the ancestors it reaches and hands you every sibling.
+
+   `recall`'s filter takes a set of ids rather than one notebook id because
+   `loci.memory` holds no store and must not: the half that can walk the
+   substrate does the walk, the half that recalls takes the answer. This
+   function is that walk, and it lives here for the same reason.
+
+   Both the notebook and its cells are in the set because a distilled fact
+   records `:source {:obj <the doc it came from> :space <the notebook>}` — the
+   notebook id alone already matches everything `distill!` writes, and the cell
+   ids additionally catch a fact whose source names only an object.
+
+   Cost: one `nb/links` per notebook in the DOWNWARD scope, and `nb/links`
+   scans every object — so that half is O(notebooks below × objects), not one
+   0.200 ms call. Measured on a synthetic 240-object store: 0.6 ms for a leaf,
+   5.4 ms for a ten-deep chain. The upward half adds one `sub/object` per
+   ancestor and no scan at all. Kept anyway, because reusing `nb/links` means
+   “spawned” and “merged-from” have exactly one definition and the scope
+   follows it, and because this runs on a search the user typed and waits on —
+   the same request spends 20–50 ms embedding the query.
+
+   Written for a notebook. `/api/memory?space=` checks with `notebook-or-error`
+   first; `remembered-context` does not, because `ask!` takes whatever id the
+   shell has open. An id that is not a notebook is not an error here — it has no
+   cells, no `:spawned-by`, and `nb/links` finds no edge to it, so the walk
+   returns `#{that id}` and the recall comes back empty. Narrow, never leaky.
+
+   Defined above `remembered-context` because that is its first caller; the
+   `/api/memory` caller is far below, and browsing widens exactly as recall
+   does — deliberately, so the pane shows what the agent is working from."
+  [st space]
+  (into (descendant-sources st space) (ancestor-sources st space)))
 
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);

@@ -1,6 +1,6 @@
 # A branch sees its trunk, not its siblings
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [x]`) syntax.
 
 **Goal:** a notebook spawned from research can see back to what it grew out of, without
 seeing the other branches that grew out of the same place.
@@ -55,7 +55,7 @@ child), and must **not** see `EUV Lithography Monopoly` (its sibling).
 
 **Files:** modify `src/loci/server.clj` (`lineage-sources`, `:806`); tests in `test/loci/server_test.clj`
 
-- [ ] **Step 1: Read first.** `lineage-sources` and its existing tests, plus
+- [x] **Step 1: Read first.** `lineage-sources` and its existing tests, plus
   `the-scope-runs-DOWN-the-lineage-and-not-up` (added yesterday) — **that test now encodes the
   old rule and must be rewritten, not deleted.** Its comment points at a contradiction in the
   previous plan; replace it with a test of the new rule and a comment that says what changed
@@ -66,7 +66,7 @@ child), and must **not** see `EUV Lithography Monopoly` (its sibling).
   as an ancestor for this purpose and **say why in the docstring** — a merged-from edge is not
   obviously the same relation as a spawn, and guessing silently is the failure mode here.
 
-- [ ] **Step 2: Write the failing tests.** Build a fixture with a real shape: root → two
+- [x] **Step 2: Write the failing tests.** Build a fixture with a real shape: root → two
   children → one grandchild under the first child. Pin:
 
   - a **child** sees its parent's facts and its own; **not its sibling's**
@@ -84,30 +84,30 @@ child), and must **not** see `EUV Lithography Monopoly` (its sibling).
   redef is silently ignored and the test passes while recording nothing). The existing tests
   hand memory in by rebinding the `mem/memory` **delay**; follow that.
 
-- [ ] **Step 3: Run, watch fail.** Report the real output.
+- [x] **Step 3: Run, watch fail.** Report the real output.
 
-- [ ] **Step 4: Implement.** Keep the two walks separate and obviously so — one collects
+- [x] **Step 4: Implement.** Keep the two walks separate and obviously so — one collects
   descendants (as now), one collects ancestors' own ids. Do not merge them into a single
   clever traversal; the reason this rule is easy to get wrong is exactly that up and down are
   different, and the code should show it.
 
-- [ ] **Step 5: Green.**
+- [x] **Step 5: Green.**
 
-- [ ] **Step 6: Prove it bites.** In one batch, each failing a distinct test: let the upward
+- [x] **Step 6: Prove it bites.** In one batch, each failing a distinct test: let the upward
   walk descend from each ancestor (the sibling leak); stop the upward walk after one step
   (grandchild loses the root); drop the `seen` bound on the upward walk (the cycle test must
   hang or fail — if it hangs, say so, and make sure the test has a timeout rather than
   wedging the suite). Report real output.
 
-- [ ] **Step 7: Note the second caller.** `GET /api/memory?q=&space=` uses the same function,
+- [x] **Step 7: Note the second caller.** `GET /api/memory?q=&space=` uses the same function,
   so scoped *browsing* widens in exactly the same way. That is right — what you can browse
   should match what the agent can recall — but say so in your report and in the README
   sentence, rather than letting it change silently.
 
-- [ ] **Step 8: README.** Update the paragraph added yesterday: a branch sees its trunk, not
+- [x] **Step 8: README.** Update the paragraph added yesterday: a branch sees its trunk, not
   the branches beside it. Keep it to a few sentences in the existing voice.
 
-- [ ] **Step 9: Commit** — `feat: a branch remembers its trunk, and not the branches beside it`
+- [x] **Step 9: Commit** — `feat: a branch remembers its trunk, and not the branches beside it`
 
 ## Out of scope
 

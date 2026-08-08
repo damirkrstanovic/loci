@@ -1526,6 +1526,38 @@
       (mold/remember m txt {:source {:obj obj :space nb}}))
     m))
 
+(defn- trunk-fixture
+  "The shape the trunk rule is about — a research hub that branched twice, and
+   one of those branches going deeper:
+
+     space:root                          the trunk
+       space:a     spawned-by root         a branch
+         space:leaf  spawned-by a            deeper down that branch
+       space:b     spawned-by root         THE SIBLING — must stay invisible from a and leaf
+
+   Modelled on the live corpus: root = `Semiconductors — research hub`,
+   a = `Taiwan's Foundry Concentration`, leaf = `Geopolitical Shock Scenarios`,
+   b = `EUV Lithography Monopoly`."
+  []
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:root" "Root" "find:root-1" "chips root"  {})
+    (put-space! st "space:a"    "A"    "find:a-1"    "chips a"     {:spawned-by {:space "space:root" :prompt "go deeper"}})
+    (put-space! st "space:leaf" "Leaf" "find:leaf-1" "chips leaf"  {:spawned-by {:space "space:a" :prompt "deeper still"}})
+    (put-space! st "space:b"    "B"    "find:b-1"    "chips b"     {:spawned-by {:space "space:root" :prompt "the other way"}})
+    st))
+
+(defn- trunk-memory
+  "One fact per notebook of `trunk-fixture`, every one of them lexically
+   matching \"chips\" so only the *filter* can separate them."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[nb obj txt] [["space:root" "find:root-1" "chips are made in fabs."]
+                          ["space:a"    "find:a-1"    "chips concentrate in Taiwan."]
+                          ["space:leaf" "find:leaf-1" "chips face a blockade risk."]
+                          ["space:b"    "find:b-1"    "chips need EUV from one vendor."]]]
+      (mold/remember m txt {:source {:obj obj :space nb}}))
+    m))
+
 (defn- scoped-facts
   "The fact strings /api/memory returns for `q` under `space`, with no embedder
    configured anywhere — `:semantic? true` degrades to lexical, so this test
@@ -1544,10 +1576,12 @@
              "chips shrink with each node."}
            (:fact-set (scoped-facts st m "chips" "space:semis")))
         "spawned is lineage and it is transitive; nothing else is")
-    ;; upward is not lineage — from the child you do not see the parent
-    (is (= #{"chips need EUV lithography." "chips shrink with each node."}
+    ;; upward is the TRUNK, own ids only — from the child you see the parent
+    ;; (changed 2026-08-08; it used to stop at the child)
+    (is (= #{"chips need EUV lithography." "chips shrink with each node."
+             "chips are fabricated in Taiwan."}
            (:fact-set (scoped-facts st m "chips" "space:kid")))
-        "spawned-by is the parent, and following it would reach every sibling")
+        "the parent's own facts, because they are the trunk this branch grew out of")
     ;; a merge absorbs both sides' facts
     (is (= #{"chips were merged together." "chips are fabricated in Taiwan."
              "chips need EUV lithography." "chips shrink with each node."
@@ -1594,7 +1628,10 @@
   (let [st (lineage-fixture)
         m  (lineage-memory)
         p  (scoped-facts st m nil "space:kid")]
-    (is (= #{"chips need EUV lithography." "chips shrink with each node."} (:fact-set p)))
+    (is (= #{"chips need EUV lithography." "chips shrink with each node."
+             "chips are fabricated in Taiwan."}
+           (:fact-set p))
+        "itself, its descendant, and its parent — the trunk, browsed the same way it is recalled")
     (is (= 6 (count (mem/all-facts m))) "…out of six remembered")))
 
 (deftest an-unknown-or-non-notebook-scope-is-an-error-not-an-empty-answer
@@ -1641,6 +1678,79 @@
     (put-space! st "space:b" "B" "doc:b" "b" {:merged-from ["space:a"]})
     (is (= #{"space:a" "doc:a" "space:b" "doc:b"} (srv/lineage-sources st "space:a")))))
 
+;; ---- the trunk: an ancestor's OWN ids, and never a re-descent from it ----
+
+(deftest a-branch-sees-the-trunk-it-grew-out-of
+  (let [st (trunk-fixture)]
+    (is (= #{"space:a" "find:a-1"          ; itself
+             "space:leaf" "find:leaf-1"    ; what it spawned
+             "space:root" "find:root-1"}   ; and the trunk above it — NEW
+           (srv/lineage-sources st "space:a"))
+        "a branch sees its own work, the work below it, and its parent's own ids")))
+
+(deftest the-upward-walk-never-turns-into-a-downward-one
+  ;; THE leak this rule is easy to get wrong by. Reaching space:root and then
+  ;; walking down from it lands on space:b, which is a different branch.
+  ;; Asserted from the grandchild, the position a two-step mistake shows up in.
+  (let [st (trunk-fixture)
+        s  (srv/lineage-sources st "space:leaf")]
+    (is (= #{"space:leaf" "find:leaf-1" "space:a" "find:a-1" "space:root" "find:root-1"} s)
+        "the whole chain up to the root — parent AND grandparent — and nothing beside it")
+    (is (not (contains? s "space:b")) "the sibling of its parent is a different branch")
+    (is (not (contains? s "find:b-1")) "and so are that branch's documents")))
+
+(deftest the-root-still-sees-everything-below-it
+  ;; regression guard: the downward walk is untouched
+  (let [st (trunk-fixture)]
+    (is (= #{"space:root" "find:root-1" "space:a" "find:a-1"
+             "space:leaf" "find:leaf-1" "space:b" "find:b-1"}
+           (srv/lineage-sources st "space:root"))
+        "from the trunk, every branch and every leaf, exactly as before")))
+
+(deftest a-notebook-with-no-parent-is-scoped-exactly-as-it-was
+  (let [st (lineage-fixture)]
+    (is (= #{"space:semis" "find:semis-1" "space:kid" "find:kid-1" "space:gk" "find:gk-1"}
+           (srv/lineage-sources st "space:semis"))
+        "no :spawned-by → the upward walk contributes nothing at all")
+    (is (= #{"space:other" "find:other-1"} (srv/lineage-sources st "space:other")))
+    (is (= #{"space:peer" "find:semis-1"} (srv/lineage-sources st "space:peer")))))
+
+(deftest a-spawned-by-cycle-terminates
+  ;; :spawned-by is data like any other, and nothing in the substrate forbids a
+  ;; cycle. The upward walk carries its own `seen` set for exactly this. The
+  ;; TIMEOUT is the point of the test: without the bound this does not fail,
+  ;; it hangs, and a hang in `deftest` wedges the whole suite.
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:x" "X" "doc:x" "x" {:spawned-by {:space "space:y"}})
+    (put-space! st "space:y" "Y" "doc:y" "y" {:spawned-by {:space "space:x"}})
+    (let [f (future (srv/lineage-sources st "space:x"))
+          r (deref f 5000 ::timed-out)]
+      (future-cancel f)
+      (is (= #{"space:x" "doc:x" "space:y" "doc:y"} r)
+          "a cycle in :spawned-by terminates rather than hanging the request"))))
+
+(deftest a-merge-is-not-an-ancestor
+  ;; THE DECISION, 2026-08-08: the upward walk follows `:spawned-by` and NOT
+  ;; `:merged-from`. See `lineage-sources`' docstring for the reasoning; this
+  ;; test pins both halves of it.
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:l" "L" "doc:l" "left" {})
+    (put-space! st "space:r" "R" "doc:r" "right" {})
+    ;; a real merge (`connect!`) copies BOTH sides' cells into the new notebook
+    (sub/commit! st {:op :put :id "space:mix"
+                     :value {:id "space:mix" :kind :space :title "Mix"
+                             :value {:intent "both"
+                                     :cells [{:ref "doc:l"} {:ref "doc:r"}]
+                                     :merged-from ["space:l" "space:r"]}}})
+    (put-space! st "space:child" "Child" "doc:child" "c" {:spawned-by {:space "space:mix"}})
+    (is (= #{"space:l" "doc:l"} (srv/lineage-sources st "space:l"))
+        "a merge is DOWNSTREAM of its inputs: from an input, the merge that absorbed it is not a trunk it grew out of, and its co-inputs are siblings by another name")
+    (is (= #{"space:child" "doc:child" "space:mix" "doc:l" "doc:r"}
+           (srv/lineage-sources st "space:child"))
+        "a notebook spawned FROM a merge gets the merge's own ids — including the cells the merge copied in, so what was combined is not lost")
+    (is (not (contains? (srv/lineage-sources st "space:child") "space:r"))
+        "…but not the input NOTEBOOKS' ids: a fact recorded against space:r with no object (what `ask!` writes) is not on this branch's trunk")))
+
 ;; ============================================================================
 ;; what the AGENT is told it remembers — the same lineage scope, on ✦ Ask,
 ;; ✎ Draft, 🔍 Research and ✧ Suggest
@@ -1680,23 +1790,40 @@
       (is (str/includes? ctx "chips shrink with each node.") "and the child's child's")
       (is (not (str/includes? ctx "chips are unrelated here."))))))
 
-(deftest the-scope-runs-DOWN-the-lineage-and-not-up
-  ;; NOTE FOR THE READER OF THE PLAN: the plan's Step 2 says "lineage runs both
-  ;; ways — a fact recorded in the hub is offered to the child". It does not,
-  ;; and it must not. `lineage-sources` deliberately refuses to follow
-  ;; `spawned-by` upward (see its docstring), because the parent's other
-  ;; children hang off that same edge and one hop up is every sibling. The
-  ;; plan's own Step 6 names the upward walk as the sabotage that must break a
-  ;; test — this is that test.
-  (let [st (lineage-fixture)
-        m  (lineage-memory)
-        ctx (remembered st m "chips" "space:kid")]
-    (is (str/includes? ctx "chips need EUV lithography.") "its own")
-    (is (str/includes? ctx "chips shrink with each node.") "and its descendants'")
-    (is (not (str/includes? ctx "chips are fabricated in Taiwan."))
-        "but not its parent's — walking up would reach every sibling through the shared parent")
-    (is (not (str/includes? ctx "chips are unrelated here."))
-        "and certainly not a sibling's, which is what walking up would deliver")))
+(deftest the-agent-is-told-its-trunk-and-not-the-branches-beside-it
+  ;; WHAT CHANGED, AND WHY. This test replaces
+  ;; `the-scope-runs-DOWN-the-lineage-and-not-up`, which pinned the opposite:
+  ;; from a child, the parent's facts were OUT of scope, and its comment
+  ;; explained that one hop up the `spawned-by` edge reaches every sibling.
+  ;;
+  ;; That reasoning was right about the danger and wrong about the remedy. One
+  ;; hop up is every sibling only if you then walk DOWN from the ancestor.
+  ;; `lineage-sources` now walks up for each ancestor's OWN ids and never
+  ;; re-descends, so the trunk is visible and the branches beside you are not.
+  ;;
+  ;; The user's decision, 2026-08-08: "I go on a research and then create a
+  ;; branch — when I ask that branch it should have data to the root but not
+  ;; siblings, since that's a different branch."
+  ;;
+  ;; The sibling assertion the old test made is still made, below, and is still
+  ;; the one that matters — please do not "fix" this back to downward-only.
+  (let [st  (trunk-fixture)
+        m   (trunk-memory)
+        ctx (remembered st m "chips" "space:a")]
+    (is (str/includes? ctx "chips concentrate in Taiwan.") "its own")
+    (is (str/includes? ctx "chips face a blockade risk.") "and its descendants'")
+    (is (str/includes? ctx "chips are made in fabs.")
+        "and the trunk it grew out of — NEW: this is what changed")
+    (is (not (str/includes? ctx "chips need EUV from one vendor."))
+        "but never the branch beside it, which is what re-descending from the trunk would deliver"))
+  ;; and from the grandchild, where a two-step mistake would show
+  (let [st  (trunk-fixture)
+        m   (trunk-memory)
+        ctx (remembered st m "chips" "space:leaf")]
+    (is (str/includes? ctx "chips are made in fabs.") "the root, two hops up")
+    (is (str/includes? ctx "chips concentrate in Taiwan.") "and its own parent")
+    (is (not (str/includes? ctx "chips need EUV from one vendor."))
+        "and still not its parent's sibling")))
 
 (deftest a-brand-new-notebook-brings-no-remembered-context
   ;; a normal state, not an error: nothing has been learned here yet, so the
