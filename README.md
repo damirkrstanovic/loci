@@ -121,10 +121,10 @@ files is the worse surprise.
 `clojure -T:build uber :slim true`, which excludes the native libraries for
 every platform but linux-x86_64: Datalevin ships linux-arm64, macosx-arm64 and
 windows-x86_64 alongside it, zstd-jni ships 18 architectures and JNA 24.
-Measured 2026-08-07: 51 files, 80.7 MB → 63.9 MB of jar, 445 MB → 428 MB of
-image. That is a smaller saving than the uncompressed `unzip -l` sizes
-(44.9 MB) suggest, because the jar stores them deflated — 17.0 MB compressed is
-what actually leaves.
+Measured 2026-08-07 on the JRE-based image this replaced: 51 files, 80.7 MB →
+63.9 MB of jar, 445 MB → 428 MB of image. That is a smaller saving than the
+uncompressed `unzip -l` sizes (44.9 MB) suggest, because the jar stores them
+deflated — 17.0 MB compressed is what actually leaves.
 Nothing checks the platform at runtime — a slim jar on arm64 or macOS fails
 when Datalevin first loads libdtlv, not at startup — so the manifest records
 which kind it is:
@@ -136,6 +136,47 @@ unzip -p target/loci-standalone.jar META-INF/MANIFEST.MF | grep Loci-Platform
 
 Plain `clojure -T:build uber` still builds the portable jar, and that is the
 default; only the Dockerfile opts in.
+
+**The JVM in the image is not a JRE.** It is a `jlink`ed runtime of nine module
+roots — fifteen modules once the transitive requires resolve — on a
+`debian:bookworm-slim` base rather than a whole `eclipse-temurin:26-jre`.
+Measured 2026-08-08: **428 MB → 191 MB**, as 258 MB of JDK became 51 MB of
+runtime. Cold start did not pay for it: 3.78 s on the JRE image against 3.63 s
+on this one, back to back on the same host. Debian 12 is not an arbitrary
+choice — `clojure:temurin-26-tools-deps` *is* bookworm, and a jlinked runtime
+carries the JDK's own `.so` files, linked against that image's glibc (2.36). The
+build stage installs `binutils`, because on JDK 26 `--strip-debug` shells out to
+`objcopy` and fails the link without it.
+
+The module list was found empirically and the Dockerfile records what each root
+is for. `jdeps` alone was not enough, twice over:
+
+- Run against the uberjar it answers `java.base,java.naming,java.sql`, and that
+  is wrong. bcprov ships a `META-INF/versions/9/module-info.class` which
+  tools.build carries into the uberjar, so jdeps reads the whole jar as the named
+  module `org.bouncycastle.provider` and reports *that* module's `requires`
+  instead of analysing the classes. Unzip the jar first and it finds eleven.
+- Even unzipped it cannot see what Clojure loads reflectively, so the second pass
+  is `-Xlog:class+load=info` against a running server while the substrate is read
+  and written. That pass is what showed `jdk.net` and `jdk.management` are
+  actually needed, and that most of what jdeps found — `java.desktop`,
+  `jdk.sctp`, `java.rmi`, `java.compiler`, `jdk.incubator.vector` — never loads.
+
+Neither pass says anything about **TLS**, because a JCA provider is loaded by
+name and an offline exercise never speaks https. The trap is a runtime that
+serves `/api/state` happily while every model, embedder, reranker and web-search
+call dies at the handshake. On JDK 26 it turns out no extra module is needed:
+`SunEC` has moved into `java.base` — `jdk.crypto.ec` still exists but
+`java --describe-module` shows it now declares nothing at all — so ECDH, X25519,
+X448 and XDH are present as linked. That was verified rather than assumed, with
+a real TLS 1.3 handshake through loci's own http-kit client inside the image.
+**Re-check it on the next JDK**, since this is the one failure the trimming
+invites and the healthcheck cannot see.
+
+The rest was verified in the container too: LMDB opens (`data.mdb` and
+`lock.mdb` land on the volume owned by 10001), `/api/state` answers 200, a
+`POST /api/connect` takes the substrate from 35 events to 36 and the new space is
+still there after `docker restart`, and `HEALTHCHECK` reports `healthy`.
 
 **Configuration is read from the real environment first, then from `loci.env`, then
 from the single-value files in the working directory** — and a container has none of
