@@ -2116,8 +2116,14 @@
   ;; A FRESH store per flow: ✎ Draft and 🔍 Research each append a cell to the
   ;; notebook, which legitimately widens the next call's scope. Reusing one
   ;; store would compare each flow against a stale expectation.
-  (let [want {:k 6 :semantic? true
-              :filter {:sources (srv/lineage-sources (lineage-fixture) "space:kid")}}
+  ;; The two empty sets are NOT noise. `recall-spy` answers `all-facts` with [],
+  ;; so `subject-set` has no names to detect and no lineage facts to read, and
+  ;; the opts show that honestly: this caller asked about subjects and found
+  ;; none. An absent key would mean something else — "this caller does not do
+  ;; subjects at all", which is what /api/leap and the memory pane still say.
+  (let [want {:k 6 :semantic? true :subjects #{}
+              :filter {:sources (srv/lineage-sources (lineage-fixture) "space:kid")
+                       :entities #{}}}
         opts (fn [f]
                (let [st   (lineage-fixture)
                      seen (atom [])]
@@ -2132,5 +2138,188 @@
     (is (= [want] (opts #(srv/research! % "space:kid" "chips"))) "🔍 Research")
     (is (= [want] (opts #(srv/suggest! % "space:kid"))) "✧ Suggest")
     ;; and with no notebook, ✦ Ask asks for no filter at all
-    (is (= [{:k 6 :semantic? true}] (opts #(srv/ask! % "chips" nil)))
+    (is (= [{:k 6 :semantic? true :subjects #{}}] (opts #(srv/ask! % "chips" nil)))
         "space nil → no :filter key, exactly as before this change")))
+
+;; ============================================================================
+;; the subject set — what a recall in this notebook is ABOUT, and not merely
+;; where it stands (Task 3 of the entities plan)
+;; ============================================================================
+
+(defn- subject-fixture
+  "Two unrelated roots and a brand-new notebook — the shape the subject union
+   exists for:
+
+     space:semis   a root that has been working on chips
+       space:kid     spawned-by semis
+     space:econ    a DIFFERENT root, sharing no ancestor with semis
+     space:new     just created, holding nothing
+
+   `space:econ` is the notebook `remembered-context`'s 2026-08-08 note called
+   blind: no lineage reaches it from `space:semis` in either direction, so
+   before this change nothing either one learned could ever reach the other.
+   Modelled on the live corpus's `Serbia — open economic data` sitting beside
+   the `Semiconductors` hub."
+  []
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:semis" "Semis" "find:semis-1" "chips fabs" {})
+    (put-space! st "space:kid"   "Kid"   "find:kid-1"   "chips euv"
+                {:spawned-by {:space "space:semis" :prompt "go deeper"}})
+    (put-space! st "space:econ"  "Econ"  "find:econ-1"  "other work" {})
+    (sub/commit! st {:op :put :id "space:new"
+                     :value {:id "space:new" :kind :space :title "New"
+                             :value {:intent "just made" :cells []}}})
+    st))
+
+(defn- subject-memory
+  "Facts carrying real `:entities`, worded so each assertion below can pass for
+   exactly one reason.
+
+   Every fact recalled by subject here shares **not one token** with the prompt
+   that reaches it. That is the whole design of this fixture: `relevance` is
+   `0.6·keywords + 0.4·entities`, so a fact with a word in common would score on
+   the keyword half alone and the test would stay green with every line of the
+   subject machinery deleted. `lineage-memory` above cannot be reused for the
+   same reason — its six facts all say \"chips\", which is what makes it a good
+   fixture for a *filter* and a useless one for a *subject*.
+
+   The Serbia fact is the negative control and DOES share tokens with the game
+   prompt (`the`, `long`, `is`): it is excluded because it carries no subject in
+   the set, and if a leak ever made it a candidate it would score and show up."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[nb obj txt ents]
+            [["space:semis" "find:semis-1" "Fabrication concentrates in Taiwan."         ["TSMC" "Taiwan"]]
+             ["space:kid"   "find:kid-1"   "One vendor ships every scanner."             ["EUV" "ASML"]]
+             ["space:econ"  "find:econ-1"  "A full playthrough takes roughly 120 hours." ["Wrath of the Righteous"]]
+             ["space:econ"  "find:econ-1"  "The long series is published quarterly."     ["Serbia"]]
+             ["space:econ"  "find:econ-1"  "Fewer than sixty units ship a year."         ["ASML"]]]]
+      (mold/remember m txt {:entities ents :source {:obj obj :space nb}}))
+    m))
+
+(def ^:private game-prompt "how long is Wrath of the Righteous?")
+
+(deftest subject-set-in-an-empty-notebook-is-exactly-what-the-prompt-names
+  (let [st (subject-fixture)
+        m  (subject-memory)
+        in (fn [space prompt] (srv/subject-set m (srv/lineage-sources st space) prompt))]
+    (is (= #{"wrath of the righteous"} (in "space:new" game-prompt))
+        "a multi-word name the corpus knows, detected in the prompt and normalized")
+    (is (= #{} (in "space:new" "how long is this going to take"))
+        "and a prompt naming nothing, in a notebook holding nothing, is no subject at all")))
+
+(deftest subject-set-adds-every-name-this-lineage-already-carries
+  (let [st (subject-fixture)
+        m  (subject-memory)
+        in (fn [space prompt] (srv/subject-set m (srv/lineage-sources st space) prompt))]
+    (is (= #{"tsmc" "taiwan" "euv" "asml" "wrath of the righteous"} (in "space:semis" game-prompt))
+        "the prompt's name PLUS the names its own notebook and its child already carry")
+    (is (= #{"tsmc" "taiwan" "euv" "asml"} (in "space:semis" "chips"))
+        "…and with a prompt naming nothing, exactly the lineage's own names — this half is what makes a notebook that has been working on something keep reaching it")
+    (is (= #{"wrath of the righteous" "serbia" "asml"} (in "space:econ" game-prompt))
+        "the other root reads its own facts' names and none of semis'")))
+
+(deftest the-subject-set-of-the-WHOLE-memory-is-still-only-the-prompt
+  ;; DELIBERATE DEVIATION from the plan's draft, which read
+  ;;   mine (if sources (filter #(mem/in-sources? sources %) all) all)
+  ;; and so returned EVERY name in the corpus when there is no notebook.
+  ;;
+  ;; That is not a harmless superset. `:subjects` is unioned into `qs`, and
+  ;; `relevance` scores the entity half as (weighted) |es ∩ qs| / |es|. If qs
+  ;; contains every name, then es ⊆ qs for every fact, so the entity half
+  ;; collapses to a constant 1.0 for any fact carrying a name and 0.0 for one
+  ;; carrying none — it stops discriminating, and every entity-bearing fact in
+  ;; the corpus scores at least 0.4 whether or not it has anything to do with
+  ;; the question. A fact matching two thirds of the query's words and carrying
+  ;; no entities scores 0.4 too, and ties with it.
+  ;;
+  ;; There is also nothing to buy: `:subjects` only scores, no `:filter` is
+  ;; added on this path, and the prompt half already covers the multi-word name
+  ;; that `:subjects` exists for. §5 says "entities of facts already in THIS
+  ;; LINEAGE" and with no notebook there is no lineage, so the honest reading is
+  ;; the empty contribution.
+  (let [m (subject-memory)]
+    (is (= #{"wrath of the righteous"} (srv/subject-set m nil game-prompt))
+        "no scope → the lineage half contributes nothing, not everything")
+    (is (= #{} (srv/subject-set m nil "how long is this going to take")))))
+
+(defn- recall-spy-over
+  "A `recall-spy` that still answers `all-facts` from a real memory `m`.
+
+   `subject-set` reads `all-facts` off the very memory `remembered-context` then
+   recalls from, so the plain `recall-spy` — which answers `[]` — would build an
+   empty subject set no matter what the code under test does, and an assertion
+   on those opts would certify rather than test.
+
+   And the spy has to be a `reify`, not a `with-redefs` of `mold/recall` as the
+   plan's Step 1 suggested: `recall` is a protocol method, the compiler turns
+   the call into a cached callsite straight to the implementing class, and the
+   rebinding is silently ignored. See `recall-spy` above, which says the same
+   thing and has said it since the memory pane was written."
+  [m seen]
+  (reify mold/Recall
+    (remember  [_ f o] (mold/remember m f o))
+    (all-facts [_] (mold/all-facts m))
+    (recall    [_ q opts] (swap! seen conj [q opts]) [])))
+
+(defn- recall-opts
+  "The opts `remembered-context` asks recall for, with `m` standing in for the
+   server's memory singleton."
+  [st m prompt space]
+  (let [seen (atom [])]
+    (with-redefs [mem/memory (delay (recall-spy-over m seen))]
+      (#'srv/remembered-context st prompt space))
+    (second (first @seen))))
+
+(deftest a-scoped-recall-asks-for-the-lineage-AND-the-subject
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    ;; from a brand-new notebook: nothing in the lineage, one name in the prompt
+    (is (= {:k 6 :semantic? true
+            :subjects #{"wrath of the righteous"}
+            :filter {:sources #{"space:new"} :entities #{"wrath of the righteous"}}}
+           (recall-opts st m game-prompt "space:new"))
+        "BOTH keys: :filter to make the other root's fact eligible, :subjects to make it rank — naming it in only one of the two is the quiet failure `recall`'s own comment warns about")
+    ;; and from a notebook with a history, the lineage's names ride along
+    (is (= {:sources (srv/lineage-sources st "space:semis")
+            :entities #{"tsmc" "taiwan" "euv" "asml" "wrath of the righteous"}}
+           (:filter (recall-opts st m game-prompt "space:semis"))))))
+
+(deftest with-no-notebook-recall-still-asks-for-no-filter-at-all
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= {:k 6 :semantic? true :subjects #{"wrath of the righteous"}}
+           (recall-opts st m game-prompt nil))
+        "no :filter key — the whole memory is the candidate set, exactly as before this change")))
+
+(deftest asking-about-a-subject-anywhere-brings-the-subjects-facts-back
+  ;; THE REPORTED CASE, and the paragraph `remembered-context` used to accept as
+  ;; a cost: `space:new` shares no lineage with `space:econ` and never will.
+  (let [st  (subject-fixture)
+        m   (subject-memory)
+        ctx (str (remembered st m game-prompt "space:new"))]
+    (is (str/includes? ctx "A full playthrough takes roughly 120 hours. (⌾ find:econ-1)")
+        "a fact from an unrelated root, reached by shared subject and cited as always")
+    (is (not (str/includes? ctx "The long series is published quarterly."))
+        "…and NOT the fact beside it, which shares three of the prompt's words and no subject — the union widens on subject, it does not open the door")))
+
+(deftest a-notebook-that-has-been-working-on-something-keeps-reaching-it
+  ;; the LINEAGE half of the subject set: the prompt names nothing, so the only
+  ;; way `space:econ`'s ASML fact can reach `space:semis` is through the names
+  ;; semis' own facts already carry.
+  (let [st  (subject-fixture)
+        m   (subject-memory)
+        ctx (str (remembered st m "chips" "space:semis"))]
+    (is (str/includes? ctx "Fewer than sixty units ship a year.")
+        "another root's fact about ASML, reached because this lineage is already about ASML")
+    (is (str/includes? ctx "One vendor ships every scanner.") "its own child's, still")
+    (is (not (str/includes? ctx "The long series is published quarterly."))
+        "and still not a fact whose subject this lineage has never touched")))
+
+(deftest an-empty-notebook-with-a-subjectless-prompt-still-brings-nothing
+  ;; unchanged, and the state a brand-new notebook is normally in
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (nil? (remembered st m "how long is this going to take" "space:new"))
+        "no lineage facts and no name in the prompt → no candidates, no REMEMBERED block")
+    (is (= 5 (count (mem/all-facts m))) "…while memory itself is full")))

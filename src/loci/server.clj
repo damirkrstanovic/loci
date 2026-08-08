@@ -15,6 +15,7 @@
             [loci.config :as config]
             [loci.content :as c]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.fnlib :as fnlib]
             [loci.memory :as mem]
             [loci.mold :as mold]
@@ -1085,6 +1086,53 @@
   [st space]
   (into (descendant-sources st space) (ancestor-sources st space)))
 
+(defn subject-set
+  "The subjects a recall in this notebook is about: the names detected in
+   `prompt`, plus every name already carried by a fact in `sources`.
+
+   The second half is what makes a notebook that has been working on something
+   keep reaching the rest of what is known about it; the first is what makes a
+   BRAND-NEW notebook work, which is the reported case — ask about the game
+   anywhere, and the game's facts come back.
+
+   **`sources` nil contributes NOTHING to the second half**, and that is a
+   decision, not a fallthrough. The obvious spelling —
+   `(if sources (filter …) all)` — reads \"no scope means everything is mine\",
+   which is right for a *filter* and wrong for a *subject*: it returns every
+   name in the corpus, and `relevance` scores the entity half as the (rarity
+   weighted) fraction of a fact's names that the subject set contains. With
+   every name in it, that fraction is 1.0 for every fact carrying any name at
+   all and 0.0 for the rest — the half stops discriminating, and a fact with
+   nothing to do with the question scores 0.4 where it used to score 0.
+
+   Measured, on a ten-fact corpus of the live shape, asking `how long is Wrath
+   of the Righteous?` with no notebook open: the fix returns the answer first
+   (`A full playthrough takes roughly 120 hours.`, 0.400). The `all` version
+   drops that fact **out of the top 6 entirely** and leads with `The long series
+   is published quarterly.` (0.580) — a fact about Serbian statistics that
+   shares the words `the`, `long` and `is` and now collects a flat 0.4 for
+   carrying any name at all. It is not a superset of the right answer; it
+   displaces it.
+
+   There is nothing to buy in exchange: no `:filter` is added on the unscoped
+   path, so the candidate set is the whole memory either way, and the prompt
+   half already carries the multi-word name `:subjects` exists for. The design
+   says \"entities of facts already in THIS LINEAGE\"; with no notebook there is
+   no lineage.
+
+   Names come back normalized and non-blank — `ent/detect` guarantees it for its
+   half, and this filters the other half, which reads `:entities` off facts
+   exactly as the distiller's JSON left them and so can hand back `\"\"`.
+
+   Public so a test can call it without going through an LLM."
+  [m sources prompt]
+  (let [all   (mem/all-facts m)
+        names (set (keys (ent/index all)))
+        mine  (when sources (filter #(mem/in-sources? sources %) all))]
+    (into (ent/detect names prompt)
+          (comp (mapcat :entities) (map ent/normalize) (remove str/blank?))
+          mine)))
+
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
 ;; distill! writes new memory AFTER a flow — async, best-effort, never undone.
@@ -1111,16 +1159,34 @@
    A notebook with nothing in scope yet gets nil — no REMEMBERED block at all.
    That is what a brand-new notebook looks like, and it is a normal state.
 
-   The cost of the scope, decided 2026-08-08 and not overstated: notebooks that
-   share a SUBJECT but not a LINEAGE go blind to each other. On the live corpus
-   `space:semis` and its six deep-dive children are one lineage holding 56 of
-   80 facts, but `Serbia — open economic data` and `World economies — output
-   and prices` are separate roots, so neither will offer the other anything.
-   Lineage is what the substrate computes; subject is what tags record."
+   **The scope is no longer lineage alone.** This paragraph REPLACES the one
+   dated 2026-08-08 that accepted a cost — \"notebooks that share a SUBJECT but
+   not a LINEAGE go blind to each other\", with `Serbia — open economic data`
+   and `World economies — output and prices` named as two roots that would never
+   offer each other anything. That cost is what this fixes, and the old
+   paragraph is gone rather than kept beside this one, so nothing here reads as
+   still live when it is not. Candidates are now the lineage's facts UNION the
+   facts sharing a subject with `subject-set`, and the subject set is named in
+   BOTH `:filter {:entities}` and `:subjects` on purpose: the first makes an
+   unrelated root's fact *eligible*, the second makes it *rank*. Naming it in
+   only one is the quiet failure `recall`'s own comment describes.
+
+   `k` stays 6 and the ranking is unchanged, so **a cross-notebook fact must
+   out-score a local one to appear** — the block does not grow, it competes.
+
+   Cost: one extra pass over the whole memory per agent turn (`all-facts` plus
+   `ent/index`), which `recall` then rebuilds for itself. Measured, mean of 300,
+   on a synthetic corpus of the live shape: **0.23 ms at 80 facts** — the live
+   size — 1.37 ms at 500 and 6.8 ms at 3000, so linear and about a seventh of
+   the `recall` it feeds (1.7 / 7.0 / 41.6 ms at those sizes), all of it in
+   front of an LLM call that takes seconds. Sharing one index between the two
+   would mean handing `loci.memory` a pre-built projection instead of a fact
+   sequence, and that is a seam worth 0.23 ms not to open."
   [st prompt space]
-  (let [opts (cond-> {:k 6 :semantic? true}
-               (and space (sub/object st space))
-               (assoc :filter {:sources (lineage-sources st space)}))
+  (let [sources (when (and space (sub/object st space)) (lineage-sources st space))
+        subs    (subject-set @mem/memory sources prompt)
+        opts    (cond-> {:k 6 :semantic? true :subjects subs}
+                  sources (assoc :filter {:sources sources :entities subs}))
         facts (try (mold/recall @mem/memory prompt opts)
                    (catch Exception _ nil))]
     (when (seq facts)
