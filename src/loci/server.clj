@@ -150,6 +150,157 @@
      ;; write — 2.2 ms this way against 3.9 ms on a 3003-event log
      :tag-colors (or (:value (get objm palette-id)) {})}))
 
+;; ---- the entity page ----
+;;
+;; Above `mold-payload` and not beside the other `/api/…` builders far below,
+;; because `mold-payload` calls `entity-payload` for a materialized entity's
+;; object page. A forward reference in Clojure is a compile error, not a warning.
+;; All any of it needs is the requires and `sub/objects`.
+
+(def ^:private entity-fact-cap
+  "How many of an entity's facts the page ranks and ships.
+
+   A cap, and deliberately **not a silent one**: `:count` on the payload counts
+   the live facts carrying the name out of the *index*, never out of this page,
+   so a subject with more facts than this renders \"50 of 137\" rather than
+   quietly looking like it has fifty. That is the whole reason the two are
+   separate keys instead of one number, and the reason a renderer is told about
+   both.
+
+   Fifty because this is a page load behind a modal and a fact is a sentence
+   plus its provenance — a few hundred bytes of JSON each. The alternative
+   considered was `:k (count (get idx nm))`, which removes the cap outright and
+   makes the two numbers always equal; rejected because it makes the size of a
+   page load a property of the corpus, and the corpus only grows."
+  50)
+
+(defn- entity-objects
+  "Normalized entity name → the object materializing it, out of an objects map
+   already in hand.
+
+   Keyed on `[:value :name]` and **never on the title**: the title is a display
+   string, and renaming `TSMC` to `TSMC (foundry)` must not re-identify the
+   entity or orphan every fact that mentions it.
+
+   The stored name is normalized here rather than trusted, for the reason
+   `ent/promoted` normalizes its own `materialized` argument instead of trusting
+   it. If this did not, an object carrying an un-normalized `TSMC` would make
+   `:promoted` true — through `promoted`, which normalizes — while `:object`
+   stayed absent, through this, which would not: one payload contradicting
+   itself about whether the entity has been materialized at all.
+
+   Lowest id wins a duplicate. Two objects for one name is a race and not a
+   normal state, but `vals` of an objects map is hash order, so with no rule the
+   page would name one of the two arbitrarily and nothing in the log would
+   explain which.
+
+   Takes the objects map, not the store: `sub/object` re-folds the whole event
+   log per lookup on both EDN stores, and `entity-payload` needs this, the
+   promotion set and every source's title out of ONE materialization."
+  [objm]
+  (reduce (fn [m o]
+            (let [n (ent/normalize (get-in o [:value :name]))]
+              (if (or (str/blank? n)
+                      (and (contains? m n) (neg? (compare (:id (get m n)) (:id o)))))
+                m
+                (assoc m n o))))
+          {}
+          (filter #(= :entity (:kind %)) (vals objm))))
+
+(defn entity-object
+  "The materialized object for a normalized entity name, or nil. Matched on
+   `[:value :name]`, never on the title — see `entity-objects`.
+
+   `nm` is expected already normalized, as every name that has been through
+   `ent/normalize` or `ent/detect` is. Handing it a raw one simply misses, which
+   is the silent failure `ent/detect`'s docstring names — so normalize at the
+   door, as `entity-payload` does, rather than here on every lookup."
+  [st nm]
+  (get (entity-objects (sub/objects st)) nm))
+
+(defn materialized-names
+  "The normalized names that already have an object, so `ent/promoted` can be
+   told which entities never demote."
+  [st]
+  (set (keys (entity-objects (sub/objects st)))))
+
+(defn entity-payload
+  "The entity page: the subject, the live facts that mention it ranked by the
+   ordinary recall score, and the objects and notebooks those facts came from.
+
+   **One payload, two surfaces.** `GET /api/entity?name=…` serves it to the
+   modal you get before materializing; `mold-payload` returns the same map under
+   `:rendered` for the entity object's page afterwards. Two renderers would
+   drift, and the drift would be invisible until someone materialized something
+   and the page they had been reading changed under them.
+
+   `:semantic? false` — the candidate set is already exactly the facts carrying
+   this name, so meaning has nothing left to decide, and this is a page load:
+   embedding the query would be a 20–50 ms round trip to reorder facts that are
+   all on the subject already.
+
+   `:subjects` carries the name because a multi-word one matches no query token
+   — `taiwan semiconductor manufacturing` is three tokens to the scorer and one
+   name to the index — so without it a fact carrying only that name scores 0 on
+   the entity half and `recall` drops it for not being positive: an entity page
+   with facts behind it showing none. `:filter {:entities}` carries it too, and
+   the two are not the same thing (see `recall`'s `opts:` note): the filter
+   makes facts eligible, the subject makes them rank. Naming it in one and not
+   the other is the documented silent failure.
+
+   `:count` is how many live facts carry the name and `:facts` is the ranked
+   page of at most `entity-fact-cap` of them. **They differ exactly when the cap
+   bites** — the candidate set is the index's own set, so nothing else can
+   separate them — which is what lets the page say \"50 of 137\" instead of
+   truncating in silence.
+
+   `:promoted` false with facts present is a real state and must render: a merge
+   can push a name back below the threshold, and the page should say so rather
+   than vanish.
+
+   `:sources` is in the facts' rank order — the best fact's origins first —
+   deduped, with each fact's own ids sorted so nothing depends on the iteration
+   order of the set `mem/source-ids` hands back. An id with no object behind it
+   is DROPPED rather than rendered as `{:title nil}`: a fact outlives the
+   document it was distilled from, and a chip with no name on it is worse than
+   no chip. Documents and notebooks share one list because a fact's `:source`
+   names both and the question the list answers — where did this come from — is
+   answered by either.
+
+   Cost: two passes over the whole memory — `ent/index` here for `:count` and
+   `:promoted`, and `recall`'s own `df-map` a moment later — plus one
+   materialization of the objects map, shared between the entity lookup, the
+   promotion set and every source's title. The same shape and the same reason as
+   `remembered-context`'s: sharing one index would mean handing `loci.memory` a
+   pre-built projection instead of a fact sequence, and this runs on a click, not
+   on a keystroke."
+  [st m raw-name]
+  ;; `nm`, not `name`: a local called `name` shadows clojure.core/name, which
+  ;; each source's `:kind` needs below.
+  (let [nm (ent/normalize raw-name)]
+    (if (str/blank? nm)
+      ;; ahead of `all-facts`, `ent/index` and the objects map — none of which
+      ;; has anything to answer for a request that named no subject, and the
+      ;; last of them walks every object in the store
+      {:error "no entity name given"}
+      (let [objm  (sub/objects st)
+            ments (entity-objects objm)
+            idx   (ent/index (mem/all-facts m))
+            obj   (get ments nm)
+            hits  (mold/recall m nm {:k entity-fact-cap :semantic? false
+                                     :subjects #{nm} :filter {:entities #{nm}}})
+            srcs  (->> hits (mapcat (comp sort mem/source-ids)) distinct
+                       (keep (fn [id]
+                               (when-let [o (get objm id)]
+                                 {:id id :title (:title o) :kind (name (:kind o))})))
+                       vec)]
+        (cond-> {:name     nm
+                 :count    (count (get idx nm #{}))
+                 :promoted (contains? (ent/promoted idx (keys ments)) nm)
+                 :facts    (mapv #(dissoc % :vec) hits)
+                 :sources  srcs}
+          obj (assoc :object (:id obj)))))))
+
 (defn dynamic-views [st target]
   (->> (sub/objects st) vals
        (filter #(and (#{:viewspec :applet} (:kind %)) (= target (get-in % [:value :target]))))))
@@ -1848,6 +1999,7 @@
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
+      (= uri "/api/entity")  (json-resp (entity-payload st @mem/memory (params "name")))
       (= uri "/api/memory-unmerge")(let [{:keys [survivor absorbed]} (body-json req)]
                                      (json-resp (memory-unmerge! @mem/memory survivor absorbed)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]

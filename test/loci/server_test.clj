@@ -4,6 +4,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.agent :as agent]
+            [loci.content :as c]
             [loci.embed :as embed]
             [loci.memory :as mem]
             [loci.mold :as mold]
@@ -2461,3 +2462,307 @@
     (is (nil? (remembered st m "how long is this going to take" "space:new"))
         "no lineage facts and no name in the prompt → no candidates, no REMEMBERED block")
     (is (= 12 (count (mem/all-facts m))) "…while memory itself is full")))
+
+;; ============================================================================
+;; the entity page — ONE payload, served to the modal and to the object page
+;; ============================================================================
+
+(def ^:private entity-rows
+  "The corpus behind the entity-page tests: `[text entities source]`, in the
+   order it is written.
+
+   **The write order is neither the ranked order nor its reverse**, and that is
+   the point of it. Ranked by `recall`, the four `TSMC` facts come back
+   F1 F2 F3 F4; written, they land F3 F1 F4 F2, so `:ts` ascending gives
+   F3 F1 F4 F2 and `:ts` descending gives F2 F4 F1 F3. A fixture written in
+   ranked order would pass with the ranking replaced by the log.
+
+   The scores are arranged, not observed. `relevance` is
+   `0.6·jaccard(query tokens, fact tokens) + 0.4·(inverse-frequency entity
+   overlap)`, the query here is the name itself, and every name's document
+   frequency is fixed by this table — tsmc 4, taiwan 3, asml 2, arizona 1 — so
+   for `?name=tsmc`:
+
+     F1  0.5200   says `tsmc` in five words, and carries only `tsmc`
+     F2  0.4000   carries only `tsmc`, and shares no word with the query
+     F3  0.1714   carries `tsmc` and `taiwan`, so the name is diluted
+     F4  0.0480   carries four names, three of them rarer than `tsmc`
+
+   Four scores, each separated from the next in the first or second decimal
+   place, against a `decay` spread of about two parts in a million — see
+   `stamp-ts!`. No assertion on this name depends on how a tie breaks, because
+   there are no ties.
+
+   `doc:gone` is a source with **no object behind it**: a fact outlives the
+   document it was distilled from, and the page must drop the id rather than
+   render a chip reading `null`.
+
+   The last two facts carry a MULTI-WORD name and share no word with it. Query
+   tokens are single words, so `taiwan semiconductor manufacturing` is three
+   tokens to the scorer and one name to the index: without `:subjects` both
+   score exactly 0 on both halves and `recall` drops them for not being
+   positive. That is the case `:subjects` exists for, and this is where it is
+   pinned."
+  [;; F3 — mem-1
+   ["a second advanced packaging site opens next spring"
+    ["TSMC" "Taiwan"] {:obj "doc:gone" :space "space:semis"}]
+   ;; F1 — mem-2
+   ["tsmc leads at three nanometres"
+    ["TSMC"] {:obj "doc:fab" :space "space:semis"}]
+   ;; F4 — mem-3
+   ["the arizona plant hires from four local colleges"
+    ["TSMC" "Taiwan" "ASML" "Arizona"] {:obj "doc:az" :space "space:az"}]
+   ;; F2 — mem-4
+   ["the foundry raised capital spending for the coming year"
+    ["TSMC"] {:obj "doc:fab" :space "space:semis"}]
+   ;; the rest of the corpus, which exists to fix the document frequencies
+   ["the island exports more than it imports each quarter"
+    ["Taiwan"] {:obj "doc:fab" :space "space:semis"}]
+   ["one vendor ships every extreme ultraviolet scanner"
+    ["ASML"] {:obj "doc:fab" :space "space:semis"}]
+   ;; the multi-word pair — G3 then G4, so G4 is the newer of the two
+   ["the board approved a new packaging campus on its northern edge"
+    ["Taiwan Semiconductor Manufacturing"] {:obj "doc:az" :space "space:az"}]
+   ["wafer starts held steady through the winter months"
+    ["Taiwan Semiconductor Manufacturing"] {:obj "doc:az" :space "space:az"}]])
+
+(defn- stamp-ts!
+  "Give every fact a distinct timestamp, one second apart, in the order it was
+   written.
+
+   `remember` stamps `System/currentTimeMillis`, and a fixture written in a
+   `doseq` lands several facts in the SAME millisecond. `sort-by` is stable, so
+   sorting a same-`:ts` corpus by `:ts` is a **no-op** — and the sabotage this
+   fixture exists to fail, ranking the page by recency instead of by score,
+   would leave the order untouched and the test would pass with the bug in
+   place. A test that cannot fail is worse than no test.
+
+   One second apart and a minute ago, so `decay` moves the scores by about two
+   parts in a million: enough to break a tie deterministically (the multi-word
+   pair below ties exactly on relevance, and the newer must lead), far too
+   little to reorder facts whose relevances differ in the second decimal place."
+  [m]
+  (let [base (- (System/currentTimeMillis) 60000)]
+    (swap! (:!facts m)
+           (fn [fs]
+             (reduce-kv (fn [acc id f]
+                          (assoc acc id (assoc f :ts (+ base (* 1000 (parse-long (subs id 4)))))))
+                        {} fs))))
+  m)
+
+(defn- entity-memory []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[txt ents src] entity-rows]
+      (mold/remember m txt {:entities ents :source src}))
+    (stamp-ts! m)))
+
+(defn- entity-fixture
+  "The objects the facts above were recorded against — minus `doc:gone`, which
+   is the point of it."
+  []
+  (let [st (sub/fresh-store)]
+    (doseq [o [{:id "doc:fab" :kind :doc :title "Fab notes" :value "…"}
+               {:id "doc:az" :kind :doc :title "Arizona plans" :value "…"}
+               {:id "space:semis" :kind :space :title "Semiconductors"
+                :value {:intent "the supply chain" :cells []}}
+               {:id "space:az" :kind :space :title "Arizona build"
+                :value {:intent "the fab" :cells []}}]]
+      (sub/commit! st {:op :put :id (:id o) :value o}))
+    st))
+
+(defn- materialize!
+  "Hand-commit the object Task 5 will commit: `:kind :entity`, the NORMALIZED
+   name under `[:value :name]`, and a title that is deliberately not the name —
+   matching on the title would make every one of these lookups miss."
+  [st id nm title]
+  (sub/commit! st {:op :put :id id
+                   :value {:id id :kind :entity :title title :value {:name nm}}})
+  st)
+
+(def ^:private tsmc-ranked
+  "The four `tsmc` facts in the order `entity-payload` must return them, best
+   first. See `entity-rows` for the arithmetic."
+  ["tsmc leads at three nanometres"                        ; 0.5200
+   "the foundry raised capital spending for the coming year" ; 0.4000
+   "a second advanced packaging site opens next spring"     ; 0.1714
+   "the arizona plant hires from four local colleges"])     ; 0.0480
+
+(deftest an-entity-page-is-its-facts-ranked-and-not-its-facts-logged
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= "tsmc" (:name p)))
+    (is (= 4 (:count p)) "every live fact carrying the name, from the index")
+    (is (true? (:promoted p)) "four facts is well past the threshold")
+    (is (nil? (:object p)) "and nothing has been materialized")
+    (is (= tsmc-ranked (mapv :fact (:facts p)))
+        "RANKED, not logged — written F3 F1 F4 F2, so neither :ts order is this")
+    ;; the claim above is only worth something if the two orders really differ
+    (is (not= tsmc-ranked (mapv :fact (sort-by :ts > (:facts p))))
+        "newest-first is a different order…")
+    (is (not= tsmc-ranked (mapv :fact (sort-by :ts (:facts p))))
+        "…and so is oldest-first")))
+
+(deftest an-entity-page-names-where-its-facts-came-from
+  ;; Documents AND notebooks in one list: a fact's `:source` names both (see
+  ;; `mem/source-ids`), and the page is asking "where did this come from",
+  ;; which either answers. Design §3: "the notebooks and documents those facts
+  ;; came from."
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= [{:id "doc:fab" :title "Fab notes" :kind "doc"}
+            {:id "space:semis" :title "Semiconductors" :kind "space"}
+            {:id "doc:az" :title "Arizona plans" :kind "doc"}
+            {:id "space:az" :title "Arizona build" :kind "space"}]
+           (:sources p))
+        "in the FACTS' rank order, deduped, and with `doc:gone` — a source whose object is gone — dropped rather than rendered as a chip with no title")
+    (is (not-any? #(nil? (:title %)) (:sources p)))))
+
+(deftest one-fact-is-not-a-place-yet-but-the-page-still-renders
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "arizona")]
+    (is (= 1 (:count p)))
+    (is (false? (:promoted p)) "one live fact is below the threshold")
+    (is (= ["the arizona plant hires from four local colleges"] (mapv :fact (:facts p)))
+        "…and the page renders anyway: `:promoted` false with facts present is a real state, not a reason to vanish")))
+
+(deftest a-name-nothing-was-ever-recorded-about-is-empty-and-not-an-error
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "graphene")]
+    (is (nil? (:error p)) "asking about a subject with no facts is a normal question")
+    (is (= "graphene" (:name p)))
+    (is (= 0 (:count p)))
+    (is (= [] (:facts p)))
+    (is (= [] (:sources p)))
+    (is (false? (:promoted p)))))
+
+(deftest no-name-at-all-is-an-error-and-never-a-500
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    ;; the last is a non-breaking space, spelled as an escape: `ent/normalize`
+    ;; collapses `[\\s\\p{Z}]+` and not bare `\\s`, so this trims to "" too — and
+    ;; a name that is only a U+00A0 is exactly as absent as one that is nothing
+    (doseq [absent [nil "" "   " "\u00a0"]]
+      (is (= {:error "no entity name given"} (srv/entity-payload st m absent))
+          (str "…for " (pr-str absent))))))
+
+(deftest a-multi-word-name-finds-its-own-facts
+  ;; The case `:subjects` exists for. Query tokens are single words, so
+  ;; `taiwan semiconductor manufacturing` can never match one; without the name
+  ;; in `:subjects` both facts score 0 on the entity half, 0 on the keyword half
+  ;; (neither text uses any of the three words), and `recall` drops them for not
+  ;; being positive — an entity page with facts behind it that shows none.
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "Taiwan Semiconductor Manufacturing")]
+    (is (= "taiwan semiconductor manufacturing" (:name p)))
+    (is (= 2 (:count p)))
+    (is (true? (:promoted p)))
+    (is (= ["wafer starts held steady through the winter months"
+            "the board approved a new packaging campus on its northern edge"]
+           (mapv :fact (:facts p)))
+        "both of them, newer first — they tie exactly on relevance and `decay` breaks it")))
+
+(defn- but-scores
+  "A payload with the recall scores dropped.
+
+   Two calls a millisecond apart cannot produce equal payloads and never could:
+   `weight` multiplies relevance by `decay(ts, now)` with `now` read afresh
+   inside each `recall`, so the scores differ in the eleventh decimal place —
+   measured, `0.5199883642572858` against `0.5199883640566775`. What is under
+   test is that two spellings of one name answer with the same PAGE: the same
+   facts in the same order, the same counts, the same sources. Not that a float
+   computed twice off two readings of the clock agrees with itself."
+  [p]
+  (update p :facts #(mapv (fn [f] (dissoc f :score)) %)))
+
+(deftest a-name-is-normalized-at-the-door
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (but-scores (srv/entity-payload st m "tsmc"))
+        pay (fn [n] (but-scores (srv/entity-payload st m n)))]
+    (is (= p (pay "TSMC")))
+    (is (= p (pay "  tsmc  ")))
+    ;; spelled as an escape rather than pasted, so it is readable as one: a
+    ;; literal U+00A0 in the source looks exactly like a space and the next edit
+    ;; through this file would "tidy" it into one without noticing
+    (is (= p (pay "\u00a0TSMC\u00a0"))
+        "…including a non-breaking space, which is what a pasted PDF hands you and what a bare \\s would never have stripped")))
+
+(deftest the-entity-route-answers-the-same-payload-through-the-URL
+  ;; The route is otherwise untested, and Task 8 finds a missing one only at
+  ;; runtime. `c/store` and `mem/memory` are both delays behind ordinary vars,
+  ;; so rebinding them means neither the user's Datalevin store nor
+  ;; `data/memory.edn` is ever opened.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        get! (fn [qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri "/api/entity" :query-string qs}))
+                                :key-fn keyword)))]
+    (is (= 4 (:count (get! "name=tsmc"))))
+    (is (= tsmc-ranked (mapv :fact (:facts (get! "name=tsmc"))))
+        "the route serves the same ranked page the modal and the object page get")
+    (is (= (but-scores (get! "name=tsmc"))
+           (but-scores (get! "name=TSMC"))
+           (but-scores (get! "name=%20tsmc%20")))
+        "?name=TSMC and ?name=%20tsmc%20 answer identically — %20 is `parse-query`'s to decode and the surrounding space is `ent/normalize`'s to trim")
+    (is (= "no entity name given" (:error (get! nil))))
+    (is (= "no entity name given" (:error (get! "name="))))))
+
+(deftest a-materialized-entity-carries-its-object-and-never-demotes
+  (let [st (-> (entity-fixture)
+               (materialize! "ent:tsmc" "tsmc" "TSMC — the foundry")
+               (materialize! "ent:az" "arizona" "The Arizona build"))
+        m  (entity-memory)]
+    (is (= "ent:tsmc" (:object (srv/entity-payload st m "tsmc")))
+        "the page is now that object's page")
+    (is (= 4 (:count (srv/entity-payload st m "tsmc"))) "and says exactly what it said before")
+    (let [az (srv/entity-payload st m "arizona")]
+      (is (= "ent:az" (:object az)))
+      (is (true? (:promoted az))
+          "ONE fact and promoted: a materialized entity never demotes — it is yours, not the evidence's"))
+    (is (nil? (:object (srv/entity-payload st m "taiwan")))
+        "…and an entity nobody materialized still has none")))
+
+(deftest an-entity-is-identified-by-its-name-and-never-by-its-title
+  ;; The title is a display string. An edit to it must not re-identify the
+  ;; entity, or every fact that mentions the name is orphaned by a rename.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "tsmc" "TSMC — the foundry")]
+    (is (= "ent:tsmc" (:id (srv/entity-object st "tsmc"))))
+    (is (nil? (srv/entity-object st "tsmc — the foundry")) "the title identifies nothing")
+    (is (nil? (srv/entity-object st "graphene")))
+    (is (= #{"tsmc"} (srv/materialized-names st)))
+    (is (= #{} (srv/materialized-names (entity-fixture)))
+        "a store with no entity objects in it names none")))
+
+(defn- bulk-entity-memory
+  "`n` facts all carrying one name and sharing no word with each other.
+
+   Word-disjoint on purpose: `remember` reinforces an existing fact rather than
+   adding one when their token sets overlap by 0.6 or more, so the obvious
+   fixture — \"note one\", \"note two\" — would collapse into a handful of facts
+   with high `:strength` and the cap would never be reached."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n)]
+      (mold/remember m (str "alpha" i " beta" i " gamma" i " delta" i)
+                     {:entities ["Bulk"] :source {:obj "doc:bulk" :space "space:bulk"}}))
+    m))
+
+(deftest the-page-is-capped-and-says-so-out-loud
+  ;; `:count` and `(count :facts)` are two numbers on purpose, and this is the
+  ;; only way they can differ: `:count` comes from the index and is every live
+  ;; fact carrying the name, `:facts` is what `recall` returned at `:k 50`. With
+  ;; one number the page would truncate in silence; with two it can say
+  ;; "50 of 55" — which is what makes this a cap and not a lie.
+  (let [st (sub/fresh-store)
+        m  (bulk-entity-memory 55)
+        p  (srv/entity-payload st m "bulk")]
+    (is (= 55 (:count p)) "every live fact carrying the name")
+    (is (= 50 (count (:facts p))) "…of which the page ships fifty")
+    (is (< (count (:facts p)) (:count p))
+        "the two numbers differ, and a renderer has everything it needs to say so")))
