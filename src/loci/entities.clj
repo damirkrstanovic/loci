@@ -15,13 +15,30 @@
    Facts are NEVER rewritten to point at entity ids. They keep their `:entities`
    strings, and that is the property that makes materialization safe to undo."
   (:require [clojure.string :as str])
-  (:import [java.util.regex Pattern]))
+  (:import [java.util Locale]
+           [java.util.regex Pattern]))
 
 (defn normalize
   "The stable identity of an entity name: lowercase, trimmed, internal
-   whitespace collapsed. nil and blank normalize to \"\"."
+   whitespace collapsed. nil and blank normalize to \"\".
+
+   Collapses on `[\\s\\p{Z}]+`, not bare `\\s+`: Java's `\\s` is ASCII
+   whitespace only, so a non-breaking space (U+00A0) or a narrow no-break
+   space (U+202F) — both of which arrive intact out of a pasted PDF or a
+   model's JSON output — would survive as a distinct character instead of
+   collapsing, quietly splitting one entity into two that never merge.
+   Collapse runs *before* trim for the same reason: a leading or trailing
+   NBSP has to become an ordinary space first, or trim never sees it as
+   whitespace to strip.
+
+   Lowercases via `Locale/ROOT`, not `clojure.string/lower-case` — which is
+   `.toLowerCase()` under the JVM's *default* locale. Under a Turkish
+   locale that maps `I` to dotless `ı`, so entity identity would depend on
+   `$LANG`. `Locale/ROOT` is the one answer that does not depend on where
+   the JVM happens to be running."
   [s]
-  (-> (str s) str/trim str/lower-case (str/replace #"\s+" " ")))
+  (let [^String s (-> (str s) (str/replace #"[\s\p{Z}]+" " ") str/trim)]
+    (.toLowerCase s Locale/ROOT)))
 
 (defn index
   "name → set of fact ids, over the **live** facts you pass in.
@@ -59,18 +76,35 @@
   "The names that are entities: enough live facts, or already materialized.
 
    **A materialized entity never demotes.** Once it is an object in the world it
-   stays one regardless of the evidence — it is yours, not the evidence's."
+   stays one regardless of the evidence — it is yours, not the evidence's.
+
+   `materialized` is normalized and blank-filtered here rather than trusted
+   as already-clean. The call this exists for is
+   `(contains? (promoted idx (materialized-names st)) nm)` with `nm`
+   normalized — an un-normalized stored name would make that lookup miss
+   and report \"not promoted\" for an entity that plainly is one,
+   contradicting the sentence above instead of merely failing to help. A
+   blank name, left in, would sit in the set as an entity that is not
+   really a subject at all."
   [idx materialized]
-  (into (set materialized)
+  (into (into #{} (comp (map normalize) (remove str/blank?)) materialized)
         (keep (fn [[n ids]] (when (>= (count ids) promotion-threshold) n)))
         idx))
 
 (defn- bounded
   "`name` as a pattern that will not match inside a longer word — so \"us\" does
    not match \"thus\". The name is quoted, because it comes from a model and may
-   contain regex metacharacters."
+   contain regex metacharacters.
+
+   `(?U)` turns on UNICODE_CHARACTER_CLASS: Java's `\\p{Alnum}` is `[a-zA-Z0-9]`
+   unless told otherwise, so without the flag a non-ASCII letter reads as
+   \"not alnum\" and the boundary is satisfied where it should not be — a
+   name embedded in non-ASCII text (`\"žus radi\"`, `\"u Nišu danas\"`) then
+   over-matches the same way \"us\" would have matched inside \"thus\" with no
+   boundary check at all. The corpus already has a Serbian-language
+   notebook, so this is live text, not a hypothetical."
   [name]
-  (re-pattern (str "(?<![\\p{Alnum}])" (Pattern/quote name) "(?![\\p{Alnum}])")))
+  (re-pattern (str "(?U)(?<![\\p{Alnum}])" (Pattern/quote name) "(?![\\p{Alnum}])")))
 
 (defn detect
   "The names present in `text`, longest match first.
@@ -84,12 +118,37 @@
 
    Longest-first with blanking, so `wrath of the righteous` wins and `wrath` does
    not also match the same words. Blanking replaces every occurrence, or a second
-   mention of the long name would re-expose the short one."
+   mention of the long name would re-expose the short one.
+
+   `names` is normalized here too, not just `text`: trusting the caller to
+   have already normalized every name would fail *silently* rather than
+   loudly — an un-normalized name just never matches, so the union looks
+   like it ran and returns nothing, instead of erroring where the mistake
+   was made. The returned set is therefore always normalized, which is
+   what recall's `:subjects` and `:filter {:entities …}` already assume
+   when they compare against it.
+
+   Three known, deliberate limits, not bugs:
+   - a name's detectability is a property of the *name set*, not of the
+     text alone — blanking a longer match can occasionally manufacture a
+     shorter one that was never really there on its own
+     (`(detect #{\"aa\" \".\"} \"aa.\")` finds both), though longest-first
+     protects every name shape the distiller actually produces;
+   - two names of equal length that overlap the same span: only one
+     survives, because the tie is broken alphabetically and blanking then
+     hides the other from the rest of the pass, even though both are
+     genuine subjects;
+   - collapsing newlines during normalization lets a multi-word name match
+     across a line break (`\"TSMC\\nTaiwan\"` still matches `tsmc taiwan`).
+     That is deliberate, not an oversight — it is what lets a multi-word
+     name match text a renderer has wrapped — and a full stop or bullet
+     still blocks it."
   [names text]
   (let [t0 (normalize text)]
     (if (str/blank? t0)
       #{}
-      (loop [ns  (sort-by (juxt (comp - count) identity) (remove str/blank? names))
+      (loop [ns  (sort-by (juxt (comp - count) identity)
+                          (into #{} (comp (map normalize) (remove str/blank?)) names))
              t   t0
              out #{}]
         (if-let [n (first ns)]
