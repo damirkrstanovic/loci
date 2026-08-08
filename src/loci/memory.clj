@@ -301,6 +301,52 @@
   [model]
   (get merge-thresholds model))
 
+(defn- no-threshold-message
+  "Why a model with no measured threshold merges nothing.
+
+   One function because two callers must say exactly the same thing:
+   `merge-similar!` warns it when a pass refuses, and `merge-status` reports it
+   to the memory pane without a pass ever running. Two copies would drift, and
+   the pane would then explain the refusal in words the log does not use."
+  [model]
+  (str "no merge threshold is calibrated for the embedding model \"" model
+       "\", so nothing is merged — a threshold belongs to one model and the "
+       "nearest number from another one would merge facts that are not the "
+       "same fact. Calibrated: "
+       (str/join ", " (sort (keys merge-thresholds)))
+       ". Measure this model with loci.calibrate and add it to "
+       "loci.memory/merge-thresholds."))
+
+(defn merge-status
+  "Whether merging is running, as a value — **a lookup, never a pass**:
+
+     {:threshold 0.88}   the configured model is calibrated; merges happen
+     {:refused \"…\"}      it is not, and merge-similar! refuses every pass
+     {:off true}         no embedder is configured, so there are no vectors
+
+   Read on a GET (the memory pane), so it must not merge, must not embed and
+   must not warn. Answering by calling `merge-similar!` would spend O(n²)
+   cosines over the whole memory on a page load, and its `warn-once!` would
+   consume the single startup line into a request nobody reads stderr for.
+   Nothing here does more than resolve the configuration and look in a map.
+
+   `{:off true}` for an unconfigured embedder is the one non-obvious answer.
+   `embed-model` still resolves with no embedder — to the default, which is
+   calibrated — so the bare lookup would report `{:threshold 0.85}` for a memory
+   in which not one fact carries a vector and `merge-similar!` therefore
+   considers nothing, forever. Nor is it a refusal: a refusal names the model as
+   the reason it cannot merge, and here the model is fine and the embedder is
+   missing. `:off` is the word `loci.embed` and `semantic-ranking` already use
+   for not-configured as against not-working, and it lets a pane report the
+   absent embedder once rather than twice."
+  []
+  (if-not (embed/embedding-configured?)
+    {:off true}
+    (let [model (embed/embed-model)]
+      (if-let [t (merge-threshold model)]
+        {:threshold t}
+        {:refused (no-threshold-message model)}))))
+
 (defn- older
   "Whichever of `a` and `b` survives a merge: the older by `:ts`.
 
@@ -442,13 +488,7 @@
           :model      model
           :threshold  t
           :pairs      (:pairs r)})
-       (let [msg (str "no merge threshold is calibrated for the embedding model \"" model
-                      "\", so nothing is merged — a threshold belongs to one model and the "
-                      "nearest number from another one would merge facts that are not the "
-                      "same fact. Calibrated: "
-                      (str/join ", " (sort (keys merge-thresholds)))
-                      ". Measure this model with loci.calibrate and add it to "
-                      "loci.memory/merge-thresholds.")]
+       (let [msg (no-threshold-message model)]
          (warn-once! msg)
          {:merged 0 :considered (count facts) :model model :refused msg})))))
 

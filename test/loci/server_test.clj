@@ -1473,6 +1473,144 @@
         "and the keystroke path does not — it must stay exactly as fast as it was")))
 
 ;; ============================================================================
+;; what the pane learns about the memory layer itself
+;; ============================================================================
+
+(defn- a-closed-port
+  "A port with nothing listening: bind one, ask which it was, close it. An
+   unreachable embedder that needs no network to be unreachable."
+  []
+  (with-open [s (java.net.ServerSocket. 0)] (.getLocalPort s)))
+
+(defn- one-embedded-fact
+  "A throwaway memory holding a single fact that already carries a vector
+   stamped `model`. Poked into the atom rather than embedded, because embedding
+   it would need an embedder and what is under test is the payload."
+  [model]
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "Neptune takes 165 years to orbit the Sun." {})
+    (swap! (:!facts m) update "mem-1" assoc :vec [0.1 0.2] :model model :dim 2)
+    m))
+
+(def ^:private neptune
+  {:id "mem-1" :fact "Neptune takes 165 years to orbit the Sun." :entities []
+   :ts 1000 :strength 1 :vec [0.1 0.2] :model "embed-qwen3-4b" :dim 2})
+
+(defn- healthy-recall
+  "A Recall whose semantic half ran and worked: hits, carrying the metadata a
+   working embedder leaves behind. Opens no socket, so `embedding-configured?`
+   can be true above it without anything being contacted."
+  [facts]
+  (reify mold/Recall
+    (remember  [_ _ _] :ok)
+    (all-facts [_] facts)
+    (recall    [_ _ _] (with-meta (mapv #(assoc % :score 0.5 :via [:lexical :semantic]) facts)
+                         {:semantic :ok}))))
+
+(deftest an-unreachable-embedder-reaches-the-pane-as-a-plain-key
+  ;; recall says it is degraded in the returned vector's METADATA, and metadata
+  ;; does not survive json/write-str. Without lifting it out the pane shows
+  ;; fewer results than it did yesterday with nothing anywhere saying why.
+  (let [m (one-embedded-fact "m")
+        {:keys [env file]}
+        (embed-env {"LOCI_EMBED_ENDPOINT" (str "http://127.0.0.1:" (a-closed-port) "/v1/embeddings")
+                    "LOCI_EMBED_MODEL"    "m"})]
+    (with-redefs [embed/env env embed/from-file file]
+      (let [p (srv/memory-payload m "Neptune")]
+        (is (string? (:degraded p))
+            "a plain key on the payload, not metadata on a vector")
+        (is (str/includes? (:degraded p) "degraded"))
+        (is (= 1 (count (:facts p)))
+            "and the words still answer — degraded is not broken")))))
+
+(deftest the-healthy-configured-payload-is-key-for-key-what-it-has-always-been
+  ;; Four callers read this map. Adding :merge must move nothing else, and
+  ;; :degraded must be ABSENT rather than nil or false — a key that is always
+  ;; there and usually empty is what makes `if (p.degraded)` and
+  ;; `if ('degraded' in p)` disagree, and only one of them is right.
+  (let [m (healthy-recall [neptune])
+        ;; nothing contacts this: healthy-recall answers without an embedder,
+        ;; and the endpoint exists only to make `embedding-configured?` true
+        {:keys [env file]} (embed-env {"LOCI_EMBED_ENDPOINT" "http://embedder.invalid/v1/embeddings"
+                                       "LOCI_EMBED_MODEL"    "embed-qwen3-4b"})]
+    (with-redefs [embed/env env embed/from-file file]
+      (let [p (srv/memory-payload m "Neptune")]
+        (is (= #{:facts :awaiting :embedding :merge} (set (keys p)))
+            "the three keys it has always had, plus :merge — and nothing else")
+        (is (not (contains? p :degraded))
+            "absent, not nil and not false")
+        (is (= 0 (:awaiting p)))
+        (is (= "embed-qwen3-4b" (:embedding p)))
+        (is (= [(dissoc neptune :vec)] (mapv #(dissoc % :score :via) (:facts p)))
+            "and the facts are untouched apart from the vector that never ships")
+        (is (= {:threshold 0.88} (:merge p)))))))
+
+(deftest the-payload-says-whether-merging-runs
+  (let [payload-under (fn [env-map]
+                        (let [{:keys [env file]} (embed-env env-map)]
+                          (with-redefs [embed/env env embed/from-file file]
+                            (srv/memory-payload (one-embedded-fact "embed-qwen3-0.6b") nil))))
+        at            (fn [model] {"LOCI_EMBED_ENDPOINT" "http://embedder.invalid/v1/embeddings"
+                                   "LOCI_EMBED_MODEL"    model})]
+    (is (= {:threshold 0.85} (:merge (payload-under (at "embed-qwen3-0.6b"))))
+        "a calibrated model reports the number merging actually uses")
+    (is (= {:threshold 0.88} (:merge (payload-under (at "embed-qwen3-4b"))))
+        "each model its own — the table is per model, and so is this")
+    (let [r (:merge (payload-under (at "embed-bge-m3")))]
+      (is (string? (:refused r)) "uncalibrated: a refusal, not the nearest number")
+      (is (str/includes? (:refused r) "embed-bge-m3") "naming the model it has no number for")
+      (is (nil? (:threshold r)) "and no threshold beside it to be read instead"))
+
+    ;; The question the plan left open, answered here. With no embedder the
+    ;; DEFAULT model name still resolves and happens to be calibrated, so the
+    ;; bare lookup would answer {:threshold 0.85} for a memory in which not one
+    ;; fact has a vector and merge-similar! therefore considers nothing,
+    ;; forever. Nor is it a refusal: a refusal names the model as the reason,
+    ;; and here the model is fine and the embedder is absent. :off is the word
+    ;; loci.embed already uses for not-configured as against not-working, and
+    ;; it lets the pane report the missing embedder once instead of twice.
+    (is (= {:off true} (:merge (payload-under {})))
+        "no embedder configured is off — neither a threshold nor a refusal")))
+
+(deftest computing-the-merge-status-runs-no-merge
+  ;; This is a GET. merge-similar! is O(n²) cosines over the whole memory and
+  ;; warns once per refusal; running one to find out whether one would run
+  ;; would spend a page load on it and swallow the startup warning into a
+  ;; request that nobody is reading stderr for.
+  (let [seed  (fn [model]
+                (let [path (tmpfile)
+                      m    (mem/file-memory path)]
+                  (mold/remember m "Kepler's Third Law relates period and axis." {})
+                  (mold/remember m "The orbital period grows with distance." {})
+                  ;; identical vectors: cosine 1.0, above every calibrated
+                  ;; threshold, so a merge that ran would certainly merge
+                  (swap! (:!facts m)
+                         #(reduce-kv (fn [a k v] (assoc a k (assoc v :vec [1.0 0.0] :model model :dim 2)))
+                                     {} %))
+                  [path m]))
+        lines (fn [path] (count (str/split-lines (str/trim (slurp path)))))
+        under (fn [model f]
+                (let [{:keys [env file]} (embed-env {"LOCI_EMBED_ENDPOINT" "http://embedder.invalid/v1/embeddings"
+                                                     "LOCI_EMBED_MODEL"    model})]
+                  (with-redefs [embed/env env embed/from-file file] (f))))]
+    (let [[path m] (seed "embed-qwen3-0.6b")
+          before   (lines path)
+          p        (under "embed-qwen3-0.6b" #(srv/memory-payload m nil))]
+      (is (= {:threshold 0.85} (:merge p)))
+      (is (= before (lines path)) "nothing was appended — the pane did not merge")
+      (is (= 2 (count (mem/all-facts m))) "both facts are still there")
+      (is (every? #(nil? (:merged-from %)) (mem/all-facts m))))
+
+    (let [[_ m]  (seed "embed-bge-m3")
+          warned @@#'mem/!warned
+          err    (java.io.StringWriter.)
+          p      (binding [*err* err] (under "embed-bge-m3" #(srv/memory-payload m nil)))]
+      (is (string? (:refused (:merge p))))
+      (is (= warned @@#'mem/!warned)
+          "the once-only refusal warning was not consumed by a page load")
+      (is (= "" (str err)) "nor printed into a request"))))
+
+;; ============================================================================
 ;; memory scoped to one notebook's lineage (/api/memory?space=…)
 ;; ============================================================================
 

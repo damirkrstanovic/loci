@@ -1583,6 +1583,19 @@
    embedder configured every fact is awaiting one forever, and a count with no
    model beside it reads like a backlog rather than an unconfigured feature.
 
+   `:merge` is `mem/merge-status` — always present, always a map, one of
+   `{:threshold t}`, `{:refused \"…\"}` or `{:off true}`. Without it a switch to
+   an uncalibrated embedding model stops deduplication with one line on stderr
+   at startup and nothing in the app that ever says so again. It is a lookup in
+   the threshold table, not a merge: this is a GET.
+
+   `:degraded` is the opposite shape on purpose — **absent** when nothing is
+   wrong, rather than present and nil. Its value exists only when the embedder
+   was asked something and did not answer, and a key that is always there and
+   usually empty is what makes `if (p.degraded)` and `if ('degraded' in p)`
+   disagree in the shell that reads it. `:merge` can be unconditional because it
+   always has something true to say and its value is always a map.
+
    `scope` is nil or `{:space id :sources #{id …}}` from `lineage-sources`. Nil
    is the whole memory and the response is exactly what it has always been —
    same keys, same `recall` opts — because every caller that exists today passes
@@ -1601,7 +1614,8 @@
                 :else   (mem/all-facts m))]
      (cond-> {:facts     (mapv #(dissoc % :vec) hits)
               :awaiting  (count (mem/pending-facts m))
-              :embedding (when (embed/embedding-configured?) (embed/embed-model))}
+              :embedding (when (embed/embedding-configured?) (embed/embed-model))
+              :merge     (mem/merge-status)}
        ;; recall marks itself degraded when it asked the embedder something and
        ;; did not get an answer; saying so is cheaper than a pane that silently
        ;; shows fewer results than it did yesterday.
