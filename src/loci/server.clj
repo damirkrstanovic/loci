@@ -1087,51 +1087,82 @@
   (into (descendant-sources st space) (ancestor-sources st space)))
 
 (defn subject-set
-  "The subjects a recall in this notebook is about: the names detected in
-   `prompt`, plus every name already carried by a fact in `sources`.
+  "The subjects a recall in this notebook is about — **two sets, not one**:
 
-   The second half is what makes a notebook that has been working on something
-   keep reaching the rest of what is known about it; the first is what makes a
-   BRAND-NEW notebook work, which is the reported case — ask about the game
-   anywhere, and the game's facts come back.
+     {:scope #{name …}   what may be a candidate   → :filter {:entities …}
+      :score #{name …}}  what raises a candidate   → :subjects
 
-   **`sources` nil contributes NOTHING to the second half**, and that is a
-   decision, not a fallthrough. The obvious spelling —
+   `recall`'s own comment (`loci.memory`, at the `opts:` note) says it plainly:
+   \":subjects SCORES, :filter {:entities} SCOPES, and they are separate on
+   purpose.\" Handing one value to both collapses that distinction, and the
+   collapse is not cosmetic — it is measurable and it defeats the feature. See
+   below.
+
+   **`:scope`** is the design's subject set: the names detected in `prompt`,
+   plus every name a fact in this lineage already carries. It decides which
+   facts OUTSIDE the lineage are eligible at all; facts inside are eligible
+   already, through `:sources`.
+
+   **`:score`** is `:scope` minus the names that only this lineage has ever
+   carried. A lineage-only name can never widen anything — nothing outside
+   carries it, by definition — so all it can do is score the local facts, and
+   `relevance`'s entity half is a *ratio*: a name in the subject set that a
+   local fact carries makes that fact's entity half 1.0, a flat 0.4 of
+   relevance, with no reference to the question at all.
+
+   Measured on the live shape — the `space:semis` hub holding six ordinary
+   findings, asking `chips`, which names no entity. The one-set version puts
+   ten names in `:subjects`; all nine candidates then score **exactly 0.4000**,
+   and the top 6 is six of this notebook's own facts (board approvals, export
+   permits, prices, yields, rainfall). The fact the union exists to deliver and
+   the notebook's own CHILD's fact are both pushed out — the union does not
+   lose on merit, it ties and loses the tie-break to recency. **At the live
+   corpus's shape — `space:semis` and its six children hold 56 of 80 facts —
+   it would deliver nothing, ever.** With `:score` restricted, `:subjects` is
+   one name (`asml`), the bridge fact scores 0.4000, the child's 0.1333, and
+   the six findings score 0.0000 and are dropped.
+
+   A known, accepted inversion: the ratio asks \"how much of this fact is about
+   what you asked\", so a REMOTE fact carrying only `asml` (0.4000) outranks a
+   LOCAL one carrying `asml` and `euv` (0.1333). Defensible — the first fact is
+   wholly on subject — and more evidence for the plan's open question about
+   within-fact ratio versus global rarity, which is Task 12's to settle and not
+   this function's.
+
+   **`sources` nil makes both sets exactly what the prompt names**, and that is
+   a decision rather than a fallthrough. The obvious spelling —
    `(if sources (filter …) all)` — reads \"no scope means everything is mine\",
-   which is right for a *filter* and wrong for a *subject*: it returns every
-   name in the corpus, and `relevance` scores the entity half as the (rarity
-   weighted) fraction of a fact's names that the subject set contains. With
-   every name in it, that fraction is 1.0 for every fact carrying any name at
-   all and 0.0 for the rest — the half stops discriminating, and a fact with
-   nothing to do with the question scores 0.4 where it used to score 0.
+   which is right for a *filter* and wrong for a *subject*: it puts every name
+   in the corpus into `:subjects`, so the entity half is 1.0 for every fact
+   carrying any name and 0.0 for the rest, and stops discriminating. It is not
+   a superset of the right answer, it displaces it: `server_test`'s
+   `the-subject-set-of-the-WHOLE-memory-is-still-only-the-prompt` pins the
+   difference. There is nothing to buy in exchange — no `:filter` is added on
+   the unscoped path, so the candidate set is the whole memory either way, and
+   the prompt half already carries the multi-word name `:subjects` exists for.
 
-   Measured, on a ten-fact corpus of the live shape, asking `how long is Wrath
-   of the Righteous?` with no notebook open: the fix returns the answer first
-   (`A full playthrough takes roughly 120 hours.`, 0.400). The `all` version
-   drops that fact **out of the top 6 entirely** and leads with `The long series
-   is published quarterly.` (0.580) — a fact about Serbian statistics that
-   shares the words `the`, `long` and `is` and now collects a flat 0.4 for
-   carrying any name at all. It is not a superset of the right answer; it
-   displaces it.
+   One `all-facts` pass and one partition of it, because this runs before every
+   agent turn and `recall` is about to walk the same facts again.
 
-   There is nothing to buy in exchange: no `:filter` is added on the unscoped
-   path, so the candidate set is the whole memory either way, and the prompt
-   half already carries the multi-word name `:subjects` exists for. The design
-   says \"entities of facts already in THIS LINEAGE\"; with no notebook there is
-   no lineage.
-
-   Names come back normalized and non-blank — `ent/detect` guarantees it for its
-   half, and this filters the other half, which reads `:entities` off facts
-   exactly as the distiller's JSON left them and so can hand back `\"\"`.
+   Names come back normalized and non-blank — `ent/detect` guarantees it for
+   the prompt half, and `names-of` filters the fact halves, which read
+   `:entities` exactly as the distiller's JSON left them and so can yield `\"\"`.
 
    Public so a test can call it without going through an LLM."
   [m sources prompt]
-  (let [all   (mem/all-facts m)
-        names (set (keys (ent/index all)))
-        mine  (when sources (filter #(mem/in-sources? sources %) all))]
-    (into (ent/detect names prompt)
-          (comp (mapcat :entities) (map ent/normalize) (remove str/blank?))
-          mine)))
+  (let [all      (mem/all-facts m)
+        detected (ent/detect (set (keys (ent/index all))) prompt)
+        names-of (fn [fs] (into #{} (comp (mapcat :entities)
+                                          (map ent/normalize)
+                                          (remove str/blank?))
+                                fs))
+        ;; nil, not {}, when there is no lineage — both halves below then read
+        ;; nil and contribute nothing, which is the unscoped rule above.
+        {mine true theirs false} (when sources (group-by #(mem/in-sources? sources %) all))
+        lineage   (names-of mine)
+        elsewhere (names-of theirs)]
+    {:scope (into detected lineage)
+     :score (into detected (filter elsewhere) lineage)}))
 
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
@@ -1166,13 +1197,21 @@
    offer each other anything. That cost is what this fixes, and the old
    paragraph is gone rather than kept beside this one, so nothing here reads as
    still live when it is not. Candidates are now the lineage's facts UNION the
-   facts sharing a subject with `subject-set`, and the subject set is named in
-   BOTH `:filter {:entities}` and `:subjects` on purpose: the first makes an
-   unrelated root's fact *eligible*, the second makes it *rank*. Naming it in
-   only one is the quiet failure `recall`'s own comment describes.
+   facts sharing a subject with them, and `subject-set` returns TWO sets for the
+   two jobs: `:scope` makes an unrelated root's fact *eligible*
+   (`:filter {:entities}`), `:score` makes it *rank* (`:subjects`). Passing one
+   set to both is the defect this shape exists to prevent — `subject-set`'s
+   docstring has the measurement.
 
-   `k` stays 6 and the ranking is unchanged, so **a cross-notebook fact must
-   out-score a local one to appear** — the block does not grow, it competes.
+   `k` stays 6 and the ranking is unchanged, so the block does not grow: it
+   competes. What earns a place in it is overlap with the QUESTION — the words
+   of the prompt, and the names the prompt or the world outside this notebook
+   shares with the fact. A name only this lineage has ever used earns nothing,
+   which is what keeps six ordinary local findings from taking all six slots
+   at an identical score. (An earlier draft of this paragraph said \"a
+   cross-notebook fact must out-score a local one to appear.\" True, and empty:
+   measured, it did not out-score them, it TIED with them at 0.4000 and lost
+   the tie-break to recency, every time.)
 
    Cost: one extra pass over the whole memory per agent turn (`all-facts` plus
    `ent/index`), which `recall` then rebuilds for itself. Measured, mean of 300,
@@ -1184,9 +1223,9 @@
    sequence, and that is a seam worth 0.23 ms not to open."
   [st prompt space]
   (let [sources (when (and space (sub/object st space)) (lineage-sources st space))
-        subs    (subject-set @mem/memory sources prompt)
-        opts    (cond-> {:k 6 :semantic? true :subjects subs}
-                  sources (assoc :filter {:sources sources :entities subs}))
+        {:keys [scope score]} (subject-set @mem/memory sources prompt)
+        opts    (cond-> {:k 6 :semantic? true :subjects score}
+                  sources (assoc :filter {:sources sources :entities scope}))
         facts (try (mold/recall @mem/memory prompt opts)
                    (catch Exception _ nil))]
     (when (seq facts)

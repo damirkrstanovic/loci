@@ -2175,49 +2175,123 @@
   "Facts carrying real `:entities`, worded so each assertion below can pass for
    exactly one reason.
 
-   Every fact recalled by subject here shares **not one token** with the prompt
-   that reaches it. That is the whole design of this fixture: `relevance` is
+   Neither fact recalled BY SUBJECT here shares one token with the prompt that
+   reaches it. That is the point of the wording: `relevance` is
    `0.6·keywords + 0.4·entities`, so a fact with a word in common would score on
-   the keyword half alone and the test would stay green with every line of the
-   subject machinery deleted. `lineage-memory` above cannot be reused for the
-   same reason — its six facts all say \"chips\", which is what makes it a good
+   the keyword half alone and the assertion would stay green with every line of
+   the subject machinery deleted. `lineage-memory` above cannot be reused for
+   the same reason — its six facts all say \"chips\", which makes it a good
    fixture for a *filter* and a useless one for a *subject*.
 
-   The Serbia fact is the negative control and DOES share tokens with the game
-   prompt (`the`, `long`, `is`): it is excluded because it carries no subject in
-   the set, and if a leak ever made it a candidate it would score and show up."
+   **The six findings in `space:semis` are the reason this fixture is twelve
+   facts and not five.** They are perfectly ordinary notebook contents, they
+   carry names nothing outside the lineage has ever used, and with fewer than
+   `k`=6 candidates a test cannot see what they do: under a subject set that
+   scores lineage-only names, all six take an identical 0.4000 and fill the
+   whole block, pushing out both the fact the union exists to deliver and the
+   notebook's own child's. A test with three candidates and six slots passes
+   either way, which is certifying rather than testing.
+
+   Their token counts are deliberately all different (8, 7, 5, 6, 9, 10) and
+   none of them contains `of`, `is`, `long`, `how`, `wrath` or `righteous`, so
+   each scores a distinct keyword jaccard against the game prompt and no
+   assertion below depends on how a tie is broken.
+
+   The Serbia fact is the negative control: it shares three of the game
+   prompt's tokens (`the`, `long`, `is`) and would rank THIRD if it were ever a
+   candidate, so its absence is a competitive exclusion and not an artefact of
+   `k`. It is in neither the lineage nor the subject set.
+
+   Written lineage-last so the six findings are the NEWEST facts: recency is the
+   tie-break, and a fixture where the flattening's victims happen to be newer
+   would hide it."
   []
   (let [m (mem/file-memory (tmpfile))]
     (doseq [[nb obj txt ents]
-            [["space:semis" "find:semis-1" "Fabrication concentrates in Taiwan."         ["TSMC" "Taiwan"]]
-             ["space:kid"   "find:kid-1"   "One vendor ships every scanner."             ["EUV" "ASML"]]
-             ["space:econ"  "find:econ-1"  "A full playthrough takes roughly 120 hours." ["Wrath of the Righteous"]]
+            [["space:econ"  "find:econ-1"  "A full playthrough takes roughly 120 hours." ["Wrath of the Righteous"]]
+             ["space:econ"  "find:econ-1"  "Mythic paths branch at the third act."       ["Wrath of the Righteous" "Pathfinder"]]
              ["space:econ"  "find:econ-1"  "The long series is published quarterly."     ["Serbia"]]
-             ["space:econ"  "find:econ-1"  "Fewer than sixty units ship a year."         ["ASML"]]]]
+             ["space:econ"  "find:econ-1"  "Fewer than sixty units ship a year."         ["ASML"]]
+             ["space:kid"   "find:kid-1"   "One vendor ships every scanner."             ["EUV" "ASML"]]
+             ["space:semis" "find:semis-1" "Fabrication concentrates on one island."     ["TSMC" "Taiwan"]]
+             ;; the six ordinary findings — lineage-only names, all of them
+             ["space:semis" "find:semis-1" "Output fell by two percent over the quarter."         ["output"]]
+             ["space:semis" "find:semis-1" "Rainfall was unusually heavy through the summer."     ["rainfall"]]
+             ["space:semis" "find:semis-1" "Yields improved after the retool."                    ["yield"]]
+             ["space:semis" "find:semis-1" "Prices doubled through the spring quarter."           ["price"]]
+             ["space:semis" "find:semis-1" "Export permits were renewed in the autumn without incident." ["export permits"]]
+             ["space:semis" "find:semis-1" "Board members approved the new campus on its northern edge." ["campus"]]]]
       (mold/remember m txt {:entities ents :source {:obj obj :space nb}}))
     m))
 
 (def ^:private game-prompt "how long is Wrath of the Righteous?")
 
+(defn- lineage-only-findings
+  "The six ordinary `space:semis` findings, by text. Named once so a test can
+   say \"none of these\" without listing them and quietly listing five."
+  []
+  ["Output fell by two percent over the quarter."
+   "Rainfall was unusually heavy through the summer."
+   "Yields improved after the retool."
+   "Prices doubled through the spring quarter."
+   "Export permits were renewed in the autumn without incident."
+   "Board members approved the new campus on its northern edge."])
+
+(defn- remembered-lines
+  "The fact lines of a REMEMBERED block, in order, bullet stripped. nil for no
+   block at all, so \"nothing was recalled\" and \"an empty block was built\"
+   stay different answers."
+  [ctx]
+  (when ctx
+    (into [] (keep #(when (str/starts-with? % "- ") (subs % 2)))
+          (str/split-lines ctx))))
+
+(def ^:private semis-names
+  "Every name the `space:semis` lineage carries — its own findings and its
+   child's. All but `asml` are used nowhere else in the corpus."
+  #{"tsmc" "taiwan" "euv" "asml"
+    "output" "rainfall" "yield" "price" "export permits" "campus"})
+
 (deftest subject-set-in-an-empty-notebook-is-exactly-what-the-prompt-names
   (let [st (subject-fixture)
         m  (subject-memory)
         in (fn [space prompt] (srv/subject-set m (srv/lineage-sources st space) prompt))]
-    (is (= #{"wrath of the righteous"} (in "space:new" game-prompt))
-        "a multi-word name the corpus knows, detected in the prompt and normalized")
-    (is (= #{} (in "space:new" "how long is this going to take"))
+    (is (= {:scope #{"wrath of the righteous"} :score #{"wrath of the righteous"}}
+           (in "space:new" game-prompt))
+        "a multi-word name the corpus knows, detected in the prompt and normalized — and with no lineage the two sets have nothing to differ about")
+    (is (= {:scope #{} :score #{}} (in "space:new" "how long is this going to take"))
         "and a prompt naming nothing, in a notebook holding nothing, is no subject at all")))
 
-(deftest subject-set-adds-every-name-this-lineage-already-carries
+(deftest the-scope-set-takes-every-name-this-lineage-carries
+  ;; :scope is §5's subject set unchanged — it decides who may be a CANDIDATE
   (let [st (subject-fixture)
         m  (subject-memory)
-        in (fn [space prompt] (srv/subject-set m (srv/lineage-sources st space) prompt))]
-    (is (= #{"tsmc" "taiwan" "euv" "asml" "wrath of the righteous"} (in "space:semis" game-prompt))
-        "the prompt's name PLUS the names its own notebook and its child already carry")
-    (is (= #{"tsmc" "taiwan" "euv" "asml"} (in "space:semis" "chips"))
-        "…and with a prompt naming nothing, exactly the lineage's own names — this half is what makes a notebook that has been working on something keep reaching it")
-    (is (= #{"wrath of the righteous" "serbia" "asml"} (in "space:econ" game-prompt))
+        in (fn [space prompt] (:scope (srv/subject-set m (srv/lineage-sources st space) prompt)))]
+    (is (= (conj semis-names "wrath of the righteous") (in "space:semis" game-prompt))
+        "the prompt's name PLUS every name its own notebook and its child already carry")
+    (is (= semis-names (in "space:semis" "chips"))
+        "…and with a prompt naming nothing, exactly the lineage's own names")
+    (is (= #{"wrath of the righteous" "pathfinder" "serbia" "asml"} (in "space:econ" game-prompt))
         "the other root reads its own facts' names and none of semis'")))
+
+(deftest the-score-set-drops-the-names-only-this-lineage-has-ever-used
+  ;; THE FIX. :subjects SCORES, and `relevance`'s entity half is a ratio, so a
+  ;; name no fact outside this lineage carries cannot widen anything — it can
+  ;; only hand every local fact that carries it a flat 0.4 with no reference to
+  ;; the question. Ten names in :subjects is how six ordinary findings come to
+  ;; tie at 0.4000 and take the whole block.
+  (let [st (subject-fixture)
+        m  (subject-memory)
+        in (fn [space prompt] (:score (srv/subject-set m (srv/lineage-sources st space) prompt)))]
+    (is (= #{"asml"} (in "space:semis" "chips"))
+        "ONE name, not ten: `asml` is the only thing semis has in common with the world outside it, so it is the only lineage name that can raise anything")
+    (is (= #{"asml" "wrath of the righteous"} (in "space:semis" game-prompt))
+        "the prompt's name is always in — it is the question, not a habit of this notebook")
+    (is (= #{"asml" "wrath of the righteous"} (in "space:econ" game-prompt))
+        "and symmetrically from the other root: `pathfinder` and `serbia` are econ's alone")
+    (is (not-any? (in "space:semis" game-prompt)
+                  #{"output" "rainfall" "yield" "price" "export permits" "campus"})
+        "no lineage-only name reaches the scorer, which is the whole of the fix")))
 
 (deftest the-subject-set-of-the-WHOLE-memory-is-still-only-the-prompt
   ;; DELIBERATE DEVIATION from the plan's draft, which read
@@ -2239,9 +2313,10 @@
   ;; LINEAGE" and with no notebook there is no lineage, so the honest reading is
   ;; the empty contribution.
   (let [m (subject-memory)]
-    (is (= #{"wrath of the righteous"} (srv/subject-set m nil game-prompt))
+    (is (= {:scope #{"wrath of the righteous"} :score #{"wrath of the righteous"}}
+           (srv/subject-set m nil game-prompt))
         "no scope → the lineage half contributes nothing, not everything")
-    (is (= #{} (srv/subject-set m nil "how long is this going to take")))))
+    (is (= {:scope #{} :score #{}} (srv/subject-set m nil "how long is this going to take")))))
 
 (defn- recall-spy-over
   "A `recall-spy` that still answers `all-facts` from a real memory `m`.
@@ -2279,11 +2354,24 @@
             :subjects #{"wrath of the righteous"}
             :filter {:sources #{"space:new"} :entities #{"wrath of the righteous"}}}
            (recall-opts st m game-prompt "space:new"))
-        "BOTH keys: :filter to make the other root's fact eligible, :subjects to make it rank — naming it in only one of the two is the quiet failure `recall`'s own comment warns about")
-    ;; and from a notebook with a history, the lineage's names ride along
+        "BOTH keys: :filter to make the other root's fact eligible, :subjects to make it rank — naming it in only one of the two is the quiet failure `recall`'s own comment warns about")))
+
+(deftest the-two-subject-sets-reach-recall-as-two-different-values
+  ;; The defect this shape exists to prevent is passing ONE set to both. From a
+  ;; notebook with a history the sets genuinely differ — ten names may be
+  ;; candidates, two may raise one — and this is the assertion that would go red
+  ;; the moment they were collapsed back together.
+  (let [st   (subject-fixture)
+        m    (subject-memory)
+        opts (recall-opts st m game-prompt "space:semis")]
     (is (= {:sources (srv/lineage-sources st "space:semis")
-            :entities #{"tsmc" "taiwan" "euv" "asml" "wrath of the righteous"}}
-           (:filter (recall-opts st m game-prompt "space:semis"))))))
+            :entities (conj semis-names "wrath of the righteous")}
+           (:filter opts))
+        ":filter {:entities} SCOPES — §5's subject set, every name this lineage carries")
+    (is (= #{"asml" "wrath of the righteous"} (:subjects opts))
+        ":subjects SCORES — and only what can raise something the notebook does not already have")
+    (is (not= (:subjects opts) (:entities (:filter opts)))
+        "two jobs, two values; `loci.memory`'s own opts comment says they are separate on purpose")))
 
 (deftest with-no-notebook-recall-still-asks-for-no-filter-at-all
   (let [st (subject-fixture)
@@ -2295,26 +2383,76 @@
 (deftest asking-about-a-subject-anywhere-brings-the-subjects-facts-back
   ;; THE REPORTED CASE, and the paragraph `remembered-context` used to accept as
   ;; a cost: `space:new` shares no lineage with `space:econ` and never will.
-  (let [st  (subject-fixture)
-        m   (subject-memory)
-        ctx (str (remembered st m game-prompt "space:new"))]
-    (is (str/includes? ctx "A full playthrough takes roughly 120 hours. (⌾ find:econ-1)")
-        "a fact from an unrelated root, reached by shared subject and cited as always")
-    (is (not (str/includes? ctx "The long series is published quarterly."))
-        "…and NOT the fact beside it, which shares three of the prompt's words and no subject — the union widens on subject, it does not open the door")))
+  ;;
+  ;; Asserted as the WHOLE block, in order, rather than as three `includes?`
+  ;; calls: what matters here is not only that the game's facts arrive but that
+  ;; nothing else does, and a membership test cannot say that.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= ["A full playthrough takes roughly 120 hours. (⌾ find:econ-1)"
+            "Mythic paths branch at the third act. (⌾ find:econ-1)"]
+           (remembered-lines (remembered st m game-prompt "space:new")))
+        "both of the other root's facts about the game, best first, cited as always — and NOTHING else out of twelve, in particular not `The long series is published quarterly.`, which shares three of the prompt's words and would rank second if the subject union had opened the door instead of widening it")))
 
 (deftest a-notebook-that-has-been-working-on-something-keeps-reaching-it
-  ;; the LINEAGE half of the subject set: the prompt names nothing, so the only
-  ;; way `space:econ`'s ASML fact can reach `space:semis` is through the names
-  ;; semis' own facts already carry.
-  (let [st  (subject-fixture)
-        m   (subject-memory)
-        ctx (str (remembered st m "chips" "space:semis"))]
-    (is (str/includes? ctx "Fewer than sixty units ship a year.")
-        "another root's fact about ASML, reached because this lineage is already about ASML")
-    (is (str/includes? ctx "One vendor ships every scanner.") "its own child's, still")
-    (is (not (str/includes? ctx "The long series is published quarterly."))
-        "and still not a fact whose subject this lineage has never touched")))
+  ;; the LINEAGE half: the prompt names nothing, so the only way `space:econ`'s
+  ;; ASML fact can reach `space:semis` is through a name semis' own facts carry.
+  ;;
+  ;; This is the test the six ordinary findings exist for. They are IN the
+  ;; lineage, so they are candidates either way; the question is whether they
+  ;; score. Under a subject set that scores lineage-only names they all take
+  ;; 0.4000, tie with the bridge fact, and win on recency — the block becomes
+  ;; six notes about rainfall and board approvals, and BOTH assertions below
+  ;; flip. With `:score` restricted they score 0.0000 and are dropped.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= ["Fewer than sixty units ship a year. (⌾ find:econ-1)"     ; 0.4000, entities {asml}
+            "One vendor ships every scanner. (⌾ find:kid-1)"]         ; 0.1333, entities {asml euv}
+           (remembered-lines (remembered st m "chips" "space:semis")))
+        "another root's fact about ASML because this lineage is already about ASML, then its own child's — and not one of the six findings this notebook also holds")))
+
+(deftest a-remote-fact-wholly-on-subject-outranks-a-local-one-partly-on-it
+  ;; RECORDED, NOT FIXED. `relevance`'s entity half is a within-fact ratio, so
+  ;; it asks "how much of this fact is about what you asked" — the remote fact
+  ;; carrying only `asml` scores 0.4000 and the local one carrying `asml` and
+  ;; `euv` scores 0.1333. Defensible, and the ordering above depends on it, so
+  ;; it is pinned here where a reader will find it rather than left implicit.
+  ;;
+  ;; It is also evidence for the plan's OPEN question — within-fact ratio versus
+  ;; a global rarity factor — which is Task 12's to settle. If that changes,
+  ;; this test is the one that should be argued with, not quietly updated.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= "Fewer than sixty units ship a year. (⌾ find:econ-1)"
+           (first (remembered-lines (remembered st m "chips" "space:semis"))))
+        "the REMOTE fact leads, because all of it is about the name that matched")))
+
+(deftest a-fact-overlapping-on-neither-half-stays-out-of-a-FULL-block
+  ;; §8 asked for this and nothing pinned it: a fact in neither the lineage nor
+  ;; the subject set must stay out. Asserted with the block SATURATED — ten
+  ;; facts score above zero and `k` is 6 — so the exclusion is competitive and
+  ;; not an artefact of there being room for everything.
+  ;;
+  ;; `The long series is published quarterly.` shares `the`, `long` and `is`
+  ;; with the prompt and would score 0.18, third of the block, displacing
+  ;; `Prices doubled through the spring quarter.` at 0.05. It is excluded
+  ;; because its only name is `serbia`, which `space:semis` has never touched.
+  (let [st    (subject-fixture)
+        m     (subject-memory)
+        lines (remembered-lines (remembered st m game-prompt "space:semis"))]
+    (is (= 6 (count lines)) "the block is full — `k` is not hiding anything")
+    ;; a SET, not a vector: the two facts at 0.4000 tie exactly, and which of
+    ;; them leads is decided by a sub-millisecond difference in `decay`. The
+    ;; membership is the claim; that particular order is not.
+    (is (= #{"A full playthrough takes roughly 120 hours. (⌾ find:econ-1)"      ; 0.4000  subject
+             "Fewer than sixty units ship a year. (⌾ find:econ-1)"             ; 0.4000  subject
+             "Mythic paths branch at the third act. (⌾ find:econ-1)"           ; 0.1795  subject
+             "One vendor ships every scanner. (⌾ find:kid-1)"                  ; 0.1333  lineage
+             "Yields improved after the retool. (⌾ find:semis-1)"              ; 0.0545  lineage, one word
+             "Prices doubled through the spring quarter. (⌾ find:semis-1)"}    ; 0.0500  lineage, one word
+           (set lines)))
+    (is (not-any? #(str/includes? % "The long series is published quarterly.") lines)
+        "the fact with no overlap on EITHER half is out, though it would have ranked third of six")))
 
 (deftest an-empty-notebook-with-a-subjectless-prompt-still-brings-nothing
   ;; unchanged, and the state a brand-new notebook is normally in
@@ -2322,4 +2460,4 @@
         m  (subject-memory)]
     (is (nil? (remembered st m "how long is this going to take" "space:new"))
         "no lineage facts and no name in the prompt → no candidates, no REMEMBERED block")
-    (is (= 5 (count (mem/all-facts m))) "…while memory itself is full")))
+    (is (= 12 (count (mem/all-facts m))) "…while memory itself is full")))
