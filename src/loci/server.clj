@@ -1497,6 +1497,129 @@
                (reduce max 0))]
     (str prefix (inc n))))
 
+;; ---- materializing an entity: the one action on the entity page ----
+;;
+;; ONE global monitor, which is the opposite of `notebook-locks` above and
+;; deliberately so. What is serialised here is not one entity's cell vector but
+;; `next-id`, a read of the WHOLE store's keys: a per-name lock would let two
+;; different names mint the same `ent:1` and the second `:put` would silently
+;; replace the first — one object for two names, and a user taken to a notebook
+;; about somebody else's subject. Measured before this lock: 8 concurrent
+;; materializations of 8 different names left 3, 3 and 4 entity objects over
+;; three runs — 8 commits every time, each one overwriting the last, so the log
+;; says the work happened and the world says it did not. Measured on the EDN
+;; store, where `commit!` is one `swap!`; Datalevin's takes a lock and writes,
+;; which only widens the window.
+;;
+;; It also makes "materializing twice mints nothing" true rather than nearly
+;; true. Check-then-commit is a read-modify-write, and two clicks on one name
+;; are a plain TOCTOU race without it; two objects for one name is exactly what
+;; `entity-objects` calls a coin toss.
+;;
+;; Contention is one click on a modal against another click on a modal, so there
+;; is nothing to gain by being clever here and a whole class of loss by being
+;; wrong. `locking` is a monitor and not a distributed lock — loci is a single
+;; process, which is the whole scope of the problem; a second server against the
+;; same store would still race, exactly as `notebook-op!` records.
+(defonce ^:private materialize-lock (Object.))
+
+(defn- about-notebook
+  "The id of the notebook that is about `eid` — one whose cells reference it — or
+   nil, out of an objects map already in hand.
+
+   **The lexicographically least id wins, and nil is a real answer.**
+
+   Least id because `vals` of an objects map is hash order: with no rule at all,
+   an entity held by two notebooks would be answered with one of them
+   arbitrarily and nothing in the log would explain which. The same rule and the
+   same reason as `entity-objects`' duplicate tie-break, and like that one it
+   deliberately does not parse the id — preferring a `space:about-` id would make
+   this the second place that believes something about how notebook ids are
+   minted.
+
+   nil because an entity can genuinely have no notebook: the cell is an ordinary
+   cell and can be removed, the notebook is an ordinary object and can be
+   deleted, and `undo!` can pop the very commit that made both while an *older*
+   materialization of the same name survives. The caller ships the nil rather
+   than hiding the key, so a shell can open the entity object instead of trying
+   to enter nothing."
+  [objm eid]
+  (->> (vals objm)
+       (keep #(when (and (= :space (:kind %)) (contains? (nb/refs-of %) eid)) (:id %)))
+       sort
+       first))
+
+(defn materialize-entity!
+  "POST /api/entity-notebook {\"name\": \"tsmc\"} — the entity becomes a citizen.
+
+   ONE `:tx`: the `:entity` object carrying the normalized name, the notebook
+   about it, and the cell that puts one in the other. `undo!` pops one commit, so
+   the gesture is reversed whole. Two `commit!`s would need two undos, and the
+   state between them — a notebook about an entity that no longer exists — is one
+   the shell has no way to draw and nobody asked for.
+
+   **No fact is touched, and no fact learns this object's id.** A fact references
+   the identity — the normalized name — so undoing this returns the entity to
+   being a projection with nothing left dangling. That is the whole reason the
+   model is derived, and it is the invariant to protect in review. Today the
+   argument list enforces it: this function is never handed the memory, so it
+   *cannot* rewrite a fact. Keep it that way; the day it takes a memory is the
+   day the invariant becomes a convention.
+
+   Materializing an already-materialized name is not an error and mints nothing:
+   it answers with the object that is already there. The page is reached by name,
+   and two objects for one name would make `entity-object` a coin toss. It does
+   NOT mint a fresh notebook when the old one is gone either — the gesture is
+   reached from a modal the shell only draws for an unmaterialized name (Task 8
+   opens the object directly when the payload carries one), so this branch is a
+   stale click or a race, and answering it by spawning a notebook per stale click
+   is a worse failure than answering `nil`.
+
+   The payload, which is the contract Task 8 draws against:
+
+     :entity   the object id. Always present — the entity is a citizen either way.
+     :spaceId  the notebook to enter, or **nil**. The key is always there; nil
+               means there is no notebook about this and the shell should open
+               `:entity` instead. See `about-notebook`.
+     :state    always, including on the branch that committed nothing. That
+               branch is reached precisely when the client's world is stale —
+               someone else materialized this name, or this client's own earlier
+               POST landed and the reply was lost — so \"nothing changed\" is
+               true of the store and false of the caller. The cost is one walk
+               over every object plus one fold over the whole log for recency,
+               measured beside `state-payload` itself at 2.2 ms on a 3003-event
+               log (cheaper on Datalevin, where the objects map is already
+               materialized and only the recency fold remains). Omitting it
+               would buy that back by making the shell branch on which of two
+               shapes it got — a worse trade for a gesture that happens on a
+               click.
+
+   `nm`, not `name`: a local called `name` shadows `clojure.core/name`, which
+   nothing here happens to need today and which the next edit to this function
+   would find missing for no visible reason. `entity-payload` renamed for the
+   same reason."
+  [st name*]
+  (let [nm (ent/normalize name*)]
+    (if (str/blank? nm)
+      {:error "no entity name given"}
+      ;; Nothing but the reads and the commit is inside the monitor — the payload
+      ;; is built after it, and no agent call or other I/O may move in.
+      (let [[eid sid]
+            (locking materialize-lock
+              (let [objm (sub/objects st)]
+                (if-let [o (get (entity-objects objm) nm)]
+                  [(:id o) (about-notebook objm (:id o))]
+                  (let [eid  (next-id st "ent:")
+                        sid  (next-id st "space:about-")
+                        eobj {:id eid :kind :entity :title nm :value {:name nm}}
+                        sobj {:id sid :kind :space :title nm
+                              :value {:intent (str "everything about " nm)
+                                      :cells [{:ref eid}]}}]
+                    (sub/commit! st {:op :tx :events [{:op :put :id eid :value eobj}
+                                                      {:op :put :id sid :value sobj}]})
+                    [eid sid]))))]
+        {:state (state-payload st) :entity eid :spaceId sid}))))
+
 (defn keep-note! [st space title text]
   (let [sp  (sub/object st space)
         nid (next-id st (str "note:" (subs space (inc (str/index-of space ":"))) "-"))]
@@ -2027,6 +2150,11 @@
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
       (= uri "/api/entity")  (json-resp (entity-payload st @mem/memory (params "name")))
+      ;; `{nm :name}` and not `{:keys [name]}`: a local called `name` shadows
+      ;; `clojure.core/name` for the rest of this branch, in a `cond` where the
+      ;; branch above it is one edit away from needing it.
+      (= uri "/api/entity-notebook")(let [{nm :name} (body-json req)]
+                                      (json-resp (materialize-entity! st nm)))
       (= uri "/api/memory-unmerge")(let [{:keys [survivor absorbed]} (body-json req)]
                                      (json-resp (memory-unmerge! @mem/memory survivor absorbed)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]

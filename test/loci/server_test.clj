@@ -6,6 +6,7 @@
             [loci.agent :as agent]
             [loci.content :as c]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -2811,3 +2812,201 @@
     (is (= 50 (count (:facts p))) "…of which the page ships fifty")
     (is (< (count (:facts p)) (:count p))
         "the two numbers differ, and a renderer has everything it needs to say so")))
+
+;; ============================================================================
+;; materialization — one object, one notebook, one undo
+;; ============================================================================
+
+(defn- entity-objects-in
+  "Every `:kind :entity` object in the store, by id. The store is the only place
+   that can answer \"how many objects claim this name\", and that count is what
+   separates \"materializing twice mints nothing\" from \"materializing twice
+   happens to answer the same id\"."
+  [st]
+  (into {} (filter #(= :entity (:kind (val %)))) (sub/objects st)))
+
+(deftest materializing-is-one-commit-and-one-undo
+  (let [st  (entity-fixture)
+        n0  (count (sub/history st))
+        r   (srv/materialize-entity! st "tsmc")
+        eid (:entity r)
+        sid (:spaceId r)]
+    (is (= (inc n0) (count (sub/history st)))
+        "ONE commit, not two — `undo!` pops one, so two would leave a notebook about an entity that no longer exists")
+    (is (= (inc n0) (:events (:state r)))
+        "…and the payload's state is the state after the write, not before it")
+    (is (= :entity (:kind (sub/object st eid))))
+    (is (= :space (:kind (sub/object st sid))))
+    (is (= #{eid} (nb/refs-of (sub/object st sid)))
+        "the cell that puts one in the other")
+    (sub/undo! st)
+    (is (= n0 (count (sub/history st))) "one undo, and the log is where it started")
+    (is (nil? (sub/object st eid)) "the entity object is gone…")
+    (is (nil? (sub/object st sid)) "…and so is the notebook — one gesture, one undo")
+    (is (empty? (entity-objects-in st)))))
+
+(deftest materialization-touches-no-fact-and-no-fact-learns-the-object-id
+  ;; THE INVARIANT. A fact references an entity by its normalized name and never
+  ;; by an object id, which is the whole reason the model is derived: `undo!` of
+  ;; a materialization returns the entity to being a projection with nothing left
+  ;; dangling. The moment a fact stores `ent:1`, undo dangles it.
+  ;;
+  ;; `materialize-entity!` is not even handed the memory, so today the invariant
+  ;; is enforced by the argument list. This asserts it anyway, because the
+  ;; argument list is one refactor from changing and this is the property that
+  ;; would silently stop holding.
+  (let [st     (entity-fixture)
+        m      (entity-memory)
+        before (vec (mem/all-facts m))]
+    (is (= 8 (count before)) "the fixture really has facts that could be rewritten")
+    (is (= 4 (count (filter #(contains? (set (map ent/normalize (:entities %))) "tsmc") before)))
+        "…four of them carrying the very name about to be materialized")
+    (let [r      (srv/materialize-entity! st "tsmc")
+          during (vec (mem/all-facts m))
+          _      (sub/undo! st)
+          after  (vec (mem/all-facts m))]
+      (is (= before during) "materializing rewrote no fact")
+      (is (= before after) "…and undoing it rewrote none back")
+      (is (= (pr-str before) (pr-str during) (pr-str after))
+          "byte-identical and not merely `=`: a fact that gained a key, or lost one, or had a value replaced by an equal-printing-differently one, compares unequal here and only here")
+      (is (not (str/includes? (pr-str after) (:entity r)))
+          (str "no fact carries " (:entity r) " — the id undo is about to make dangle"))
+      (is (not (str/includes? (pr-str after) "ent:"))
+          "…nor any other entity object id, under any key, at any depth"))))
+
+(deftest materializing-twice-mints-nothing
+  (let [st (entity-fixture)
+        a  (srv/materialize-entity! st "TSMC")
+        n1 (count (sub/history st))
+        b  (srv/materialize-entity! st "  tsmc  ")]
+    (is (= (:entity a) (:entity b)) "the object that is already there, not a second one")
+    (is (= (:spaceId a) (:spaceId b)) "…and the notebook that is already about it")
+    (is (= n1 (count (sub/history st))) "and not one event was written")
+    (is (= 1 (count (entity-objects-in st)))
+        "ONE object for one name — the page is reached BY NAME, and two objects would make `entity-object` a coin toss")))
+
+(deftest the-object-carries-the-normalized-name-whatever-was-typed
+  ;; Spelled with a non-breaking space, which is what a pasted PDF and a model's
+  ;; JSON both hand you: `ent/normalize` collapses `[\s\p{Z}]+`, so this is one
+  ;; name, and an object storing the raw string would be an entity no fact and no
+  ;; chip could ever reach.
+  (let [st (entity-fixture)
+        r  (srv/materialize-entity! st "  TSMC\u00a0Arizona ")
+        o  (sub/object st (:entity r))
+        sp (sub/object st (:spaceId r))]
+    (is (= "tsmc arizona" (get-in o [:value :name])) "the identity is the normalized name")
+    (is (= "tsmc arizona" (:title o)))
+    (is (= (:entity r) (:id o)) "and the object knows its own id")
+    (is (= (:entity r) (:id (srv/entity-object st "tsmc arizona")))
+        "…so the page reached by name finds it")
+    (is (= "tsmc arizona" (:title sp)))
+    (is (= "everything about tsmc arizona" (get-in sp [:value :intent])))
+    (is (= #{"tsmc arizona"} (srv/materialized-names st)))))
+
+(deftest a-blank-name-materializes-nothing
+  (let [st (entity-fixture)
+        n0 (count (sub/history st))]
+    (doseq [absent [nil "" "   " "\u00a0"]]
+      (is (= {:error "no entity name given"} (srv/materialize-entity! st absent))
+          (str "…for " (pr-str absent)))
+      (is (= n0 (count (sub/history st))) (str "and nothing was written for " (pr-str absent))))
+    (is (empty? (entity-objects-in st)))))
+
+(deftest a-materialized-entity-never-demotes-and-undo-returns-it-to-a-projection
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        idx (ent/index (mem/all-facts m))
+        up? (fn [] (contains? (ent/promoted idx (srv/materialized-names st)) "arizona"))]
+    (is (= 1 (count (get idx "arizona"))) "one fact — below the threshold on the evidence alone")
+    (is (false? (up?)) "so on the evidence alone it is not a place")
+    (srv/materialize-entity! st "Arizona")
+    (is (= #{"arizona"} (srv/materialized-names st)) "reported normalized, the only form `promoted` can compare")
+    (is (true? (up?)) "a materialized entity never demotes — it is yours, not the evidence's")
+    (sub/undo! st)
+    (is (= #{} (srv/materialized-names st)))
+    (is (false? (up?)) "and undo returns it to being a projection: one fact, not a place")))
+
+(deftest the-already-materialized-answer-is-honest-about-its-notebook
+  (let [st  (entity-fixture)
+        a   (srv/materialize-entity! st "tsmc")
+        sid (:spaceId a)]
+    (is (= sid (:spaceId (srv/materialize-entity! st "tsmc")))
+        "the notebook that is about it, found by its cells and not by its id's shape")
+    ;; a notebook is an ordinary object and its cells are ordinary edits — the
+    ;; user can take the entity back out of the notebook they were just given
+    (sub/commit! st (nb/set-cells-event sid []))
+    (let [b (srv/materialize-entity! st "tsmc")]
+      (is (= (:entity a) (:entity b)) "still that entity, and still nothing minted")
+      (is (contains? b :spaceId) "the key is THERE…")
+      (is (nil? (:spaceId b))
+          "…and null: there is no notebook about this any more, and a shell told `null` opens the entity object instead of entering nothing"))))
+
+(deftest two-notebooks-about-one-entity-answer-the-same-one-every-time
+  ;; `vals` of an objects map is hash order. With no rule the answer would name
+  ;; one of the two arbitrarily and nothing in the log would explain which — the
+  ;; same determinism `entity-objects` breaks its own duplicate tie for.
+  (let [st  (entity-fixture)
+        a   (srv/materialize-entity! st "tsmc")
+        eid (:entity a)]
+    (sub/commit! st {:op :put :id "space:aaa"
+                     :value {:id "space:aaa" :kind :space :title "Also about it"
+                             :value {:intent "i" :cells [{:ref eid}]}}})
+    (is (= "space:aaa" (:spaceId (srv/materialize-entity! st "tsmc")))
+        "the lexicographically least id, which is a rule and not an accident")
+    (is (apply = (repeatedly 5 #(:spaceId (srv/materialize-entity! st "tsmc"))))
+        "…and it is the same answer every time it is asked")))
+
+(deftest concurrent-materializations-mint-distinct-ids
+  ;; `next-id` reads the whole store's keys and mints from the highest suffix, so
+  ;; two materializations that both read before either commits both mint `ent:1`
+  ;; — and the second `:put` REPLACES the first. One object for two names, a user
+  ;; taken to a notebook about somebody else's subject, and an entity that was
+  ;; materialized and then silently was not. This is `nb/append-cell-event`'s
+  ;; defect in a new place: 24 concurrent appends once left 6 cells.
+  ;;
+  ;; It is also what makes "materializing twice mints nothing" true rather than
+  ;; nearly true: the check and the commit are a read-modify-write, and without
+  ;; the lock two clicks on one name are a plain TOCTOU race.
+  (let [st      (entity-fixture)
+        n0      (count (sub/history st))
+        names   (mapv #(str "subject " %) (range 8))
+        latch   (java.util.concurrent.CountDownLatch. 1)
+        results (atom [])
+        ts      (mapv (fn [n]
+                        (doto (Thread. #(do (.await latch)
+                                            (swap! results conj (srv/materialize-entity! st n))))
+                          (.start)))
+                      names)]
+    (.countDown latch)
+    (doseq [t ts] (.join t))
+    (let [ents (vals (entity-objects-in st))]
+      (is (= 8 (count ents)) "eight names, eight objects — none replaced by another")
+      (is (= (set names) (set (map #(get-in % [:value :name]) ents)))
+          "…and each object carries its own name"))
+    (is (= 8 (count (set (map :entity @results)))) "eight distinct object ids answered")
+    (is (= 8 (count (set (map :spaceId @results)))) "eight distinct notebooks answered")
+    (is (every? #(= :space (:kind (sub/object st (:spaceId %)))) @results)
+        "and every notebook a caller was sent to is really there")
+    (is (= (+ n0 8) (count (sub/history st)))
+        "eight `:tx`s on top of the fixture — one commit each, and no thread wrote twice")))
+
+(deftest the-materialize-route-answers-through-the-URL
+  ;; The route is otherwise untested, and Task 8 finds a missing one only at
+  ;; runtime. `c/store` is a delay behind an ordinary var, so rebinding it means
+  ;; the user's Datalevin store is never opened.
+  (let [st    (entity-fixture)
+        post! (fn [body]
+                (with-redefs [c/store (delay st)]
+                  (json/read-str (:body (srv/handler
+                                         {:uri "/api/entity-notebook" :request-method :post
+                                          :body (java.io.StringReader. (json/write-str body))}))
+                                 :key-fn keyword)))
+        r     (post! {:name "  TSMC "})]
+    (is (= "tsmc" (get-in (sub/object st (:entity r)) [:value :name])))
+    (is (= :space (:kind (sub/object st (:spaceId r)))))
+    (is (= (inc 4) (:events (:state r))) "the state comes back with the write in it")
+    (let [again (post! {:name "tsmc"})]
+      (is (= (:entity r) (:entity again)) "a second POST mints nothing")
+      (is (= (:spaceId r) (:spaceId again))))
+    (is (= "no entity name given" (:error (post! {}))) "a body with no name is a message, never a 500")
+    (is (= "no entity name given" (:error (post! {:name "   "}))))))
