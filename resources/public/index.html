@@ -1910,12 +1910,25 @@ q.addEventListener('input',()=>{sel=0;renderLeap();scheduleDeep();});
 q.addEventListener('keydown',e=>{
   if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,filtered.length-1);paintSel();}
   else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paintSel();}
-  // Enter searches by meaning NOW instead of waiting out the pause, and then
-  // acts. Be clear about what that is worth: every act() that acts closes the
-  // palette, which empties the box, and the staleness check then drops the deep
-  // answer — as the spec says it should. What it buys is the row that does NOT
-  // act, the `__deep__` note, where Enter is "ask again" and the answer lands.
-  else if(e.key==='Enter'){e.preventDefault();deepen(q.value.trim());act();}
+  // Enter does exactly ONE of two things, and which one depends on the row it
+  // lands on.
+  //
+  // On a `by meaning` NOTE — "the embedder is not answering", "n chunks awaiting
+  // embedding" — it re-asks the deep query. That is the one row act() refuses
+  // (`if(e.note) return`), so nothing closes the palette, the box still holds the
+  // query the answer is for, and the answer lands: the note is replaced by
+  // whatever the second ask found. Enter on a note is "ask again".
+  //
+  // On every other row it activates the row and asks NOTHING. Acting closes the
+  // palette, which empties the box, and the staleness check in deepen() then
+  // drops the answer — so asking here bought an embedding round trip and a full
+  // re-chunk of the substrate (`ch/pending`) per Enter for a response that was
+  // thrown away. Measured: the request went out, the list did not change.
+  //
+  // The 250 ms pause still covers the ordinary case; this is only about Enter.
+  else if(e.key==='Enter'){e.preventDefault();
+    const r=filtered[sel];
+    if(r&&r.note) deepen(q.value.trim()); else act();}
   else if(e.key==='Escape'){ if(q.value){q.value='';renderLeap();} else {closeLeap(); if(mode==='focus') overview();} }
 });
 addEventListener('keydown',e=>{

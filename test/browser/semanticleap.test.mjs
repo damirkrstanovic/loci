@@ -36,6 +36,10 @@ const defaultDeep = (q) => [
 // A ?deep=1 response is the flat lexical array with the semantic rows added —
 // same shape, extra rows. `hold` lets a test keep one in flight for as long as
 // it needs, which is how "the lexical list is drawn first" is provable at all.
+//
+// `deepRows(q, nth)` is given the ordinal of the deep request, 1-based, so a test
+// can answer the second ask differently from the first — which is the only way
+// "asking again brought back something else" is visible in the DOM at all.
 async function stubLeap(page, opts = {}) {
   const seen = { lex: [], deep: [], done: [] };
   const deepRows = opts.deepRows || defaultDeep;
@@ -44,9 +48,9 @@ async function stubLeap(page, opts = {}) {
     const q = url.searchParams.get('q') || '';
     const deep = url.searchParams.get('deep') === '1';
     if (!deep) { seen.lex.push(q); await route.fulfill({ json: [...content(q), VERB] }); return; }
-    seen.deep.push(q);
+    const nth = seen.deep.push(q);
     if (opts.hold) await opts.hold(q);
-    await route.fulfill({ json: [...content(q), ...deepRows(q), VERB] });
+    await route.fulfill({ json: [...content(q), ...deepRows(q, nth), VERB] });
     seen.done.push(q);
   });
   return seen;
@@ -76,6 +80,22 @@ const leapTo = async (page, text) => {
 
 const hasByMeaning = (page) => page.evaluate(() =>
   [...document.querySelectorAll('#results .group')].some(g => g.textContent === 'By meaning'));
+
+// Walk the selection to a named row with the arrow keys, the way a hand would.
+// Not `sel = n` from evaluate(): the point of the Enter tests is the keyboard
+// path, and the keydown handler reading a selection somebody else set is not it.
+const selectRow = async (page, text) => {
+  const target = await page.$$eval('#results .res',
+    (els, t) => els.findIndex(e => e.querySelector('.title').textContent === t), text);
+  assert.ok(target >= 0, `there is no row reading “${text}”: ` +
+    JSON.stringify(await page.$$eval('#results .res .title', e => e.map(x => x.textContent))));
+  for (let i = 0; i <= target + 40; i++) {
+    const cur = await page.evaluate(() => sel);
+    if (cur === target) return target;
+    await page.locator('#q').press(cur < target ? 'ArrowDown' : 'ArrowUp');
+  }
+  throw new Error(`the arrows never reached “${text}”`);
+};
 
 // Poll rather than sleep, and fail with what was actually seen.
 const until = async (fn, what, ms = 10_000) => {
@@ -336,5 +356,98 @@ test('the __deep__ note is a statement, not a result: it has its own group and d
     await settle(page);
     assert.deepEqual(await page.evaluate(() => ({ mode, openId, live: cmd.classList.contains('live'), q: q.value })),
       was, 'clicking the __deep__ note did something — there is no object behind that id');
+  });
+});
+
+// ---------------- Enter ----------------
+// Enter is one key with two jobs, split by the row it lands on, and the two tests
+// below are the two halves of that. Neither asserts "Enter fired a deep request"
+// on its own: the defect being pinned against is a request that is fired and then
+// thrown away, which such an assertion would pass.
+
+// Half one. A `by meaning` note is the only row act() refuses, so it is the only
+// row where nothing closes the palette, the box still holds the query, and a
+// second answer has somewhere to land. That makes Enter on a note "ask again" —
+// which matters, because both notes the server sends are transient: an embedder
+// that was down may be up, and chunks that were awaiting may be swept.
+test('Enter on a `by meaning` note asks again, and the second answer replaces the note on screen', async () => {
+  await withPage(browser, 'leap-deep-enter-asks-again', async (page) => {
+    const DEGRADED = 'search by meaning is unavailable — the embedder is not answering';
+    // The first ask is degraded, the second finds something. Answering the two
+    // asks differently is what makes "the second answer was drawn" — rather than
+    // fetched and discarded — readable from the rows alone.
+    await stubLeap(page, {
+      deepRows: (q, nth) => nth === 1
+        ? [{ id: '__deep__', note: true, group: 'by meaning', label: DEGRADED, degraded: 'refused' }]
+        : [{ id: 'tbl:planets', label: 'DEEP-OBJ ' + q, group: 'by meaning',
+             kind: 'table', score: 0.62, touched: 0 }],
+    });
+    await bootedShell(page, server.url);
+    await leapTo(page, 'planets');
+    await page.waitForFunction(t => [...document.querySelectorAll('#results .res .title')]
+      .some(el => el.textContent === t), DEGRADED);
+
+    await selectRow(page, DEGRADED);
+    await page.locator('#q').press('Enter');
+
+    await until(async () => (await rowTexts(page)).includes('DEEP-OBJ planets'),
+      'the second deep answer to reach the screen — Enter on the note either asked ' +
+      'nothing or asked and dropped the answer');
+    const rows = await rowTexts(page);
+    assert.ok(!rows.includes(DEGRADED),
+      `the stale note is still on screen beside the fresh answer: ${JSON.stringify(rows)}`);
+    // it had a home only because a note is not something to activate: the palette
+    // is still open and still holding the query the answer belongs to
+    assert.ok(await page.locator('#results').isVisible(),
+      'the palette closed — Enter activated a note, which has no object behind it');
+    assert.equal(await page.inputValue('#q'), 'planets',
+      'the box no longer holds the query the second answer was for');
+    assert.ok(rows.includes('LEX-A planets'),
+      `asking again threw the lexical half away: ${JSON.stringify(rows)}`);
+  });
+});
+
+// Half two, and the reason the call is gated rather than left where it was: on a
+// row that acts, Enter must ask nothing. Every acting path in act() calls
+// closeLeap(), which empties the box, so deepen()'s staleness check drops that
+// answer — the request bought an embedding round trip and a re-chunk of the whole
+// substrate for a response nobody reads.
+//
+// Be plain about the assertion: a discarded response leaves no trace in the DOM,
+// by construction, so "nothing was asked" is only legible in the requests. The
+// rendered half here is that the row really did activate; the request count is
+// the half that fails on the version which asked anyway.
+test('Enter on a row that acts activates it and asks nothing by meaning', async () => {
+  await withPage(browser, 'leap-deep-enter-acts-only', async (page) => {
+    const seen = await stubLeap(page);
+    await bootedShell(page, server.url);
+    await page.evaluate(() => overview());
+    await page.waitForFunction(() => document.getElementById('world').classList.contains('cards'));
+    assert.equal(await page.textContent('#crumbName'), 'all notebooks',
+      'this test starts from the overview so that entering a notebook is a visible change');
+
+    await leapTo(page, 'planets');
+    await until(() => seen.done.length > 0, 'the deep answer the 250 ms pause asks for');
+    await page.waitForFunction(() => [...document.querySelectorAll('#results .res .title')]
+      .some(el => el.textContent === 'DEEP-SPACE planets'));
+    const asked = seen.deep.length;
+
+    // LEX-A is space:cosmos, a lexical notebook hit — act() enters it, and
+    // enter() closes the palette
+    await selectRow(page, 'LEX-A planets');
+    await page.locator('#q').press('Enter');
+
+    await until(async () => (await page.textContent('#crumbName')) === 'The Solar System',
+      'the notebook named by the selected row to be entered — Enter did not activate it');
+    assert.ok(!(await page.locator('#results').isVisible()),
+      'the palette is still open after Enter activated a row');
+    await settle(page);
+    assert.equal(await page.inputValue('#q'), '',
+      'closeLeap() left the query in the box, so this test no longer tests what it says');
+    assert.equal(seen.deep.length, asked,
+      `Enter asked ${seen.deep.length - asked} further deep question(s) on its way out of ` +
+      'the palette. Acting closes the palette, which empties the box, so that answer is ' +
+      'dropped by the staleness check in deepen() — the request is an embedding round trip ' +
+      'and a full re-chunk spent on a response that is thrown away.');
   });
 });
