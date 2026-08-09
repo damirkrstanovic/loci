@@ -1782,12 +1782,28 @@
                (reduce max 0))]
     (str prefix (inc n))))
 
-(defn- next-id
+(defn next-id
   "Mint '<prefix>N' with N = 1 + the highest existing numeric suffix across the
    WHOLE store. Counting a notebook's refs collides after a cell remove — a
-   removed ref lowers the count while the object lives on."
+   removed ref lowers the count while the object lives on.
+
+   Public for `loci.repair`, which mints a restored findings document and must
+   mint it by exactly this rule. A repair carrying its own copy of the rule is
+   how one prefix comes to have two counters, neither of which can see all the
+   ids under it — the failure § 7 of the 2026-08-09 forensics is about."
   [st prefix]
   (next-id-in (sub/objects st) prefix))
+
+(defn findings-prefix
+  "The `find:` prefix a notebook's findings documents are minted under:
+   `space:dd-35` → `find:dd-35-`.
+
+   A function rather than the expression inlined at its one call site, because
+   there are now two call sites — `research!` and `loci.repair`, which restores
+   a findings document that `research!` originally wrote. Two copies of this
+   would let a repaired document be named by a rule the server no longer uses."
+  [space]
+  (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
 
 ;; ---- materializing an entity: the one action on the entity page ----
 ;;
@@ -2047,7 +2063,7 @@
                         (:saved_as (tools/save-table!
                                     st (str "Extracted — " (if (> (count p) 40) (str (subs p 0 40) "…") p))
                                     rows space))))
-              fid (next-id st (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
+              fid (next-id st (findings-prefix space))
               title (str "Findings — " (if (> (count p) 44) (str (subs p 0 44) "…") p))]
           (sub/commit! st {:op :tx :events [{:op :put :id fid :value {:id fid :kind :doc :title title :value text}}
                                             (nb/append-cell-event st space {:ref fid})]})
@@ -2078,13 +2094,17 @@
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
     (catch Exception e {:error (.getMessage e)})))
 
-(defn- fresh-dd-id
+(defn fresh-dd-id
   "One past the highest space:dd-N, and never one that already exists. The old
    form derived the id from the TOTAL notebook count, which had nothing to do
    with the dd sequence; two notebooks in the store mint \"space:dd-3\", so the
    day anything deletes a notebook that :put would overwrite a live notebook in
    silence. The existence loop terminates: n only rises, and the store holds
-   finitely many objects."
+   finitely many objects.
+
+   Public for `loci.repair`, which restores the three notebooks the count form
+   destroyed and must mint their new ids by the rule that replaced it — see
+   `next-id` for why the repair does not carry its own copy."
   [st]
   (let [highest (->> (nb/notebooks st)
                      (keep #(some->> (:id %) (re-find #"^space:dd-(\d+)$") second parse-long))
