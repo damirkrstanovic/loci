@@ -116,8 +116,13 @@ What to restore, from the events named in Task 0:
 | "Inner vs. Outer Planets" | ev 56 | a fresh `space:dd-N`, `:spawned-by {:space "space:cosmos"}` |
 | "Planetary Moons" | ev 59 | a fresh `space:dd-N` |
 | "Orbital Period Scaling" | ev 61 | a fresh `space:dd-N` |
-| its findings doc (1,733 chars) | ev 58 | a fresh `find:` doc, celled into the first |
-| its findings doc (2,752 chars) | ev 60 | a fresh `find:` doc, celled into the second |
+| its findings doc (**1,416** chars) | ev 58 | a fresh `find:` doc, celled into the first |
+| its findings doc (**2,442** chars) | ev 60 | a fresh `find:` doc, celled into the second |
+
+> **Correction, 2026-08-09.** An earlier draft of this table said 1,733 and 2,752. Those are the
+> lengths of the whole EDN **log lines** — `:tx` wrapper, ids, titles, escaping. The document
+> **bodies** are **1,416** and **2,442**. Assert against the body lengths; asserting against the
+> line lengths would fail and look like data loss.
 | `tbl:extract-14-588` | **already live, orphaned** | celled into the first — adopted, not copied |
 
 **dd-18's findings document was empty and stays uncreated.** Restoring an empty document to hold
