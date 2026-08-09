@@ -1509,105 +1509,80 @@
   (into (descendant-sources st space) (ancestor-sources st space)))
 
 (defn subject-set
-  "The subjects a recall in this notebook is about — **two sets, not one**:
+  "The subjects a recall is about: **the names `prompt` names, and nothing
+   else.** Used for both jobs `recall` separates —
+   `:filter {:entities}`, which decides what may be a candidate, and
+   `:subjects`, which decides what raises one. One value, because after
+   2026-08-09 there is no longer anything for the two to disagree about.
 
-     {:scope #{name …}   what may be a candidate   → :filter {:entities …}
-      :score #{name …}}  what raises a candidate   → :subjects
+   **This deliberately departs from design §5**, which defines the subject set
+   as \"entities detected in the prompt ∪ entities of facts already in this
+   lineage\". The second half is gone. Do not restore it — it was built, shipped,
+   measured on the real corpus, and it made things worse; the record is
+   `docs/superpowers/specs/2026-08-08-entities-recall-measured.md`.
 
-   `recall`'s own comment (`loci.memory`, at the `opts:` note) says it plainly:
-   \":subjects SCORES, :filter {:entities} SCOPES, and they are separate on
-   purpose.\" Handing one value to both collapses that distinction, and the
-   collapse is not cosmetic — it is measurable and it defeats the feature. See
-   below.
+   What the measurement found, over 12 prompts a person would actually type:
+   **7 got worse, and all 7 were prompts typed into a notebook that has a
+   lineage.** `space:semis`, asked \"What are the chokepoints in the
+   semiconductor supply chain?\", came back with six facts about Jupiter, Saturn
+   and Mercury, replacing all six on-subject ones. The EUV notebook lost every
+   EUV fact; the EDA notebook displaced the US EDA export ban itself.
 
-   **`:scope`** is the design's subject set: the names detected in `prompt`,
-   plus every name a fact in this lineage already carries. It decides which
-   facts OUTSIDE the lineage are eligible at all; facts inside are eligible
-   already, through `:sources`.
+   The cause was the lineage half, in both of the shapes it was tried:
 
-   **`:score`** is `:scope` minus the names that only this lineage has ever
-   carried **and the prompt did not name**. Both halves of that, because the
-   code unions the prompt half unconditionally: a name you asked about scores
-   whether or not anything outside this lineage has ever carried it. The
-   subtraction is about names the lineage merely happens to carry, never about
-   what you asked.
+   - **Unrestricted**, every name the lineage carries scores, so every local
+     fact's entity half saturates at 1.0 and they all tie at 0.4000 — the union
+     never out-scores anything, it ties and loses the tie-break to recency.
+   - **Restricted** to names something outside the lineage also carries — the
+     fix for that tie — it deletes precisely the names the notebook is *about*.
+     `tsmc`, `taiwan`, `asml`, `synopsys` live in the semis family and nowhere
+     else, which is what it MEANS for a research hub to have a subject, so all
+     four were stripped and `:score` for a semiconductor question came out as
+     `(\"earth\" \"japan\" \"jupiter\" \"mars\" \"mercury\" \"neptune\" \"saturn\"
+     \"sun\" \"terrestrial planets\" \"venus\")`. This is structural, not a bad
+     corpus: **the larger a notebook's lineage, the fewer of its own subjects
+     survive**, and `space:semis` holds 56 of 80 facts.
 
-   That second half is not hypothetical and it is pinned. In `subject-memory`,
-   `wrath of the righteous` is carried by `space:econ`'s facts and by nothing
-   else in the corpus — lineage-only from econ, by the same definition this
-   sentence uses — and `game-prompt` names it. `:score` from `space:econ` is
-   `#{\"asml\" \"wrath of the righteous\"}` and not `#{\"asml\"}`; making this
-   union conditional fails that assertion in
-   `the-score-set-drops-the-names-only-this-lineage-has-ever-used`, and two
-   more besides.
+   Driving the union from the prompt alone was probed against the same corpus
+   before it was adopted — baseline ids retained in the top 6, shipped-then
+   versus this:
 
-   A lineage-only name can never widen anything — nothing outside
-   carries it, by definition — so all it can do is score the local facts, and
-   `relevance`'s entity half is a *ratio*: a name in the subject set that a
-   local fact carries makes that fact's entity half 1.0, a flat 0.4 of
-   relevance, with no reference to the question at all.
+     P1 chokepoints   0/6 → 6/6      P5 blockade cost  1/6 → 3/6 (still worse)
+     P2 EUV           1/6 → 6/6      P6 capacity       4/6 → 6/6
+     P3 TSMC/Taiwan   3/6 → 6/6      P7 AI customers   3/6 → 5/6
+     P4 EDA controls  0/6 → 5/6      P10/P11/P12       all three wins kept
 
-   Measured on the live shape — the `space:semis` hub holding six ordinary
-   findings, asking `chips`, which names no entity. The one-set version puts
-   ten names in `:subjects`; all nine candidates then score **exactly 0.4000**,
-   and the top 6 is six of this notebook's own facts (board approvals, export
-   permits, prices, yields, rainfall). The fact the union exists to deliver and
-   the notebook's own CHILD's fact are both pushed out — the union does not
-   lose on merit, it ties and loses the tie-break to recency. **At the live
-   corpus's shape — `space:semis` and its six children hold 56 of 80 facts —
-   it would deliver nothing, ever.** With `:score` restricted, `:subjects` is
-   one name (`asml`), the bridge fact scores 0.4000, the child's 0.1333, and
-   the six findings score 0.0000 and are dropped.
+   One prompt degrades instead of seven, and the case the feature exists for —
+   a brand-new notebook, where the agent used to be told nothing at all — is
+   untouched.
 
-   A known, accepted inversion: the ratio asks \"how much of this fact is about
-   what you asked\", so a REMOTE fact carrying only `asml` (0.4000) outranks a
-   LOCAL one carrying `asml` and `euv` (0.1333). Defensible — the first fact is
-   wholly on subject — and more evidence for the plan's open question about
-   within-fact ratio versus global rarity, which is Task 12's to settle and not
-   this function's.
+   **The cost, named and accepted: a deep dive no longer inherits its parent's
+   SUBJECTS.** Ask a child notebook a question that names nothing, and no fact
+   is pulled in from outside its lineage on the strength of what the family
+   happens to be about. It still inherits its parent's **facts**, through
+   `:filter {:sources}` and `lineage-sources`, exactly as it always has — that
+   is a different mechanism and this change does not touch it.
 
-   **`sources` nil makes both sets exactly what the prompt names**, and that is
-   a decision rather than a fallthrough. The obvious spelling —
-   `(if sources (filter …) all)` — reads \"no scope means everything is mine\",
-   which is right for a *filter* and wrong for a *subject*: it puts every name
-   in the corpus into `:subjects`, so the entity half is 1.0 for every fact
-   carrying any name and 0.0 for the rest, and stops discriminating. It is not
-   a superset of the right answer, it displaces it: `server_test`'s
-   `the-subject-set-of-the-WHOLE-memory-is-still-only-the-prompt` pins the
-   difference. There is nothing to buy in exchange — no `:filter` is added on
-   the unscoped path, so the candidate set is the whole memory either way, and
-   the prompt half already carries the multi-word name `:subjects` exists for.
+   A consequence worth knowing: **when the prompt names no name the corpus
+   knows, this returns `#{}` and the whole feature is inert** — `:subjects` is
+   empty so `qs` is just the query tokens, `:filter {:entities}` is empty so it
+   admits nothing, and recall is character for character what it was before any
+   of this existed. The feature costs nothing when it has nothing to say.
 
-   One `all-facts` pass and one partition of it, because this runs before every
-   agent turn and `recall` is about to walk the same facts again.
-
-   Names come back normalized and non-blank — `ent/detect` guarantees it for
-   the prompt half, and `names-of` filters the fact halves, which read
-   `:entities` exactly as the distiller's JSON left them and so can yield `\"\"`.
+   Names come back normalized and non-blank; `ent/detect` guarantees both.
 
    Public so a test can call it without going through an LLM."
-  [m sources prompt]
-  (let [all      (mem/all-facts m)
-        names-of (fn [fs] (into #{} (comp (mapcat :entities)
-                                          (map ent/normalize)
-                                          (remove str/blank?))
-                                fs))
-        ;; `(names-of all)` and not `(set (keys (ent/index all)))`. The two are
-        ;; the same set by construction — `index` normalizes each `:entities`
-        ;; entry and drops the blanks, character for character what `names-of`
-        ;; does — but `index` also accumulates a set of fact ids under every
-        ;; name, and this line then throws all of them away. Measured at 800
-        ;; facts: 0.700 ms → 0.333 ms, about a quarter of this function's cost,
-        ;; on a function that runs before every agent turn and whose promise
-        ;; below is one `all-facts` pass and one partition of it.
-        detected (ent/detect (names-of all) prompt)
-        ;; nil, not {}, when there is no lineage — both halves below then read
-        ;; nil and contribute nothing, which is the unscoped rule above.
-        {mine true theirs false} (when sources (group-by #(mem/in-sources? sources %) all))
-        lineage   (names-of mine)
-        elsewhere (names-of theirs)]
-    {:scope (into detected lineage)
-     :score (into detected (filter elsewhere) lineage)}))
+  [m prompt]
+  ;; The name set is built here rather than with `(keys (ent/index …))`. The two
+  ;; are the same set by construction — `index` normalizes each `:entities` entry
+  ;; and drops the blanks, character for character what this does — but `index`
+  ;; also accumulates a set of fact ids under every name, and this would then
+  ;; throw all of them away. Measured at 800 facts: 0.700 ms → 0.333 ms.
+  (ent/detect (into #{} (comp (mapcat :entities)
+                              (map ent/normalize)
+                              (remove str/blank?))
+                    (mem/all-facts m))
+              prompt))
 
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
@@ -1642,35 +1617,39 @@
    offer each other anything. That cost is what this fixes, and the old
    paragraph is gone rather than kept beside this one, so nothing here reads as
    still live when it is not. Candidates are now the lineage's facts UNION the
-   facts sharing a subject with them, and `subject-set` returns TWO sets for the
-   two jobs: `:scope` makes an unrelated root's fact *eligible*
-   (`:filter {:entities}`), `:score` makes it *rank* (`:subjects`). Passing one
-   set to both is the defect this shape exists to prevent — `subject-set`'s
-   docstring has the measurement.
+   facts carrying a name the PROMPT named, and that one set does both jobs
+   `recall` keeps separate: `:filter {:entities}` makes an unrelated root's fact
+   eligible, `:subjects` makes it rank. Naming a subject in only one of the two
+   is the quiet failure `recall`'s own opts comment describes.
 
-   `k` stays 6 and the ranking is unchanged, so the block does not grow: it
-   competes. What earns a place in it is overlap with the QUESTION — the words
-   of the prompt, and the names the prompt or the world outside this notebook
-   shares with the fact. A name only this lineage has ever used earns nothing,
-   which is what keeps six ordinary local findings from taking all six slots
-   at an identical score. (An earlier draft of this paragraph said \"a
-   cross-notebook fact must out-score a local one to appear.\" True, and empty:
-   measured, it did not out-score them, it TIED with them at 0.4000 and lost
-   the tie-break to recency, every time.)
+   **What widens the scope is the question, never the notebook's habits.** An
+   earlier shape of this also unioned in every name the lineage already carried
+   — design §5's second half — and it was measured on the real corpus and
+   removed on 2026-08-09: it degraded 7 of 12 real prompts, every one of them a
+   prompt typed into a notebook that has a lineage. `subject-set`'s docstring
+   carries the numbers and the accepted cost. Two consequences to keep in view
+   here:
 
-   Cost: one extra pass over the whole memory per agent turn (`all-facts` plus
-   `ent/index`), which `recall` then rebuilds for itself. Measured, mean of 300,
-   on a synthetic corpus of the live shape: **0.23 ms at 80 facts** — the live
-   size — 1.37 ms at 500 and 6.8 ms at 3000, so linear and about a seventh of
-   the `recall` it feeds (1.7 / 7.0 / 41.6 ms at those sizes), all of it in
-   front of an LLM call that takes seconds. Sharing one index between the two
-   would mean handing `loci.memory` a pre-built projection instead of a fact
-   sequence, and that is a seam worth 0.23 ms not to open."
+   - `k` stays 6 and the ranking is unchanged, so the block does not grow, it
+     competes — a fact from another root has to out-score the local facts on
+     the question actually asked.
+   - When the prompt names nothing the corpus knows, `subs` is empty and this
+     is inert: no name is added to the scope, no name is added to the scoring,
+     and the block is exactly what it was before entities existed.
+
+   Cost: one extra pass over the whole memory per agent turn (`all-facts` and a
+   name set built from it), which `recall` then walks again for itself.
+   Measured, mean of 300, on a synthetic corpus of the live shape: **0.23 ms at
+   80 facts** — the live size — 1.37 ms at 500 and 6.8 ms at 3000, so linear and
+   about a seventh of the `recall` it feeds (1.7 / 7.0 / 41.6 ms at those
+   sizes), all of it in front of an LLM call that takes seconds. Sharing one
+   pass would mean handing `loci.memory` a pre-built projection instead of a
+   fact sequence, and that is a seam worth 0.23 ms not to open."
   [st prompt space]
   (let [sources (when (and space (sub/object st space)) (lineage-sources st space))
-        {:keys [scope score]} (subject-set @mem/memory sources prompt)
-        opts    (cond-> {:k 6 :semantic? true :subjects score}
-                  sources (assoc :filter {:sources sources :entities scope}))
+        subs    (subject-set @mem/memory prompt)
+        opts    (cond-> {:k 6 :semantic? true :subjects subs}
+                  sources (assoc :filter {:sources sources :entities subs}))
         facts (try (mold/recall @mem/memory prompt opts)
                    (catch Exception _ nil))]
     (when (seq facts)

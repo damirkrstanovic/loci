@@ -451,3 +451,138 @@ opts change inside a scratch process under
    does not fix its own headline example.
 5. **`max w` making four prompts keyword-dominated at 80 facts**, when the OPEN note framed
    that as a risk to watch as the corpus grew.
+
+---
+
+# Addendum, 2026-08-09: the fix, measured
+
+Everything above stands as written; nothing in it has been edited. This section records what
+happened after the user read it and decided.
+
+## The decision
+
+**Drive the union from prompt-detected names only. Drop the lineage half of the subject set
+entirely — from both `:filter {:entities}` and `:subjects`. Leave `relevance` alone.**
+
+That is a deliberate departure from design §5, which defines the subject set as "entities
+detected in the prompt ∪ entities of facts already in this lineage". The second half is
+gone, and the cost is named and accepted: **a deep dive no longer inherits its parent's
+*subjects*. It still inherits its parent's *facts*, through `:filter {:sources}` and
+`lineage-sources`, exactly as it always has** — a different mechanism, untouched.
+
+`subject-set` collapses to one value and no longer takes `sources`:
+
+```clojure
+(defn subject-set [m prompt]
+  (ent/detect (names-of (mem/all-facts m)) prompt))
+```
+
+The saturation finding in § (b) above is confirmed and **not** addressed here. The weighting
+is unchanged.
+
+## Method
+
+Identical to the Method section above, reused rather than re-derived:
+
+- the **copy** at `/tmp/loci-entities-measure/data`; `data/` was never opened
+- `mem/file-memory` with an explicit path; `loci.memory/memory` never dereferenced
+- `:semantic? false`, because not one of the 80 facts carries a `:vec`
+- **the baseline was not re-run.** Top-6 ids were read from the recorded
+  `/tmp/loci-entities-measure/before.edn` — the real df26e2b worktree run. The lineage walk
+  agrees with it: `:n-sources` matches, prompt for prompt.
+
+Results written to `/tmp/loci-entities-measure/after-prompt-only.edn`.
+
+## Retention against the df26e2b baseline
+
+| | prompt | notebook | detected in prompt | retained | what traded |
+|---|---|---|---|---|---|
+| P1 | chokepoints in the semiconductor supply chain | `space:semis` | **none** | **6 of 6, in order** | nothing — see below |
+| P2 | why can no one else build an EUV machine | `space:dd-13` | `euv` | **6 of 6, in order** | nothing |
+| P3 | how risky is TSMC's concentration in Taiwan | `space:dd-14` | `taiwan` `tsmc` | **6 of 6, in order** | nothing |
+| P4 | export controls on EDA tools and China | `space:dd-15` | `china` | **5 of 6** | `mem-10` in, `mem-1` out |
+| P5 | what would a Taiwan blockade cost | `space:dd-16` | `taiwan` | **3 of 6** | `mem-51` `mem-48` `mem-47` in; `mem-42` `mem-11` `mem-4` out |
+| P6 | TSMC capacity outside Taiwan by 2030 | `space:dd-17` | `taiwan` `tsmc` | **6 of 6**, reordered | nothing enters or leaves |
+| P7 | why can't AI chip customers move away | `space:dd-18` | `tsmc` | **5 of 6** | `mem-38` in, `mem-55` out |
+| P8 | Serbia's growth vs the region | `space:serbia` | none | — | still nothing, before and after |
+| P9 | highest inflation and unemployment | `space:pub-econ` | none | — | still nothing |
+| P10 | what do we know about TSMC and Taiwan | brand-new | `taiwan` `tsmc` | — | `mem-2` `mem-53` `mem-52` `mem-38` `mem-41` `mem-40` — **identical to the shipped run** |
+| P11 | tell me about Jupiter and the gas giants | brand-new | `gas giants` `jupiter` | — | `mem-77` `mem-76` `mem-57` `mem-26` `mem-24` `mem-27` — **identical** |
+| P12 | how exposed is the United States | brand-new | `united states` | — | `mem-49` `mem-43` `mem-16` `mem-45` `mem-3` `mem-9` — **identical** |
+
+### Totals
+
+- **Changed for the worse: 1 of 12 — P5.** Was 7 of 12.
+- Changed for the better: 3 of 12 — P10, P11, P12, the brand-new-notebook case, **all three
+  wins retained id for id.**
+- Identical to the baseline top 6: 5 of 12 (P1, P2, P3, P8, P9).
+- P4 and P7 each trade one fact; P6 keeps all six and only reorders.
+- **Every one of the seven lineage prompts that regressed now retains 5 or 6 of 6, except
+  P5.** The plan's one-third stop threshold is 33%; this is 8%.
+
+This reproduces the probe the decision was made on, prompt for prompt, with no result better
+or worse than it predicted.
+
+## P1 is inert, and that is the mechanism
+
+`space:semis`, *"What are the chokepoints in the semiconductor supply chain?"* — the prompt
+that returned six facts about Jupiter and Saturn — now returns the baseline's six ids in the
+baseline's order, because **the detected subject set is empty**. The corpus has no entity
+named `chokepoint`, `semiconductor` or `supply chain`; the prompt names nothing, so
+`:subjects` is `#{}` and `:filter {:entities}` is `#{}`, and both are no-ops inside `recall`.
+The block is character for character what df26e2b produced.
+
+Worth stating plainly rather than claiming a win: on this prompt the fix does not out-rank
+the planets, it declines to nominate them. Most real prompts do not name an entity, and on
+those the entity work now costs nothing and does nothing — which is the honest description of
+what was bought. `server_test`'s
+`a-prompt-naming-nothing-recalls-exactly-what-it-did-before-entities` pins that equivalence
+against df26e2b's opts.
+
+## The one prompt still worse, and why it is not the union's fault
+
+**P5, `space:dd-16`, "What would a Taiwan blockade cost the global economy?"** Detected:
+`taiwan`. The two facts that *are* the answer are both displaced:
+
+| id | entities | fact |
+|---|---|---|
+| `mem-42` | `institute for economics & peace`, **`taiwan strait`** | GDP −2.8% ($2.7tn) in the first year |
+| `mem-11` | **`taiwan strait`**, `bloomberg economics` | a $5–10tn global shock |
+| `mem-4` | 7 names incl. `taiwan`, six of them df 1 | the top five wafer suppliers |
+
+Two distinct causes, **neither of them the subject union**:
+
+1. **`taiwan strait` is a different entity from `taiwan`.** The prompt says "Taiwan
+   blockade", so `taiwan` is detected; the facts that answer it are filed under
+   `taiwan strait`, and the comparison is equality on normalized names. They score 0 on the
+   entity half while `mem-51` and `mem-48` — whose *only* name is `taiwan` — score 1.0. This
+   is an **alias** problem, and aliases are explicitly out of scope in the plan ("the one
+   part of the model that cannot be derived… it needs its own plan"). P5 is the first
+   measured case of what that costs.
+2. **Within-fact dilution.** `mem-4` carries `taiwan` plus six names of df 1, so its entity
+   half is ≈ 0.027 — it is penalised for the rare names it does *not* match. This is the
+   plan's OPEN ratio-versus-global-rarity question, in the wild.
+
+Both are recorded, neither is fixed here. Fixing either would be a scoring change, and the
+decision above was explicitly to leave `relevance` alone.
+
+P7's single trade has the same second cause: `mem-55` (CoWoS sold out through 2027, a genuine
+answer to "why can't they move") carries `tsmc` and `cowos`, and `cowos` is df 1, so it
+scores ≈ 0.09 on the entity half against `mem-38`'s ≈ 0.41. P4's trade goes the other way and
+is good: `mem-10`, China's €37bn domestic EUV effort, enters a question about export controls
+on China, displacing a generic ASML-monopoly fact.
+
+## Verification
+
+```
+$ md5sum -c /tmp/loci-entities-measure/before.md5
+/home/damirk/src/loci/data/memory.edn: OK
+/home/damirk/src/loci/data/substrate.edn: OK
+```
+
+`data/memory.edn` = `1999a9d108df48b17ccbb51291a0a955`, `data/substrate.edn` =
+`e7a6eecdff7bb44ad6b959bb1a7fb7c6`, unchanged. Nothing under `data/` was opened; every JVM
+ran against the copy with `LOCI_DATA` and `-Dloci.data-dir` pointed there.
+
+Suites at the commit that carries this: `clojure -M:test` 458 tests / 1830 assertions, 0
+failures; `npm run test:browser` 89 / 89.
