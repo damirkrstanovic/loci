@@ -11,7 +11,8 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub])
+  (:import [java.util Locale]))
 
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))
@@ -3326,6 +3327,12 @@
         "`:object` on the row, so the shell has ONE thing to decide on rather than two")
     (is (= 1 (:count row))
         "one fact — the count is what the evidence says, and the row is here anyway")
+    ;; The one fixture in the suite that can tell a name from a title: every
+    ;; entity `materialize-entity!` mints is TITLED with its own normalized name,
+    ;; so `:label (or (:title o) n)` is indistinguishable from `:label n` on all
+    ;; of them. This object is titled `The Arizona build`.
+    (is (= "arizona" (:label row))
+        "the label is the NAME and never the object's title — a rename must not change what you type to find the subject, which is the whole reason `entity-objects` matches on `[:value :name]`")
     (is (= "subject:arizona" (:id row))
         "the row is still the SUBJECT's, not the object's: the object is where it takes you, not what it is")
     (is (= 0 (:touched row))
@@ -3413,6 +3420,48 @@
   (undo!   [_]       (sub/undo! inner))
   (as-of   [_ n]     (sub/as-of inner n)))
 
+(defrecord MutatingStore [inner !n after]
+  ;; Commits `after` the moment the FIRST `objects` read has been answered, so
+  ;; the second read of one request sees a world the first did not. That is the
+  ;; race, made deterministic — a real one needs another thread committing
+  ;; between two reads of the same payload, which is a normal Tuesday on a store
+  ;; an agent flow is also writing to.
+  sub/Store
+  (commit! [_ event] (sub/commit! inner event))
+  (state   [_]       (sub/state inner))
+  (objects [_]       (let [m (sub/objects inner)]
+                       (when (= 1 (swap! !n inc)) (sub/commit! inner after))
+                       m))
+  (object  [_ id]    (sub/object inner id))
+  (history [_]       (sub/history inner))
+  (undo!   [_]       (sub/undo! inner))
+  (as-of   [_ n]     (sub/as-of inner n)))
+
+(deftest one-payload-reads-the-objects-once-and-so-answers-about-one-world
+  ;; `objs`, `intext` and `made` each used to call `sub/objects` for themselves,
+  ;; which is three reads of a store anything else may be writing to — and the
+  ;; halves disagree in a way that loses rows rather than duplicating them. The
+  ;; document below appears between the first read and the second: the old shape
+  ;; showed it under `in text` while the object scan, which read the older world,
+  ;; had never heard of it.
+  ;;
+  ;; The property is not "the new document is offered" — a request may honestly
+  ;; predate it. It is that ONE request answers about ONE world: a document is
+  ;; either in this payload or not in it, never present to one group and absent
+  ;; from another.
+  (let [inner (sub/fresh-store)
+        m     (mem/file-memory (tmpfile))
+        late  {:op :put :id "doc:late"
+               ;; a title that does NOT match, so `intext` would not exclude it,
+               ;; and a body that does — the shape that made the old skew visible
+               :value {:id "doc:late" :kind :doc :title "Memo" :value "the zzz body"}}
+        st    (->MutatingStore inner (atom 0) late)
+        rows  (srv/leap-payload st m "zzz")]
+    (is (some? (sub/object inner "doc:late"))
+        "control: the store really did grow mid-request — the spy committed it")
+    (is (empty? (filter #(= "doc:late" (:id %)) rows))
+        "the document that arrived after this request read the world is in NO group of it, rather than in `in text` and nowhere else")))
+
 (deftest the-subject-group-builds-one-objects-map-and-not-one-per-name
   ;; `entity-object` per promoted name and `materialized-names` beside it is N+1
   ;; whole objects maps **on a keystroke** — and N is every name the query
@@ -3447,7 +3496,88 @@
         labels (fn [q] (mapv :label (subject-rows (srv/leap-payload st m q))))]
     (is (= ["tsmc"] (labels "TSMC"))
         "`leap-payload` lower-cases the query and `ent/normalize` lower-cased the names, so the two sides meet")
+    ;; INFIX, and that word is load-bearing: both names below start with
+    ;; `taiwan`, so the assertion under them holds verbatim under a
+    ;; `str/starts-with?` filter and says nothing about substrings. These two do
+    ;; not — `semiconductor` is in the middle of one name and `sml` is inside
+    ;; `asml` — and a prefix filter answers `[]` to each.
+    (is (= ["taiwan semiconductor manufacturing"] (labels "semiconductor"))
+        "a match INSIDE a name, not at its front: LEAP is a substring search and a subject is found the way a document is")
+    (is (= ["asml"] (labels "sml"))
+        "…including inside a single word")
     (is (= ["taiwan" "taiwan semiconductor manufacturing"] (labels "taiwan"))
-        "a SUBSTRING match, not a prefix and not an exact one — and alphabetical between the two")
+        "two matches for one query, alphabetical between them")
     (is (= [] (labels " tsmc "))
         "a query with surrounding space finds nothing here — exactly as it finds nothing in any other group, because `leap-payload` lower-cases `q` and deliberately does not trim it, and the shell trims before it asks")))
+
+(deftest leap-folds-case-with-the-locale-entity-identity-uses-and-not-the-JVMs
+  ;; Measured under `-Duser.language=tr`, one doc titled `IBM memo` and two facts
+  ;; naming `IBM`. Before the fix NEITHER spelling of the query returned the
+  ;; page, and they failed in opposite directions:
+  ;;
+  ;;   q="IBM"  →  the doc alone. `q` folded to `ıbm` through `str/lower-case`,
+  ;;               so it matched neither the subject `ibm` — folded by
+  ;;               `ent/normalize` under `Locale/ROOT` — nor the facts, since
+  ;;               `mold/recall` was handed the mangled query too.
+  ;;   q="ibm"  →  the subject and the facts, and NOT the doc: `hit?` folds the
+  ;;               HAYSTACK, so the title became `ıbm memo` and an
+  ;;               already-lower-case query lost it.
+  ;;
+  ;; This test changes the default locale instead of constructing the mismatch
+  ;; out of strings, and that is the point rather than a shortcut: under an
+  ;; English locale `str/lower-case` and `Locale/ROOT` agree on every input, so
+  ;; NO payload this function can produce tells the broken code from the fixed
+  ;; one. That is why 453 tests and 1810 assertions passed over the bug, and why
+  ;; a string-level assertion here would join them. The only test that can fail
+  ;; is one that runs where the two disagree.
+  ;;
+  ;; `setDefault` is JVM-global, so it is restored in a `finally` — which runs
+  ;; on a failing `is` too, because `is` records rather than throws — and the
+  ;; runner is sequential.
+  (let [was (Locale/getDefault)]
+    (try
+      (Locale/setDefault (Locale/forLanguageTag "tr"))
+      (is (not= "ibm" (str/lower-case "IBM"))
+          "control: this JVM is folding `I` to a dotless `ı` right now — without it the rest of this test proves nothing")
+      (let [st (sub/fresh-store)
+            m  (mem/file-memory (tmpfile))]
+        (sub/commit! st {:op :put :id "doc:memo"
+                         :value {:id "doc:memo" :kind :doc :title "IBM memo" :value "…"}})
+        ;; two facts, so `ibm` is promoted; word-disjoint, so `remember`
+        ;; reinforces neither into the other and both survive as facts
+        (mold/remember m "the mainframe division posted another quarter"
+                       {:entities ["IBM"] :source {:obj "doc:memo"}})
+        (mold/remember m "quantum roadmap slips by eighteen months"
+                       {:entities ["IBM"] :source {:obj "doc:memo"}})
+        (let [rows  (fn [q] (set (map (juxt :group :id :label) (srv/leap-payload st m q))))
+              upper (rows "IBM")
+              lower (rows "ibm")]
+          (is (contains? upper ["subject" "subject:ibm" "ibm"])
+              "typing the name as it is written finds the subject — folding `q` under the default locale lost it")
+          (is (contains? lower ["doc" "doc:memo" "IBM memo"])
+              "…and typing it lower-case still finds the document — folding the TITLE under the default locale lost that")
+          (is (= upper lower)
+              "the two spellings answer the same page, which is the whole property: one locale-independent fold on both sides of every comparison")
+          (is (some (fn [[g]] (= "memory" g)) upper)
+              "including the facts, which `mold/recall` never saw for a mangled query")))
+      (finally (Locale/setDefault was)))))
+
+(deftest the-mold-route-reads-the-past-when-asked-and-the-present-when-not
+  ;; `?at=` on /api/mold is otherwise untested: deleting `store-at` from that one
+  ;; route leaves every mold assertion in this file green, because they all call
+  ;; `mold-payload` directly. Task 6 reasons at length about WHICH store the
+  ;; entity branch is handed under `?at=`; nothing pinned that the route hands it
+  ;; one at all.
+  (let [st   (sub/fresh-store)
+        m    (entity-memory)
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory (delay m)]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))]
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "first"}})
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "second"}})
+    (is (= "second" (:rendered (get! "id=doc:d")))
+        "no ?at= reads the live store")
+    (is (= "first" (:rendered (get! "id=doc:d&at=1")))
+        "?at=1 is the world after one event — the route passes the store through `store-at`, and nothing else can produce this")
+    (is (= "second" (:rendered (get! "id=doc:d&at=99")))
+        "…clamped to the log's length rather than answering an empty world")))

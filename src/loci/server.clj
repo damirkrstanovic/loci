@@ -23,6 +23,7 @@
             [loci.substrate :as sub]
             [loci.tools :as tools]
             [loci.viewspec :as vs])
+  (:import [java.util Locale])
   ;; :gen-class is what makes `java -jar` possible at all. AOT alone emits
   ;; loci/server$_main.class but no class *named* loci.server, so the uberjar's
   ;; Main-Class points at nothing and the jar dies with ClassNotFoundException
@@ -224,13 +225,31 @@
    `nm` is expected already normalized, as every name that has been through
    `ent/normalize` or `ent/detect` is. Handing it a raw one simply misses, which
    is the silent failure `ent/detect`'s docstring names — so normalize at the
-   door, as `entity-payload` does, rather than here on every lookup."
+   door, as `entity-payload` does, rather than here on every lookup.
+
+   **A store-taking convenience, and NOT the calling convention for anything
+   that looks up more than one name.** It rebuilds the whole objects map per
+   call, so a loop over it is one map per name: measured on an EDN store,
+   `leap-payload`'s subject group at 360 matching names over 900 objects cost
+   121.98 ms this way against 1.66 ms building `entity-objects` once. Every
+   production caller — `leap-payload`, `entity-payload`, `materialize-entity!` —
+   therefore calls `entity-objects` with a map already in hand, and this
+   survives for callers holding a store and wanting exactly one answer."
   [st nm]
   (get (entity-objects (sub/objects st)) nm))
 
 (defn materialized-names
   "The normalized names that already have an object, so `ent/promoted` can be
-   told which entities never demote."
+   told which entities never demote.
+
+   The same store-taking convenience `entity-object` is, with the same warning:
+   it builds the whole objects map, so a caller that also wants the objects
+   themselves is asking for two maps. `leap-payload` and `entity-payload` both
+   want both, so both bind `(entity-objects objm)` once and pass `(keys …)` to
+   `ent/promoted` — which is what `ent/promoted`'s docstring means by
+   \"`materialized` is normalized and blank-filtered here\", since those keys
+   already are. This is the one-line spelling for a caller that wants only the
+   names."
   [st]
   (set (keys (entity-objects (sub/objects st)))))
 
@@ -547,6 +566,34 @@
           (pos? awaiting)
           (conj (deep-note (str awaiting " chunk(s) awaiting embedding") {:awaiting awaiting})))))))
 
+(defn- lower-root
+  "Lower-case under `Locale/ROOT` — the ONE case-folding LEAP is allowed to use.
+
+   `clojure.string/lower-case` is `.toLowerCase()` under the JVM's *default*
+   locale, and under a Turkish or Azeri one that maps `I` to a dotless `ı`. Every
+   comparison in `leap-payload` folds a query against a haystack, so a
+   locale-sensitive fold breaks them in two different ways at once, and both were
+   measured under `-Duser.language=tr` against one doc titled `IBM memo` and two
+   facts naming `IBM`:
+
+   - the query and an entity name are folded by *different* functions —
+     `str/lower-case` for `q`, `ent/normalize`'s `Locale/ROOT` for the name — so
+     `IBM` typed into the box became `ıbm` and matched the subject `ibm` never;
+   - `hit?` folds the HAYSTACK, so an already-lower-case `ibm` matched the doc
+     titled `IBM memo` never, because that title folded to `ıbm memo`.
+
+   Typing `IBM` returned the doc alone, losing the subject and the memory facts;
+   typing `ibm` returned the subject and the facts, losing the doc. Neither
+   query returned the page. Folding `q` alone with `Locale/ROOT` fixes the first
+   and leaves the second, which is why this is a function used at every site
+   rather than a one-line change at the top of `leap-payload`.
+
+   `ent/normalize` already made this argument for entity identity: `$LANG` is not
+   something a name's identity may depend on. LEAP is the same claim about
+   finding it."
+  ^String [s]
+  (.toLowerCase (str s) Locale/ROOT))
+
 (defn leap-payload
   "ONE incremental search across everything: objects, notebook prose, doc
    bodies, subjects, memory facts, view verbs. Content groups only appear once
@@ -559,9 +606,13 @@
    anything."
   ([st mem q] (leap-payload st mem q nil))
   ([st mem q {:keys [deep? chunks]}]
-    (let [q    (str/lower-case (or q ""))
-          hit? (fn [& ss] (str/includes? (str/lower-case (str/join " " (map str ss))) q))
-          snip (fn [text] (let [i (or (str/index-of (str/lower-case text) q) 0)]
+    ;; `lower-root` at all three sites and `str/lower-case` at none — see its
+    ;; docstring. `q` and every haystack it is compared against must be folded by
+    ;; the SAME locale-independent function, or the two halves of one comparison
+    ;; disagree and a query finds some of its own page.
+    (let [q    (lower-root (or q ""))
+          hit? (fn [& ss] (str/includes? (lower-root (str/join " " (map str ss))) q))
+          snip (fn [text] (let [i (or (str/index-of (lower-root text) q) 0)]
                             (ell (subs text (max 0 (- i 20))) 70)))
           touched (last-touched st)
           ;; recency BEFORE the cap: taking "the first 8 encountered" dropped
@@ -569,7 +620,21 @@
           recent  (fn [e] (or (:touched e) 0))
           cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
                              (sort-by recent >) (take group-cap) vec))
-          ;; ONE materialization, shared with the subject group below.
+          ;; ONE materialization, shared by the object scan, `intext`, `made`
+          ;; and the subject group. Three reads of the store became one, and they
+          ;; were not merely wasteful: they were three *snapshots*. A doc
+          ;; committed between them whose TITLE matches `q` was offered by no
+          ;; group at all — `objs` read the older map and did not have it,
+          ;; `intext` read the newer one and excluded it precisely because its
+          ;; title hits. One map means one answer about what exists.
+          ;;
+          ;; A lexical payload is therefore two reads and not one: `nb/notebooks`
+          ;; inside `prose` still takes its own, so a NOTEBOOK committed
+          ;; mid-request can still be seen by one group and not another. Narrowed
+          ;; here and not closed, and said out loud rather than left to be
+          ;; rediscovered — closing it means threading `objm` through
+          ;; `nb/notebooks`, which is a change to `loci.notebook`'s interface and
+          ;; not to this payload.
           ;;
           ;; `materialized-names` and `entity-object` each rebuild the whole
           ;; objects map, so the plain reading of the subject group —
@@ -602,6 +667,20 @@
                      ;; is that destination: emitting this one too would put one
                      ;; subject under two headings, which is the collision the
                      ;; design split the groups to avoid.
+                     ;;
+                     ;; The exclusion is unconditional and the subject group is
+                     ;; `(seq q)`-guarded, so for the EMPTY query — and only
+                     ;; that one — a materialized entity is offered by no group
+                     ;; at all. That is the cost, stated rather than discovered:
+                     ;; "the subject row is already that destination" is true of
+                     ;; every query except the one that has no subject rows.
+                     ;; Left as is because nothing becomes unreachable — the
+                     ;; notebook `materialize-entity!` mints is listed, and it
+                     ;; holds the entity as its one cell — and because gating
+                     ;; this on `(seq q)` would put `ent:` rows back into an
+                     ;; opened palette under a heading no renderer has, which is
+                     ;; the state Task 6 removed. Revisit with the shell, not
+                     ;; here.
                      (remove #(#{:entity :viewspec :applet :fn :palette} (:kind %)))
                      (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))
                      (map (fn [o] {:id (:id o) :label (:title o) :group (name (:kind o))})))
@@ -613,12 +692,12 @@
                         :when (and (:text c) (hit? (:text c)))]
                     {:id (:id o) :label (str (:title o) " · " (snip (:text c))) :group "prose"}))
           intext (when (seq q)
-                   (for [o (vals (sub/objects st))
+                   (for [o (vals objm)
                          :when (and (= :doc (:kind o)) (string? (:value o))
                                     (hit? (:value o)) (not (hit? (:title o) (:id o))))]
                      {:id (:id o) :label (str (:title o) " · …" (snip (:value o))) :group "in text"}))
           made  (when (seq q)
-                  (for [o (vals (sub/objects st))
+                  (for [o (vals objm)
                         :when (and (#{:applet :viewspec :fn} (:kind o))
                                    (hit? (:title o) (:id o) (get-in o [:value :label])))]
                     {:id (:id o)
@@ -660,13 +739,15 @@
           ;; **Cost, because this runs on every keystroke.** `ent/index` walks
           ;; every live fact, and it is the second such walk in this function —
           ;; `recall` builds its own `ent/df-map` a few lines down. Measured
-          ;; (mean of 200, EDN store, throwaway memory):
+          ;; (mean of 200, EDN store, throwaway memory; two runs, so the totals
+          ;; are given to the precision they reproduce at and not to five
+          ;; digits):
           ;;
-          ;;    80 facts / 104 names    group 0.18 ms   leap-payload 1.06 ms
-          ;;   800 facts / 1040 names   group 1.48 ms   leap-payload 7.25 ms
+          ;;    80 facts / 104 names    group 0.18 ms   leap-payload ~1.1 ms
+          ;;   800 facts / 1040 names   group 1.5 ms    leap-payload ~7.5 ms
           ;;
           ;; Fine at both, and not fine forever: at 800 facts the whole payload
-          ;; is 7 ms of which `recall` is 5.5, so the ceiling this approaches is
+          ;; is ~7.5 ms of which `recall` is ~5, so the ceiling this approaches is
           ;; the memory layer's and not this group's. Sharing one index between
           ;; the two would mean handing `loci.memory` a pre-built projection
           ;; instead of a fact sequence — the same trade `entity-payload` and
@@ -677,27 +758,20 @@
                  (let [idx   (ent/index (mem/all-facts mem))
                        ments (entity-objects objm)]
                    (->> (ent/promoted idx (keys ments))
-                        ;; `q` is already lower-cased and `ent/normalize`
-                        ;; lower-cased every name, so this compares like with
-                        ;; like. It does NOT trim — no group here does, and the
-                        ;; shell trims before it asks.
+                        ;; Like against like on both axes. `q` was folded by
+                        ;; `lower-root` and every name by `ent/normalize`, and
+                        ;; those are the same `Locale/ROOT` fold — which they
+                        ;; were NOT before this group existed. `q` used
+                        ;; `str/lower-case`, so under a Turkish locale a typed
+                        ;; `IBM` arrived here as `ıbm` and matched the subject
+                        ;; `ibm` never. That was not a gap peculiar to this
+                        ;; group: `hit?` folded its haystacks the same way and
+                        ;; lost the doc titled `IBM memo` for the opposite
+                        ;; query, and `mold/recall` was handed the mangled `q`
+                        ;; and lost the facts. See `lower-root`.
                         ;;
-                        ;; The two lower-casings are NOT the same function,
-                        ;; and this is the one comparison in the payload where
-                        ;; that shows. `q`'s is `str/lower-case`, under the
-                        ;; JVM's default locale; a name's was `ent/normalize`'s
-                        ;; `Locale/ROOT`. They agree on every input but a dotted
-                        ;; `I` under a Turkish locale, where `IBM` typed into
-                        ;; the box becomes `ıbm` while the name stays `ibm` — a
-                        ;; subject you cannot reach by typing its own name. The
-                        ;; object scan has no such gap: it lower-cases both
-                        ;; sides with the same function, so it errs twice in the
-                        ;; same direction and still matches.
-                        ;;
-                        ;; Not patched here. The honest fix is `Locale/ROOT` for
-                        ;; the whole payload's `q`, and a second casing rule
-                        ;; living in this group is exactly what `ent/normalize`
-                        ;; argues against.
+                        ;; It does NOT trim — no group here does, and the shell
+                        ;; trims before it asks.
                         (filter #(str/includes? % q))
                         sort
                         (map (fn [n]
