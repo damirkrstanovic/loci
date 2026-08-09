@@ -226,11 +226,22 @@
 
 (defn distill-facts
   "Post-flow memory distillation: pull 1-5 durable, atomic facts out of what an
-   agent flow produced. Returns [{:fact string :entities [string]} …]."
+   agent flow produced. Returns [{:fact string :entities [string]} …].
+
+   Each sentence is told to name its own subject: a fact is read later with
+   no notebook around it, so 'the Aeon path locks out the Lich ending' has to
+   say which game. `context` already tells the model what the subject is —
+   this only makes saying so part of the sentence. Applies to new facts only;
+   the ones already on file are not retroactively rewritten (see entities
+   design doc §6) — that would be a silent rewrite of what was recorded,
+   which is a different act from reinforcing it."
   [context text]
   (let [sys (str "Extract 1-5 durable, atomic facts worth remembering from this work — "
                  "figures, causal claims, named entities. One sentence each; skip process "
-                 "notes and pleasantries. Respond ONLY as JSON "
+                 "notes and pleasantries. **Each sentence must name its own subject** — it "
+                 "will be read on its own, with no notebook around it, so \"the Aeon path "
+                 "locks out the Lich ending\" must say which game. "
+                 "Respond ONLY as JSON "
                  "{\"facts\":[{\"fact\":\"…\",\"entities\":[\"lowercase\",…]}]}."
                  (when (seq (str context)) (str "\nThe work was about: " context)))]
     (:facts (json/read-str (chat [{:role "system" :content sys}
