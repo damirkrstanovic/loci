@@ -1082,6 +1082,9 @@
 (def ^:private sci-opts {:classes {'Math java.lang.Math}})
 (defn- json-safe [rows] (walk/postwalk #(if (ratio? %) (double %) %) rows))
 
+;; both live at the bottom, next to the entity minting they were split for
+(declare next-id next-id-in)
+
 ;; only a real :space may receive a cell append — an existence check alone lets
 ;; a table id through, and the :assoc on its vector :value poisons the log
 (defn- space? [st id] (= :space (:kind (sub/object st id))))
@@ -1117,11 +1120,23 @@
               out  (:rows r)]
           (if (:error r)
             {:error (str "compute failed: " (:error r))}
-            (let [nf (count (filter #(= :fn (:kind %)) (vals (sub/objects st))))
-                  nt (count (filter #(= :table (:kind %)) (vals (sub/objects st))))
-                  p  (str/trim prompt)
-                  fid (str "fn:" (subs id (inc (str/index-of id ":"))) "-" (inc nf))
-                  nid (str "tbl:derived-" (inc nt))
+            ;; max+1, not count+1. Counting is how three notebooks died on
+            ;; 2026-07-23: `space:dd-` was minted `(inc (count …))` over a store
+            ;; that had booted 49 of 80 events, so it re-minted 16/17/18 onto
+            ;; live notebooks and `:put` — `assoc-in`, no occupancy check —
+            ;; replaced them in silence. These two had neither the
+            ;; `(rand-int 9999)` suffix that saved `tbl:extract-14-677` nor an
+            ;; existence check, and `fn-apply!` below already minted
+            ;; `tbl:derived-` through `next-id`: one prefix, two rules. A count
+            ;; also falls with nothing wrong at all — remove a derived table and
+            ;; the next compute re-mints the id of one still sitting there.
+            ;; `next-id-in` over ONE `sub/objects` rather than `next-id` twice:
+            ;; each call re-folds the whole log on the EDN stores (2.334 ms vs
+            ;; 1.135 ms at 3003 events), and both ids come from one snapshot.
+            (let [objm (sub/objects st)
+                  p    (str/trim prompt)
+                  fid  (next-id-in objm (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
+                  nid  (next-id-in objm "tbl:derived-")
                   ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
                   fobj {:id fid :kind :fn :title (str "fn: " p)
                         :value {:source id :prompt p :lang "clojure" :code code}}
@@ -1151,8 +1166,6 @@
 
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
-(declare next-id)
-
 (defn- table-rows [st id]
   (let [rows (:value (sub/object st id))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))

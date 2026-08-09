@@ -588,6 +588,73 @@
       (is (str/starts-with? (:error r) "compute failed:"))
       (is (= before (count (sub/history st)))))))         ; nothing committed
 
+;; ---- the two ids compute mints, and why they are max+1 and not count+1 ----
+;;
+;; 2026-07-23: `space:dd-` was minted `(inc (count (nb/notebooks st)))` over a
+;; store that had silently booted 49 of 80 events, so it re-minted 16, 17 and 18
+;; onto three LIVE astronomy notebooks. `:put` is `assoc-in` with no occupancy
+;; check, so it overwrote them with no error anywhere and three notebooks were
+;; gone. `compute-clj!` minted BOTH its ids the same way, with neither the
+;; `(inc (rand-int 9999))` suffix that saved `tbl:extract-14-677` from doing the
+;; same to `tbl:extract-14-588` nor an existence check — and `server.clj` was
+;; already minting `tbl:derived-` through `next-id` sixty lines further down, so
+;; one prefix had two rules.
+;;
+;; The fixture below is the collision shape and nothing else: FEWER live objects
+;; of each kind than the highest suffix already taken. Count and max must
+;; genuinely disagree or the test passes under the bug.
+
+(defn- store-with-a-gap-between-count-and-max
+  "Two tables and one :fn live, but `-5` is taken for both prefixes: a
+   count-based mint says `-3`/`-2`, a max-based one says `-6`."
+  []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value trows}})
+    (sub/commit! st {:op :put :id "tbl:derived-5"
+                     :value {:id "tbl:derived-5" :kind :table :title "the fifth derived table"
+                             :value trows}})
+    (sub/commit! st {:op :put :id "fn:x-5"
+                     :value {:id "fn:x-5" :kind :fn :title "fn: the fifth function"
+                             :value {:source "tbl:x" :prompt "five" :lang "clojure"
+                                     :code "(fn [rows] rows)"}}})
+    st))
+
+(deftest compute-mints-past-the-highest-id-not-past-the-count
+  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+    (let [st     (store-with-a-gap-between-count-and-max)
+          before (count (sub/history st))
+          r      (srv/compute-clj! st "tbl:x" "add x" nil)
+          fid    (:via (sub/object st (:openId r)))]
+      (is (nil? (:error r)))
+      (is (= "tbl:derived-6" (:openId r)))                 ; two tables live → count said -3
+      (is (= "fn:x-6" fid))                                ; one :fn live → count said -2
+      ;; the assertion the July notebooks would have wanted: the occupants live
+      (is (= "the fifth derived table" (:title (sub/object st "tbl:derived-5"))))
+      (is (= "fn: the fifth function" (:title (sub/object st "fn:x-5"))))
+      ;; the :fn and its table are ONE :tx, so one undo reverses both
+      (is (= (inc before) (count (sub/history st))))
+      (sub/undo! st)
+      (is (nil? (sub/object st "tbl:derived-6")))
+      (is (nil? (sub/object st "fn:x-6"))))))
+
+(deftest compute-numbers-functions-per-source-not-across-the-store
+  ;; `fn:` carries the source's local name — `fn:<src>-N` — so the sequence is
+  ;; per-source, and `next-id`'s prefix has to carry that name too. A store-wide
+  ;; count numbered every source's functions off one running total, so the FIRST
+  ;; function over a brand-new table came out `fn:y-2`. Two sources, because one
+  ;; source cannot tell "counts the store" from "counts this source".
+  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+    (let [st (store-with-a-gap-between-count-and-max)]
+      (sub/commit! st {:op :put :id "tbl:y"
+                       :value {:id "tbl:y" :kind :table :title "Y" :value trows}})
+      (let [ry (srv/compute-clj! st "tbl:y" "add x" nil)]
+        (is (= "fn:y-1" (:via (sub/object st (:openId ry)))))  ; store-wide count said -2
+        (is (= "tbl:derived-6" (:openId ry))))
+      (let [rx (srv/compute-clj! st "tbl:x" "add x again" nil)]
+        (is (= "fn:x-6" (:via (sub/object st (:openId rx)))))  ; fn:x- keeps its own run
+        (is (= "tbl:derived-7" (:openId rx)))))))              ; tbl:derived- keeps one run
+
 (deftest flow-step-refs-walk-back-past-outputless-steps
   ;; the live-fire bug: the planner counted 1-based, so "$1" hit the GATE
   ;; (no :out) and the literal "$1" reached compute. $N now means "the
