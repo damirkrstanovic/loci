@@ -278,6 +278,15 @@
   .memfact{border:1px solid var(--line);border-radius:9px;padding:9px 12px;margin-bottom:9px}
   .memfact .src{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:4px}
   .memfact .dots{color:var(--accent);letter-spacing:2px}
+  /* what a fact is ABOUT, on its own line between the fact and the .src run —
+     never inside that run, which is already six `·`-separated segments and would
+     grow a dangling separator the first time a fact named nothing. Mono, because
+     a chip reads `tsmc`: a normalized identity rather than a botched title, and
+     the same register .entname draws it in on the page the chip opens.
+     line-height, because several subjects wrap and inline-block chips on a
+     wrapped line otherwise touch. */
+  .memfact .ents{margin-top:6px;font-family:var(--mono);font-size:10.5px;line-height:2}
+  .memfact .ents .ghostchip{margin:0 4px 0 0}
   /* what the memory layer is doing, in the same mono/muted register as .src */
   .memstat{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:-6px 0 12px}
   .memfact .mergedtoggle{cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent-line)}
@@ -1865,6 +1874,46 @@ function viaLabel(via){
   if(v.includes('semantic')) parts.push('meaning');
   return parts.join(' + ');
 }
+// What a fact is about, as the pane draws it.
+//
+// `:entities` are the raw strings the distiller wrote, and the design keeps them
+// that way — facts are never rewritten to point at entity ids. `absorb` then
+// unions them with `distinct` over those raw strings, so one survivor really can
+// carry ["tsmc","TSMC"," tsmc "]: three chips for one subject, all three opening
+// the same page. And a model's JSON puts "" and null in there, which are not
+// subjects at all.
+//
+// So fold before drawing: lowercase, collapse whitespace, trim, drop blanks, keep
+// first-seen order. That is loci.entities/normalize's rule, and this is a
+// SHELL-SIDE APPROXIMATION of it — the shell has no access to the real one, and
+// there is no endpoint that normalizes a list. The two agree closely: JS's `\s`
+// already covers U+00A0 and U+202F (Java's does not, which is exactly why the
+// server's rule spells it [\s\p{Z}]), and JS toLowerCase is locale-independent
+// where Java's .toLowerCase() follows $LANG. Where they could still disagree the
+// cost is cosmetic — the name travels to /api/entity, which normalizes at the
+// door, and the page that comes back draws the SERVER's identity in .entname, so
+// a disagreement lands on screen instead of in a broken link.
+//
+// Rejected: draw the raw string and deduplicate on the folded one. That makes the
+// pane pick a winner among six spellings and then show a chip whose text is not
+// the subject it opens.
+//
+// Uncapped, also deliberately. Measured on the live corpus: 84 facts, mean 2.5
+// subjects, widest 7 — and the thing that inflates the list, a merge unioning raw
+// spellings, is precisely what the fold above collapses. A cap would need a reveal
+// control to avoid truncating in silence (this project's rule), which is a second
+// disclosure widget beside .mergedtoggle for a case that has never occurred; and a
+// fact naming forty subjects is a distiller that over-extracted, which is
+// something this pane exists to make visible rather than to hide behind "+33 more".
+function factEntities(f){
+  const out=[], seen=new Set();
+  for(const e of ((f&&f.entities)||[])){
+    const k=String(e==null?'':e).replace(/\s+/g,' ').trim().toLowerCase();
+    if(!k||seen.has(k)) continue;
+    seen.add(k); out.push(k);
+  }
+  return out;
+}
 async function openMemory(qstr){
   const res=await API.memory(qstr||'');
   const facts=res.facts||[];
@@ -1885,7 +1934,15 @@ async function openMemory(qstr){
     // erring-high threshold auditable rather than merely careful
     const absorbed=f['merged-from']||[];
     const via=qstr?viaLabel(f.via):'';
+    // the answer to "we remembered some facts about a game, but there is nothing
+    // pointing to this game" — the fact has always said what it is about, and this
+    // is where it finally says it out loud. Its own row above the `.src` run and
+    // never a segment inside it: a fact naming no subject would otherwise leave a
+    // dangling `·` there, in every combination of merged/relevance/via.
+    const ents=factEntities(f);
     h+='<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div>'+
+      (ents.length?'<div class="ents">'+ents.map(e=>
+        '<span class="ghostchip" data-entity="'+esc(e)+'">'+esc(e)+'</span>').join(' ')+'</div>':'')+
       '<div class="src"><span class="dots">'+'●'.repeat(Math.min(5,f.strength||1))+'</span>'+
       (absorbed.length?' <span class="mergedtoggle" data-merged="'+i+'">+'+absorbed.length+' merged</span>':'')+' · '+
       (f.source&&f.source.obj?'<span class="ghostchip" data-open="'+esc(f.source.obj)+'">⌾ '+esc(f.source.obj)+'</span>'
@@ -1909,6 +1966,15 @@ async function openMemory(qstr){
   mq.focus();
   mq.addEventListener('keydown',e=>{ if(e.key==='Enter') openMemory(mq.value.trim()); });
   modal.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>{ closeModal(); openObject(el.dataset.open); }));
+  // A subject, not an object — `data-entity` and never `data-open`, because
+  // openEntity's own modal runs a [data-open] delegation of its own and a chip
+  // carrying both would be fetched as /api/object/tsmc, an id nothing has.
+  //
+  // closeModal() here rather than inside openEntity: a payload carrying `object`
+  // short-circuits to openObject and never touches the modal, so without this the
+  // pane would sit on top of the object the chip just sent the reader to.
+  modal.querySelectorAll('[data-entity]').forEach(el=>el.addEventListener('click',()=>{
+    closeModal(); openEntity(el.dataset.entity); }));
   modal.querySelectorAll('[data-merged]').forEach(el=>el.addEventListener('click',()=>{
     const list=modal.querySelector('#merged-'+el.dataset.merged);
     if(list) list.hidden=!list.hidden;

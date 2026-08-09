@@ -439,3 +439,198 @@ test('in the past the button writes nothing and says why', async () => {
       'the click dropped the reader out of the past');
   });
 });
+
+// ── a fact says what it is about ───────────────────────────────────────────
+//
+// The memory pane, not the entity page — and no server change under any of it.
+// Every fact has carried `:entities` since the distiller's first run and
+// `memory-payload` has always shipped them (it drops `:vec` and nothing else);
+// they had simply never been drawn. So what these tests own is rendering, and one
+// delegation.
+//
+// Stubbed exactly as memorypane.test.mjs stubs it, `(\?|$)` and all:
+// /api/memory-unmerge starts with /api/memory, so a bare /\/api\/memory/ would
+// answer the unmerge POST with a pane payload — the same trap as /api/entity and
+// /api/entity-notebook above.
+const MEMORY_URL = /\/api\/memory(\?|$)/;
+const stubMemory = (page, body) => page.route(MEMORY_URL, route => {
+  const q = new URL(route.request().url()).searchParams.get('q') || '';
+  route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify(typeof body === 'function' ? body(q) : body),
+  });
+});
+
+const HEALTHY = { embedding: 'embed-qwen3-4b', awaiting: 0, merge: { threshold: 0.88 } };
+// A pane fact — `fact` above is an entity-PAGE fact and the two shapes differ.
+const memFact = (over = {}) => ({
+  id: 'fact:neptune', fact: 'Neptune is the eighth planet from the Sun',
+  ts: Date.now(), strength: 2, source: { space: 'space:cosmos' }, ...over,
+});
+
+// openMemory is a top-level function declaration, so it is on window.
+const openPane = async (page, q = '') => {
+  await page.evaluate(qq => openMemory(qq), q);
+  await page.waitForSelector('.modalcard');
+};
+const chipTexts = page =>
+  page.$$eval('.memfact .ents .ghostchip', els => els.map(e => e.innerText.trim()));
+
+// Locate by the TEXT the chip must carry, and fail in five seconds with a
+// sentence if there is no clickable thing carrying it. Clicking straight through
+// a locator that matches nothing is a thirty-second timeout that can only say the
+// selector never appeared — which is how three of Task 8's sabotages managed to
+// "fail" without ever running the assertion that named the defect.
+const clickChip = async (page, name) => {
+  const chip = page.locator('.memfact .ents .ghostchip', { hasText: name });
+  await until(async () => (await chip.count()) === 1,
+    `no clickable subject reading “${name}” in the memory pane — the subjects were drawn ` +
+    'as plain text, so there is nothing to click');
+  await chip.click();
+};
+
+test('a fact draws one chip per subject, folded to the identity the server keys on', async () => {
+  await withPage(browser, 'memory-fact-chips', async (page) => {
+    await bootedShell(page, server.url);
+    // What `absorb` really leaves behind: it unions `:entities` with `distinct`
+    // over the RAW strings, so a survivor carries every casing and spacing any
+    // absorbed fact happened to be written with — plus the "" and null a model's
+    // JSON can put there. Six strings, two subjects, one of them named nothing.
+    await stubMemory(page, { ...HEALTHY, total: 1, facts: [memFact({
+      fact: 'The most advanced nodes are three years ahead of anyone else’s',
+      entities: ['TSMC', 'taiwan', ' tsmc ', '', null, 'Taiwan'] })] });
+    await openPane(page);
+
+    assert.deepEqual(await chipTexts(page), ['tsmc', 'taiwan'],
+      'one chip per subject, in the order the fact names them, drawn as the identity the ' +
+      'server keys on rather than as the six strings the distiller happened to write');
+
+    // …the row was added, not swapped in for the fact
+    const [row] = await page.$$eval('.memfact', els => els.map(e => e.innerText.trim()));
+    assert.ok(row.includes('three years ahead'), `the chips replaced the fact itself:\n${row}`);
+    // …and it really is folded: no spelling but the folded one is on screen, so a
+    // pane that drew the raw strings and merely deduplicated them fails here
+    assert.ok(!row.includes('TSMC') && !row.includes('Taiwan'),
+      `a second spelling of a subject that already has a chip is a second subject to a ` +
+      `reader, and there is only one page behind both:\n${row}`);
+  });
+});
+
+test('a fact about nothing draws no row, and the line under it is untouched', async () => {
+  await withPage(browser, 'memory-fact-chips-absent', async (page) => {
+    await bootedShell(page, server.url);
+    // Four facts identical in everything the `.src` line is built from — strength
+    // dots, a merge, a source, an age, a relevance and a `via`, which is every
+    // segment of that `·`-separated run at once — and differing only in their
+    // subjects. So anything the new row does to that line shows up as a
+    // difference between these four strings.
+    const common = { strength: 2, score: 0.52, via: ['lexical', 'semantic'],
+      'merged-from': [{ id: 'fact:absorbed', fact: 'Neptune is about 30 AU from the Sun' }] };
+    await stubMemory(page, { ...HEALTHY, total: 4, facts: [
+      memFact({ id: 'fact:has',   fact: 'Neptune is the eighth planet from the Sun',
+                entities: ['neptune'], ...common }),
+      memFact({ id: 'fact:empty', fact: 'The ice giants are cold', entities: [], ...common }),
+      memFact({ id: 'fact:blank', fact: 'Something was written down',
+                entities: ['', null, '   '], ...common }),
+      memFact({ id: 'fact:none',  fact: 'A fact from before there was a distiller', ...common }),
+    ] });
+    await openPane(page, 'neptune');
+
+    const srcs = await page.$$eval('.memfact .src', els => els.map(e => e.innerText.trim()));
+    assert.equal(srcs.length, 4, `one .src line per fact:\n${srcs.join('\n')}`);
+    // the whole run, spelled out: a dangling `·` or a doubled one is a character
+    // in this string and nowhere else
+    assert.equal(srcs[0],
+      '●● +1 merged · ⌾ space:cosmos · today · relevance 0.52 · words + meaning',
+      'the line under a fact that names a subject');
+    for (const s of srcs) assert.equal(s, srcs[0],
+      'a fact with subjects and a fact without must read identically on the line below ' +
+      `them — the chips go above it, and never into that run:\n${srcs.join('\n')}`);
+
+    assert.deepEqual(await chipTexts(page), ['neptune'],
+      '"" and null are not subjects, and neither is a missing key');
+    // Structural on purpose, and the only assertion in this file that is: an empty
+    // <div class="ents"> contributes nothing to innerText and six pixels to the
+    // screen, so no assertion about text can see it. Rendering the row
+    // unconditionally is exactly the defect.
+    assert.equal(await page.locator('.memfact .ents').count(), 1,
+      'a row of subjects was drawn for a fact that names none — three empty rows, one under ' +
+      'each of the three facts that had nothing to put in them');
+  });
+});
+
+test('clicking a subject asks the server for it, and lands on its page', async () => {
+  await withPage(browser, 'memory-fact-chip-opens-subject', async (page) => {
+    await bootedShell(page, server.url);
+    await stubMemory(page, { ...HEALTHY, total: 2, facts: [
+      memFact({ id: 'fact:tw',  fact: 'The island exports most of the world’s leading-edge silicon',
+                entities: ['taiwan'] }),
+      memFact({ id: 'fact:fab', fact: 'The most advanced nodes are three years ahead',
+                entities: ['tsmc'] }),
+    ] });
+    const asked = await stubEntity(page, PAGE());
+    // Nothing here is an object. A chip carrying `data-open` would be picked up by
+    // openMemory's own [data-open] delegation and fetched as /api/object/tsmc, so
+    // this records what would happen and asserts it did not.
+    const opened = await stubObjects(page, {});
+
+    await openPane(page);
+    // the chip on the SECOND fact, so a delegation that always opened the first
+    // subject on the page would pass a click on either one
+    await clickChip(page, 'tsmc');
+
+    // Either endpoint ends the wait, and the assertions below say which one was
+    // reached. Waiting on `asked` alone would let a chip that went to openObject
+    // instead fall through to a thirty-second waitForSelector whose only message
+    // is that a selector never appeared.
+    await until(() => asked.length + opened.length > 0,
+      'the chip click reached no endpoint at all — the pane has no [data-entity] delegation');
+    assert.deepEqual(opened, [],
+      'the chip was opened as an object — data-open and data-entity are two different ' +
+      'gestures, and there is no object whose id is “tsmc”');
+    assert.deepEqual(asked, ['tsmc'],
+      'the chip must ask for the subject it carries, not the first one on the page');
+    await page.waitForSelector('.modalcard .entname');
+
+    const txt = await modalText(page);
+    assert.ok(txt.includes('seventy per cent of global foundry revenue'),
+      `the subject page did not render:\n${txt}`);
+    assert.ok(!txt.includes('leading-edge silicon'),
+      `the memory pane is still on screen under the subject it opened:\n${txt}`);
+  });
+});
+
+test('a subject that is already a citizen opens its object, and the pane does not stay over it',
+  async () => {
+    await withPage(browser, 'memory-fact-chip-materialized', async (page) => {
+      await bootedShell(page, server.url);
+      await stubMemory(page, { ...HEALTHY, total: 1, facts: [
+        memFact({ id: 'fact:fab', fact: 'The most advanced nodes are three years ahead',
+                  entities: ['tsmc'] }),
+      ] });
+      const rendered = PAGE({ object: 'ent:1' });
+      await stubEntity(page, rendered);
+      const opened = await stubObjects(page, { 'ent:1': MOLD(rendered) });
+
+      await openPane(page);
+      await clickChip(page, 'tsmc');
+
+      await until(() => opened.length > 0,
+        'the chip click reached no endpoint at all — the pane has no [data-entity] delegation');
+      // asserted BEFORE the molder is waited for: a chip carrying data-open sends
+      // its own text to openObject, which puts /api/object/tsmc on this very list
+      // and satisfies the wait above — and then the molder never comes, so the
+      // whole test would "fail" thirty seconds later with nothing to say. Measured:
+      // it did exactly that until this line was moved up.
+      assert.deepEqual(opened, ['ent:1'],
+        'the payload named an object and the chip opened something else — a subject is not ' +
+        'an id, and /api/object/tsmc is a request for an object nothing has');
+      await page.waitForSelector('.molder .entname');
+      // openEntity short-circuits to openObject and never touches the modal — that
+      // is deliberate, and it is why the pane is only gone if the chip's own
+      // handler closed it first. The source chips in openEntity's modal carry the
+      // same rule for the same reason.
+      assert.equal(await page.locator('.modalcard').count(), 0,
+        'the memory pane stayed on screen over the object the chip sent you to');
+    });
+  });
