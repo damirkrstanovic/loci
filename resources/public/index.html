@@ -294,6 +294,17 @@
                        border:1px solid var(--accent-line);border-radius:5px;padding:0 5px;cursor:pointer}
   .memfact .mergedlist .unmerge:hover{background:var(--accent-wash,transparent)}
   .memfact .mergedlist .unmerge[disabled]{opacity:.5;cursor:default}
+  /* the entity page — ONE renderer, two surfaces, so every rule here is drawn
+     into the modal (before the subject is a citizen) and into the molder (after).
+     .entname is mono because `tsmc` is a normalized key and not a botched title:
+     in the mono register a lowercase token reads as an identity, which is what
+     it is, and nothing is tempted to re-case it. It reuses .memfact for the
+     facts themselves — they ARE memory facts, and a second box that looked
+     nearly like one would be the drift this page exists to avoid. */
+  .entname{font-family:var(--mono);font-size:15px;color:var(--ink)}
+  .entmeta{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:3px 0 12px}
+  .entmeta.warn{color:var(--attn)}
+  .entsrc{font-size:11.5px;color:var(--muted);margin-top:10px}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -354,6 +365,13 @@ const API = {
   // answers with the two records, NOT a pane payload — it carries no q and no
   // space, so the caller refetches /api/memory with whatever it was showing
   memoryUnmerge: (survivor,absorbed) => POST('/api/memory-unmerge',{survivor,absorbed}),
+  // the subject page, in ONE payload the modal and the molder both draw. The raw
+  // string goes over the wire: `ent/normalize` is the server's, and a second
+  // implementation of it in the page would be the thing that disagrees with it.
+  entity: name => fetch('/api/entity?name='+encodeURIComponent(name)).then(r=>r.json()),
+  // one reversible commit — the :entity object AND the notebook about it. Answers
+  // {state, entity, spaceId}; `spaceId` is always a key and null is a real answer.
+  entityNotebook: name => POST('/api/entity-notebook',{name}),
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -1073,6 +1091,9 @@ function renderMold(m){
     case 'kpi':    return renderKPI(d);
     case 'applet': return '<div id="appletHost" style="min-height:340px"></div>';
     case 'flow':   return renderFlow(m.rendered, m.id);
+    // a subject — no viewers, and the shell draws the very page the modal draws,
+    // out of the very payload it draws it from. See renderEntityPage.
+    case 'entity': return renderEntityPage(m.rendered);
     default:       return '<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
   }
 }
@@ -1911,6 +1932,108 @@ async function openMemory(qstr){
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
 modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
+
+// ---------------- a subject, and the place it has ----------------
+//
+// The entity page. Drawn from `/api/entity?name=` into the modal before the
+// subject is a citizen of the substrate, and from `/api/object/…`'s `rendered`
+// into the molder once it is one — ONE payload shape and ONE renderer, or the
+// page quietly becomes two pages and the drift is invisible until somebody
+// materializes something and the page they had been reading changes under them.
+//
+// The name is drawn HERE rather than left to each surface's own header, which was
+// the alternative and reads better on the molder (whose header already carries
+// `m.title`). Rejected: the title is a display string the server explicitly does
+// not identify on — `entity-objects` matches `[:value :name]` alone — so a renamed
+// entity object would leave its page saying nothing about the identity its facts
+// actually hang on. Where the two agree the repetition costs a line; where they
+// disagree it is the only thing on screen that says so.
+function renderEntityPage(p){
+  p=p||{};
+  // Both surfaces can be handed `{error}`: `/api/entity?name=` with a blank name,
+  // and `mold-payload` for an :entity object whose stored name normalizes to
+  // nothing. Handled once, here, for this function's whole reason for existing.
+  // Falling through would draw an unnamed subject reading "0 facts · Nothing is
+  // remembered about this yet" — a confident statement about a subject nobody
+  // named, which is an answer where a refusal belongs.
+  if(p.error) return '<div class="entmeta warn">'+esc(p.error)+'</div>';
+  const facts=p.facts||[], srcs=p.sources||[], n=facts.length;
+  // `count` is every live fact carrying the name; `facts` is the ranked page of
+  // at most fifty of them. The server keeps the two apart precisely so this line
+  // can say "50 of 137" instead of truncating in silence — the same rule the
+  // memory pane's status line follows for `total`, and for the same reason: a
+  // number derived from the page is a claim about the page wearing the clothes
+  // of a claim about the world.
+  //
+  // The "of" appears only when it is true. `count` can come back one SHORT of the
+  // page — `mem/all-facts` and `mold/recall` deref the fact map independently, so
+  // a `remember` landing between them is counted by one and not the other — and
+  // "49 of 48" is worse than saying nothing.
+  const tot=(typeof p.count==='number'&&p.count>n)?p.count:null;
+  let h='<div class="entname">◈ '+esc(p.name)+'</div>'+
+    '<div class="entmeta">'+(tot?n+' of '+tot+' facts':n+' fact'+(n===1?'':'s'))+
+    // `absorb` unions the absorbed fact's entities onto the survivor, so two facts
+    // naming a subject become one and the evidence really does collapse back below
+    // the threshold. Say so, rather than let the page vanish under a reader.
+    (p.promoted?'':' · not yet a subject of its own — two facts promote it, and a merge can collapse them back')+
+    '</div>';
+  h+=n
+    ? facts.map(f=>'<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div></div>').join('')
+    : '<div style="color:var(--muted);font-size:13px">Nothing is remembered about this yet.</div>';
+  if(srcs.length) h+='<div class="entsrc">from '+srcs.map(s=>
+    '<span class="ghostchip" data-open="'+esc(s.id)+'">'+esc(s.title||s.id)+'</span>').join(' ')+'</div>';
+  return h;
+}
+// A subject, opened. ONE decision and the SERVER takes it: a payload carrying
+// `object` is a subject that is already a citizen, so we open the object and the
+// modal — which exists to offer materialization — never appears. The shell
+// working it out for itself would need the objects map, and would be wrong the
+// moment anything else materialized the name.
+//
+// A LEAP subject row carries `:object` too, and this deliberately does not take
+// it as an argument to shortcut with: that key is a snapshot from when the query
+// ran, and `undo!` can remove the object between the keystroke and the Enter.
+// One round trip on a click buys an answer that is true now, and leaves exactly
+// one path through this function instead of two with one of them untested.
+async function openEntity(name){
+  let p; try{ p=await API.entity(name); }catch(e){ showToast('subject: network error'); return; }
+  if(p.object) return openObject(p.object);
+  modal.innerHTML='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
+    '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">SUBJECT</span>'+
+    (p.error?'':'<span class="q">derived from the agent’s memory — not an object yet</span>')+'</div>'+
+    '<div class="modal-b">'+renderEntityPage(p)+'</div>'+
+    '<div class="modal-f">'+(p.error?'':'<button class="btn sm" id="entNb">✦ New notebook about this</button>')+
+    '<button class="btn ghost sm" id="closeModal">Close</button>'+
+    '<span style="font-size:11.5px;color:var(--muted)">acting on a subject is what makes it real — reversibly</span></div></div>';
+  modal.classList.add('on');
+  modal.querySelector('#closeModal').addEventListener('click',closeModal);
+  // the modal has no renderDetail around it, so its source chips need the same
+  // delegation openMemory's do; the molder's are wired by renderDetail already.
+  modal.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>{
+    closeModal(); openObject(el.dataset.open); }));
+  const nb=modal.querySelector('#entNb');
+  if(nb) nb.addEventListener('click',async()=>{
+    // never act into the past — refused BEFORE the POST, the way keepNote is,
+    // rather than reported after a commit has already landed
+    if(TIME){ showToast('time mode — ↩ now to make a notebook'); return; }
+    nb.disabled=true;                       // one subject cannot be minted twice
+    let r; try{ r=await API.entityNotebook(p.name); }
+    catch(e){ nb.disabled=false; showToast('subject: network error'); return; }
+    if(r.error){ nb.disabled=false; showToast(r.error); return; }
+    // …and scrubbing into the past while the POST was in flight must not yank the
+    // reader back into the present, which applyState would
+    if(TIME){ showToast('made — ↩ now to see it'); return; }
+    applyState(r.state); closeModal(); rebuild();
+    // `spaceId` is always a KEY and null is a real answer: the notebook about this
+    // subject may have been renamed or had its cell removed, and
+    // materialize-entity! answers nil rather than minting a second one on a stale
+    // click. The entity itself is always there, so land on that — a gesture that
+    // commits and then shows you nothing is worse than one that shows you less.
+    const i=r.spaceId?STATE.spaces.findIndex(s=>s.id===r.spaceId):-1;
+    if(i>=0) enter(i); else openObject(r.entity);
+    showToast('“'+p.name+'” is a subject in the world now — reversible', undo);
+  });
+}
 async function askAgent(prompt, space){
   closeLeap();
   const scope = space ? ((STATE.spaces.find(s=>s.id===space)||{}).title) : 'your whole workspace';
