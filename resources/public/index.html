@@ -1630,7 +1630,7 @@ function composeLeap(keepSel){
   if(sel>=filtered.length) sel=0;
   if(!filtered.length){ results.innerHTML='<div class="group">no match</div>'; return; }
   let h='',last=null,flat=0;
-  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions','by meaning':'By meaning'};
+  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',subject:'Subjects',memory:'Memory','views & functions':'Views & functions','by meaning':'By meaning'};
   filtered.forEach(e=>{ const grp=gname[e.group]||'Content';
     if(grp!==last){h+='<div class="group">'+grp+'</div>';last=grp;}
     const i=flat++;
@@ -1638,10 +1638,27 @@ function composeLeap(keepSel){
     // found by meaning wears a notebook's mark — and act() enters it rather
     // than opening it as a document. The group header says how it was found.
     const sp=e.group==='space'||(e.group===DEEP_GROUP&&e.kind==='space');
+    // A subject takes no class of its own. `space` and `verb` are promises about
+    // what Enter does — go inside a notebook; do something rather than go
+    // somewhere — and a subject's Enter opens a page to read, which is what an
+    // undressed row promises already. A `.subject` rule would be a stylesheet
+    // grown for a distinction the heading and the mark make without one.
     const cls=e.note?'note':sp?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask'||e.group==='filter')?'verb':'';
-    const ic=e.note?'⋯':sp?'▢':e.group==='ask'?'✦':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    // ◈ and not ⌾: ⌾ is memory's mark, a subject is where memory hangs, and the
+    // two groups appear in the same list — one query returns both.
+    const ic=e.note?'⋯':sp?'▢':e.group==='ask'?'✦':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='subject'?'◈':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    // The grey right-hand column says WHICH of several same-reading rows this is,
+    // and above a subject the heading has just said it — `subject:tsmc` there
+    // would be that heading plus the label again, in the one slot on the row
+    // whose job is to add something. What only this row can say is how much is
+    // behind the name, which is also what decides whether it is worth going to,
+    // and the only thing that tells two subjects apart. `:object` rides on the
+    // row too and is deliberately NOT drawn: it is a snapshot act() must not read
+    // (see there), and putting it on screen would advertise the very short-circuit
+    // the design refused.
+    const gp=e.group==='subject'?(e.count===1?'1 fact':(e.count||0)+' facts'):e.id;
     h+='<div class="res '+cls+(i===sel?' sel':'')+'" data-i="'+i+'"><span class="ic">'+ic+'</span>'+
-       '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(e.id)+'</span></div>'; });
+       '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(gp)+'</span></div>'; });
   results.innerHTML=h;
   results.querySelectorAll('.res').forEach(r=>{ r.addEventListener('mousemove',()=>{sel=+r.dataset.i;paintSel();}); r.addEventListener('click',()=>{sel=+r.dataset.i;act();}); });
 }
@@ -1694,6 +1711,23 @@ async function act(){ const e=filtered[sel]; if(!e) return;
   else if(e.group===DEEP_GROUP){
     if(e.kind==='space'){ const i=STATE.spaces.findIndex(s=>s.id===e.id); if(i>=0) enter(i); }
     else openObject(e.id); }
+  // `e.name`, never `e.id`: `subject:<name>` is what the row IS and not where it
+  // goes, and picking the name back out of that string would be a second place
+  // that has to know how a subject id is spelled. `e.label`
+  // is the same string by construction and is only the fallback — openEntity(undefined)
+  // asks for a subject named “undefined”, which renders as a page and not as an error.
+  //
+  // The row's `:object` is informational and is NOT handed on as a short-cut. It is
+  // a snapshot from when the query ran, and `undo!` can remove that object between
+  // the keystroke and the Enter; the round trip is authoritative and costs one local
+  // request on the gesture that ENDS a keystroke sequence.
+  //
+  // No TIME guard, and none is missing: what act() guards is the branches that
+  // WRITE, and a subject is a destination like a notebook or a document, neither of
+  // which is guarded. Reading one in the past is fine, and openEntity's one writing
+  // control refuses there on its own. The palette does not open in the past anyway —
+  // q's focus handler turns it away, and enterTime closes it through overview().
+  else if(e.group==='subject'){ closeLeap(); openEntity(e.name||e.label); }
   else { openObject(e.id); } }
 async function createSpace(prompt){
   closeLeap();

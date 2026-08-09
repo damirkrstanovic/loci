@@ -634,3 +634,236 @@ test('a subject that is already a citizen opens its object, and the pane does no
         'the memory pane stayed on screen over the object the chip sent you to');
     });
   });
+
+// ── LEAP acts on a subject ─────────────────────────────────────────────────
+//
+// Task 7 taught `/api/leap` to emit a `subject` row, and the shell did not know
+// what one was: it drew it under **Content**, wearing `▤` — the document's mark —
+// and Enter handed `subject:tsmc` to openObject, which the server answers with a
+// null title and an empty body. So the molder OPENED, and only its emptiness said
+// that anything had gone wrong. Measured on a real payload after materializing
+// `tsmc`, a document and a subject came back indistinguishable but for the grey
+// id column.
+//
+// That heading is the design's whole argument for a separate group — "entity
+// names can collide with object titles, so it is its own result group, not a
+// merged list" — so a test that only checked the row was PRESENT would have
+// passed on every one of those defects. What is asserted here is therefore where
+// the row sits, what it is marked with, and what goes over the wire when it is
+// picked.
+
+// A row exactly as `leap-payload`'s subject group builds it: the id is
+// `subject:<name>`, which is what the row IS and never where it goes, and the
+// name travels in a field of its own rather than being re-parsed out of it.
+const subjRow = (name = 'tsmc', over = {}) =>
+  ({ id: 'subject:' + name, label: name, group: 'subject', name, count: 2, ...over });
+
+// A predicate rather than a glob, for the reason ENTITY_URL is a regex: `?` is a
+// wildcard in playwright's glob syntax and every LEAP url carries one. Records
+// the two asks separately — the lexical list goes out on the keystroke and a
+// `deep=1` one follows 250 ms after the keys stop — because "the past asked at
+// all" is a claim about the wire.
+const stubLeap = async (page, rows) => {
+  const seen = { lex: [], deep: [] };
+  await page.route(u => u.pathname === '/api/leap', async (route) => {
+    const url = new URL(route.request().url());
+    const q = url.searchParams.get('q') || '';
+    (url.searchParams.get('deep') === '1' ? seen.deep : seen.lex).push(q);
+    await route.fulfill({ json: q ? rows : [] });
+  });
+  return seen;
+};
+
+// Headings interleaved with rows, in document order: WHERE a row sits relative to
+// its heading is most of what is being asserted, so read #results' children in
+// order rather than the rows alone.
+const listing = page => page.$$eval('#results > *', els => els.map(e =>
+  e.classList.contains('group')
+    ? { group: e.textContent }
+    : { row: e.querySelector('.title').textContent,
+        ic: e.querySelector('.ic').textContent,
+        gp: e.querySelector('.gp').textContent,
+        cls: [...e.classList].filter(c => c !== 'sel' && c !== 'res').join(' ') }));
+
+const leapTo = async (page, text) => {
+  await page.click('#q');
+  await page.locator('#q').pressSequentially(text, { delay: 20 });
+  await page.waitForFunction(t => [...document.querySelectorAll('#results .res .title')]
+    .some(el => el.textContent === 'Ask the agent: “' + t + '”'), text);
+};
+
+// The row whose title is EXACTLY this — “tsmc” as a substring also matches
+// “Ask the agent: “tsmc””, and clicking that instead would ask the agent.
+const rowIndex = async (page, title) => {
+  const i = await page.$$eval('#results .res',
+    (els, t) => els.findIndex(e => e.querySelector('.title').textContent === t), title);
+  assert.ok(i >= 0, `there is no row reading “${title}”: ` +
+    JSON.stringify(await page.$$eval('#results .res .title', e => e.map(x => x.textContent))));
+  return i;
+};
+
+test('a subject is its own group, with a mark that is neither a document’s nor memory’s',
+  async () => {
+    await withPage(browser, 'leap-subject-group', async (page) => {
+      // one row per group a subject has to be told apart from, all on screen at
+      // once: a notebook, a document, and a memory hit
+      await stubLeap(page, [
+        { id: 'space:about-1', label: 'About TSMC', group: 'space' },
+        { id: 'doc:teardown', label: 'A teardown', group: 'doc' },
+        subjRow('tsmc'),
+        { id: '__memory__', group: 'memory',
+          label: 'TSMC controls roughly seventy per cent of global foundry revenue' },
+      ]);
+      await bootedShell(page, server.url);
+      await leapTo(page, 'tsmc');
+
+      const l = await listing(page);
+      const si = l.findIndex(x => x.group === 'Subjects');
+      assert.ok(si >= 0,
+        'the subject was drawn under some other heading — the heading is the only thing on a ' +
+        `row that says a subject is not a document:\n${JSON.stringify(l, null, 1)}`);
+      const sub = l[si + 1];
+      assert.equal(sub && sub.row, 'tsmc',
+        `the “Subjects” heading has something other than the subject under it:\n` +
+        JSON.stringify(l, null, 1));
+      // and it is a heading of its own, not a rename of one that was already there
+      assert.ok(l.some(x => x.group === 'Content') && l.some(x => x.group === 'Notebooks'),
+        `the subject group swallowed a group that was already there:\n${JSON.stringify(l, null, 1)}`);
+
+      // the marks, side by side: ⌾ is memory's, and a subject is where memory
+      // hangs, so those two above all have to be tellable apart at a glance
+      const mem = l[l.findIndex(x => x.group === 'Memory') + 1];
+      assert.equal(mem.ic, '⌾',
+        'the fixture stopped putting memory’s mark on screen, so the assertion below compares ' +
+        'the subject’s mark against nothing');
+      assert.equal(sub.ic, '◈', `a subject wears the wrong mark: ${sub.ic}`);
+
+      // The grey right-hand column. `subject:tsmc` there is the heading and the
+      // label again, in the one slot on the row whose job is to say something the
+      // row does not already say. How much is behind a name is what decides
+      // whether it is worth going to, and it is the only thing that tells two
+      // subjects apart. `:object` rides on the row too and is deliberately NOT
+      // drawn: it is a snapshot act() must not read, and advertising it invites
+      // exactly the short-circuit the design refused.
+      assert.equal(sub.gp, '2 facts', `the grey column says nothing the row had not said: ${sub.gp}`);
+
+      // Structural, and the second such assertion in this file, for the reason the
+      // first one gives: a class contributes nothing to innerText, so no assertion
+      // about the text on screen can see a subject row dressed as something else.
+      // `cls` is a claim about the GESTURE — `space` promises Enter takes you
+      // inside a notebook, `verb` promises Enter does something rather than going
+      // somewhere — and a subject's Enter opens a page to read, which is what an
+      // undressed row already promises.
+      assert.equal(sub.cls, '',
+        `a subject row is dressed as “${sub.cls}”, which promises something about Enter that ` +
+        'acting on it does not keep');
+    });
+  });
+
+test('selecting a subject asks the server for the name, never for the subject: id', async () => {
+  await withPage(browser, 'leap-subject-acts', async (page) => {
+    // the second row carries no `:name` at all. Not a shape the server sends —
+    // `:label` and `:name` are the same string by construction — but the fallback
+    // exists because `openEntity(undefined)` asks for a subject literally named
+    // “undefined”, and that renders as a page rather than as an error. Two paths,
+    // and this is the one that would otherwise never be walked.
+    await stubLeap(page, [subjRow('tsmc'), subjRow('taiwan', { name: undefined })]);
+    const asked = await stubEntity(page, PAGE());
+    // Nothing on this row is an object id, so a request for one is the defect
+    // itself: /api/object/subject:tsmc is answered with a null title and an empty
+    // body, and the molder opens on it.
+    const opened = await stubObjects(page, {});
+    await bootedShell(page, server.url);
+    await leapTo(page, 'tsmc');
+
+    await page.locator('#results .res').nth(await rowIndex(page, 'tsmc')).click();
+    // Either endpoint ends the wait and the assertions say which was reached.
+    // Waiting on `asked` alone would let a fall-through to openObject run out a
+    // thirty-second waitForSelector whose only message is that a selector never
+    // appeared — which is how three of Task 8's sabotages "failed".
+    await until(() => asked.length + opened.length > 0,
+      'selecting the subject reached no endpoint at all');
+    assert.deepEqual(opened, [],
+      'the row was opened as an object — `subject:tsmc` is what the row IS, not where it ' +
+      'goes, and nothing in the substrate has that id');
+    assert.deepEqual(asked, ['tsmc'],
+      'the name travels in its own field; re-parsing it out of the id would be a second place ' +
+      'that has to know how a subject id is spelled');
+    await page.waitForSelector('.modalcard .entname');
+    // the palette is a keystroke sequence, and picking a row is what ends it
+    assert.equal(await page.locator('#cmd.live').count(), 0,
+      'the palette stayed live under the subject page it sent you to');
+
+    // …and the row with no `:name` asks for what the reader can see on it
+    await page.evaluate(() => closeModal());
+    await leapTo(page, 'tsmc');
+    await page.locator('#results .res').nth(await rowIndex(page, 'taiwan')).click();
+    await until(() => asked.length > 1, 'the second subject reached no endpoint at all');
+    assert.deepEqual(asked, ['tsmc', 'taiwan'],
+      'a row that names no subject asked for “undefined”, which is a page and not an error');
+  });
+});
+
+test('a subject and a document that read the same are two rows under two headings', async () => {
+  await withPage(browser, 'leap-subject-collision', async (page) => {
+    // `materialize-entity!` titles the notebook it mints with the entity's own
+    // name, so a subject colliding with an object's title is the ordinary case
+    // and not a contrived one. Suppressing either would hide a destination; one
+    // row that guesses which was meant is not an answer either.
+    await stubLeap(page, [
+      { id: 'doc:teardown', label: 'tsmc', group: 'doc' },
+      subjRow('tsmc', { count: 1 }),
+    ]);
+    await bootedShell(page, server.url);
+    await leapTo(page, 'tsmc');
+
+    const l = await listing(page);
+    assert.equal(l.filter(x => x.row === 'tsmc').length, 2,
+      `both destinations must be offered:\n${JSON.stringify(l, null, 1)}`);
+    const ci = l.findIndex(x => x.group === 'Content');
+    const si = l.findIndex(x => x.group === 'Subjects');
+    assert.ok(ci >= 0 && si >= 0,
+      `two rows reading the same under one heading is the collision the group exists to ` +
+      `undo:\n${JSON.stringify(l, null, 1)}`);
+    assert.deepEqual([l[ci + 1].row, l[ci + 1].ic], ['tsmc', '▤'],
+      'the document must stay a document');
+    assert.deepEqual([l[si + 1].row, l[si + 1].ic], ['tsmc', '◈'],
+      'the subject is under its own heading with its own mark');
+    // one fact, said in the singular — the grey column is prose, not a field dump
+    assert.equal(l[si + 1].gp, '1 fact', `the count reads as a machine wrote it: ${l[si + 1].gp}`);
+  });
+});
+
+test('the past offers no subject to act on, because it offers no palette at all', async () => {
+  await withPage(browser, 'leap-subject-time-mode', async (page) => {
+    // Why act()'s subject branch carries no TIME guard, pinned rather than
+    // assumed. Every guarded branch in act() guards a WRITE — ask, create,
+    // connect — and a subject is a destination, like a notebook or a document,
+    // neither of which is guarded. Reading one in the past is fine; `openEntity`'s
+    // one writing control refuses on its own, which the time-mode test above
+    // pins. What makes a guard here unreachable rather than merely redundant is
+    // this: the palette does not open in the past, and entering the past closes it
+    // through overview().
+    const seen = await stubLeap(page, [subjRow('tsmc')]);
+    await bootedShell(page, server.url);
+    await page.click('#timeBtn');
+    await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME);
+
+    await page.click('#q');
+    // Asserted here, before anything is waited for, and both halves of that matter.
+    // The focus handler is synchronous — it either adds `live` or blurs and toasts,
+    // and the click has returned — so there is nothing to wait for. And when the
+    // guard is gone there is no toast at all: measured, waiting for one first turned
+    // this test into a 31-second waitForSelector whose message was that a selector
+    // never appeared, with the line below — the one that names the defect — never run.
+    assert.equal(await page.locator('#cmd.live').count(), 0,
+      'the palette opened in the past — a subject row is reachable there, so act() needs the ' +
+      'guard this task argued it did not');
+    await until(() => page.locator('.toast.on').count().then(n => n > 0),
+      'the palette shut in the reader’s face and said nothing at all');
+    const toast = (await page.innerText('.toast')).trim();
+    assert.match(toast, /time mode/, `the palette shut without saying why: ${toast}`);
+    assert.deepEqual(seen.lex, [],
+      'the past asked /api/leap, whose answers are all about the present');
+  });
+});
