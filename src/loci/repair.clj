@@ -42,6 +42,7 @@
    fifteen fact ids, every one of them a number a reviewer can check against the
    forensics by eye."
   (:require [clojure.string :as str]
+            [loci.memory :as mem]
             [loci.notebook :as nb]
             [loci.server :as server]
             [loci.substrate :as sub]))
@@ -330,3 +331,152 @@
                (do (sub/commit! st {:op :tx :events events})
                    {:ok? true :dry-run? false :plan plan
                     :committed (count (sub/history st))})))))))))
+
+;; ----------------------------------------------------------------------------
+;; Task 3 — the fifteen facts
+;; ----------------------------------------------------------------------------
+
+(defn- target-of
+  "Where an entry's facts belong now: `{:obj <restored findings doc> :space
+   <restored notebook>}`, or nil when nothing has been restored from it yet.
+
+   **Both halves, and that is the point of the whole exercise.** Rewriting
+   `:space` alone would leave `:obj \"find:dd-16-1\"` — a *cell of today's*
+   `space:dd-16` — and `lineage-sources` puts a notebook's cell ids in scope
+   beside its own, so the facts would still sit inside the semiconductor
+   notebook's scope. `remembered-context` cites `(or (:obj …) (:space …))`, so
+   the agent would still print a Jupiter fact as `⌾ find:dd-16-1`.
+
+   `:obj` is found by asking the restored notebook which of its cells is a
+   document, rather than by remembering what was minted: the third notebook has
+   no findings document, so its `:obj` comes out nil without a special case —
+   `{:obj nil :space …}` is a shape `ask!` already writes, through `distill!`'s
+   nil `obj-id`."
+  [st {:keys [space]}]
+  (when-let [o (get (restorations st) space)]
+    {:obj   (first (for [{:keys [ref]} (nb/cells-of o)
+                         :when (= :doc (:kind (sub/object st ref)))]
+                     ref))
+     :space (:id o)}))
+
+(defn- refile-plan
+  "What each of the fifteen would become, or the reasons it cannot.
+
+   Three states per fact, and only three: it carries the `:source` the forensics
+   recorded (re-file it), it already carries the target (leave it — this is what
+   makes a second run a no-op), or it carries something else. The third is a
+   refusal for the whole run, not a skip: a fact whose provenance has moved since
+   the forensics is a fact somebody or something else has touched, and applying
+   fourteen of fifteen would leave a memory nobody can characterise."
+  [st facts]
+  (reduce
+   (fn [acc {:keys [space findings] :as entry}]
+     (if-let [to (target-of st entry)]
+       (let [from {:obj findings :space space}]
+         (reduce
+          (fn [acc id]
+            (let [rec (get facts id)]
+              (cond
+                (nil? rec)
+                (update acc :errors conj
+                        (str "there is no fact " id " in this memory — the fifteen are named "
+                             "in loci.repair/overwritten and every one of them must be found"))
+
+                (:merged-into rec)
+                (update acc :errors conj
+                        (str id " is a tombstone: the semantic merge absorbed it into "
+                             (:merged-into rec) ", which is where its provenance now lives"))
+
+                (= to (:source rec))     (update acc :already conj id)
+                (= from (:source rec))   (update acc :refile conj {:id id :from from :to to})
+
+                :else
+                (update acc :errors conj
+                        (str id "'s :source is " (pr-str (:source rec)) ", which is neither "
+                             (pr-str from) " nor " (pr-str to)
+                             " — something has moved this fact since the forensics, so nothing "
+                             "is re-filed")))))
+          acc (:facts entry)))
+       (update acc :errors conj
+               (str "nothing in the store was restored from " space
+                    " — run restore-astronomy-dives! first, or these facts have nowhere to go"))))
+   {:refile [] :already [] :errors []}
+   overwritten))
+
+(defn- refile-one!
+  "One fact's `:source`, replaced, and the record appended.
+
+   The record written is the one taken out of the map the swap landed on, not the
+   one the plan read — `store-vector!`'s rule, for `store-vector!`'s reason: a
+   reinforcement or an embedding that landed while the repair was deciding is in
+   the record now, and appending a copy taken earlier would roll it back under
+   the same id with the log reporting success. The in-swap guard is `unmerge!`'s:
+   if the `:source` moved since the plan, this writes nothing and says so, rather
+   than overwriting whatever moved it.
+
+   **`:ts` and `:strength` are not touched, and that is the whole reason this
+   does not go through `mold/remember`.** `remember` would find the fact itself
+   as a jaccard ≥ 0.6 duplicate, `(update :strength inc)` and
+   `(assoc :ts (System/currentTimeMillis))` — and `:ts` is a multiplier in
+   `weight`, so all fifteen planet facts would jump to the top of every ranking,
+   which is a worse version of the bug being repaired. Worse still, its `dup` is
+   a `some` over an unordered map and can match a *different* fact whose wording
+   overlaps 60%; `mem-33`/`mem-34` and `mem-25`/`mem-35` are live candidates.
+
+   One append per fact rather than one swap for all fifteen: the log is
+   append-only and last-wins by `:id`, so a run interrupted halfway leaves a
+   prefix of correct facts and the rest exactly as they were. Nothing is ever
+   rewritten in place — `loci.memory/next-id`'s tombstone reasoning depends on
+   that."
+  [!facts file {:keys [id from to]}]
+  (let [[before after] (swap-vals! !facts
+                                   (fn [fs] (if (= from (:source (get fs id)))
+                                              (assoc-in fs [id :source] to)
+                                              fs)))]
+    (if (identical? before after)
+      :declined
+      (do (mem/append-line! file (get after id)) :applied))))
+
+(defn refile-astronomy-facts!
+  "Re-file the fifteen facts onto the notebooks `restore-astronomy-dives!` put
+   back. **Dry run by default.**
+
+   `m` is a `loci.memory/FileMemory`; `st` is the store the restoration landed
+   in, and is read for one thing only — which notebook now carries each old id,
+   and which of its cells is the findings document (`target-of`).
+
+   Returns a report, never throws:
+
+     :ok?       did the memory end up holding the re-filed facts
+     :dry-run?  was this a plan or an act
+     :plan      {:refile [{:id :from :to} …] :already [id …] :appends n}
+     :appended  lines actually appended
+     :declined  facts whose :source moved between the plan and the write
+     :error     why not, when not
+
+   **No undo.** `data/memory.edn` is append-only and last-wins by `:id`, so the
+   reversal of this is fifteen more appends carrying the old `:source` — or, more
+   simply, the backup Task 4 takes before running it. Say so plainly rather than
+   let a reader assume the substrate's `undo!` covers both halves; it covers
+   neither this nor anything committed after it."
+  ([st m] (refile-astronomy-facts! st m {}))
+  ([st m {:keys [dry-run?] :or {dry-run? true}}]
+   (let [{:keys [!facts file]} m]
+     (if-not (and !facts file)
+       {:ok? false :dry-run? dry-run?
+        :error (str "this needs a loci.memory/FileMemory — it appends to the fact log the way "
+                    "store-vector! and unmerge! do, and " (.getName (class m)) " has no log")}
+       (let [{:keys [refile already errors]} (refile-plan st @!facts)
+             plan {:refile refile :already already :appends (count refile)}]
+         (cond
+           (seq errors)
+           {:ok? false :dry-run? dry-run? :error (first errors) :errors errors :plan plan}
+
+           dry-run?
+           {:ok? true :dry-run? true :plan plan}
+
+           :else
+           (let [done (mapv (fn [e] [(:id e) (refile-one! !facts file e)]) refile)]
+             {:ok? true :dry-run? false :plan plan
+              :appended (count (filter #(= :applied (second %)) done))
+              :declined (mapv first (filter #(= :declined (second %)) done))})))))))

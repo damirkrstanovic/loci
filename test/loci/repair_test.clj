@@ -7,9 +7,14 @@
    three hours later. Everything the repair reads, it reads out of that log, so
    a test that passes here is a test against the shape the real store is in.
 
-   Nothing in this namespace opens `data/`: it runs on `sub/fresh-store`."
-  (:require [clojure.string :as str]
+   Nothing in this namespace opens `data/`. The substrate half runs on
+   `sub/fresh-store`; the memory half writes to a temp file removed in a
+   `finally`."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [loci.memory :as mem]
+            [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.repair :as repair]
             [loci.server :as server]
@@ -118,6 +123,65 @@
   (let [r (repair/restore-astronomy-dives! st {:dry-run? false})]
     (is (:ok? r) (str "restore refused: " (:error r)))
     r))
+
+;; ---------------------------------------------------------------------------
+;; the memory fixture
+;; ---------------------------------------------------------------------------
+
+(def astronomy-facts
+  "The fifteen, with the `:ts` and `:strength` the real log carries. The point
+   of pinning real timestamps is that `remember` would replace every one of
+   them with `System/currentTimeMillis`, and an assertion against a value the
+   fixture invented would not notice."
+  (concat
+   (map-indexed (fn [i t] {:id (str "mem-" (+ 23 i)) :fact t :entities ["jupiter"]
+                           :source {:obj "find:dd-16-1" :space "space:dd-16"}
+                           :ts (+ 1784830205451 i) :strength 1})
+                ["Terrestrial planets are rocky." "Gas giants are ~90% hydrogen."
+                 "Terrestrial planets orbit close to the Sun."
+                 "Terrestrial planets have few moons." "Gas giants rotate fast."])
+   (map-indexed (fn [i t] {:id (str "mem-" (+ 28 i)) :fact t :entities ["neptune"]
+                           :source {:obj "find:dd-17-1" :space "space:dd-17"}
+                           :ts (+ 1784830234578 i) :strength 1})
+                ["Giant planets have large Hill spheres." "Neptune's Hill sphere is largest."
+                 "Mercury and Venus have tiny Hill spheres." "Earth's Moon formed from Theia."
+                 "Phobos and Deimos are captured asteroids."])
+   (map-indexed (fn [i t] {:id (str "mem-" (+ 33 i)) :fact t :entities ["kepler's third law"]
+                           :source {:obj "find:dd-18-1" :space "space:dd-18"}
+                           :ts (+ 1784830248504 i) :strength 1})
+                ["Orbital period rises with distance." "Kepler's Third Law is T² ∝ a³."
+                 "Mercury's period is 88 days." "Neptune's period is 165 years."
+                 "Period and distance follow a power law."])))
+
+(def semiconductor-facts
+  "mem-42…mem-46 — five facts with the SAME `:source` as mem-23…mem-27 and no
+   business moving anywhere. They are in the fixture because they are the reason
+   the fifteen are named one by one rather than derived from `:source`: a
+   derivation over `{:obj \"find:dd-16-1\"}` selects ten facts, and five of them
+   are correctly filed."
+  (map-indexed (fn [i t] {:id (str "mem-" (+ 42 i)) :fact t :entities ["taiwan"]
+                          :source {:obj "find:dd-16-1" :space "space:dd-16"}
+                          :ts (+ 1784840886000 i) :strength 1})
+               ["A blockade could cut global GDP 2.8%." "War could cost $10 trillion."
+                "The S&P 500 could fall 40%." "Intervention shortens the recession."
+                "Chip industries would forgo $1.6 trillion."]))
+
+(defn- with-memory*
+  [facts f]
+  (let [path (str (System/getProperty "java.io.tmpdir") "/loci-repair-" (System/nanoTime) ".edn")]
+    (try
+      (spit path (apply str (map #(str (pr-str %) "\n") facts)))
+      (f (mem/file-memory path) path)
+      (finally (.delete (io/file path))))))
+
+(defmacro with-memory
+  "A FileMemory over a temp log seeded with `facts`, always removed."
+  [[m path facts] & body]
+  `(with-memory* ~facts (fn [~m ~path] ~@body)))
+
+(defn- lines [path] (vec (remove str/blank? (str/split-lines (slurp path)))))
+
+(defn- fact-line-count [path] (count (lines path)))
 
 ;; ===========================================================================
 ;; Task 2 — the substrate half
@@ -315,3 +379,168 @@
       (is (:already-done? r))
       (is (= n (count (sub/history st))))
       (is (= o (sub/objects st))))))
+
+;; ===========================================================================
+;; Task 3 — the memory half
+;; ===========================================================================
+
+(deftest refiling-appends-exactly-fifteen-lines-and-changes-only-the-source
+  (let [st (damaged-store)
+        r  (restored-ok! st)
+        [a b c] (get-in r [:plan :notebooks])]
+    (with-memory [m path (concat astronomy-facts semiconductor-facts)]
+      (let [before (into {} (map (juxt :id identity)) (mold/all-facts m))
+            n      (fact-line-count path)
+            rr     (repair/refile-astronomy-facts! st m {:dry-run? false})
+            after  (into {} (map (juxt :id identity)) (mold/all-facts (mem/file-memory path)))]
+        (is (:ok? rr) (str "refile refused: " (:error rr)))
+        (is (= 15 (:appended rr)))
+        (is (= 15 (- (fact-line-count path) n)) "exactly fifteen lines, appended")
+
+        (testing "both halves of :source move, together"
+          (doseq [id ["mem-23" "mem-24" "mem-25" "mem-26" "mem-27"]]
+            (is (= {:obj (get-in a [:findings :id]) :space (:id a)} (:source (after id)))))
+          (doseq [id ["mem-28" "mem-29" "mem-30" "mem-31" "mem-32"]]
+            (is (= {:obj (get-in b [:findings :id]) :space (:id b)} (:source (after id)))))
+          (doseq [id ["mem-33" "mem-34" "mem-35" "mem-36" "mem-37"]]
+            (is (= {:obj nil :space (:id c)} (:source (after id)))
+                "dd-18 had no findings document, so :obj is nil — the shape ask! writes")))
+
+        (testing "no fact still names a notebook that is now a semiconductor one"
+          (doseq [id (map :id astronomy-facts)]
+            (is (not (contains? #{"space:dd-16" "space:dd-17" "space:dd-18"}
+                                (get-in (after id) [:source :space]))))
+            (is (not (contains? #{"find:dd-16-1" "find:dd-17-1" "find:dd-18-1"}
+                                (get-in (after id) [:source :obj])))
+                "rewriting :space alone leaves the fact a cell of today's space:dd-16")))
+
+        (testing ":ts and :strength are untouched — the remember trap, asserted directly"
+          (doseq [id (map :id astronomy-facts)]
+            (is (= (:ts (before id)) (:ts (after id)))
+                (str id "'s :ts moved — :ts is a multiplier in weight"))
+            (is (= (:strength (before id)) (:strength (after id))))
+            (is (= (:fact (before id)) (:fact (after id))))
+            (is (= (:entities (before id)) (:entities (after id))))))
+
+        (testing "the five correctly-filed facts on the same :source do not move"
+          (doseq [f semiconductor-facts]
+            (is (= f (after (:id f)))
+                (str (:id f) " was re-filed — it is a semiconductor fact and was never misfiled"))))))))
+
+(deftest refiling-preserves-an-embedding-it-finds
+  (let [st (damaged-store)]
+    (restored-ok! st)
+    (with-memory [m path (map #(cond-> % (= "mem-23" (:id %))
+                                       (assoc :vec [0.1 0.2] :model "embed-qwen3-0.6b" :dim 2))
+                              astronomy-facts)]
+      (is (:ok? (repair/refile-astronomy-facts! st m {:dry-run? false})))
+      (let [f (first (filter #(= "mem-23" (:id %)) (mold/all-facts (mem/file-memory path))))]
+        (is (= [0.1 0.2] (:vec f)) "the vector describes the text, which did not change")
+        (is (= "embed-qwen3-0.6b" (:model f)))
+        (is (= 2 (:dim f)))))))
+
+(deftest a-refile-dry-run-appends-nothing
+  (let [st (damaged-store)]
+    (restored-ok! st)
+    (with-memory [m path astronomy-facts]
+      (let [text (slurp path)
+            r    (repair/refile-astronomy-facts! st m)]
+        (is (:ok? r))
+        (is (:dry-run? r) "dry-run? must be the DEFAULT here too")
+        (is (= text (slurp path)) "a dry run appended to the log")
+        (is (= 15 (get-in r [:plan :appends])))
+        (is (= 15 (count (get-in r [:plan :refile]))))
+        (is (= "mem-23" (:id (first (get-in r [:plan :refile])))))
+        (is (= {:obj "find:dd-16-1" :space "space:dd-16"} (:from (first (get-in r [:plan :refile])))))
+        (is (empty? (get-in r [:plan :already])))))))
+
+(deftest a-second-refile-is-a-no-op
+  (let [st (damaged-store)]
+    (restored-ok! st)
+    (with-memory [m path astronomy-facts]
+      (repair/refile-astronomy-facts! st m {:dry-run? false})
+      (let [n (fact-line-count path)
+            r (repair/refile-astronomy-facts! st m {:dry-run? false})]
+        (is (:ok? r))
+        (is (= 0 (:appended r)))
+        (is (= 15 (count (get-in r [:plan :already]))))
+        (is (empty? (get-in r [:plan :refile])))
+        (is (= n (fact-line-count path)) "an already-correct fact was appended again")))))
+
+(deftest the-record-is-read-at-write-time
+  ;; A watch on the fact map bumps mem-30's :strength once, after the FIRST
+  ;; fact's swap lands — so the change exists in the atom by the time mem-30's
+  ;; turn comes, and not before the run started. An implementation that built
+  ;; its fifteen records up front would append mem-30 with the strength it had
+  ;; when the plan was made, silently rolling the bump back under the same id.
+  (let [st (damaged-store)]
+    (restored-ok! st)
+    (with-memory [m path astronomy-facts]
+      (add-watch (:!facts m) ::bump
+                 (fn [k a _ _]
+                   (remove-watch a k)
+                   (swap! a update-in ["mem-30" :strength] inc)))
+      (is (:ok? (repair/refile-astronomy-facts! st m {:dry-run? false})))
+      (let [f (first (filter #(= "mem-30" (:id %)) (mold/all-facts (mem/file-memory path))))]
+        (is (= 2 (:strength f))
+            "mem-30 was appended from a snapshot taken before the run, not read at write time")
+        (is (= "space:dd-20" (get-in f [:source :space]))     ; mem-30 is a dd-17 fact
+            ;; guards the guard: if the refile had skipped mem-30 entirely, the
+            ;; strength assertion above would pass on the seeded line
+            "mem-30 was not re-filed at all, so the strength assertion proved nothing")))))
+
+(deftest refiling-refuses-a-memory-that-does-not-look-as-expected
+  (testing "nothing has been restored yet"
+    (let [st (damaged-store)]
+      (with-memory [m path astronomy-facts]
+        (let [text (slurp path)
+              r    (repair/refile-astronomy-facts! st m {:dry-run? false})]
+          (is (false? (:ok? r)))
+          (is (str/includes? (:error r) "restore-astronomy-dives!"))
+          (is (= text (slurp path)))))))
+
+  (testing "a fact whose source is neither the old one nor the new one"
+    (let [st (damaged-store)]
+      (restored-ok! st)
+      (with-memory [m path (map #(cond-> % (= "mem-31" (:id %))
+                                         (assoc :source {:obj nil :space "space:pub-geo"}))
+                                astronomy-facts)]
+        (let [text (slurp path)
+              r    (repair/refile-astronomy-facts! st m {:dry-run? false})]
+          (is (false? (:ok? r)))
+          (is (str/includes? (:error r) "mem-31"))
+          (is (= text (slurp path))
+              "a repair that half-applies is worse than one that refuses")))))
+
+  (testing "a fact that is not there at all"
+    (let [st (damaged-store)]
+      (restored-ok! st)
+      (with-memory [m path (remove #(= "mem-37" (:id %)) astronomy-facts)]
+        (let [text (slurp path)
+              r    (repair/refile-astronomy-facts! st m {:dry-run? false})]
+          (is (false? (:ok? r)))
+          (is (str/includes? (:error r) "mem-37"))
+          (is (= text (slurp path)))))))
+
+  ;; A tombstone is a state this repair can genuinely meet on the real memory:
+  ;; the embed worker runs `merge-similar!` on a timer, and the forensics named
+  ;; mem-33/mem-34 and mem-25/mem-35 as pairs close enough to be candidates. An
+  ;; absorbed fact carries no `:source` at all, so the generic "neither" branch
+  ;; would also stop the run — but it would report a nil and say nothing about
+  ;; where the provenance went, and the survivor is the record that now has to
+  ;; be re-filed by hand.
+  (testing "a fact the semantic merge absorbed"
+    (let [st (damaged-store)]
+      (restored-ok! st)
+      (with-memory [m path (map #(if (= "mem-33" (:id %))
+                                   {:id "mem-33" :fact (:fact %) :ts (:ts %) :merged-into "mem-34"}
+                                   %)
+                                astronomy-facts)]
+        (let [text (slurp path)
+              r    (repair/refile-astronomy-facts! st m {:dry-run? false})]
+          (is (false? (:ok? r)))
+          (is (str/includes? (:error r) "mem-33"))
+          (is (str/includes? (:error r) "tombstone"))
+          (is (str/includes? (:error r) "mem-34")
+              "the refusal must name the survivor — that is where the provenance went")
+          (is (= text (slurp path))))))))

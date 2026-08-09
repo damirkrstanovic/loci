@@ -125,7 +125,17 @@
 
 (defn- score [qt qs dfm now f] (* (relevance qt qs dfm f) (weight now f)))
 
-(defn- append-line! [file rec]
+(defn append-line!
+  "One record, appended. The only way anything in this namespace writes a fact:
+   the log is append-only and last-wins by :id, so a change to a fact is the
+   fact written again, never a line edited in place — `next-id`'s tombstone
+   reasoning depends on nothing ever being removed.
+
+   Public for `loci.repair`, which re-files fifteen facts whose notebooks were
+   overwritten. It appends the way `store-vector!` and `unmerge!` do rather than
+   going through `remember`, which would re-stamp `:ts` and bump `:strength`;
+   sharing this function is what keeps \"appended\" meaning one thing."
+  [file rec]
   (io/make-parents (io/file file))
   (spit file (str (pr-str rec) "\n") :append true))
 
