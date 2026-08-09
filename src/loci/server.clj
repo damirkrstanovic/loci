@@ -427,11 +427,14 @@
             {:keys [kind rendered]} (vs/interpret (get-in vo [:value :spec]) (:value o))]
         {:id id :title (:title o) :kind (name kind) :view view
          :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)})
-      ;; a built-in viewer
+      ;; a built-in viewer. `mv`, not `m`: `m` is this function's MEMORY, and
+      ;; shadowing it here would be correct only for as long as this branch never
+      ;; needs the memory — which is exactly the assumption the entity branch
+      ;; above just stopped being able to make for the function as a whole.
       :else
-      (let [m (mold/mold (:value o) (when (seq view) (str->kw view)))]
-        {:id id :title (:title o) :kind (name (:kind m)) :view (when (:view m) (kw->str (:view m)))
-         :label (:label m) :rendered (:rendered m) :alternatives (alternatives st o)}))))
+      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
+        {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
+         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)}))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -1523,7 +1526,22 @@
    already, through `:sources`.
 
    **`:score`** is `:scope` minus the names that only this lineage has ever
-   carried. A lineage-only name can never widen anything — nothing outside
+   carried **and the prompt did not name**. Both halves of that, because the
+   code unions the prompt half unconditionally: a name you asked about scores
+   whether or not anything outside this lineage has ever carried it. The
+   subtraction is about names the lineage merely happens to carry, never about
+   what you asked.
+
+   That second half is not hypothetical and it is pinned. In `subject-memory`,
+   `wrath of the righteous` is carried by `space:econ`'s facts and by nothing
+   else in the corpus — lineage-only from econ, by the same definition this
+   sentence uses — and `game-prompt` names it. `:score` from `space:econ` is
+   `#{\"asml\" \"wrath of the righteous\"}` and not `#{\"asml\"}`; making this
+   union conditional fails that assertion in
+   `the-score-set-drops-the-names-only-this-lineage-has-ever-used`, and two
+   more besides.
+
+   A lineage-only name can never widen anything — nothing outside
    carries it, by definition — so all it can do is score the local facts, and
    `relevance`'s entity half is a *ratio*: a name in the subject set that a
    local fact carries makes that fact's entity half 1.0, a flat 0.4 of
@@ -1570,11 +1588,19 @@
    Public so a test can call it without going through an LLM."
   [m sources prompt]
   (let [all      (mem/all-facts m)
-        detected (ent/detect (set (keys (ent/index all))) prompt)
         names-of (fn [fs] (into #{} (comp (mapcat :entities)
                                           (map ent/normalize)
                                           (remove str/blank?))
                                 fs))
+        ;; `(names-of all)` and not `(set (keys (ent/index all)))`. The two are
+        ;; the same set by construction — `index` normalizes each `:entities`
+        ;; entry and drops the blanks, character for character what `names-of`
+        ;; does — but `index` also accumulates a set of fact ids under every
+        ;; name, and this line then throws all of them away. Measured at 800
+        ;; facts: 0.700 ms → 0.333 ms, about a quarter of this function's cost,
+        ;; on a function that runs before every agent turn and whose promise
+        ;; below is one `all-facts` pass and one partition of it.
+        detected (ent/detect (names-of all) prompt)
         ;; nil, not {}, when there is no lineage — both halves below then read
         ;; nil and contribute nothing, which is the unscoped rule above.
         {mine true theirs false} (when sources (group-by #(mem/in-sources? sources %) all))

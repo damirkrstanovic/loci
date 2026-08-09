@@ -3118,6 +3118,28 @@
       (is (= eid (:object r))
           "…and the page carries the id of the object whose page it is, which is what tells the shell not to offer materialization again"))))
 
+(deftest the-molder-header-is-the-objects-title-and-never-the-entitys-name
+  ;; `:title` is what `renderDetail` draws above the molded body, and Task 8 is
+  ;; about to depend on it. Nothing pinned it: `materialize-entity!` titles the
+  ;; object WITH the name, so on everything it mints `(:title o)` and `(:name p)`
+  ;; are the same string and the assertion could not tell a correct branch from
+  ;; one reading the payload instead of the object.
+  ;;
+  ;; So this uses the hand-committed shape `materialize!` exists for — an object
+  ;; whose title diverges from its name, which is what a rename produces and what
+  ;; a migrated or restored object may always have carried. A rename must be able
+  ;; to change the header without re-identifying the entity; that is the whole
+  ;; reason `entity-objects` matches on the name and never on the title.
+  (let [st (materialize! (entity-fixture) "ent:az" "arizona" "The Arizona build")
+        m  (entity-memory)
+        p  (srv/mold-payload st m "ent:az" nil)]
+    (is (= "The Arizona build" (:title p))
+        "the header is the OBJECT's title")
+    (is (= "arizona" (:name (:rendered p)))
+        "…while the page underneath is still keyed on the name, and the two are different strings here on purpose")
+    (is (= "ent:az" (:object (:rendered p)))
+        "and the payload still identifies the object whose page this is")))
+
 (deftest the-object-page-and-the-modal-are-one-payload
   ;; The claim the whole task exists to make. Two renderers would drift, and the
   ;; drift would be invisible until somebody materialized something and the page
