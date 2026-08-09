@@ -2799,6 +2799,38 @@
     (is (= "no entity name given" (:error (get! nil))))
     (is (= "no entity name given" (:error (get! "name="))))))
 
+(deftest the-entity-route-freezes-at-the-point-it-was-asked-for
+  ;; `/api/mold` and `/api/object/…` have always gone through `store-at`; this one
+  ;; did not, and the shell's short-circuit made that reachable. Measured in a
+  ;; browser: materialize `tsmc`, scrub to one event before the materialization,
+  ;; click the subject chip. The route read the LIVE store, answered
+  ;; `:object "ent:1"`, and the shell — which trusts that key completely — asked
+  ;; `/api/object/ent:1?at=35` for an object that does not exist there. On screen: a
+  ;; molder with an empty header and the single word `null`; scrubbed further back,
+  ;; an uncaught TypeError and a blank world.
+  ;;
+  ;; The facts are today's on both pages, and that is not an oversight: the memory
+  ;; has no time dimension and `undo!` never touches a fact, so there is no past set
+  ;; to read. What `?at=` governs is everything the page reads out of the SUBSTRATE.
+  (let [st   (entity-fixture)
+        m    (entity-memory)
+        n    (count (sub/history st))
+        _    (srv/materialize-entity! st "tsmc")
+        get! (fn [qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri "/api/entity" :query-string qs}))
+                                :key-fn keyword)))
+        now  (get! "name=tsmc")
+        past (get! (str "name=tsmc&at=" n))]
+    (is (some? (:object now))
+        "live, the subject is a citizen — without this the assertion below is vacuous")
+    (is (nil? (:object past))
+        "frozen before the materialization it is a projection again, so the shell opens the modal instead of an object that is not there yet")
+    (is (= (:count now) (:count past) 4)
+        "the facts are today's on both pages: the memory has no time dimension")
+    (is (true? (:promoted past))
+        "…so the past page is a real page with real evidence on it, and not an empty one")))
+
 (deftest a-materialized-entity-carries-its-object-and-never-demotes
   (let [st (-> (entity-fixture)
                (materialize! "ent:tsmc" "tsmc" "TSMC — the foundry")

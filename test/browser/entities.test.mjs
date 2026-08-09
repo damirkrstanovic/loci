@@ -1,8 +1,10 @@
-// The entity page — ONE payload shape, ONE renderer, two surfaces: a modal
-// before the subject is a citizen of the substrate, the molder after. Two
-// renderers would drift, and the drift would be invisible until somebody
-// materialized something, so the load-bearing test in this file is the one that
-// draws the SAME payload through both surfaces and compares the text.
+// The entity page — ONE payload shape, ONE renderer, THREE surfaces: a modal
+// before the subject is a citizen of the substrate, and after it, the molder and
+// a notebook cell (materialize-entity! mints a notebook whose only cell is the
+// entity, so that is where the reader lands the instant they act). Renderers that
+// drift would drift invisibly until somebody materialized something, so the
+// load-bearing test in this file draws the SAME payload through two of them and
+// compares the text.
 //
 // Every entity payload below is served by page.route, never by the server. The
 // states worth testing are a 50-of-137 cap, a subject that lost its promotion to
@@ -117,6 +119,15 @@ const until = async (fn, why, ms = 5000) => {
     await new Promise(r => setTimeout(r, 50));
   }
 };
+// The same, for something that must appear on screen. `waitForSelector` is a
+// 30-second wall whose only message is that a selector never appeared, and it
+// hides every assertion written below it: measured against the `case 'entity'`
+// sabotage at 31.6 s, 32.1 s and 31.9 s, with the guards underneath — including
+// the one written to catch exactly that sabotage — never running.
+const untilSel = (page, sel, why) =>
+  until(async () => (await page.locator(sel).count()) > 0, why);
+// occurrences, so "the identity is on the page once" is a claim about text
+const times = (s, sub) => s.split(sub).length - 1;
 
 // ── the page, on the modal surface ─────────────────────────────────────────
 
@@ -149,30 +160,90 @@ test('the page lists its facts and names where they came from', async () => {
   });
 });
 
-test('a source chip opens the object it names', async () => {
+// A source is a document OR a notebook — `memory-payload`'s `:source` names an
+// object and the space it sat in, so an entity page with any facts at all has
+// both kinds of chip on it — and they are two different gestures. The first
+// version of this test stubbed the NOTEBOOK as `kind:'text'`, which is a fixture
+// manufacturing the one shape that hides the defect: openObject on a notebook
+// renders its {intent, cells} map as raw JSON, which is precisely what act()'s
+// semantic branch documents and refuses to do.
+//
+// The real notebook comes out of the running server, so "entered it" is the shell
+// entering a notebook that exists rather than a stub agreeing it did.
+const aNotebook = async () => {
+  const state = await (await fetch(`${server.url}/api/state`)).json();
+  return state.spaces[state.spaces.length - 1];
+};
+const crumb = page => page.textContent('#crumbName');
+
+test('a document chip opens the document; a notebook chip enters the notebook', async () => {
   await withPage(browser, 'entity-source-chip-opens', async (page) => {
     await bootedShell(page, server.url);
-    await stubEntity(page, PAGE());
-    const opened = await stubObjects(page, { 'space:semis': {
-      id: 'space:semis', title: 'Semiconductors', kind: 'text', view: null, label: 'Text',
+    const nb = await aNotebook();
+    await stubEntity(page, PAGE({ sources: [
+      { id: 'doc:fab', title: 'Fab capacity', kind: 'doc' },
+      { id: nb.id, title: nb.title, kind: 'space' },
+    ] }));
+    const opened = await stubObjects(page, { 'doc:fab': {
+      id: 'doc:fab', title: 'Fab capacity', kind: 'text', view: null, label: 'Text',
       rendered: 'Fab capacity, in wafer starts per month.', alternatives: [],
     } });
 
+    // 1. the SECOND chip, and a notebook: a delegation that always opened the first
+    //    source would pass a click on either one, and one that opened this by id
+    //    would draw a notebook as a document
+    await page.evaluate(() => enter(0));
+    assert.notEqual(await crumb(page), nb.title, 'the fixture cannot show a move');
     await openEnt(page);
-    await page.waitForSelector('.modalcard .entsrc .ghostchip');
-    // the SECOND chip, not the first: a delegation that always opened the first
-    // source on the page would pass a click on either one
-    await page.locator('.modalcard .entsrc .ghostchip', { hasText: 'Semiconductors' }).click();
+    await untilSel(page, '.modalcard .entsrc .ghostchip',
+      'the page drew no source chips at all');
+    await page.locator('.modalcard .entsrc .ghostchip', { hasText: nb.title }).click();
 
-    await until(() => opened.length > 0,
-      'the chip click reached no endpoint at all — the modal has no [data-open] delegation');
-    await page.waitForSelector('.molder');
-    assert.deepEqual(opened, ['space:semis'],
-      'the chip must open the id it carries, not the first source on the page');
+    await until(async () => (await crumb(page)) === nb.title,
+      `the notebook chip did not enter “${nb.title}” — a notebook reached through openObject ` +
+      'renders its {intent, cells} map as raw JSON under a crumb still naming somewhere else');
+    assert.deepEqual(opened, [],
+      'the notebook was fetched as an object — :kind is on every source precisely so the ' +
+      'shell can tell the two gestures apart');
     assert.equal(await page.locator('.modalcard').count(), 0,
-      'the modal stayed over the object it just sent you to');
+      'the modal stayed over the notebook it just sent you to');
+    assert.equal(await page.locator('.molder-b pre').count(), 0,
+      'a notebook was rendered as a JSON dump');
+
+    // 2. …and a document still opens, from the first chip
+    await openEnt(page);
+    await untilSel(page, '.modalcard .entsrc .ghostchip', 'the page drew no source chips at all');
+    await page.locator('.modalcard .entsrc .ghostchip', { hasText: 'Fab capacity' }).click();
+    await until(() => opened.length > 0,
+      'the document chip reached no endpoint at all — the modal has no [data-open] delegation');
+    assert.deepEqual(opened, ['doc:fab'],
+      'the chip must open the id it carries, not the first source on the page');
+    await untilSel(page, '.molder', 'the document was asked for but never drawn');
     assert.ok((await page.innerText('.molder')).includes('wafer starts'),
       'the object opened but did not render');
+  });
+});
+
+test('a notebook chip on the molder surface enters it too', async () => {
+  await withPage(browser, 'entity-molder-space-chip', async (page) => {
+    await bootedShell(page, server.url);
+    // renderDetail had a [data-open] delegation and no [data-space] one, so this
+    // half of the fix lives in a different function from the modal's and needs its
+    // own click. renderBody and renderNotebook have carried one all along.
+    const nb = await aNotebook();
+    await stubObjects(page, { 'ent:1': MOLD(PAGE({ object: 'ent:1',
+      sources: [{ id: nb.id, title: nb.title, kind: 'space' }] })) });
+
+    await page.evaluate(() => enter(0));
+    assert.notEqual(await crumb(page), nb.title, 'the fixture cannot show a move');
+    await page.evaluate(() => openObject('ent:1'));
+    await untilSel(page, '.molder .entsrc .ghostchip',
+      'the molder drew no source chips — renderMold has no entity case');
+    await page.locator('.molder .entsrc .ghostchip', { hasText: nb.title }).click();
+
+    await until(async () => (await crumb(page)) === nb.title,
+      `the notebook chip on the molder did not enter “${nb.title}” — renderDetail wires ` +
+      '[data-open] and, until this fix, nothing at all for [data-space]');
   });
 });
 
@@ -266,23 +337,107 @@ test('a materialized subject opens its object — the modal never appears', asyn
 test('the molder and the modal draw the same page from the same payload', async () => {
   await withPage(browser, 'entity-one-renderer', async (page) => {
     await bootedShell(page, server.url);
-    // the molder surface: the payload as a materialized entity answers it
-    await stubObjects(page, { 'ent:1': MOLD(PAGE({ object: 'ent:1' })) });
+    // A title that has DIVERGED from the identity — a renamed entity object, which
+    // `entity-objects` allows because it matches [:value :name] and never the
+    // title. Both surfaces then draw the name, so this compares whole pages rather
+    // than a page against a page minus the one line one of them suppresses. The
+    // suppression itself is the next test's subject.
+    await stubObjects(page, { 'ent:1': {
+      ...MOLD(PAGE({ object: 'ent:1' })), title: 'The foundry, renamed' } });
     await page.evaluate(() => openObject('ent:1'));
-    await page.waitForSelector('.molder .entname');
+    await untilSel(page, '.molder .entname',
+      'the molder drew no entity page at all — renderMold has no entity case');
     const molder = (await page.innerText('.molder-b')).trim();
 
     // the modal surface: the same payload, minus the `object` that would send it
     // to the molder instead
     await stubEntity(page, PAGE());
     await openEnt(page);
-    await page.waitForSelector('.modalcard .entname');
+    await untilSel(page, '.modalcard .entname', 'the modal drew no entity page at all');
     const modal = (await page.innerText('.modal-b')).trim();
 
-    assert.ok(molder.includes('Hsinchu') && molder.includes('Fab capacity'),
+    assert.ok(molder.includes('Hsinchu') && molder.includes('Fab capacity')
+              && molder.includes('tsmc'),
       `the molder rendered nothing, so the comparison below is vacuous:\n${molder}`);
     assert.equal(modal, molder,
       'two surfaces, one renderer — the moment these differ the page has quietly become two pages');
+  });
+});
+
+test('the identity is drawn where the frame does not already say it', async () => {
+  await withPage(browser, 'entity-name-not-twice', async (page) => {
+    await bootedShell(page, server.url);
+    // The modal has no header of its own, so the page must name its own subject.
+    await stubEntity(page, PAGE());
+    await openEnt(page);
+    await untilSel(page, '.modalcard .entmeta', 'the modal drew no entity page at all');
+    assert.equal(times(await page.innerText('.modal-b'), 'tsmc'), 1,
+      'the modal is the one surface with nothing above it saying what this page is about');
+
+    // The molder's header is `m.title`, which materialize-entity! sets to the name —
+    // so drawing it again is the sixth `tsmc` in seven lines, measured, in a strip
+    // whose other notebooks read "The Solar System".
+    await stubObjects(page, { 'ent:1': MOLD(PAGE({ object: 'ent:1' })) });
+    await page.evaluate(() => { closeModal(); return openObject('ent:1'); });
+    await untilSel(page, '.molder .entmeta', 'the molder drew no entity page at all');
+    assert.equal((await page.innerText('.molder-h')).trim(), 'tsmc',
+      'the header is where the title lives, and it still says it');
+    assert.equal(times(await page.innerText('.molder-b'), 'tsmc'), 0,
+      'the identity is drawn immediately under a header that already said it');
+
+    // …and when the stored title HAS diverged, the identity is the only thing on
+    // screen that says what the facts are indexed by, so it comes back.
+    await stubObjects(page, { 'ent:2': {
+      ...MOLD(PAGE({ object: 'ent:2' }), 'ent:2'), title: 'The foundry, renamed' } });
+    await page.evaluate(() => openObject('ent:2'));
+    await until(async () => (await page.innerText('.molder-h')).includes('renamed'),
+      'the molder never re-rendered for the second object');
+    assert.equal(times(await page.innerText('.molder-b'), 'tsmc'), 1,
+      'the title was renamed away from the identity and the page stopped saying what it ' +
+      'is about — which is the whole case for drawing the name at all');
+  });
+});
+
+// The third surface, and the one the reader actually meets: `materialize-entity!`
+// mints a notebook whose ONLY cell is the entity, and the gesture lands you in it.
+// It goes through renderMold like the molder does, but through a different wrapper
+// with a header of its own — so `framedBy` reaches it, and until this test nothing
+// had ever drawn an entity into a cell.
+const NOTEBOOK_URL = /\/api\/notebook\?/;
+
+test('the entity’s own notebook draws its subject as a cell, once', async () => {
+  await withPage(browser, 'entity-as-a-cell', async (page) => {
+    await bootedShell(page, server.url);
+    const nb = await aNotebook();
+    await page.route(NOTEBOOK_URL, route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({
+        id: nb.id, title: nb.title, intent: 'everything about tsmc', connected: [],
+        events: 1,
+        // a `ref` cell IS a mold-payload with {i, type} merged onto it
+        cells: [{ i: 0, type: 'ref', ...MOLD(PAGE({ object: 'ent:1' })) }],
+      }),
+    }));
+    const i = await page.evaluate(id => STATE.spaces.findIndex(s => s.id === id), nb.id);
+    await page.evaluate(n => enter(n), i);
+
+    // Scoped to THIS panel. Every panel is in the DOM at once — the others are
+    // translated off-screen, not removed — and the panel focused at boot rendered
+    // its own real notebook before this route was installed, so a bare `.cellmold`
+    // reads the seeded corpus and not the cell under test. Measured: it did.
+    const cell = `#body${i} .cellmold`;
+    await untilSel(page, `${cell} .bd .entmeta`,
+      'the notebook cell drew no entity page — renderMold has no entity case, or the ' +
+      'notebook path never reaches it');
+    const bd = await page.innerText(`${cell} .bd`);
+    assert.ok(bd.includes('Hsinchu'), `the facts are not in the cell:\n${bd}`);
+    assert.equal(await page.locator(`${cell} .bd pre`).count(), 0,
+      'the cell fell through to the JSON default');
+    assert.equal((await page.innerText(`${cell} .hd .t`)).trim(), 'tsmc',
+      'the cell header is the object’s title, and it still says it');
+    assert.equal(times(bd, 'tsmc'), 0,
+      'the identity is drawn immediately under a cell header that already said it — this ' +
+      'is the notebook the reader lands in the moment they materialize a subject');
   });
 });
 
@@ -308,6 +463,122 @@ test('the molder draws the entity page, not its JSON, and grows no dead chrome',
       '✦ make… is for table-shaped objects');
     assert.equal(await page.locator('#editbtn').count(), 0,
       'Edit is for :kind text — an entity’s text is its facts, and they are the memory’s');
+  });
+});
+
+test('a subject with nothing behind it says so, and draws no empty “from”', async () => {
+  await withPage(browser, 'entity-empty-branches', async (page) => {
+    await bootedShell(page, server.url);
+    // Not contrived: `entity-payload` DROPS a source whose object is gone rather
+    // than draw a chip with no name on it, so "facts but no sources" is what a
+    // subject whose documents were deleted looks like — and count:0 is one every
+    // fact naming it was tombstoned from.
+    await stubEntity(page, PAGE({ count: 0, promoted: false, facts: [], sources: [] }));
+    await openEnt(page);
+    await untilSel(page, '.modalcard .entmeta', 'the modal drew no entity page at all');
+
+    // `.modal-b` and not `.modalcard`: the modal's own header says "derived FROM
+    // the agent's memory", which would make the "from" check below pass on chrome.
+    const txt = await page.innerText('.modal-b');
+    assert.ok(txt.includes('Nothing is remembered about this yet'),
+      `a page with no facts said nothing at all:\n${txt}`);
+    assert.ok(txt.includes('0 facts'), `the count went missing:\n${txt}`);
+    assert.ok(txt.includes('not yet a subject of its own'),
+      `nothing names it, so it is certainly not promoted:\n${txt}`);
+    // …and the half of that line that only applies once there IS evidence. "0 facts
+    // · a merge can collapse them back" describes a history this subject cannot
+    // have had.
+    assert.ok(!txt.includes('merge'),
+      `a page with no facts explained itself with a merge that cannot have happened:\n${txt}`);
+    // an empty <div class="entsrc"> renders the bare word "from" with nothing after
+    // it — six pixels and a dangling preposition
+    assert.ok(!/\bfrom\b/.test(txt), `a bare “from” with no sources after it:\n${txt}`);
+  });
+});
+
+// ── the past is one world, not two ─────────────────────────────────────────
+
+test('in the past the subject is asked for at the point you are standing', async () => {
+  await withPage(browser, 'entity-at-travels', async (page) => {
+    await bootedShell(page, server.url);
+    // `/api/entity` read the live store while `openObject` read the frozen one, so
+    // a subject materialized AFTER the point you scrubbed to answered `:object`
+    // and the short-circuit went to fetch an object that does not exist there.
+    // Measured: a molder with an empty header and the word `null`; further back,
+    // an uncaught TypeError and a blank world.
+    //
+    // The route answers the way the fixed server does — the subject IS a citizen
+    // today and was NOT one at event 3 — so dropping the `at` does not merely send
+    // a different URL here, it walks the shell into the defect: the answer says
+    // "citizen", the short-circuit fires, and openObject asks for that object at a
+    // point where it does not exist.
+    const ats = [];
+    await page.route(ENTITY_URL, route => {
+      const at = new URL(route.request().url()).searchParams.get('at');
+      ats.push(at);
+      route.fulfill({ status: 200, contentType: 'application/json',
+                      body: JSON.stringify(at === null ? PAGE({ object: 'ent:1' }) : PAGE()) });
+    });
+    const opened = await stubObjects(page, { 'ent:1': MOLD(PAGE({ object: 'ent:1' })) });
+
+    // in the present, no `at` at all — and `at!=null` rather than `at?`, so this
+    // also catches an `&at=undefined` going over the wire
+    await openEnt(page);
+    await untilSel(page, '.molder .entmeta', 'the materialized subject never opened');
+    assert.deepEqual(ats, [null], 'the present is not a point in the past');
+    assert.deepEqual(opened, ['ent:1'], 'today the subject is a citizen and opens as one');
+
+    // the modal is a full-screen scrim, so ⏱ is behind it until it is dismissed —
+    // which is also how a reader gets there, since enterTime closes it anyway
+    await page.evaluate(() => closeModal());
+    await page.click('#timeBtn');
+    await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME);
+    await page.evaluate(() => scrubTo(3));
+    await page.waitForFunction(() => TIME.n === 3);
+
+    await openEnt(page);
+    await untilSel(page, '.modalcard .entmeta',
+      'the subject was read out of the live store while standing in the past: the answer ' +
+      'said “citizen”, the short-circuit fired, and openObject went to fetch an object ' +
+      'that does not exist at that point — an empty molder, or a blank world');
+    assert.deepEqual(ats, [null, '3'],
+      'the two halves of one gesture must stand in the same world — openObject sends `at` ' +
+      'whether /api/entity does or not');
+    assert.deepEqual(opened, ['ent:1'],
+      'a second object fetch: the past answered “citizen” because it was asked as if it ' +
+      'were the present');
+  });
+});
+
+test('a second subject asked for while the first is in flight is the one drawn', async () => {
+  await withPage(browser, 'entity-in-flight', async (page) => {
+    await bootedShell(page, server.url);
+    // Measured: /api/entity?name=tsmc delayed 1.2 s, openEntity('asml') fired 100 ms
+    // later, and the modal read ◈ tsmc. The file carries this guard five times
+    // already — renderLeap, deepen, openFnPalette's pvSeq and its anchor.isConnected,
+    // scrubTo's TIME.n!==want — and pvSeq is the shape copied here.
+    await page.route(ENTITY_URL, async route => {
+      const nm = new URL(route.request().url()).searchParams.get('name');
+      if (nm === 'tsmc') await new Promise(r => setTimeout(r, 1200));
+      route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify(PAGE({ name: nm, count: 1, sources: [],
+          facts: [fact('mem-1', `A remembered thing about ${nm}`)] })) });
+    });
+
+    const slow = page.evaluate(() => openEntity('tsmc'));   // not awaited
+    await new Promise(r => setTimeout(r, 100));
+    await openEnt(page, 'asml');
+    await untilSel(page, '.modalcard .entname', 'the second subject never drew');
+    assert.match(await page.innerText('.modal-b'), /asml/,
+      'the fast answer did not draw at all');
+
+    await slow;                                    // let the stale answer land
+    await new Promise(r => setTimeout(r, 300));
+    const after = await page.innerText('.modal-b');
+    assert.ok(after.includes('asml'),
+      `the stale response overwrote the subject that was asked for later:\n${after}`);
+    assert.ok(!after.includes('tsmc'),
+      `a subject nobody asked for is on screen under the name of one who did:\n${after}`);
   });
 });
 
@@ -404,7 +675,8 @@ test('a subject whose notebook is gone opens the subject itself', async () => {
     await until(() => opened.length > 0,
       'no notebook came back and the shell opened nothing at all — the gesture committed and ' +
       'then showed the reader the same modal it started from');
-    await page.waitForSelector('.molder .entname');
+    await untilSel(page, '.molder .entmeta',
+      'the subject was fetched but its page never drew');
     assert.equal(posted.length, 1);
     assert.deepEqual(opened, ['ent:1'],
       'no notebook came back, so the gesture must land on the subject rather than nowhere');
@@ -496,14 +768,22 @@ test('a fact draws one chip per subject, folded to the identity the server keys 
     // over the RAW strings, so a survivor carries every casing and spacing any
     // absorbed fact happened to be written with — plus the "" and null a model's
     // JSON can put there. Six strings, two subjects, one of them named nothing.
+    //
+    // `Taiwan  Semiconductor` carries the INTERNAL double space, which is the half
+    // of the fold `.trim()` alone cannot do. Without it the fixture exercised
+    // trimming and case only, and deleting the collapse from factEntities left this
+    // file 19/19 green — an assertion whose message named a fold it never ran. The
+    // defect it now catches is one a reader sees: two chips reading identically side
+    // by side, because HTML collapses the double space on the way to the screen.
     await stubMemory(page, { ...HEALTHY, total: 1, facts: [memFact({
       fact: 'The most advanced nodes are three years ahead of anyone else’s',
-      entities: ['TSMC', 'taiwan', ' tsmc ', '', null, 'Taiwan'] })] });
+      entities: ['TSMC', 'taiwan', ' tsmc ', '', null, 'Taiwan',
+                 'Taiwan  Semiconductor', 'taiwan semiconductor'] })] });
     await openPane(page);
 
-    assert.deepEqual(await chipTexts(page), ['tsmc', 'taiwan'],
+    assert.deepEqual(await chipTexts(page), ['tsmc', 'taiwan', 'taiwan semiconductor'],
       'one chip per subject, in the order the fact names them, drawn as the identity the ' +
-      'server keys on rather than as the six strings the distiller happened to write');
+      'server keys on rather than as the eight strings the distiller happened to write');
 
     // …the row was added, not swapped in for the fact
     const [row] = await page.$$eval('.memfact', els => els.map(e => e.innerText.trim()));
@@ -513,6 +793,39 @@ test('a fact draws one chip per subject, folded to the identity the server keys 
     assert.ok(!row.includes('TSMC') && !row.includes('Taiwan'),
       `a second spelling of a subject that already has a chip is a second subject to a ` +
       `reader, and there is only one page behind both:\n${row}`);
+  });
+});
+
+test('a subject spelled with a byte-order mark asks for the one the fact names', async () => {
+  await withPage(browser, 'memory-fact-chip-bom', async (page) => {
+    await bootedShell(page, server.url);
+    // The case the shell-layer sweep measured, and the reason this fold is a PORT
+    // of ent/normalize rather than an approximation of it. A trailing U+FEFF is
+    // what a pasted file or a model's JSON leaves behind, and the server KEEPS it:
+    // Java's `\s` does not cover it, and clojure.string/trim walks
+    // Character.isWhitespace, which is false for it. So the fact is filed under
+    // `nanjing﻿`.
+    //
+    // Both the shipped fold (`\s+` then `.trim()`) and the obvious repair
+    // (`[\s\p{Z}]` then `.trim()`) drop it, because JS's WhiteSpace — which
+    // `.trim()` uses — carries U+FEFF and Java's does not. The chip then read
+    // `nanjing`, asked for a subject with no facts behind it, and the page that
+    // came back said "Nothing is remembered about this yet": a chip ON a fact
+    // opening a page that denies the fact exists, still offering ✦ New notebook
+    // about this.
+    const BOM = '﻿';
+    await stubMemory(page, { ...HEALTHY, total: 1, facts: [memFact({
+      id: 'fact:nanjing', fact: 'The city sits on the lower Yangtze',
+      entities: ['Nanjing' + BOM] })] });
+    const asked = await stubEntity(page, PAGE({ name: 'nanjing' + BOM, count: 1 }));
+
+    await openPane(page);
+    await clickChip(page, 'nanjing');
+    await until(() => asked.length > 0,
+      'the chip click reached no endpoint at all — the pane has no [data-entity] delegation');
+    assert.deepEqual(asked, ['nanjing' + BOM],
+      'the chip asked for a subject the fact does not name: the shell fold and ent/normalize ' +
+      'disagreed, so the page that comes back denies the fact the chip is sitting on');
   });
 });
 
@@ -590,7 +903,7 @@ test('clicking a subject asks the server for it, and lands on its page', async (
       'gestures, and there is no object whose id is “tsmc”');
     assert.deepEqual(asked, ['tsmc'],
       'the chip must ask for the subject it carries, not the first one on the page');
-    await page.waitForSelector('.modalcard .entname');
+    await untilSel(page, '.modalcard .entname', 'the subject was asked for but its page never drew');
 
     const txt = await modalText(page);
     assert.ok(txt.includes('seventy per cent of global foundry revenue'),
@@ -625,7 +938,7 @@ test('a subject that is already a citizen opens its object, and the pane does no
       assert.deepEqual(opened, ['ent:1'],
         'the payload named an object and the chip opened something else — a subject is not ' +
         'an id, and /api/object/tsmc is a request for an object nothing has');
-      await page.waitForSelector('.molder .entname');
+      await untilSel(page, '.molder .entmeta', 'the object was fetched but its page never drew');
       // openEntity short-circuits to openObject and never touches the modal — that
       // is deliberate, and it is why the pane is only gone if the chip's own
       // handler closed it first. The source chips in openEntity's modal carry the

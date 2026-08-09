@@ -2451,7 +2451,16 @@
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
-      (= uri "/api/entity")  (json-resp (entity-payload st @mem/memory (params "name")))
+      ;; `store-at`, like every other read route — and `mold-payload`'s entity
+      ;; branch already reasons at length about why the source chips must be the
+      ;; objects that existed at `?at=`. This route simply did not honour it, and
+      ;; the asymmetry was reachable: the shell hands a payload's `:object`
+      ;; straight to `/api/object/…?at=`, so under `?at=` the live store answering
+      ;; "citizen" sent it to fetch an object the frozen store does not have.
+      ;; Measured in a browser — an empty molder showing the word `null`, and far
+      ;; enough back an uncaught TypeError and a blank world.
+      (= uri "/api/entity")  (json-resp (entity-payload (store-at st (params "at"))
+                                                        @mem/memory (params "name")))
       ;; `{nm :name}` and not `{:keys [name]}`: a local called `name` shadows
       ;; `clojure.core/name` for the rest of this branch, in a `cond` where the
       ;; branch above it is one edit away from needing it.
