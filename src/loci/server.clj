@@ -1031,6 +1031,14 @@
       {:state (state-payload st) :notebook (notebook-payload st space)})))
 
 ;; ---- writes (every one a substrate event) ----
+;;
+;; Forward-declared because the minting below starts ~500 lines before these are
+;; defined, down beside the entity work `next-id-in` was split out for. Both are
+;; 1 + the highest existing suffix. Every unguarded count-based minter in this
+;; file now goes through one of them; `import-csv!` is the one holdout, and it
+;; still carries the `(rand-int 9999)` suffix the forensics addendum argues about.
+(declare next-id next-id-in)
+
 (defn edit! [st id value]
   (if-not (and id (sub/object st id))
     {:error (str "no such object: " id)}
@@ -1045,8 +1053,12 @@
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "describe works on tables"}
         (let [spec (agent/describe-view (mapv name (keys (first rows))) (take 2 rows) prompt)
-              n (count (filter #(= :viewspec (:kind %)) (vals (sub/objects st))))
-              vid (str "view:" (subs id (inc (str/index-of id ":"))) "-" (inc n))
+              ;; max+1 over this source's own run, not `(inc (count :viewspec))`
+              ;; over the store — the count form is what overwrote three notebooks
+              ;; in July, and `:put` would replace an occupied `view:` in the same
+              ;; silence. `next-id` rather than `next-id-in` because the id must be
+              ;; minted AFTER `describe-view`'s network call, not before it.
+              vid (next-id st (str "view:" (subs id (inc (str/index-of id ":"))) "-"))
               vobj {:id vid :kind :viewspec :title (str "view: " (:label spec))
                     :value {:target id :label (or (:label spec) prompt) :spec spec}}]
           (sub/commit! st {:op :put :id vid :value vobj})
@@ -1064,9 +1076,9 @@
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "code views work on tables"}
         (let [code (agent/make-applet (mapv name (keys (first rows))) (take 3 rows) prompt)
-              n (count (filter #(= :applet (:kind %)) (vals (sub/objects st))))
               p (str/trim prompt)
-              vid (str "app:" (subs id (inc (str/index-of id ":"))) "-" (inc n))
+              ;; max+1 per source, for `describe!`'s reason directly above
+              vid (next-id st (str "app:" (subs id (inc (str/index-of id ":"))) "-"))
               vobj {:id vid :kind :applet :title (str "app: " p)
                     :value {:target id :code code
                             :label (str "▶ " (if (> (count p) 26) (str (subs p 0 26) "…") p))}}]
@@ -1081,9 +1093,6 @@
 ;; (atomic, single undo). The browser only renders.
 (def ^:private sci-opts {:classes {'Math java.lang.Math}})
 (defn- json-safe [rows] (walk/postwalk #(if (ratio? %) (double %) %) rows))
-
-;; both live at the bottom, next to the entity minting they were split for
-(declare next-id next-id-in)
 
 ;; only a real :space may receive a cell append — an existence check alone lets
 ;; a table id through, and the :assoc on its vector :value poisons the log
@@ -1318,8 +1327,20 @@
           title (or (not-empty (:title spec)) prompt)
           intent (or (not-empty (:intent spec)) prompt)
           members (vec (filter ids (or (:members spec) [])))
-          n (count (filter #(= :space (:kind %)) (vals (sub/objects st))))
-          sid (str "space:new-" (inc n))]
+          ;; max+1 over `space:new-`, and this one is not merely the SHAPE that
+          ;; destroyed `space:dd-16/17/18` on 2026-07-23 — it is the same form,
+          ;; `(inc (count …))` over `:space`, minting a notebook id. `fresh-dd-id`
+          ;; does not reach it: that matches `^space:dd-(\d+)$` and this prefix is
+          ;; `space:new-`. `:put` is `assoc-in` with no occupancy check, so a count
+          ;; that has fallen — a delete, or an event the store cannot see — replaces
+          ;; a LIVE notebook's title, intent, cells and lineage and reports success.
+          ;; A view or an applet can be re-made from its target; a notebook cannot.
+          ;;
+          ;; Read at mint time, not from the `objects` fold above: `plan-space` is a
+          ;; network call, and taking the id before it would age the snapshot by
+          ;; however long the model takes. That is why this is `next-id` and not
+          ;; `next-id-in` over a map already in hand.
+          sid (next-id st "space:new-")]
       (sub/commit! st {:op :put :id sid
                        :value {:id sid :kind :space :title title
                                :value {:intent intent :members members}}})

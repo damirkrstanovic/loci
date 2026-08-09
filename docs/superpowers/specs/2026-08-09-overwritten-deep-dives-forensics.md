@@ -465,3 +465,73 @@ Datalevin store; **82** lines in the repaired `data/substrate.edn` and **80** in
    distiller reads the prompt from the system message. They are not wrong — Kepler's Third Law is
    Kepler's Third Law — but they are facts about the world rather than facts about this work, and
    nothing in the record said so until someone counted the characters.
+
+---
+
+## Addendum, 2026-08-09 — three more count-based minters, and one open recommendation
+
+Appended while executing Task 1. Nothing above this line was edited.
+
+### Found and closed: three minters § 7's table did not list
+
+§ 7 named `compute!`'s two as the only unguarded count-based minters left in `src/`. It missed
+three, all in `server.clj`, all `(inc (count <kind>))` over the whole store, all with **no random
+suffix and no existence check**, all landing via `:put`:
+
+| site | minted | counter |
+|---|---|---|
+| `new-space!` | `space:new-<N>` | `(count :space)` |
+| `describe!` | `view:<src>-<N>` | `(count :viewspec)` |
+| `make-view!` | `app:<src>-<N>` | `(count :applet)` |
+
+**`new-space!` was not merely the same shape as the form that destroyed `space:dd-16/17/18`. It was
+the same form** — `(inc (count …))` over `:space`, the same kind, minting a **notebook** id. What
+separates it from the deleted `space:dd-` minter is the prefix and nothing else, and the prefix is
+exactly why `fresh-dd-id` never covered it: that matches `^space:dd-(\d+)$`. A view or an applet can
+be re-made from its target; a notebook carries cells, prose and lineage that nothing else holds.
+
+All three now mint through `next-id` — 1 + the highest existing suffix — read **at mint time** rather
+than from an objects map taken earlier, because in all three the id is minted after a model call and
+an earlier snapshot would age by however long the model takes. (`compute-clj!` is the exception and
+uses `next-id-in` over one map: it makes no model call between the fold and the mint, and it mints
+two ids, so one fold serves both.) The change is **shape-preserving** — `space:new-N` is still
+`space:new-N` — so nothing a user sees changes.
+
+The test that matters is `new-space-mints-past-the-highest-id-and-leaves-the-occupant-alone`: two
+spaces live with `space:new-3` among them, so `(inc (count :space))` is exactly 3 and the count form
+lands **on** the occupied id rather than near it. Under that form the assertions report the occupant's
+title as `"World economies"`, its intent replaced, and its `:cells` and `:spawned-by` `nil` — the July
+defect reproduced in a test rather than argued from the log.
+
+### Open recommendation, NOT a finding: the three random-suffix minters
+
+`tools.clj:116` (`do-query`), `tools.clj:154` (`save-table!`) and `server.clj`'s `import-csv!` mint
+`<prefix>-<count>-<(inc (rand-int 9999))>`. **They were left alone deliberately**; this section is a
+recommendation for a decision, not something this work established as broken.
+
+The argument for changing them:
+
+- **The count half demonstrably collides.** § 3 is the evidence: `tbl:extract-14-677` and
+  `tbl:extract-14-588` agreed on the count and differed only in the random draw. The guard that
+  survived July is a 1-in-9,999 coin, not a design — § 7 already says so.
+- **The consequence of losing that coin is silent.** `:put` has no occupancy check, so the loss is a
+  destroyed table with the log reporting success — the same silence as the notebooks.
+- **One prefix now carries two shapes.** `tbl:derived-` is minted `tbl:derived-N` by `compute-clj!`
+  and `fn-apply!`, and `tbl:derived-N-RRRR` by `do-query`. `next-id-in` does
+  `(Long/parseLong (subs key (count prefix)))`, so `"9-4211"` throws and the key is **skipped**:
+  the max-based counter cannot see the random-suffix ids at all, and the random-suffix counter
+  cannot see the max-based ones. They cannot collide with each other — the strings differ — but
+  neither counter has a complete view of its own prefix, which is the same class of blindness that
+  started all of this, with the consequence removed rather than the cause.
+
+The argument against, and the reason it is a decision rather than a subagent:
+
+- **It changes the id shape users see.** `tbl:extract-14-677` would become `tbl:extract-15`. The
+  three minters closed above are shape-preserving; these are not. Ids appear in the shell, in flow
+  step outputs and in `:source` provenance, and existing objects keep their old shape either way, so
+  a workspace would carry both conventions permanently.
+
+Suggested resolution if it is taken: move all three to `next-id` on their existing prefixes,
+accepting the shape change, so that each prefix has exactly one rule and one counter that can see
+every id under it. That is the property `compute-clj!` was fixed to get, and the property the
+`tbl:derived-` prefix still does not have.

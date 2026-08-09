@@ -605,8 +605,11 @@
 ;; genuinely disagree or the test passes under the bug.
 
 (defn- store-with-a-gap-between-count-and-max
-  "Two tables and one :fn live, but `-5` is taken for both prefixes: a
-   count-based mint says `-3`/`-2`, a max-based one says `-6`."
+  "One live object of each minted kind, but `-5` is taken for every prefix: a
+   count-based mint says `-2` (`-3` for tables, which have `tbl:x` too), a
+   max-based one says `-6`. Every kind `compute-clj!`, `describe!` and
+   `make-view!` mint over is in here, because all three took their number from
+   a store-wide count of their own kind."
   []
   (let [st (sub/fresh-store)]
     (sub/commit! st {:op :put :id "tbl:x"
@@ -618,6 +621,13 @@
                      :value {:id "fn:x-5" :kind :fn :title "fn: the fifth function"
                              :value {:source "tbl:x" :prompt "five" :lang "clojure"
                                      :code "(fn [rows] rows)"}}})
+    (sub/commit! st {:op :put :id "view:x-5"
+                     :value {:id "view:x-5" :kind :viewspec :title "view: the fifth view"
+                             :value {:target "tbl:x" :label "the fifth view"
+                                     :spec {:kind "table"}}}})
+    (sub/commit! st {:op :put :id "app:x-5"
+                     :value {:id "app:x-5" :kind :applet :title "app: the fifth applet"
+                             :value {:target "tbl:x" :code "el.textContent='5'" :label "▶ five"}}})
     st))
 
 (deftest compute-mints-past-the-highest-id-not-past-the-count
@@ -654,6 +664,86 @@
       (let [rx (srv/compute-clj! st "tbl:x" "add x again" nil)]
         (is (= "fn:x-6" (:via (sub/object st (:openId rx)))))  ; fn:x- keeps its own run
         (is (= "tbl:derived-7" (:openId rx)))))))              ; tbl:derived- keeps one run
+
+;; ---- and the three minters the forensics table missed ----
+;;
+;; `new-space!`, `describe!` and `make-view!` each took `(inc (count <kind>))`
+;; over the whole store, with no random suffix and no existence check, landing
+;; via `:put`. `new-space!` is the one that matters: it counts `:space` and
+;; mints a NOTEBOOK id, which is `(inc (count (nb/notebooks st)))` under a
+;; different prefix — the identical form that destroyed `space:dd-16/17/18`,
+;; not merely the same shape. `fresh-dd-id` does not reach it: it matches
+;; `^space:dd-(\d+)$`, and this prefix is `space:new-`. A view or an applet can
+;; be re-made from its target; a notebook carries cells, prose and lineage that
+;; nothing else holds.
+
+(defn- store-with-an-occupied-space-new
+  "TWO spaces live and `space:new-3` among them, so `(inc (count :space))` is
+   exactly 3 — the count form lands on the occupied id rather than merely near
+   it. That is the July defect and not an analogy to it: the notebook the mint
+   overwrites is here, with a title, cells and lineage to lose."
+  []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:cosmos"
+                     :value {:id "space:cosmos" :kind :space :title "Cosmos"
+                             :value {:intent "the solar system, end to end" :cells []}}})
+    (sub/commit! st {:op :put :id "space:new-3"
+                     :value {:id "space:new-3" :kind :space :title "Inner vs. Outer Planets"
+                             :value {:intent "Compare the terrestrial and giant planets."
+                                     :cells [{:ref "tbl:planets"}]
+                                     :spawned-by {:space "space:cosmos"}}}})
+    st))
+
+(deftest new-space-mints-past-the-highest-id-and-leaves-the-occupant-alone
+  (with-redefs [agent/plan-space (fn [& _] {:title "World economies"
+                                            :intent "output and prices" :members []})]
+    (let [st (store-with-an-occupied-space-new)
+          r  (srv/new-space! st "world economies")]
+      (is (= "space:new-4" (:spaceId r)))                  ; two spaces live → count said -3
+      (is (= "World economies" (:title (sub/object st "space:new-4"))))
+      ;; the July defect, reproduced rather than argued: under the count form
+      ;; every one of these four is the semiconductor notebook's data
+      (let [occupant (sub/object st "space:new-3")]
+        (is (= "Inner vs. Outer Planets" (:title occupant)))
+        (is (= "Compare the terrestrial and giant planets." (get-in occupant [:value :intent])))
+        (is (= [{:ref "tbl:planets"}] (get-in occupant [:value :cells])))
+        (is (= "space:cosmos" (get-in occupant [:value :spawned-by :space])))))))
+
+(deftest describe-and-make-view-mint-past-the-highest-id-not-past-the-count
+  (with-redefs [agent/describe-view (fn [& _] {:label "by region" :kind "table"})
+                agent/make-applet   (fn [& _] "el.textContent = data.length")]
+    (let [st     (store-with-a-gap-between-count-and-max)
+          before (count (sub/history st))]
+      (srv/describe! st "tbl:x" "chart it")
+      (srv/make-view! st "tbl:x" "draw it")
+      (is (= (+ 2 before) (count (sub/history st))))       ; one commit each, and they happened
+      (is (= "view: by region" (:title (sub/object st "view:x-6"))))  ; count said view:x-2
+      (is (= "app: draw it" (:title (sub/object st "app:x-6"))))      ; count said app:x-2
+      (is (nil? (sub/object st "view:x-2")))
+      (is (nil? (sub/object st "app:x-2")))
+      ;; the occupants of -5, which a count form walks toward with every mint
+      (is (= "view: the fifth view" (:title (sub/object st "view:x-5"))))
+      (is (= "app: the fifth applet" (:title (sub/object st "app:x-5")))))))
+
+(deftest view-and-app-ids-number-per-source-not-across-the-store
+  ;; same argument as `fn:` above: `view:<src>-N` and `app:<src>-N` carry the
+  ;; source's local name, so each source owns its own run. A store-wide count
+  ;; numbered them off one running total, so the FIRST view over a brand-new
+  ;; table came out `view:y-2`. Two sources, because one cannot tell "counts
+  ;; the store" from "counts this source".
+  (with-redefs [agent/describe-view (fn [& _] {:label "by region" :kind "table"})
+                agent/make-applet   (fn [& _] "el.textContent = data.length")]
+    (let [st (store-with-a-gap-between-count-and-max)]
+      (sub/commit! st {:op :put :id "tbl:y"
+                       :value {:id "tbl:y" :kind :table :title "Y" :value trows}})
+      (srv/describe! st "tbl:y" "chart it")
+      (srv/make-view! st "tbl:y" "draw it")
+      (is (= "view: by region" (:title (sub/object st "view:y-1"))))  ; count said view:y-2
+      (is (= "app: draw it" (:title (sub/object st "app:y-1"))))      ; count said app:y-2
+      (srv/describe! st "tbl:x" "chart it")
+      (srv/make-view! st "tbl:x" "draw it")
+      (is (= "view: by region" (:title (sub/object st "view:x-6"))))  ; view:x- keeps its own run
+      (is (= "app: draw it" (:title (sub/object st "app:x-6")))))))
 
 (deftest flow-step-refs-walk-back-past-outputless-steps
   ;; the live-fire bug: the planner counted 1-based, so "$1" hit the GATE
