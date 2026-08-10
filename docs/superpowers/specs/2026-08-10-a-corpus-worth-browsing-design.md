@@ -150,11 +150,18 @@ multiplier in `weight`. Every imported fact would be stamped today while the exi
 weeks old: `1/(1 + 14/30) = 0.68` against `1.0`, so the new corpus gets a **~47% ranking advantage
 over the user's real work** in every recall. That is a real distortion of the thing being judged.
 
-> **OPEN, to be decided in the plan with numbers in front of it.** Either accept it — they *are*
-> facts recorded today, which is honest — or append directly the way `loci.repair` does, carrying
-> a `:ts` derived from the source's own date. The second is more faithful and costs the dedup that
-> `remember` provides. **Measure the top-6 for a few prompts both ways before choosing**; this is
-> the same class of decision as the recall weighting, and it was got wrong there by reasoning.
+> **RESOLVED, 2026-08-10, by a separate design — and this spec now DEPENDS on it.**
+> See `2026-08-10-facts-that-do-not-decay-design.md`. The user's answer to the `:ts` problem was
+> that the premise was wrong: *"there are some real world facts that bear no decay — only some
+> findings that agent discovered during execution should undergo decay."*
+>
+> Facts gain a `:durable?` flag, `weight` skips `decay` when it is set, the distiller proposes it,
+> and **the existing 80 facts are classified in the same pass** so both halves of the memory are
+> judged by one rule rather than by their arrival date.
+>
+> **That spec must ship first.** Importing durable facts into a memory whose existing facts are
+> still decaying would turn the ~47% advantage described above from temporary into *permanent* —
+> strictly worse than the problem it was meant to solve.
 
 ## Safety
 
