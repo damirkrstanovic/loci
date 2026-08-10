@@ -46,13 +46,23 @@ const enterTime = async page => {
 // the debounced settle to have landed by watching the event count the payload
 // carries. `state-payload`'s :events IS the prefix length, so `STATE.events === n`
 // says "the world you are looking at is the world at event n", with no timeout.
+// Not page.waitForFunction: measured, a slider that snaps (step≠1) turns this into
+// a 30-second wall whose only message is that a predicate stayed false, with the
+// assertions below it never running. Both halves of the wait say what went wrong
+// instead — the value the track accepted, and the world failing to follow it.
 const scrubTo = async (page, n) => {
-  await page.evaluate(x => {
+  const took = await page.evaluate(x => {
     const r = document.getElementById('timeRange');
     r.value = String(x);
     r.dispatchEvent(new Event('input', { bubbles: true }));
+    return +r.value;
   }, n);
-  await page.waitForFunction(x => STATE.events === x, n);
+  assert.equal(took, n,
+    `the track refused event ${n} and snapped to ${took} — step is no longer 1, so ` +
+    `there are points in the log you cannot stand on`);
+  await until(async () => (await page.evaluate(() => STATE.events)) === n,
+    `the world never arrived at event ${n}: the debounced settle never landed, or ` +
+    `it landed on a different point than the thumb is at`);
 };
 
 // The doc: prose plus a `## Sources` list, appended to space:cosmos by the
@@ -201,5 +211,48 @@ test('scrubbing past a document’s creation falls back to the overview and says
     // in the shell's own words, not in a class name.
     assert.equal((await page.textContent('#crumbName')).trim(), 'all notebooks',
       'the fallback left the shell in a focused notebook rather than the overview');
+  });
+});
+
+// ── aiming ─────────────────────────────────────────────────────────────────
+
+// "I cannot do fine control" has a better answer than pixels: a range input
+// already answers ← → with exactly one step, and `step` is already 1. What was
+// missing is that nothing said so and nothing had focus, so the keys did nothing
+// until you had clicked the track — which is the gesture you were trying to avoid.
+// One press per event beats 5.9px of mouse travel at any log length.
+test('the slider takes the arrow keys the moment time opens, and says so', async () => {
+  await withPage(browser, 'timescrub-arrow-keys', async (page) => {
+    await bootedShell(page, server.url);
+    await enterTime(page);
+
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'timeRange',
+      'the track does not have focus on the way in, so ← → do nothing until you ' +
+      'click it first — and clicking the track is the gesture being replaced');
+
+    // the hint, in the bar itself: a key that works but is never mentioned is a
+    // key nobody presses
+    const bar = await page.innerText('#timebar');
+    assert.ok(/←\s*→/.test(bar) && /event/.test(bar),
+      `the bar never mentions the keys, so only someone who already knew would\n` +
+      `press them:\n  ${JSON.stringify(bar)}`);
+
+    const value = () => page.evaluate(() => +document.getElementById('timeRange').value);
+    const before = await value();
+    await page.keyboard.press('ArrowLeft');
+    await until(async () => (await value()) !== before,
+      'ArrowLeft moved nothing at all — the key never reached the track');
+    assert.equal(await value(), before - 1,
+      'one press is not one event: fine control is exactly what this is for');
+    assert.equal(await page.evaluate(() => TIME.n), before - 1,
+      'the thumb moved but the world did not follow it');
+
+    // Escape is the shell's way out of the past, and focusing the track put an
+    // INPUT in front of the global handler — which blurs a focused field and
+    // returns. Without a way through, ⏱ would need two Escapes to leave.
+    await page.keyboard.press('Escape');
+    await until(() => page.evaluate(() => TIME === null),
+      'Escape did not leave the past: the focused slider swallowed it, and the ' +
+      'first press now only blurs the field');
   });
 });

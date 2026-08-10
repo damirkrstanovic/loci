@@ -234,6 +234,10 @@
   /* min-width:0 or a long caption pushes the row wider than the pill instead of
      ellipsizing — flex items refuse to shrink below their content by default */
   .timelabel{flex:1 1 auto;min-width:0;font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* the keys are the real answer to "I cannot do fine control" — one press is one
+     event at any log length, where the mouse gets 5.9px. A key that works but is
+     never mentioned is a key nobody presses, so it is on the bar, not in a title. */
+  .timekeys{flex:0 0 auto;font-family:var(--mono);font-size:10.5px;color:var(--muted);opacity:.7;white-space:nowrap}
   .world.timemode .actions,.world.timemode .cellbar,.world.timemode .addrow,
   .world.timemode .mkcell,.world.timemode select[data-remold],
   .world.timemode #editbtn,.world.timemode #makebtn,.world.timemode .fnpal{display:none!important}
@@ -366,6 +370,7 @@
   <div class="timerow">
     <button class="btn ghost sm" id="timeNow">↩ now</button>
     <div class="timelabel" id="timeLabel">—</div>
+    <div class="timekeys">← → one event</div>
   </div>
   <input type="range" id="timeRange" min="0" max="0" value="0">
 </div>
@@ -1444,6 +1449,9 @@ async function enterTime(){
   // refusal to open in the past is documented as relying on that.
   closeModal(); closeLeap();
   timebar.classList.add('on'); paintTime();
+  // focus on the way in, or ← → do nothing until you have clicked the track —
+  // which is the gesture the keys are there to replace
+  timeRange.focus();
 }
 function timeCaption(){
   if(!TIME) return '—';
@@ -1511,6 +1519,10 @@ async function exitTime(){
 document.getElementById('timeBtn').addEventListener('click',()=>TIME?exitTime():enterTime());
 document.getElementById('timeNow').addEventListener('click',exitTime);
 timeRange.addEventListener('input',()=>scrubTo(+timeRange.value));
+// Escape leaves the past — and now has to be caught HERE. The global handler sees
+// a focused INPUT in front of it and does the right thing for a text field: blur
+// and return. Without this, ⏱ would need two Escapes to close.
+timeRange.addEventListener('keydown',e=>{ if(e.key==='Escape'){ e.preventDefault(); exitTime(); } });
 
 // ---------------- LEAP filters the overview ----------------
 // Filtering is an entry in LEAP's own list rather than a mode: the dropdown
