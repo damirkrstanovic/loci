@@ -168,6 +168,14 @@ It reads the live facts, asks the classifier in batches, and appends each fact a
 `:durable?` and `:durable-by "agent"` — the same last-wins append `store-vector!` and `unmerge!`
 use.
 
+> **Ratified in Task 3, and this task must match it: accept a judgement only when it is
+> `boolean?`, not merely present.** A model answering the *string* `"false"` is truthy in Clojure,
+> so `weight` would skip decay on the very fact the classifier said ages — stamped
+> `:durable-by "agent"`, and undoable only by hand in the pane. `contains?` guards against silence
+> and not against noise, and the two fail in the same direction. A malformed answer must leave the
+> fact **unjudged**, exactly as no answer does. If the two writers disagree about what a malformed
+> answer means, one of them is silently wrong for as long as nobody looks.
+
 **It must NOT go through `mold/remember`.** `remember` would find the fact as its own jaccard ≥ 0.6
 duplicate, bump `:strength`, and **reset `:ts` to now** — handing every not-durable fact a fresh
 1.0 multiplier, which is the opposite of this plan. The 2026-08-09 repair documented this trap;
