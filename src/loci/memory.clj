@@ -118,9 +118,32 @@
 
 (defn- weight
   "Recency times the strength bonus — the part of a fact's score that has nothing
-   to do with the query. Applied exactly once on every path."
+   to do with the query. Applied exactly once on every path.
+
+   A fact marked `:durable?` skips the recency half entirely. Decay reads every
+   fact as carrying an implicit \"as of now\", and most do: *\"lithography capacity
+   is booked through 2027\"* is worth less each month, correctly. But `T² ∝ a³` is
+   not a measurement of a world that moves, and at 365 days decay ranks it at
+   0.076 of itself and at 730 days 0.039 — a law of physics deleted by
+   arithmetic. That is what this branch is for.
+
+   **Absent means decays**, not the other way round, so `(:durable? f)` and not
+   `(contains? f :durable?)`: the whole corpus is unjudged until something
+   classifies it, and an unjudged fact must rank exactly where it ranked
+   yesterday. `false` is then a real judgement — *\"this one is as-of-now\"* — and
+   weighs the same as never having been asked, which is the honest reading of it.
+
+   The alternative considered was a per-fact half-life, richer and probably
+   truer. It was rejected in brainstorming: every extra number is a place to be
+   wrong, and nothing yet says a binary is insufficient.
+
+   The strength bonus is deliberately OUTSIDE the branch and still applies to a
+   durable fact. \"It keeps coming up\" is orthogonal to \"it ages\", and returning a
+   flat 1.0 here would be a second change hiding inside this one — a fact
+   recalled three times would stop outranking one recalled once, the moment
+   somebody judged it timeless."
   [now f]
-  (* (decay (:ts f) now)
+  (* (if (:durable? f) 1.0 (decay (:ts f) now))
      (+ 1.0 (* 0.25 (dec (:strength f 1))))))
 
 (defn- score [qt qs dfm now f] (* (relevance qt qs dfm f) (weight now f)))

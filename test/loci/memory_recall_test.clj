@@ -563,3 +563,91 @@
       (is (= ["mem-2" "mem-1"] (mapv :id hits))
           "score first, id only where the scores are equal")
       (is (apply > (map :score hits))))))
+
+;; ---- what ages, and what does not ----
+;;
+;; `weight` is the only place `decay` is consulted, so these call it directly
+;; rather than through `recall`: the arithmetic is the subject, and a fixture
+;; that had to score a query against a corpus first would make every number
+;; below a product of two things instead of one.
+
+(def ^:private day-ms 86400000)
+
+(def ^:private t-now
+  "A fixed `now`. `weight` takes the clock as an argument, so nothing here
+   depends on when the suite runs or on how long it took to get to this line."
+  1700000000000)
+
+(defn- aged
+  "A fact `d` days old at `t-now`, carrying `extra` — `:durable?`, `:strength`,
+   or neither. Only `:ts` and `extra` matter to `weight`; `:fact` is here so the
+   map is a fact rather than a pair of keys that happens to weigh something."
+  [d extra]
+  (merge {:id "mem-1" :fact "a claim" :ts (- t-now (* d day-ms))} extra))
+
+(defn- weight-of [f] (#'mem/weight t-now f))
+
+(deftest a-durable-fact-weighs-the-same-at-any-age
+  (let [w0    (weight-of (aged 0    {:durable? true}))
+        w365  (weight-of (aged 365  {:durable? true}))
+        w3650 (weight-of (aged 3650 {:durable? true}))]
+    (is (= 1.0 w0 w365 w3650)
+        (str "Kepler's Third Law is as true in ten years as it is today. Decay would rank "
+             "the ten-year-old copy at " (weight-of (aged 3650 {})) " of the fresh one — "
+             "a law of physics deleted by arithmetic. Got: " [w0 w365 w3650]))))
+
+(deftest an-ordinary-fact-decays-exactly-as-it-always-has
+  ;; The curve, pinned with literal numbers rather than by calling `decay` again:
+  ;; a test that recomputes the thing it is testing agrees with any refactor of
+  ;; it, including a wrong one. These four numbers are the behaviour every fact
+  ;; in the corpus has today, and after this change every fact that nothing has
+  ;; judged still has.
+  (is (= 1.0 (weight-of (aged 0 {})))
+      "written now: there is no age to charge for yet")
+  (is (= 0.5 (weight-of (aged 30 {})))
+      "halved after ~30 days, which is the entire claim of the 30-day constant")
+  (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {})))) 1e-9)
+      (str "a year old and worth 7.6% of itself — the number this plan exists to answer. Got: "
+           (weight-of (aged 365 {}))))
+  (is (< (Math/abs (- 0.008152174 (weight-of (aged 3650 {})))) 1e-9)
+      (str "ten years, and effectively gone. Got: " (weight-of (aged 3650 {})))))
+
+(deftest a-fact-judged-not-durable-still-ages
+  ;; `false` and absent must both decay, and they are separate tests on purpose:
+  ;; `(if (:durable? f) …)` and `(if (contains? f :durable?) …)` agree on `true`
+  ;; and on absent, and disagree only here. Only one of them is right, and this
+  ;; is the assertion that says which.
+  (let [decayed (weight-of (aged 365 {}))]
+    (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {:durable? false})))) 1e-9)
+        (str "\"this one really is as-of-now\" is a judgement that the fact ages, not merely a "
+             "record that somebody looked at it. Got: "
+             (weight-of (aged 365 {:durable? false}))))
+    ;; the literal above and the comparison below are not the same assertion: the
+    ;; first would still hold if `false` were special-cased into some third
+    ;; behaviour that happened to land on the same number, the second says a
+    ;; judged-not-durable fact is weighed by the identical branch an unjudged one
+    ;; is. Written relative-only, this test survived the "return 1.0
+    ;; unconditionally" sabotage, because both sides moved together.
+    (is (= decayed (weight-of (aged 365 {:durable? false})))
+        (str "and by the same arithmetic the unjudged fact gets: " decayed))))
+
+(deftest a-fact-nothing-has-judged-still-ages
+  ;; Absent means decays: the whole corpus is unjudged the moment this ships, so
+  ;; if this fails, every fact in the memory just changed rank without anyone
+  ;; deciding anything about it.
+  (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {})))) 1e-9)
+      (str "no :durable? key at all is today's behaviour, unchanged. Got: "
+           (weight-of (aged 365 {})))))
+
+(deftest the-strength-bonus-still-multiplies-a-durable-fact
+  ;; "it keeps coming up" is orthogonal to "it ages". Folding the strength bonus
+  ;; into the durable branch — returning a flat 1.0 for a durable fact — would be
+  ;; a second change hiding inside this one, and a fact recalled three times would
+  ;; stop outranking one recalled once the moment it was judged timeless.
+  (is (= 1.5 (weight-of (aged 3650 {:durable? true :strength 3})))
+      (str "1.0 + 0.25 × (3 - 1), undecayed. Got: "
+           (weight-of (aged 3650 {:durable? true :strength 3}))))
+  (is (= 1.0 (weight-of (aged 3650 {:durable? true :strength 1})))
+      "and a strength of 1 is the bonus's identity, so the 1.5 above is the bonus and not the age")
+  (is (= (* 1.5 (weight-of (aged 365 {}))) (weight-of (aged 365 {:strength 3})))
+      "the bonus multiplies a decaying fact exactly as it did before, too"))
