@@ -99,8 +99,22 @@ RUN jlink \
 # build.clj builds the project basis at runtime with b/create-basis, which -P
 # never runs. Measured: -P -T:build alone leaves ~/.m2 at 15 MB with no
 # datalevin; adding -P -M:serve takes it to 80 MB.
+#
+# The `--mount=type=cache` is what makes a re-download impossible rather than
+# merely unlikely. Without it the jars live *inside this layer*, so anything that
+# invalidates the layer loses them: a `deps.edn` edit, `--no-cache`, or BuildKit's
+# GC evicting it to make room for another project's cache. A cache mount is a
+# persistent store attached at RUN time and is not part of the layer at all, so a
+# busted layer becomes a re-*resolve* against jars already on disk instead of a
+# re-*download*. `/root/.m2` and not `~/.m2`: this stage runs as uid 0 with
+# HOME=/root (checked, not assumed — the mount silently does nothing if the path
+# is wrong, and the build still succeeds).
+#
+# `sharing=locked` because two concurrent builds writing one ~/.m2 is how a
+# half-written jar gets cached and every later build fails on it.
 COPY deps.edn build.clj ./
-RUN clojure -P -M:serve && clojure -P -T:build uber
+RUN --mount=type=cache,target=/root/.m2,sharing=locked \
+    clojure -P -M:serve && clojure -P -T:build uber
 COPY src ./src
 COPY resources ./resources
 # :slim true drops the native libraries for every platform but linux-x86_64 —
@@ -109,7 +123,13 @@ COPY resources ./resources
 # 2026-08-07: 51 files, 80.7 MB → 63.9 MB of jar, 445 → 428 MB of image. The jar it
 # produces runs on linux-x86_64 only; `clojure -T:build uber` without the flag
 # still builds the portable one. See `foreign-natives` in build.clj.
-RUN clojure -T:build uber :slim true
+#
+# The same mount, and it is not optional here: this step runs on EVERY source
+# edit, `b/create-basis` resolves the project deps again each time, and without
+# the mount it would find an ~/.m2 holding only whatever the prefetch layer
+# baked in. With it, both steps read and write one store.
+RUN --mount=type=cache,target=/root/.m2,sharing=locked \
+    clojure -T:build uber :slim true
 
 # …and run it on that runtime, on the same distribution the runtime was linked on.
 # Debian 12 is not incidental: clojure:temurin-26-tools-deps *is* bookworm, and a
