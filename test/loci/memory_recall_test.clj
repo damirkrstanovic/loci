@@ -651,3 +651,127 @@
       "and a strength of 1 is the bonus's identity, so the 1.5 above is the bonus and not the age")
   (is (= (* 1.5 (weight-of (aged 365 {}))) (weight-of (aged 365 {:strength 3})))
       "the bonus multiplies a decaying fact exactly as it did before, too"))
+
+;; ---- who wrote the judgement, and who may overwrite it ----
+;;
+;; `remember` has two branches and they carry the flag differently. The new-fact
+;; branch takes whatever `opts` says and writes NOTHING when `opts` says nothing;
+;; the reinforcement branch may overwrite an agent's judgement and may never
+;; overwrite yours. These go through `mold/remember` on a real `FileMemory` under
+;; java.io.tmpdir: `remember` is a protocol method, so `with-redefs` cannot reach
+;; it, and stubbing the thing under test would be pointless here anyway.
+
+(defn- one-fact
+  "The single fact in `m`, as it was actually stored. Fails loudly rather than
+   returning nil if there is more than one — a fixture whose two sentences did
+   not reinforce into one is the way every assertion below goes vacuous."
+  [m]
+  (let [fs (mold/all-facts m)]
+    (assert (= 1 (count fs)) (str "fixture expected one fact, got " (mapv :fact fs)))
+    (first fs)))
+
+(def ^:private kepler
+  "Reinforced by remembering it a second time: `remember` treats a jaccard of
+   0.6 or more as the same fact, and the same sentence scores 1.0. This is the
+   real case — auto-distill re-derives the same wording from the same work."
+  "Kepler's third law says the square of the period goes as the cube of the axis")
+
+(deftest a-fact-nothing-has-judged-carries-no-judgement
+  ;; `:durable? nil` would be a key that is present and false-y, and then
+  ;; `(:durable? f)` and `(contains? f :durable?)` stop agreeing — the same shape
+  ;; `memory-payload`'s `:degraded` is absent-when-healthy to avoid. `weight`
+  ;; distinguishes `false` from absent, so "nothing has judged this" has to be a
+  ;; state the record can actually be in.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:entities ["Kepler"]})
+    (let [f (one-fact m)]
+      (is (false? (contains? f :durable?))
+          (str "no key at all, not a nil one — got " (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (false? (contains? f :durable-by))
+          "and no provenance for a judgement nobody made"))))
+
+(deftest a-new-fact-can-arrive-already-judged
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? true})
+    (let [f (one-fact m)]
+      (is (true? (:durable? f)) "the distiller's judgement, carried through")
+      (is (= "agent" (:durable-by f))
+          "…stamped as the agent's, because that is who may later be overruled")))
+  ;; `false` is a judgement too, and it is the one a `(when (:durable? opts) …)`
+  ;; implementation drops on the floor: the fact would come back unjudged and
+  ;; indistinguishable from one nothing had looked at.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (let [f (one-fact m)]
+      ;; `false?` and not `(not (:durable? f))`: the second passes on a fact the
+      ;; branch never wrote to at all, which is the whole defect being tested.
+      (is (false? (:durable? f)) "\"this one really is as-of-now\" is an answer, not a silence")
+      (is (= "agent" (:durable-by f))))))
+
+(deftest reinforcement-may-change-the-agents-own-mind
+  ;; The permitted direction. A later pass with better context is allowed to
+  ;; correct an earlier one — it is the same author.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (mold/remember m kepler {:durable? true})
+    (let [f (one-fact m)]
+      (is (= 2 (:strength f))
+          "the second remember REINFORCED rather than adding a fact — without this the rest is vacuous")
+      (is (true? (:durable? f)) "the newer agent judgement wins")
+      (is (= "agent" (:durable-by f))))))
+
+(deftest reinforcement-never-reverts-your-judgement
+  ;; The whole reason `:durable-by` exists. Nothing writes `"you"` until the
+  ;; memory pane's toggle lands, so the fixture stamps it the way that route
+  ;; will: the record, by id, in the atom the pane's append would also update.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (swap! (:!facts m) update "mem-1" assoc :durable? true :durable-by "you")
+    ;; the incoming opts say the OPPOSITE of what you said. An implementation
+    ;; that only skipped agreeing judgements would pass a weaker version of this.
+    (mold/remember m kepler {:durable? false})
+    (let [f (one-fact m)]
+      (is (= 2 (:strength f))
+          (str "the reinforcement branch really ran — this fixture proves the flag survived a "
+               "rewrite rather than that `remember` never found the duplicate"))
+      (is (true? (:durable? f))
+          (str "you said this fact is timeless; an agent re-deriving it next week does not get to "
+               "quietly disagree. Got " (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (= "you" (:durable-by f)) "…and it is still your judgement, not laundered into the agent's"))))
+
+(deftest reinforcement-with-no-judgement-leaves-the-flag-where-it-was
+  ;; Distillation does not always answer — an older model, or a refusal. Silence
+  ;; must not read as `false`, under either provenance.
+  (testing "an agent's judgement"
+    (let [m (mem/file-memory (tmpfile))]
+      (mold/remember m kepler {:durable? true})
+      (mold/remember m kepler {:entities ["Kepler"]})
+      (let [f (one-fact m)]
+        (is (= 2 (:strength f)) "reinforced, not added")
+        (is (true? (:durable? f)) "no answer is not the answer `false`")
+        (is (= "agent" (:durable-by f)) "…and it did not change hands"))))
+  (testing "yours"
+    (let [m (mem/file-memory (tmpfile))]
+      (mold/remember m kepler {:durable? true})
+      (swap! (:!facts m) update "mem-1" assoc :durable-by "you")
+      (mold/remember m kepler {:entities ["Kepler"]})
+      (let [f (one-fact m)]
+        (is (= 2 (:strength f)) "reinforced, not added")
+        (is (true? (:durable? f))
+            "the value survives too — dropping BOTH guards at once would clear it to nil here")
+        (is (= "you" (:durable-by f)) "silence does not relabel your judgement as the agent's")))))
+
+(deftest the-judgement-is-on-the-line-that-was-appended
+  ;; `!facts` and the file are written from the same record, so this is one
+  ;; assertion about `append-line!` rather than a second about `remember` — but
+  ;; the file is what survives a restart, and a flag that only lived in RAM would
+  ;; be a fact that quietly starts decaying again the next time loci boots.
+  (let [path (tmpfile)
+        m    (mem/file-memory path)]
+    (mold/remember m kepler {:durable? true})
+    (mold/remember m "alpha beta gamma delta epsilon" {})
+    (let [reopened (into {} (map (juxt :id identity)) (mold/all-facts (mem/file-memory path)))]
+      (is (true? (:durable? (reopened "mem-1"))) "read back off disk")
+      (is (= "agent" (:durable-by (reopened "mem-1"))))
+      (is (false? (contains? (reopened "mem-2") :durable?))
+          "and the unjudged fact is unjudged on disk too, not `nil` there"))))

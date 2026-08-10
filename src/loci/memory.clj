@@ -3,11 +3,14 @@
    engine behind the loci.mold/Recall protocol.
 
    A fact is {:id :fact :entities :source :ts :strength}, and once embedded it
-   also carries {:vec :model :dim}. remember reinforces near-duplicates instead
-   of duplicating; recall fuses keyword, entity, recency and strength signals,
-   and — when asked for it with `:semantic? true` — cosine against the query's
-   embedding, by reciprocal rank. This is the agent's domain: revisable and
-   decaying — deliberately NOT the substrate, and never touched by undo.
+   also carries {:vec :model :dim}. Once something has judged whether the claim
+   ages it also carries {:durable? :durable-by} — absent means nobody has, which
+   is why the pair is listed apart rather than folded into the shape above.
+   remember reinforces near-duplicates instead of duplicating; recall fuses
+   keyword, entity, recency and strength signals, and — when asked for it with
+   `:semantic? true` — cosine against the query's embedding, by reciprocal rank.
+   This is the agent's domain: revisable and decaying — deliberately NOT the
+   substrate, and never touched by undo.
 
    Persistence is an append-only EDN-lines file; reinforcement appends the
    updated fact under the same :id and load is last-wins by :id. **Embedding is
@@ -1082,10 +1085,30 @@
                   ;; vector; different wording drops it, so the next pass
                   ;; re-embeds rather than leaving a vector pointing at a
                   ;; sentence that is no longer stored.
-                  (not= fact (:fact dup)) (dissoc :vec :model :dim))
-                {:id (next-id @!facts)
-                 :fact fact :entities (vec (:entities opts))
-                 :source (:source opts) :ts (System/currentTimeMillis) :strength 1})]
+                  (not= fact (:fact dup)) (dissoc :vec :model :dim)
+                  ;; A judgement about whether the claim ages, and WHOSE it was.
+                  ;; Reinforcement may overwrite the agent's own earlier answer —
+                  ;; same author, later context — and may never overwrite yours:
+                  ;; without that, the agent re-deriving this sentence next week
+                  ;; silently reverts a call you made by hand, which is exactly
+                  ;; the failure `:no-merge` exists to prevent on the merge path.
+                  ;;
+                  ;; `contains?` and not `(:durable? opts)`, so silence stays
+                  ;; silence. A distiller that answered nothing — an older model,
+                  ;; a refusal — must not be read as having answered `false`.
+                  (and (contains? opts :durable?)
+                       (not= "you" (:durable-by dup)))
+                  (assoc :durable? (:durable? opts) :durable-by "agent"))
+                (cond-> {:id (next-id @!facts)
+                         :fact fact :entities (vec (:entities opts))
+                         :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
+                  ;; Absent, not nil. A key that is always present and usually
+                  ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
+                  ;; disagree — the shape `memory-payload`'s `:degraded` is
+                  ;; absent-when-healthy to avoid — and `weight` reads the value,
+                  ;; so absent has to keep meaning "nothing has judged this yet".
+                  (contains? opts :durable?)
+                  (assoc :durable? (:durable? opts) :durable-by "agent")))]
       (append-line! file rec)
       (swap! !facts assoc (:id rec) rec)
       :ok))
