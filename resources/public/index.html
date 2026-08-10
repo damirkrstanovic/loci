@@ -210,11 +210,30 @@
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);z-index:80;background:var(--ink);color:var(--paper);font-size:12.5px;padding:9px 15px;border-radius:999px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;display:flex;gap:10px;align-items:center}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast .u{color:var(--accent-line);cursor:pointer;pointer-events:auto;font-weight:500}
-  .timebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:75;display:none;align-items:center;gap:12px;
-           background:var(--white);border:1px solid var(--accent-line);border-radius:999px;padding:8px 16px;box-shadow:0 20px 50px -30px rgba(20,30,25,.5);width:min(720px,92vw)}
+  /* TWO ROWS, and the split is the whole fix. The label sizes to its own text and
+     that text changes on every scrub — `now · 116 events` at one end, `event
+     65/116 · ＋ Geopolitical Shock Scenarios · 23/07/2026, 21:07:24` in the middle.
+     While it shared a row with the track inside this fixed-width pill, the track
+     absorbed the difference: measured 500.9px → 325.5px on the test fixture, live,
+     mid-drag. A pixel↔event scale that moves under the cursor is exactly what "it
+     changes size / I cannot do fine control / I slide a little and nothing happens"
+     feels like — three complaints, one mechanism.
+     Reserving a fixed width for the label (flex:0 0 288px) would also have held the
+     track still and been a smaller diff, but it spends 40% of the bar on text
+     forever and leaves ~4px per event. On its own row the label cannot reach the
+     track at all, and the track spans the pill: 688px, constant. The precision is
+     the point, so the bar gets taller instead.
+     ↩ now moves up to the label row for the same reason — it is the same button in
+     the same corner, and leaving it beside the track would have cost 84px of it. */
+  .timebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:75;display:none;
+           flex-direction:column;gap:8px;
+           background:var(--white);border:1px solid var(--accent-line);border-radius:16px;padding:9px 16px 12px;box-shadow:0 20px 50px -30px rgba(20,30,25,.5);width:min(720px,92vw)}
   .timebar.on{display:flex}
-  .timebar input[type=range]{flex:1}
-  .timelabel{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;max-width:40%;overflow:hidden;text-overflow:ellipsis}
+  .timerow{display:flex;align-items:center;gap:12px}
+  .timebar input[type=range]{width:100%;margin:0;display:block}
+  /* min-width:0 or a long caption pushes the row wider than the pill instead of
+     ellipsizing — flex items refuse to shrink below their content by default */
+  .timelabel{flex:1 1 auto;min-width:0;font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .world.timemode .actions,.world.timemode .cellbar,.world.timemode .addrow,
   .world.timemode .mkcell,.world.timemode select[data-remold],
   .world.timemode #editbtn,.world.timemode #makebtn,.world.timemode .fnpal{display:none!important}
@@ -344,9 +363,11 @@
 <div class="world" id="world"><svg class="edges" id="edges"></svg></div>
 <div class="toast" id="toast"></div>
 <div class="timebar" id="timebar">
-  <button class="btn ghost sm" id="timeNow">↩ now</button>
+  <div class="timerow">
+    <button class="btn ghost sm" id="timeNow">↩ now</button>
+    <div class="timelabel" id="timeLabel">—</div>
+  </div>
   <input type="range" id="timeRange" min="0" max="0" value="0">
-  <div class="timelabel" id="timeLabel">—</div>
 </div>
 <div class="modal" id="modal"></div>
 
