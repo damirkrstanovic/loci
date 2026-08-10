@@ -187,6 +187,39 @@ test('scrubbing past a document’s creation falls back to the overview and says
     }, `nothing said why the document went away — the panel just emptied. The toast\n` +
        `has to name "${DOC_TITLE}" at the moment it is dropped.`);
 
+    // …and it has to be READABLE next to the thing it is about. The toast and the
+    // bar both live at the bottom of the screen, and the bar grew a row when the
+    // label moved off the track — measured on a hand-drive, the message landed on
+    // top of the track. Geometry is the only thing that can see this: both elements
+    // are present and correct, they are just in the same place.
+    //
+    // Measured ONCE, when the slide-in has settled — NOT by polling for the answer
+    // we want. The toast takes itself down after 2.5s, so a poll that never sees
+    // what it is waiting for ends by dereferencing a toast that is gone: measured,
+    // a TypeError naming nothing where the assertion should have been.
+    const box = await page.evaluate(() => new Promise(resolve => {
+      const t = document.querySelector('.toast.on');
+      if (!t) return resolve(null);
+      let last = t.getBoundingClientRect().top, still = 0, frames = 0;
+      const tick = () => {
+        const now = t.getBoundingClientRect().top;
+        still = Math.abs(now - last) < 0.1 ? still + 1 : 0;
+        last = now;
+        if (still >= 3 || ++frames > 120) {
+          const a = t.getBoundingClientRect(), r = document.getElementById('timeRange').getBoundingClientRect();
+          return resolve({ toast: [a.top, a.bottom], track: [r.top, r.bottom] });
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }));
+    assert.ok(box, 'the toast was already gone by the time it could be measured');
+    const [tt, tb] = box.toast, [rt, rb] = box.track;
+    assert.ok(!(tb > rt && tt < rb),
+      `the toast is drawn over the track it is telling you about — you cannot see ` +
+      `where the thumb went while it is up. toast ${tt.toFixed(0)}–${tb.toFixed(0)}, ` +
+      `track ${rt.toFixed(0)}–${rb.toFixed(0)}`);
+
     // Structure, deliberately, and this is the exception to "assert on text": an
     // EMPTY molder is textually identical to no molder at all, and "this should not
     // have been drawn" is a claim nothing but the DOM can settle.

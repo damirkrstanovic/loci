@@ -221,14 +221,19 @@
      Reserving a fixed width for the label (flex:0 0 288px) would also have held the
      track still and been a smaller diff, but it spends 40% of the bar on text
      forever and leaves ~4px per event. On its own row the label cannot reach the
-     track at all, and the track spans the pill: 688px, constant. The precision is
-     the point, so the bar gets taller instead.
+     track at all, and the track spans the pill: 686px measured, constant at every
+     position. The precision is the point, so the bar gets taller instead.
      ↩ now moves up to the label row for the same reason — it is the same button in
      the same corner, and leaving it beside the track would have cost 84px of it. */
   .timebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:75;display:none;
            flex-direction:column;gap:8px;
            background:var(--white);border:1px solid var(--accent-line);border-radius:16px;padding:9px 16px 12px;box-shadow:0 20px 50px -30px rgba(20,30,25,.5);width:min(720px,92vw)}
   .timebar.on{display:flex}
+  /* The toast lives at the bottom of the screen and so does this bar — and the bar
+     grew a row, so a message about the scrub landed ON the track it was about.
+     Measured: 72px tall at bottom:18px, so 102px clears it with room. `~` because
+     the toast follows .world in the markup, and .timemode is on .world already. */
+  .world.timemode ~ .toast{bottom:102px}
   .timerow{display:flex;align-items:center;gap:12px}
   .timebar input[type=range]{width:100%;margin:0;display:block}
   /* min-width:0 or a long caption pushes the row wider than the pill instead of
