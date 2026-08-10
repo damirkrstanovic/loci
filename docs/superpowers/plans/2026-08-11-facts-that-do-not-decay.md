@@ -92,12 +92,21 @@ meaning *"nothing has judged this yet"*.
 **Reinforcement** — an agent judgement may be overwritten; **yours may not.**
 
 ```clojure
-(if (= "you" (:durable-by dup))
-  dup                                     ; your call stands
-  (cond-> dup
-    (contains? opts :durable?) (assoc :durable?   (:durable? opts)
-                                      :durable-by "agent")))
+;; ONE MORE CLAUSE in the existing cond->, NOT a wrapper around it
+(cond-> dup
+  ;; … the existing :fact / :ts / :source / :strength / :entities clauses …
+  (and (contains? opts :durable?)
+       (not= "you" (:durable-by dup)))
+  (assoc :durable? (:durable? opts) :durable-by "agent"))
 ```
+
+> **Corrected 2026-08-11, after Task 2 implemented it.** This plan first wrote the guard as
+> `(if (= "you" (:durable-by dup)) dup …)`. Read literally that returns `dup` **whole** — skipping
+> the `:strength` bump, the `:fact` rewrite and the `:entities` union — so a fact you had marked
+> durable would be frozen at strength 1 forever, with text that never updated. **Only the
+> judgement stands; the rest of reinforcement must still happen.** Task 2 pinned it with a
+> sabotage that restores the literal form and watches `(= 2 (:strength f))` fail.
+> **Task 5: do not "correct" the shipped code back to this plan's first draft.**
 
 Without this, the agent re-deriving a fact next week silently reverts a judgement you made by
 hand — the failure `:no-merge` exists to prevent on the merge path, reintroduced on a new one.

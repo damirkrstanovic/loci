@@ -61,13 +61,21 @@ fact next week would silently revert a judgement you made by hand. That is the f
 **The rule: reinforcement may overwrite an agent's judgement, never yours.**
 
 ```clojure
-;; in remember's reinforcement branch
-(if (= "you" (:durable-by dup))
-  dup                                     ; your call stands
-  (cond-> dup
-    (contains? opts :durable?) (assoc :durable?   (:durable? opts)
-                                     :durable-by "agent")))
+;; in remember's reinforcement branch — ONE MORE CLAUSE in the existing cond->,
+;; NOT a wrapper around it
+(cond-> dup
+  ;; … the existing :fact / :ts / :source / :strength / :entities clauses …
+  (and (contains? opts :durable?)
+       (not= "you" (:durable-by dup)))
+  (assoc :durable? (:durable? opts) :durable-by "agent"))
 ```
+
+> **Corrected 2026-08-11, after Task 2 implemented it.** An earlier draft wrote this guard as
+> `(if (= "you" (:durable-by dup)) dup …)`. Read literally that returns `dup` **whole** — skipping
+> the `:strength` bump, the `:fact` rewrite and the `:entities` union — so a fact you had marked
+> durable would be frozen at strength 1 forever, with text that never updated. **Only the
+> judgement stands; the rest of reinforcement must still happen.** Pinned by a sabotage that
+> restores the literal form and watches `(= 2 (:strength f))` fail. Do not "correct" it back.
 
 **`remember` has two branches and both need this.** The reinforcement branch is above; the
 new-fact branch must carry the flag through from `opts` as well, and must **omit both keys
