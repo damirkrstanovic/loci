@@ -984,7 +984,13 @@ async function openObject(id){
   const owner=STATE.spaces.findIndex(s=>s.members.includes(id));
   if(owner>=0 && (mode!=='focus' || focusIdx!==owner)){ focusIdx=owner; }
   mode='focus'; closeLeap();
-  const m=await API.object(id,tat());
+  const at=tat();
+  const m=await API.object(id,at);
+  // A scrub now re-opens what is open at every settle, so two of these can be in
+  // flight down one drag — and drawing whichever answers last would leave the
+  // molder showing a point in time the bar has already left. The same guard
+  // renderNotebook, deepen, pvSeq and scrubTo itself carry.
+  if(openId!==id||tat()!==at) return;
   renderDetail(focusIdx,m); layout();
 }
 async function remold(id,view){ const m=await API.mold(id,view,tat()); renderDetail(focusIdx,m); }
@@ -1428,8 +1434,16 @@ async function enterTime(){
   let ev; try{ ev=await API.events(); }catch(e){ showToast('time: network error'); return; }
   TIME={n:ev.total,total:ev.total,events:ev.events};
   timeRange.min=0; timeRange.max=ev.total; timeRange.value=ev.total;
-  closeModal();
-  timebar.classList.add('on'); overview(); rebuild(); paintTime();
+  // Entering time stands you at `now` — the world already on screen — so there is
+  // nothing to re-render, and no reason to throw away what you were reading. This
+  // used to be `overview(); rebuild()`, which closed the document you pressed ⏱
+  // while reading, for the same bad reason `scrubTo` did. A rebuild would in fact
+  // COST a round trip here: renderBody draws “loading…” for an open object, so it
+  // would need openObject to fetch a payload that is already drawn.
+  // closeLeap explicitly, because overview() used to do it and the palette's
+  // refusal to open in the past is documented as relying on that.
+  closeModal(); closeLeap();
+  timebar.classList.add('on'); paintTime();
 }
 function timeCaption(){
   if(!TIME) return '—';
@@ -1445,6 +1459,31 @@ function paintTime(){
   // when clicked (with why), rather than being a control that quietly does nothing
   document.getElementById('undoBtn').classList.toggle('dim', !!TIME);
 }
+// Openable at a point in time: the object is in that state's `:objects` AND some
+// notebook there holds it. Both halves are load-bearing — the molder draws INSIDE
+// a notebook panel, and the seed puts every document before the spaces that
+// reference it, so there is a stretch of the log where a document exists with
+// nowhere to draw it (renderDetail would reach for a `#bodyN` that isn't there).
+function openableAt(s,id){
+  return !!id && s.objects.some(o=>o.id===id) && s.spaces.some(sp=>sp.members.includes(id));
+}
+// Draw the world `s` describes and keep what is open — if it is there to keep.
+// `where` names the point we just moved to, for the one case where it isn't.
+function restoreInto(s,where){
+  const was=openId, wasTitle=(STATE.objects[was]||{}).title||was;
+  applyState(s);
+  if(was && !openableAt(s,was)){
+    // An object open at event 90 may not exist at event 40, and the silent version
+    // of this is a known defect at another door: /api/object answers a missing
+    // object with {title:null, kind:"data", rendered:null} and the molder draws an
+    // empty header over the word `null`. So fall back LOUDLY — name what was
+    // dropped and say where it went.
+    openId=null; mode='overview'; rebuild();
+    showToast('“'+wasTitle+'” does not exist '+where+' — showing the overview');
+    return;
+  }
+  rebuild(); if(openId) openObject(openId);   // renderBody draws “loading…” until this lands
+}
 async function scrubTo(n){
   TIME.n=n; paintTime();
   clearTimeout(timeDeb);
@@ -1453,14 +1492,21 @@ async function scrubTo(n){
     const want=TIME.n;
     let s; try{ s=await API.state(want<TIME.total?want:undefined); }catch(e){ showToast('time: network error'); return; }
     if(!TIME||TIME.n!==want) return;                       // stale response
-    applyState(s); mode='overview'; openId=null; rebuild();
+    // This used to end `mode='overview'; openId=null`, so the first millimetre of
+    // drag closed whatever you were reading — and watching ONE thing change across
+    // the log is the main reason to have a scrubber at all. Keep it open and
+    // re-read it at the new `?at=`.
+    restoreInto(s,'at event '+want);
   },120);
 }
 async function exitTime(){
   let s; try{ s=await API.state(); }catch(e){ showToast('network error — still in the past'); return; }
   TIME=null; timebar.classList.remove('on'); world.classList.remove('timemode');
   document.getElementById('undoBtn').classList.remove('dim');   // the present is writable again
-  applyState(s); rebuild();
+  // ↩ now can land on something open, now that scrubbing keeps your place — and a
+  // document you opened in the past may have been deleted since. Same restore, and
+  // without it a bare `rebuild()` would leave the panel reading “loading…” forever.
+  restoreInto(s,'in the present');
 }
 document.getElementById('timeBtn').addEventListener('click',()=>TIME?exitTime():enterTime());
 document.getElementById('timeNow').addEventListener('click',exitTime);
@@ -1776,7 +1822,7 @@ async function act(){ const e=filtered[sel]; if(!e) return;
   // WRITE, and a subject is a destination like a notebook or a document, neither of
   // which is guarded. Reading one in the past is fine, and openEntity's one writing
   // control refuses there on its own. The palette does not open in the past anyway —
-  // q's focus handler turns it away, and enterTime closes it through overview().
+  // q's focus handler turns it away, and enterTime closes it on the way in.
   else if(e.group==='subject'){ closeLeap(); openEntity(e.name||e.label); }
   else { openObject(e.id); } }
 async function createSpace(prompt){

@@ -42,6 +42,44 @@ const enterTime = async page => {
   await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME !== null);
 };
 
+// Drive the slider the way the browser does — `input`, not `change` — and wait for
+// the debounced settle to have landed by watching the event count the payload
+// carries. `state-payload`'s :events IS the prefix length, so `STATE.events === n`
+// says "the world you are looking at is the world at event n", with no timeout.
+const scrubTo = async (page, n) => {
+  await page.evaluate(x => {
+    const r = document.getElementById('timeRange');
+    r.value = String(x);
+    r.dispatchEvent(new Event('input', { bubbles: true }));
+  }, n);
+  await page.waitForFunction(x => STATE.events === x, n);
+};
+
+// The doc: prose plus a `## Sources` list, appended to space:cosmos by the
+// harness fixture in ONE :tx — so a single event separates "in a notebook" from
+// "does not exist", which is exactly the boundary the fallback has to notice.
+const DOC = 'doc:sources', DOC_TITLE = 'Sources — fixture';
+
+const stateAt = async n => (await fetch(`${server.url}/api/state?at=${n}`)).json();
+// Openable = the object exists AND some notebook at that point holds it. Both
+// halves matter: the molder draws INSIDE a notebook panel, and the seed puts
+// every document before the spaces that reference them.
+const openableIn = (s, id) => s.objects.some(o => o.id === id) &&
+                              s.spaces.some(sp => sp.members.includes(id));
+// Nothing in this fixture is ever deleted, so "openable" is monotone in n and a
+// binary search finds the event that created it — six requests instead of forty,
+// and no hard-coded index to rot the next time the fixture grows a line.
+const bornAt = async (id, total) => {
+  let lo = 0, hi = total;                       // openableIn(lo)=false, openableIn(hi)=true
+  assert.ok(openableIn(await stateAt(hi), id), `${id} is not in the fixture at all`);
+  assert.ok(!openableIn(await stateAt(lo), id), `${id} exists before the log starts`);
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (openableIn(await stateAt(mid), id)) hi = mid; else lo = mid;
+  }
+  return hi;
+};
+
 // Set the slider and read the bar back in the SAME frame: `paintTime` writes the
 // label synchronously inside `scrubTo` (only the state fetch is debounced), and
 // getBoundingClientRect forces the layout that the new label would have caused.
@@ -84,5 +122,84 @@ test('the track is the same width wherever the thumb is', async () => {
     assert.ok(spread <= 0.5,
       `the track resizes by ${spread.toFixed(1)}px while you drag it — the pixel↔event\n` +
       `scale moves under the cursor, which is the whole complaint:\n  ${show}`);
+  });
+});
+
+// ── scrubbing keeps your place ─────────────────────────────────────────────
+
+// `scrubTo` ran `mode='overview'; openId=null` on every settle, so watching one
+// document change across the log — the main reason to have a scrubber at all —
+// was impossible: the first millimetre of drag closed it.
+test('scrubbing back does not close the document you were reading', async () => {
+  await withPage(browser, 'timescrub-keeps-your-place', async (page) => {
+    await bootedShell(page, server.url);
+    await page.evaluate(id => openObject(id), DOC);
+    await until(async () => (await page.locator('.molder .t').count()) > 0,
+      'the document never opened in the present — the fixture, not the fix');
+    assert.equal((await page.textContent('.molder .t')).trim(), DOC_TITLE);
+
+    await enterTime(page);
+    const total = Number(await page.getAttribute('#timeRange', 'max'));
+    // one event back, and that event is a tag being set — it removes nothing
+    await scrubTo(page, total - 1);
+
+    await until(async () => (await page.locator('.molder .t').count()) > 0,
+      `scrubbing one event back closed the document: the panel is showing something\n` +
+      `other than the molder, so you cannot watch anything change over time`);
+    assert.equal((await page.textContent('.molder .t')).trim(), DOC_TITLE,
+      'a molder is open, but not on the document that was open before the scrub');
+    // and it is drawn at the point we are standing, not left over from the present
+    assert.equal(await page.evaluate(() => STATE.events), total - 1);
+  });
+});
+
+test('scrubbing past a document’s creation falls back to the overview and says so', async () => {
+  await withPage(browser, 'timescrub-fallback-is-loud', async (page) => {
+    await bootedShell(page, server.url);
+    const total = Number((await stateAt(1e9)).events);
+    const born = await bornAt(DOC, total);
+
+    await page.evaluate(id => openObject(id), DOC);
+    await until(async () => (await page.locator('.molder .t').count()) > 0,
+      'the document never opened in the present — the fixture, not the fix');
+
+    await enterTime(page);
+    await scrubTo(page, born - 1);        // one event before it existed at all
+
+    // The toast first, because it is the part that is time-limited on screen, and
+    // because a silent fallback is the defect: /api/object answers a missing object
+    // with {title:null, kind:"data", rendered:null} and the molder draws an empty
+    // header over the word `null` — the same silent emptiness the entities sweep
+    // fixed at a different door.
+    await until(async () => {
+      const t = page.locator('.toast.on');
+      return (await t.count()) > 0 && (await t.innerText()).includes(DOC_TITLE);
+    }, `nothing said why the document went away — the panel just emptied. The toast\n` +
+       `has to name "${DOC_TITLE}" at the moment it is dropped.`);
+
+    // Structure, deliberately, and this is the exception to "assert on text": an
+    // EMPTY molder is textually identical to no molder at all, and "this should not
+    // have been drawn" is a claim nothing but the DOM can settle.
+    //
+    // BOTH counts, because the two half-fixes fail differently and the first
+    // version of this test could only see one of them. Leave `openId` set while
+    // switching to the overview and no molder is ever drawn: renderBody draws the
+    // detail for an open id whatever the mode is, and with no payload in hand that
+    // is the `loading…` stub — a panel that says it is fetching something, forever.
+    // Measured: that sabotage passed a bare `.molder === 0`.
+    const left = await page.evaluate(() => ({
+      molders: document.querySelectorAll('.molder').length,
+      loading: [...document.querySelectorAll('.p-body')]
+        .filter(b => b.innerText.trim() === 'loading…').length,
+    }));
+    assert.deepEqual(left, { molders: 0, loading: 0 },
+      'the fallback left something behind in the panel: a molder drawn over a null ' +
+      'payload, or a body stuck on “loading…” because the open id was never cleared');
+
+    // …and last, because a fallback that clears the open id but stays in the
+    // focused notebook leaves neither of the two above: "the overview is showing"
+    // in the shell's own words, not in a class name.
+    assert.equal((await page.textContent('#crumbName')).trim(), 'all notebooks',
+      'the fallback left the shell in a focused notebook rather than the overview');
   });
 });

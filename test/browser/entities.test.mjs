@@ -1156,7 +1156,9 @@ test('the past offers no subject to act on, because it offers no palette at all'
     // one writing control refuses on its own, which the time-mode test above
     // pins. What makes a guard here unreachable rather than merely redundant is
     // this: the palette does not open in the past, and entering the past closes it
-    // through overview().
+    // on the way in. (It used to close through overview() — enterTime no longer
+    // calls that, because entering time stopped throwing away what you were
+    // reading, so it calls closeLeap itself.)
     const seen = await stubLeap(page, [subjRow('tsmc')]);
     await bootedShell(page, server.url);
     await page.click('#timeBtn');
