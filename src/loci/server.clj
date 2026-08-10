@@ -1695,9 +1695,30 @@
 (defn- distill! [prompt text obj-id space]
   (future
     (try
-      (doseq [{:keys [fact entities]} (agent/distill-facts prompt text)]
-        (mold/remember @mem/memory fact {:entities (mapv str entities)
-                                         :source {:obj obj-id :space space}}))
+      (doseq [{:keys [fact entities] :as f} (agent/distill-facts prompt text)]
+        (mold/remember @mem/memory fact
+                       ;; A judgement passes ONLY if it is one — `boolean?`, on
+                       ;; the whole map, and never a `{:keys [durable]}`
+                       ;; destructure. `remember` keys on `contains?`, so
+                       ;; `:durable? nil` reads as an answer rather than as
+                       ;; silence, and every unjudged fact would land stamped
+                       ;; `:durable-by "agent"`: judged by nobody, and past the
+                       ;; guard that lets a later agent pass revise its own calls.
+                       ;;
+                       ;; `boolean?` and not `contains?` because a MALFORMED answer
+                       ;; is worse than a missing one, and in the same direction:
+                       ;; a model answering the string "false" would be truthy, so
+                       ;; `weight` would skip decay on the fact it just declined to
+                       ;; call timeless — a wrong judgement, stamped, that only a
+                       ;; hand toggle can undo. Anything that is not true or false
+                       ;; is treated as not having answered, which is the state the
+                       ;; whole corpus is in and costs nothing to be in.
+                       ;;
+                       ;; Renamed on the way through: the model is asked for
+                       ;; "durable", the record keys on :durable?.
+                       (cond-> {:entities (mapv str entities)
+                                :source {:obj obj-id :space space}}
+                         (boolean? (:durable f)) (assoc :durable? (:durable f)))))
       (catch Exception _))))
 
 (defn suggest-tags!
