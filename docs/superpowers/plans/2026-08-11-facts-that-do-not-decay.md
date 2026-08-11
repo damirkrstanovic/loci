@@ -285,8 +285,20 @@ fact carries a `:vec`). Do not re-derive the baseline; it is recorded there.
 - [ ] **Step 1:** Confirm no server is running (`pgrep -af 'loci|clojure'`) and say what you found.
       `FileMemory` holds `!facts` in RAM; a concurrent `remember` would append from a stale atom.
 - [ ] **Step 2:** Back up — `cp data/memory.edn data/memory.edn.bak-2026-08-11`. Record the md5.
-- [ ] **Step 3:** Dry-run against the real `data/` and **paste the plan**. Compare it line by line
-      with Task 6's run on the copy. Any difference is a stop.
+- [ ] **Step 3:** Dry-run against the real `data/` and **paste the plan**. Compare it with Task 6's
+      run on the copy.
+
+      > **Corrected 2026-08-11, after Task 4 built it.** This step first said *"any difference is a
+      > stop"*. That is too strict and would stop on nothing: `agent/request` sends
+      > `:temperature 0.2`, **not 0**, so individual judgements are not reproducible between runs.
+      >
+      > **A differing judgement is a question** — look at the sentence and decide whether either
+      > answer is defensible. **A differing set of ids is a real stop** — it means the memory moved
+      > between the measurement and the write, and the plan you reviewed is not the plan that would
+      > run. Compare the *id sets* strictly and the *judgements* with your eyes.
+      >
+      > Note also: **the dry run costs the same model calls as a live one** — the judgements *are*
+      > the plan. Four calls over 80 facts at batch size 20. Budget for two rounds, not one.
 - [ ] **Step 4:** Run it.
 - [ ] **Step 5: Verify.** Line count grows by **exactly the number the dry run planned** — not
       necessarily 80, since a fact already carrying `:durable-by "you"` is skipped; the append-only
