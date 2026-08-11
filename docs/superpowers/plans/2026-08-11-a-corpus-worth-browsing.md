@@ -198,9 +198,19 @@ collapse is a fact you thought you added and did not.
       dismiss the process.
 - [ ] **Step 2:** Back up: `cp data/memory.edn data/memory.edn.bak-<date>` and
       `cp -r data/substrate data/substrate.bak-<date>`. Record both md5s.
-- [ ] **Step 3:** Dry-run against the real `data/` and compare with Task 4's. **Compare the id
-      sets strictly; nothing here is model-generated, so the plans must match exactly.**
-- [ ] **Step 4:** Run both halves.
+- [ ] **Step 3–4: INTERLEAVE — dry substrate → compare → run substrate → dry facts → compare →
+      run facts.**
+
+      > **Corrected 2026-08-11, after Task 4 rehearsed it.** This step first said "dry-run against
+      > the real `data/` and compare with Task 4's, then run both halves". **That is not possible:**
+      > `import-facts!` refuses before `import-corpus!` has committed — *"nothing in the store was
+      > imported from art-objects.csv"* — because a fact's `:source` must resolve to a real object.
+      > There is no point at which both plans exist before anything is written.
+      >
+      > Compare the **id sets strictly** at each stage; nothing here is model-generated, so each
+      > plan must match Task 4's exactly. A second `import-corpus!` is a clean no-op
+      > (`:already-done? true`), so an interrupted substrate half is safe to re-run — **the facts
+      > half is not**, since a second run restamps `:ts` and bumps `:strength` on all 70.
 - [ ] **Step 5: Classify the new facts** — `loci.classify` over the real memory. Dry-run first and
       print the judgements. The existing 80 already carry `:durable-by "agent"` and are skipped, so
       this judges only what the corpus added.
@@ -261,6 +271,26 @@ molds as. **Task 6 should be able to see all three.**
    `#{:tenure-band :dept :channel :region :stage}`, so the monthly table's ten economies will draw
    as **one interleaved line**. This is the one most likely to look obviously wrong on screen, and
    it is the reason a monthly table was included at all.
+
+4. **Entity linkage is by exact entity string, not by topic** — found by Task 4, and it is the
+   sharpest constraint on what "entanglement" can mean.
+
+   `netherlands` crosses because both corpora happened to write the country's name. **`gallium`
+   does not, because neither side ever wrote the word on the other** — the pre-existing 80 name
+   TSMC, ASML, Taiwan, Synopsys and Cadence but never `gallium`, and never `semiconductors`
+   either, so the corpus built a `semiconductors` page nothing pre-existing joins.
+
+   Nothing here is broken: `ent/index` is a projection over the strings the distiller wrote, and
+   the design says so. But it means **a subject crosses domains only when both sides spell it**,
+   which is a much narrower promise than "these topics are related". It is also the clearest
+   argument yet for the **aliases** work the entities spec deferred (§1) — and the second measured
+   cost of deferring it, after `taiwan strait` ≠ `taiwan`.
+
+5. **A prose extract's `:entangles` become every fact's `:entities`**, so five voter-turnout
+   *methodology* facts land on the `netherlands` page at ranks 6–10 — correctly sourced, saying
+   nothing about the Netherlands, outranking the Delft and Kalf material a reader came for.
+   Task 6 should look at this: it is a question about whether file-level subject tagging is the
+   right granularity, not a bug in anything.
 
 ## Out of scope
 
