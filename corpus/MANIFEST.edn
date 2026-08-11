@@ -15,7 +15,14 @@
 ;; the gap between them is a finding about loci, not a defect in the data.
 ;;
 ;; :rows records source count -> committed count, and :filter the reduction, so a
-;; reader can tell an extract from a sample and reproduce it.
+;; reader can tell an extract from a sample and reproduce it. Every :filter also
+;; has a RUNNABLE form under corpus/fetch/ — see :scripts — and each builder was
+;; re-run from the committed script and reproduces its file byte-for-byte.
+;;
+;; :prose holds short QUOTED extracts. Nothing under corpus/prose/ was written
+;; here: every body is a span lifted verbatim from a source that clears the same
+;; licence bar, located by anchor string rather than retyped. Whitespace is the
+;; only thing normalised, and OCR errors in the 1890 scan are left as scanned.
 ;;
 ;; This file is plain EDN: every value is a literal, nothing here needs eval.
 
@@ -25,6 +32,7 @@
 
  :files
  [{:file    "art-objects.csv"
+   :built-by "fetch/build_met.py"
    :title   "The Metropolitan Museum of Art — 352 objects across eight eras"
    :domain  :arts
    :source  {:publisher "The Metropolitan Museum of Art"
@@ -84,6 +92,7 @@ and between co-authors. That is how the source writes them and it was left alone
    :entangles ["cobalt" "china" "netherlands" "lead" "united states" "egypt" "iran"]}
 
   {:file    "mineral-production.csv"
+   :built-by "fetch/build_minerals.py"
    :title   "USGS Mineral Commodity Summaries 2026 — world production, nine commodities"
    :domain  :sciences
    :source  {:publisher "U.S. Geological Survey, National Minerals Information Center"
@@ -131,6 +140,7 @@ loci's ->val would leave as a string rather than parse as a number. Both are han
                "united states" "silicon" "rare earths"]}
 
   {:file    "lead-phaseout.csv"
+   :built-by "fetch/build_owid.py"
    :title   "The global phase-out of leaded petrol — year of ban, by country"
    :domain  :politics
    :source  {:publisher "Our World in Data"
@@ -168,6 +178,7 @@ real test of that normalisation against headers nobody sanitised."
    :entangles ["lead" "netherlands" "united states" "china"]}
 
   {:file    "elections-turnout.csv"
+   :built-by "fetch/build_owid.py"
    :title   "Voter turnout of registered voters — most recent national election per country"
    :domain  :politics
    :source  {:publisher "V-Dem, processed by Our World in Data"
@@ -209,6 +220,7 @@ measure."
    :entangles ["united states" "netherlands" "china"]}
 
   {:file    "interest-rates-monthly.csv"
+   :built-by "fetch/build_rates.py"
    :title   "Three-month money-market interest rates, monthly, ten economies"
    :domain  :finance
    :source  {:publisher "Eurostat"
@@ -260,28 +272,298 @@ Known wart, and not a defect in the data: `line` looks for a series column among
 economies as a single interleaved line."
    :entangles ["united states" "japan" "euro area" "united kingdom"]}]
 
+ ;; ---------------------------------------------------------------------------
+ ;; PROSE — short quoted extracts, so LEAP's `prose` and `in text` groups have
+ ;; something real to rank. Task 2 turns each into a :kind :doc object; the
+ ;; title is the file's `# ` heading and the body is the file.
+ ;;
+ ;; Nothing here was written by the importer. Each body is a verbatim span,
+ ;; located by anchor string in `fetch/build_prose.py` rather than retyped, from
+ ;; a source that clears the same licence bar as the tables.
+ ;; ---------------------------------------------------------------------------
+ :prose
+ {:dir      "prose"
+  :built-by "fetch/build_prose.py"
+  :bytes    23968
+  :normalisation
+  "Whitespace only: runs of spaces collapse to one, end-of-line hyphenation is
+joined, hard-wrapped lines become paragraphs. OCR errors in the 1890 scan (for
+instance \"Bleu dc Thhiard\" for \"Bleu de Thénard\") are LEFT AS SCANNED. A
+silently corrected quotation is no longer a quotation, and this corpus's whole
+claim is that nothing in it was invented."
+  :files
+  [{:file "cobalt-blue-the-pigment.md"
+    :title "Cobalt blue, as a chemist to the Royal Academy described it in 1890"
+    :domain :arts
+    :source {:publisher "A. H. Church, The Chemistry of Paints and Painting (London: Seeley and Co., 1890)"
+             :scan "Getty Research Institute, via the Internet Archive, item gri_33125003356652"
+             :url "https://archive.org/details/gri_33125003356652"
+             :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain"
+              :established
+              "Published 1890; the author died in 1915, so the work is in the public domain in the
+United States by any measure. A faithful photographic reproduction of a public-domain
+two-dimensional work creates no new copyright in the US, so the Getty scan adds no restriction."}
+    :entangles ["cobalt" "cobalt blue" "pigment"]}
+
+   {:file "white-lead-the-painters-white.md"
+    :title "White lead: the painter's white, and its poisonous character"
+    :domain :arts
+    :source {:publisher "A. H. Church, The Chemistry of Paints and Painting (London: Seeley and Co., 1890)"
+             :scan "Getty Research Institute, via the Internet Archive, item gri_33125003356652"
+             :url "https://archive.org/details/gri_33125003356652"
+             :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain" :established "As above — published 1890, author died 1915."}
+    :entangles ["lead" "lead white" "white lead" "pigment"]}
+
+   {:file "cobalt-blue-kangxi-porcelain.md"
+    :title "Cobalt blue at its height: Jingdezhen under the Kangxi emperor"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art" :object "accession 2020.174"
+             :url "https://clevelandart.org/art/2020.174" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["cobalt" "cobalt blue" "china" "porcelain"]}
+
+   {:file "cobalt-blue-banned-in-joseon-korea.md"
+    :title "When cobalt was a luxury import a court could ban"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art" :object "accession 1985.19"
+             :url "https://clevelandart.org/art/1985.19" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["cobalt" "cobalt blue" "korea" "porcelain"]}
+
+   {:file "dutch-trade-in-a-still-life.md"
+    :title "A Chinese porcelain bowl as evidence of the Dutch trading empire"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art" :object "Willem Kalf, 1663, accession 1962.292"
+             :url "https://clevelandart.org/art/1962.292" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["netherlands" "china" "porcelain" "willem kalf"]}
+
+   {:file "chinese-vases-in-a-dutch-parlour.md"
+    :title "Chinese vases and Japanese boxes in a Dutch room, 1663"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art" :object "Pieter de Hooch, 1663, accession 1951.355"
+             :url "https://clevelandart.org/art/1951.355" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["netherlands" "china" "japan" "pieter de hooch"]}
+
+   {:file "delft-flower-pyramid.md"
+    :title "Delft at its most ambitious, and a queen who spread the fashion"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art"
+             :object "Adrianus Kocx / De Grieksche A factory, c. 1690, accession 2024.27.a"
+             :url "https://clevelandart.org/art/2024.27.a" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["netherlands" "delft" "ceramics"]}
+
+   {:file "delft-nautilus-cup.md"
+    :title "A shell from Indonesia, mounted in silver in Delft"
+    :domain :arts
+    :source {:publisher "Cleveland Museum of Art"
+             :object "Cornelis Jansz van der Burch, 1607, accession 2023.154"
+             :url "https://clevelandart.org/art/2023.154" :retrieved "2026-08-11"}
+    :licence {:id "CC0-1.0" :established :cma}
+    :entangles ["netherlands" "delft" "indonesia"]}
+
+   {:file "cobalt-the-congo-export-ban.md"
+    :title "Cobalt in 2025: Congo bans exports, then meters them by quota"
+    :domain :sciences
+    :source {:publisher "U.S. Geological Survey, Mineral Commodity Summaries 2026, chapter COBALT"
+             :url "https://doi.org/10.3133/mcs2026" :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain" :established :usgs}
+    :entangles ["cobalt" "democratic republic of congo" "china" "united states" "lead"]}
+
+   {:file "gallium-and-the-export-controls.md"
+    :title "Gallium: no US primary production since 1987, and China holds 99%"
+    :domain :sciences
+    :source {:publisher "U.S. Geological Survey, Mineral Commodity Summaries 2026, chapter GALLIUM"
+             :url "https://doi.org/10.3133/mcs2026" :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain" :established :usgs}
+    :entangles ["gallium" "china" "united states" "semiconductors" "japan"]}
+
+   {:file "rare-earths-export-controls.md"
+    :title "Rare earths in 2025: two rounds of Chinese export controls"
+    :domain :sciences
+    :source {:publisher "U.S. Geological Survey, Mineral Commodity Summaries 2026, chapter RARE EARTHS"
+             :url "https://doi.org/10.3133/mcs2026" :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain" :established :usgs}
+    :entangles ["rare earths" "china" "united states"]}
+
+   {:file "lead-becomes-a-critical-mineral.md"
+    :title "Lead joins the United States critical minerals list, 2025"
+    :domain :politics
+    :source {:publisher "U.S. Geological Survey, Mineral Commodity Summaries 2026, chapter LEAD"
+             :url "https://doi.org/10.3133/mcs2026" :retrieved "2026-08-11"}
+    :licence {:id "US-public-domain" :established :usgs}
+    :entangles ["lead" "united states" "copper" "silicon"]}
+
+   {:file "the-leaded-petrol-phase-out.md"
+    :title "The leaded petrol phase-out, and how the dates were assembled"
+    :domain :politics
+    :source {:publisher "Our World in Data"
+             :url "https://ourworldindata.org/grapher/lead-petrol-ban"
+             :metadata "https://api.ourworldindata.org/v1/indicators/1208075.metadata.json"
+             :retrieved "2026-08-11"}
+    :licence {:id "CC-BY-4.0"
+              :established
+              "Same establishment as lead-phaseout.csv above: OWID's FAQ grants CC BY over data OWID
+produces, and this indicator's own metadata records it as OWID-produced."}
+    :entangles ["lead" "leaded petrol" "algeria" "united states"]}
+
+   {:file "voter-turnout-what-it-measures.md"
+    :title "What \"voter turnout of registered voters\" actually measures"
+    :domain :politics
+    :source {:publisher "V-Dem, Democracy report v16 (2026), processed by Our World in Data"
+             :url "https://ourworldindata.org/grapher/voter-turnout-of-registered-voters"
+             :metadata "https://api.ourworldindata.org/v1/indicators/1210039.metadata.json"
+             :retrieved "2026-08-11"}
+    :licence {:id "CC-BY-4.0"
+              :established
+              "Same establishment as elections-turnout.csv above: the indicator's origins block
+carries license {\"name\": \"CC BY 4.0\"} for producer V-Dem."}
+    :entangles ["voter turnout" "democracy" "united states" "netherlands"]}]
+
+  ;; the two :established shorthands used above, written out once
+  :established
+  {:cma
+   "The Cleveland Museum of Art's open-access statement, read 2026-08-11 at
+https://www.clevelandart.org/open-access-api: \"The Cleveland Museum of Art provides datasets of
+information on more than 64,000 artwork records in its Collection for unrestricted commercial and
+noncommercial use... To the extent possible under law, the Cleveland Museum of Art has waived all
+copyright and related or neighboring rights to this dataset using Creative Commons Zero.\" Every
+record quoted additionally carries `share_license_status: CC0` in the API response, checked per
+object."
+   :usgs
+   "The Mineral Commodity Summaries 2026 data release carries a machine-readable rights field on
+ScienceBase — \"This work is marked with the Creative Commons Zero v1.0 Universal (CC0-1.0) public
+domain dedication\" — and the report itself is a work of the United States Government, in the
+public domain under 17 U.S.C. 105."}}
+
+ ;; ---------------------------------------------------------------------------
+ ;; SCRIPTS — the runnable form of every :filter above. Each was re-run from the
+ ;; committed copy on 2026-08-11 and reproduces its output BYTE-FOR-BYTE (md5s
+ ;; under :checksums). They are not a pipeline: each expects its source file
+ ;; already downloaded into the working directory, and the fetch command is at
+ ;; the top of each script.
+ ;; ---------------------------------------------------------------------------
+ :scripts
+ [{:file "fetch/build_met.py"      :produces "art-objects.csv"
+   :needs "MetObjects.csv (~303 MB, Git LFS media URL in the docstring)"
+   :carries "the cat-col guard, written out in full — see :findings"}
+  {:file "fetch/build_minerals.py" :produces "mineral-production.csv"
+   :needs "MCS2026_Commodities_Data.csv (ScienceBase, curl in the docstring)"
+   :carries "the cp1252 decode and the thousands-separator strip, each with why it matters"}
+  {:file "fetch/build_owid.py"     :produces ["lead-phaseout.csv" "elections-turnout.csv"]
+   :needs "three OWID grapher CSVs (lead-petrol-ban, voter-turnout-of-registered-voters, continents)"}
+  {:file "fetch/build_rates.py"    :produces "interest-rates-monthly.csv"
+   :needs "the Eurostat SDMX-CSV response for irt_st_m"}
+  {:file "fetch/build_prose.py"    :produces "prose/*.md"
+   :needs "church.txt, mcs2026.txt, cma_picked.json and two OWID metadata JSONs"
+   :carries "every quoted span, located by anchor string so it cannot be mistyped"}
+  {:file "fetch/verify_molds.clj"  :produces "the :molds-as table below"
+   :run "LOCI_DATA=/tmp/throwaway clojure -M -e '(load-file \"corpus/fetch/verify_molds.clj\")'"
+   :carries "the Pivot assertion — it exits non-zero if any table stops offering Pivot"}]
+
+ ;; ---------------------------------------------------------------------------
+ ;; FINDINGS about loci, discovered while shaping this corpus. These are not
+ ;; corpus workarounds; they are things the next person will hit.
+ ;; ---------------------------------------------------------------------------
+ :findings
+ [{:about "cat-col"
+   :where "src/loci/content.clj"
+   :finding
+   "`cat-col` sorts candidate string columns by DISTINCT COUNT ASCENDING and takes the first, so
+among columns with 2-12 distinct values FEWER ALWAYS WINS — and a two-valued boolean flag beats a
+nine-value taxonomy every time. USGS's `Is critical mineral 2025` (Yes/No) out-ranks `Commodity`
+(9); MET's `Department` (10) out-ranks `era` (8). Nothing warns you: the table still offers Pivot
+and Bar, it just pivots on the wrong axis and the coarse column you designed is inert. Two columns
+were dropped from this corpus for that reason alone."}
+  {:about "measure-col"
+   :where "src/loci/content.clj"
+   :finding
+   "A column is treated as a summable quantity unless its NAME matches the rate pattern or all its
+values fall in [1500, 2200]. So `Voter turnout of registered voters` passed through verbatim would
+be SUMMED by the Bar viewer — percentages added together — and MET's `Object Begin Date` would be
+summed too, because this extract spans -1900 to 2003 and so fails the year-like test. Both were
+renamed (`turnout_pct`, `year`) to get an honest default chart."}
+  {:about "line"
+   :where "src/loci/content.clj"
+   :finding
+   "`line` looks for a series column only among #{:tenure-band :dept :channel :region :stage}. The
+monthly table's coarse column is `country`, which is not in that set, so Over time draws ten
+economies as one interleaved line. Left alone deliberately — Task 6 should see it."}
+  {:about "col-kw and safe-event"
+   :where "src/loci/substrate.clj"
+   :finding
+   "No header in this corpus broke anything. `col-kw` was run over every committed header and over
+the source headers that were dropped — `Is critical mineral 2025`, `MCS chapter`, `LAST UPDATE`,
+`Which countries have banned the use of leaded petrol in road vehicles?`, and `Key Proponent(s)`,
+the header that truncated the log in July — and every one round-trips through pr-str/read-string.
+`safe-event` is a no-op on all five tables. The fix holds against real data."}]
+
  :entanglement
  {"cobalt"        {:arts     "45 rows whose Medium or Title names cobalt — chiefly Jingdezhen porcelain painted in underglaze cobalt blue from 1300 onward, plus Delft tin-glaze"
-                   :sciences "cobalt world production 2024-2025; Democratic Republic of Congo 226,000 t (2024), 230,000 t (2025)"}
+                   :sciences "cobalt world production 2024-2025; Democratic Republic of Congo 226,000 t (2024), 230,000 t (2025)"
+                   :prose    ["cobalt-blue-the-pigment.md — Church 1890 on how cobalt blue is made and how it behaves in oil, fresco and mixture"
+                              "cobalt-blue-kangxi-porcelain.md — cobalt blue as the Kangxi court and its foreign markets wanted it"
+                              "cobalt-blue-banned-in-joseon-korea.md — cobalt as an IMPORTED COMMODITY a court could ban, in an art record: the pigment and the supply chain in one paragraph"
+                              "cobalt-the-congo-export-ban.md — the 2025 Congo export ban and quota, China as refiner and consumer, and cobalt substitutes 'in paints'"]}
   "lead"          {:arts     "44 rows with lead in the Medium — lead-glazed earthenware, cast lead sculpture, leaded glass"
                    :politics "129 countries' leaded-petrol ban years, 1986-2021"
-                   :sciences "lead world production 2024-2025"}
-  "gallium"       {:sciences "China 839 t (2024), 900 t (2025) — the export-control commodity"}
+                   :sciences "lead world production 2024-2025"
+                   :prose    ["white-lead-the-painters-white.md — Church 1890 on white lead's 'poisonous character' alongside its unimpeachable whiteness: the art and health senses in one sentence"
+                              "the-leaded-petrol-phase-out.md — OWID on how the ban dates were assembled, Algeria last in 2021"
+                              "lead-becomes-a-critical-mineral.md — lead added to the US critical minerals list, November 2025"]}
+  "gallium"       {:sciences "China 839 t (2024), 900 t (2025) — the export-control commodity"
+                   :prose    ["gallium-and-the-export-controls.md — no US primary production since 1987, China at 99%, GaAs and GaN in integrated circuits, and the 2023-2025 export-control sequence"]}
   "china"         {:arts     "86 objects with Culture China; blue-and-white porcelain from the Yuan onward"
-                   :sciences "gallium, rare earths, graphite, silicon, lead, copper"}
+                   :sciences "gallium, rare earths, graphite, silicon, lead, copper"
+                   :prose    ["cobalt-blue-kangxi-porcelain.md" "dutch-trade-in-a-still-life.md"
+                              "chinese-vases-in-a-dutch-parlour.md" "gallium-and-the-export-controls.md"
+                              "rare-earths-export-controls.md"]}
   "netherlands"   {:arts     "10 objects with Country Netherlands, 55 with Dutch culture or a Dutch master's name, 25 Delft"
-                   :politics "leaded petrol banned 1998; 2025 election, 78.3% turnout"}
+                   :politics "leaded petrol banned 1998; 2025 election, 78.3% turnout"
+                   :prose    ["dutch-trade-in-a-still-life.md — Kalf's Chinese porcelain bowl as evidence of 'the great wealth and global reach of the Dutch trading empire'"
+                              "chinese-vases-in-a-dutch-parlour.md — de Hooch, 1663: Chinese vases and Japanese lacquered boxes as 'a reference to the flourishing Dutch trade with Asia'"
+                              "delft-flower-pyramid.md — the Greek A factory, and Queen Mary II spreading the fashion"
+                              "delft-nautilus-cup.md — a shell from Indonesia mounted in silver in Delft, 1607"]}
   "united states" {:arts     "objects with Country United States"
                    :sciences "US production across all nine commodities"
                    :politics "leaded petrol banned 1996; 2024 election, 70.75% turnout"
-                   :finance  "the 2021-2024 rate cycle, 0.22% to 5.36%"}}
+                   :finance  "the 2021-2024 rate cycle, 0.22% to 5.36%"
+                   :prose    ["cobalt-the-congo-export-ban.md" "gallium-and-the-export-controls.md"
+                              "rare-earths-export-controls.md" "lead-becomes-a-critical-mineral.md"
+                              "the-leaded-petrol-phase-out.md" "voter-turnout-what-it-measures.md"]}}
 
  :checksums
  {"art-objects.csv"            "219697bcf48d274716dc1af1e05ae096"
   "elections-turnout.csv"      "9915ce536f71d363f2b74e2508156256"
   "interest-rates-monthly.csv" "1db55036a6cb301de4b4dc8b3c4fc81f"
   "lead-phaseout.csv"          "1e4c98ab6741f41734418f17089e88ef"
-  "mineral-production.csv"     "83c3a139f96f8d87fdfb90792db2c414"}
+  "mineral-production.csv"     "83c3a139f96f8d87fdfb90792db2c414"
+
+  "prose/chinese-vases-in-a-dutch-parlour.md"   "63776f62e72fdd32f2f5997d80a736b2"
+  "prose/cobalt-blue-banned-in-joseon-korea.md" "83f07db60a0145ae89c71c54e426a15c"
+  "prose/cobalt-blue-kangxi-porcelain.md"       "e5aaa1e37865119990674bf232d9fef7"
+  "prose/cobalt-blue-the-pigment.md"            "40cf090b85165e34971eb5a9e84279a7"
+  "prose/cobalt-the-congo-export-ban.md"        "a8e7c2b5a9a652839a4a5b4990119b59"
+  "prose/delft-flower-pyramid.md"               "2b9b2362438142fda85f475b3b009012"
+  "prose/delft-nautilus-cup.md"                 "f5eb87a764e18dfdd8d60fccefdd3a6e"
+  "prose/dutch-trade-in-a-still-life.md"        "cf91208776c7383fe9b88991e078751a"
+  "prose/gallium-and-the-export-controls.md"    "0c106f406a1c0fd19a3dc702f0074067"
+  "prose/lead-becomes-a-critical-mineral.md"    "9fe1793a842003d17e4faa55e66885a0"
+  "prose/rare-earths-export-controls.md"        "6d5042a9b5ddcac774845775a1154e92"
+  "prose/the-leaded-petrol-phase-out.md"        "1108d3988357fc6b2b925054071db404"
+  "prose/voter-turnout-what-it-measures.md"     "52741adc6d2a0363155c00cbcaea8979"
+  "prose/white-lead-the-painters-white.md"      "20c37d2e48a1832a57702d4016942146"
+
+  "fetch/build_met.py"       "4b864b9bf4713099078d0988e9e8000d"
+  "fetch/build_minerals.py"  "e6fb5b64d9fa5e3bdaec4b6290c994b2"
+  "fetch/build_owid.py"      "6be2ebd03e4419649c55faae72409ff2"
+  "fetch/build_prose.py"     "c4755083c1af9cbdbbb1b15c403c768f"
+  "fetch/build_rates.py"     "ccd84194faa21f4f759311c6bc7aa997"
+  "fetch/verify_molds.clj"   "117a5124777cf03f576223a45a3c543f"}
 
  ;; measured 2026-08-11 with loci.tools/parse-csv + loci.mold/viewers-for
  :molds-as
@@ -290,7 +572,8 @@ economies as a single interleaved line."
   "lead-phaseout.csv"          [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
   "mineral-production.csv"     [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
   "interest-rates-monthly.csv" [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist
-                                :table/line :table/kpi]}
+                                :table/line :table/kpi]
+  "prose/*.md"                 [:doc/raw :doc/outline]}
 
  :rejected
  [{:source "BIS Data Portal — central bank policy rates (WS_CBPOL), monthly, 38 economies"
@@ -306,4 +589,17 @@ however permissive it reads."}
    :reason
    "Same CC0 data, different transport. It began returning HTTP 403 to this host part way through
 the fetch — rate limiting, not a licence problem. Switched to the full MetObjects.csv over Git LFS,
-which is the canonical distribution anyway, and reduced from there."}]}
+which is the canonical distribution anyway, and reduced from there."}
+  {:source "OWID — Mean lead concentrations in the blood of children (indicator 1208083)"
+   :url    "https://ourworldindata.org/grapher/lead-concentrations-blood-children"
+   :reason
+   "Wanted for the lead-exposure half of the lead white / blood lead crossing, and rejected on
+licence. Its origins block, unlike the turnout indicator's, carries NO license field: the producer
+is \"Ericson et al.\" and the origin is a Lancet Planetary Health paper, which is not OWID-produced
+and not established as CC BY. Under the bar that is a licence that could not be established, so it
+does not go in. The health sense of lead is carried instead by Church 1890 on white lead's
+poisonous character (US public domain) and by OWID's own leaded-petrol dataset (CC BY)."}
+  {:source "Wikipedia / Wikisource article prose"
+   :reason
+   "The obvious well for pigment and art-history prose, and excluded by the bar as written: text on
+both is CC BY-SA, which is copyleft. Not used anywhere, for anything."}]}
