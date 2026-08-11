@@ -22,9 +22,12 @@
             [clojure.test :refer [deftest is testing]]
             [loci.content]
             [loci.corpus :as corpus]
+            [loci.entities :as ent]
+            [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
-            [loci.substrate :as sub])
+            [loci.substrate :as sub]
+            [loci.tools :as tools])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -459,3 +462,417 @@
     (is (= (count placed) (count (set placed))) "no prose file is placed twice")
     (is (= (set (map :file (prose-files))) (set placed))
         "every prose file is placed, and nothing is placed that is not prose")))
+
+;; ===========================================================================
+;; the facts
+;; ===========================================================================
+;;
+;; The memory these tests write to is a fresh `mem/file-memory` under
+;; `java.io.tmpdir`, one per test. Never `@mem/memory`: that delay opens
+;; `data/memory.edn`, the real one, and this half of the import has no undo —
+;; a test that reached it would append seventy facts to somebody's work with
+;; no way back but a backup.
+
+(defn- fresh-memory []
+  (mem/file-memory (str (System/getProperty "java.io.tmpdir")
+                        "/loci-corpus-test-" (System/nanoTime) "/memory.edn")))
+
+(defn- imported-store
+  "A store with the substrate half already run — what `import-facts!` needs, and
+   the thing it refuses without."
+  []
+  (let [st (sub/fresh-store)] (ran! st) st))
+
+(defn- declared
+  "How many facts the declarations promise: one per locator, one per query.
+   Read off `loci.corpus`'s own vectors rather than written down as 70, because
+   the number that matters is *all of them*, not a number that agrees with
+   today's count."
+  []
+  (+ (count corpus/quoted) (count corpus/derived)))
+
+(defn- facts! [st mm]
+  (let [r (corpus/import-facts! st mm {:dir dir :dry-run? false})]
+    (is (:ok? r) (str "facts refused: " (:error r)))
+    r))
+
+;; ---------------------------------------------------------------------------
+;; a dry run remembers nothing
+;; ---------------------------------------------------------------------------
+
+(deftest a-dry-run-remembers-nothing
+  (let [st (imported-store)
+        mm (fresh-memory)
+        r  (corpus/import-facts! st mm {:dir dir})]
+    (is (:ok? r) (str "dry run refused: " (:error r)))
+    (is (:dry-run? r))
+    (is (empty? (mold/all-facts mm)) "not one fact was written")
+    (is (nil? (:remembered r)) "and the report does not claim any were")
+    (testing "the plan names every fact the declarations promise"
+      (is (= (declared) (:count (:plan r))))
+      (is (= (declared) (count (:facts (:plan r)))))
+      (is (every? (comp seq :fact) (:facts (:plan r))))
+      (is (every? (comp seq :entities) (:facts (:plan r)))))
+    (testing "…spread over all five notebooks"
+      (is (= (set (map :title corpus/hubs)) (set (keys (:by-notebook (:plan r))))))
+      (is (= (declared) (reduce + (vals (:by-notebook (:plan r)))))))))
+
+(deftest the-dry-fact-plan-is-the-plan-that-runs
+  (let [st (imported-store)
+        dry  (corpus/import-facts! st (fresh-memory) {:dir dir})
+        live (facts! st (fresh-memory))]
+    (is (= (:plan dry) (:plan live))
+        "same value, so Task 4's rehearsal on a copy is worth comparing against")))
+
+;; ---------------------------------------------------------------------------
+;; each fact lands with its entities and a source that resolves
+;; ---------------------------------------------------------------------------
+
+(deftest every-fact-lands-with-its-entities-and-a-source-that-resolves
+  (let [st (imported-store)
+        mm (fresh-memory)
+        r  (facts! st mm)
+        fs (mold/all-facts mm)]
+    (is (= (declared) (count fs))
+        "every declared fact is its own record — none was folded into another")
+    (is (= (declared) (:remembered r)))
+    (is (empty? (:reinforced r))
+        "and the importer agrees: nothing reinforced on the way in")
+
+    (doseq [f fs]
+      (testing (:fact f)
+        (is (seq (:entities f)) "a fact with no entities reaches no entity page")
+        (is (every? #(not (str/blank? %)) (:entities f)))
+        (is (= (:entities f) (mapv ent/normalize (:entities f)))
+            "names are already in the form ent/normalize would put them in")
+        (let [{:keys [obj space]} (:source f)
+              o (sub/object st obj)
+              s (sub/object st space)]
+          (is (some? o) (str "no object " obj " — the citation resolves to nothing"))
+          (is (contains? #{:doc :table} (:kind o)) "a fact cites a document or a table")
+          (is (= :space (:kind s)) "…inside a notebook")
+          (is (contains? (set (map :ref (nb/cells-of s))) obj)
+              "and the object it cites is a cell of the notebook it cites"))))))
+
+(deftest no-imported-fact-carries-a-durability-judgement
+  ;; Task 5's classifier owns `:durable?`, and `contains?` is the assertion
+  ;; because `false` and absent are different states: `weight` reads the VALUE,
+  ;; so a fact stamped `:durable? false` has been judged to decay, while a fact
+  ;; without the key has not been judged at all. `remember` keys on `contains?`
+  ;; too, so nothing but silence produces silence.
+  (let [st (imported-store)
+        mm (fresh-memory)]
+    (facts! st mm)
+    (doseq [f (mold/all-facts mm)]
+      (is (not (contains? f :durable?)) (str "judged on arrival: " (:fact f)))
+      (is (not (contains? f :durable-by)) (str "stamped with a judge: " (:fact f))))))
+
+;; ---------------------------------------------------------------------------
+;; nothing is invented
+;; ---------------------------------------------------------------------------
+
+(deftest every-quoted-fact-is-in-the-document-it-cites
+  ;; the hardest rule in the spec, asserted against the two places the text has
+  ;; to match: the file on disk and the object the store now holds.
+  (let [st (imported-store)
+        r  (corpus/import-facts! st (fresh-memory) {:dir dir})
+        qs (filterv #(= :quoted (:via %)) (:facts (:plan r)))]
+    (is (= (count corpus/quoted) (count qs)))
+    (doseq [f qs]
+      (testing (:from f)
+        (is (str/includes? (squash (slurp (io/file dir "prose" (:from f)))) (:fact f))
+            "the sentence is in the file, character for character")
+        (is (str/includes? (squash (:value (sub/object st (get-in f [:source :obj])))) (:fact f))
+            "…and in the document object the fact cites")
+        ;; The substring check above is necessary and NOT sufficient, and that
+        ;; was found by sabotage rather than by reading: a span that ignores its
+        ;; closing anchor and runs to the end of the file is still a substring,
+        ;; and passes it. The anchors are what say where the sentence stops, so
+        ;; they are what has to be asserted.
+        (is (str/starts-with? (:fact f) (:from (:args f)))
+            "the fact begins at the anchor it is located by")
+        (is (str/ends-with? (:fact f) (:to (:args f)))
+            "…and ends at the one that closes it")
+        (is (= (vec (:entangles (get (into {} (map (juxt :file identity)) (prose-files))
+                                     (:from f))))
+               (:entities f))
+            "and its entities are the manifest's own record of what the extract touches")))))
+
+(deftest a-tie-is-not-a-superlative
+  ;; `commonest` and `only-one` are the only places this namespace states a
+  ;; claim about uniqueness — "their commonest culture", "the earliest ban",
+  ;; "more than any other year" — and a stable sort would answer every one of
+  ;; them from a tie by handing back whichever row came first in the file. Both
+  ;; answer nil instead, and every caller turns nil into a refusal.
+  (let [commonest @#'corpus/commonest
+        only-one  @#'corpus/only-one]
+    (is (= ["a" 2] (vec (commonest :k [{:k "a"} {:k "a"} {:k "b"}])))
+        "a clear winner is returned")
+    (is (nil? (commonest :k [{:k "a"} {:k "b"}])) "a tie is not")
+    (is (nil? (commonest :k [{:k ""} {:k nil}])) "and blanks are not values")
+    (is (= 1 (:n (only-one < :n [{:n 2} {:n 1} {:n 3}]))))
+    (is (nil? (only-one < :n [{:n 1} {:n 1} {:n 3}])) "a tied extreme is not an extreme")
+    (is (nil? (only-one > :n [])))))
+
+(deftest derived-facts-say-what-the-rows-say
+  ;; every number below is computed HERE, off the CSV, and never asked of
+  ;; loci.corpus — a check that re-derived through the code under test would
+  ;; agree with it by construction.
+  (let [st (imported-store)
+        r  (corpus/import-facts! st (fresh-memory) {:dir dir})
+        ;; selected by the declaration that produced it — `:via` plus `:args`
+        ;; — because two `:leader` facts differ only in their arguments and a
+        ;; test that took "the :leader fact" would silently assert about
+        ;; whichever one came last.
+        one    (fn [via args] (:fact (first (filter #(and (= via (:via %)) (= args (:args %)))
+                                                    (:facts (:plan r))))))
+        rows   #(tools/parse-csv (slurp (io/file dir %)))]
+
+    (testing "the cobalt leader is the largest 2025 producer in the file"
+      (let [g (sort-by :production_tonnes >
+                       (filter #(and (= "Cobalt" (:commodity %)) (= 2025 (:year %)))
+                               (rows "mineral-production.csv")))
+            f (one :leader {:commodity "Cobalt" :year 2025})]
+        (is (str/includes? f (:country (first g))))
+        (is (str/includes? f "230000") "the tonnage as the row carries it")
+        (is (= 230000.0 (:production_tonnes (first g))) "…and that is what the row carries")
+        (is (str/includes? f (:country (second g))) "with the runner-up named")))
+
+    (testing "the absence really is an absence"
+      (let [g (filter #(= "Gallium" (:commodity %)) (rows "mineral-production.csv"))]
+        (is (not-any? #(= "United States" (:country %)) g)
+            "the USGS extract lists no US gallium production…")
+        (is (str/includes? (one :absent {:commodity "Gallium" :country "United States"})
+                           "no United States gallium production")
+            "…which is what the fact says")))
+
+    (testing "every ban year is the year beside that country in the file"
+      (let [by (into {} (map (juxt :entity identity)) (rows "lead-phaseout.csv"))
+            f  (one :ban-years {:countries ["Japan" "United States" "Netherlands" "China"]})]
+        (doseq [c ["Japan" "United States" "Netherlands" "China"]]
+          (is (str/includes? f (str c " " (:ban_year (by c)))) c))))
+
+    (testing "the MET count is the number of rows that match"
+      (let [n (count (filter #(re-find #"(?i)\bcobalt\b" (str (:medium %) " " (:title %)))
+                             (rows "art-objects.csv")))]
+        (is (pos? n))
+        (is (str/starts-with? (one :matching {:word "cobalt" :columns [:medium :title]
+                                              :as "medium or title"})
+                              (str n " MET objects")))))))
+
+(deftest every-table-and-every-extract-is-read-by-at-least-one-fact
+  ;; the quiet failure this catches: an extract fetched, licence-cleared,
+  ;; committed and imported as a document that no fact ever quotes, so the
+  ;; entity pages it was fetched for show nothing.
+  (let [st (imported-store)
+        r  (corpus/import-facts! st (fresh-memory) {:dir dir})
+        by-file (frequencies (map :from (:facts (:plan r))))]
+    (doseq [{:keys [file]} (tables)]
+      (is (pos? (get by-file file 0)) (str "no fact reads " file)))
+    (doseq [{:keys [file]} (prose-files)]
+      (is (pos? (get by-file file 0)) (str "no fact quotes " file)))))
+
+;; ---------------------------------------------------------------------------
+;; reinforcement is reported, never silent
+;; ---------------------------------------------------------------------------
+
+(deftest a-fact-that-reinforces-an-existing-one-is-reported
+  ;; `remember` folds two facts into one at jaccard ≥ 0.6 and returns :ok either
+  ;; way, so an import that did not check would report seventy facts written and
+  ;; have written sixty-nine. The fixture is a near-duplicate of one of them —
+  ;; the same sentence with its last word gone, which shares every other token.
+  (let [st     (imported-store)
+        mm     (fresh-memory)
+        plan   (:facts (:plan (corpus/import-facts! st mm {:dir dir})))
+        victim (first (filter #(= :earliest-ban (:via %)) plan))
+        near   (str/join " " (butlast (str/split (:fact victim) #"\s+")))]
+    (mold/remember mm near {:entities ["seeded"] :source {:obj "doc:seed" :space "space:seed"}})
+    (let [r  (facts! st mm)
+          rf (:reinforced r)]
+      (is (= 1 (count rf)) "one fact was absorbed, and the report says so")
+      (is (= (:fact victim) (:fact (first rf))) "…naming which one")
+      (is (= "mem-1" (:into (first rf))) "…and which record swallowed it")
+      (is (= near (:absorbed (first rf)))
+          "…and the wording that is now gone, which nothing else records")
+      (is (= 2 (:strength (first rf))))
+      (is (= (dec (count plan)) (:remembered r))
+          "the count of facts written is one short, and honestly so")
+      (is (= (count plan) (count (mold/all-facts mm)))
+          "seeded fact + 69 written = 70 records: the absorbed one added nothing"))))
+
+(deftest a-second-run-reinforces-rather-than-duplicating-and-says-so
+  (let [st (imported-store)
+        mm (fresh-memory)
+        r1 (facts! st mm)
+        n1 (count (mold/all-facts mm))
+        r2 (facts! st mm)]
+    (is (= n1 (count (mold/all-facts mm))) "not one new record")
+    (is (zero? (:remembered r2)))
+    (is (= (count (:facts (:plan r2))) (count (:reinforced r2)))
+        "every fact is reported as reinforced, not silently re-remembered")
+    (is (every? #(= (:fact %) (:absorbed %)) (:reinforced r2))
+        "each absorbed its own earlier self, wording unchanged")
+    (is (every? #(= 2 (:strength %)) (:reinforced r2)))
+    (is (= (:remembered r1) n1))))
+
+;; ---------------------------------------------------------------------------
+;; the entanglement — what the facts exist for
+;; ---------------------------------------------------------------------------
+
+(deftest cobalt-and-netherlands-reach-more-than-one-notebook
+  ;; the corpus's whole purpose, asserted at the level the entity page reads:
+  ;; a name on a fact, and the notebook that fact cites.
+  (let [st  (imported-store)
+        mm  (fresh-memory)
+        _   (facts! st mm)
+        fs  (mold/all-facts mm)
+        nbs (notebooks-by-file st)
+        spaces (fn [nm] (set (keep (fn [f] (when (some #{nm} (:entities f))
+                                             (get-in f [:source :space])))
+                                   fs)))
+        space-of #(:id (get nbs %))]
+    (testing "cobalt is a pigment and a supply chain"
+      (let [s (spaces "cobalt")]
+        (is (contains? s (space-of "art-objects.csv")) "…in the art notebook")
+        (is (contains? s (space-of "mineral-production.csv")) "…and in the minerals notebook")
+        (is (<= 2 (count s)))))
+    (testing "netherlands is Dutch painting and a petrol ban and an election"
+      (let [s (spaces "netherlands")]
+        (is (contains? s (space-of "art-objects.csv")))
+        (is (contains? s (space-of "lead-phaseout.csv")))
+        (is (contains? s (space-of "elections-turnout.csv")))))
+    (testing "lead is a paint and a metal and a law"
+      (let [s (spaces "lead")]
+        (is (contains? s (space-of "art-objects.csv")))
+        (is (contains? s (space-of "mineral-production.csv")))
+        (is (contains? s (space-of "lead-phaseout.csv")))))))
+
+;; ---------------------------------------------------------------------------
+;; refusals — nothing is remembered when anything is wrong
+;; ---------------------------------------------------------------------------
+
+(deftest facts-refuse-rather-than-throw
+  (testing "the notebooks are not there yet"
+    (let [mm (fresh-memory)
+          r  (corpus/import-facts! (sub/fresh-store) mm {:dir dir :dry-run? false})]
+      (is (false? (:ok? r)))
+      (is (str/includes? (str (:error r)) "import-corpus!"))
+      (is (empty? (mold/all-facts mm)))))
+
+  (testing "an anchor that no longer matches its extract"
+    (with-copy [d]
+      (let [f (io/file d "prose/cobalt-the-congo-export-ban.md")]
+        (spit f (str/replace (slurp f) "In February, Congo" "In March, Congo")))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            _  (corpus/import-corpus! st {:dir (.getPath d) :dry-run? false})
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (str/includes? (str (:error r)) "cobalt-the-congo-export-ban.md"))
+        (is (str/includes? (str (:error r)) "In February, Congo"))
+        (is (empty? (mold/all-facts mm))
+            "and the eighteen facts declared before it were not written either"))))
+
+  (testing "a derivation whose rows are gone"
+    ;; the row COUNT and the coarse column are untouched, so this gets past
+    ;; material-complaint and is caught by the derivation itself.
+    (with-copy [d]
+      (let [f (io/file d "mineral-production.csv")]
+        (spit f (str/replace (slurp f) "United States" "USA")))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            _  (corpus/import-corpus! st {:dir (.getPath d) :dry-run? false})
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (str/includes? (str (:error r)) "producer"))
+        (is (str/includes? (str (:error r)) "mineral-production.csv"))
+        (is (empty? (mold/all-facts mm))))))
+
+  (testing "an extract whose manifest entry lost its entangled subjects"
+    ;; a fact with no name is written, counted, reported as imported — and
+    ;; reachable from no entity page, because `entity-payload` finds facts BY
+    ;; name. Neither declaration can catch it: a quotation's names come out of
+    ;; the manifest, so the plan is the first place the gap is visible.
+    (with-copy [d]
+      (let [f (io/file d "MANIFEST.edn")]
+        (spit f (str/replace (slurp f) "\n    :entangles [\"cobalt\" \"cobalt blue\" \"pigment\"]}"
+                             "}")))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            _  (corpus/import-corpus! st {:dir (.getPath d) :dry-run? false})
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (str/includes? (str (:error r)) "no entity name"))
+        (is (str/includes? (str (:error r)) "cobalt-blue-the-pigment.md"))
+        (is (empty? (mold/all-facts mm))))))
+
+  (testing "two things wrong, and the first is what is reported"
+    ;; also found by sabotage: with nothing carrying a refusal out through the
+    ;; remaining notebooks, the reason reported is whichever failure came LAST,
+    ;; and a reader fixing the corpus is sent to the wrong file.
+    (with-copy [d]
+      (doseq [[f from to] [["prose/cobalt-blue-the-pigment.md"
+                            "Excluding smalt" "Excluding SMALT"]
+                           ["prose/rare-earths-export-controls.md"
+                            "In April 2025, China tightened" "In May 2025, China tightened"]]]
+        (let [g (io/file d f)] (spit g (str/replace (slurp g) from to))))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            _  (corpus/import-corpus! st {:dir (.getPath d) :dry-run? false})
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (str/includes? (str (:error r)) "cobalt-blue-the-pigment.md")
+            "the art notebook comes first, so its anchor is the one named")
+        (is (not (str/includes? (str (:error r)) "rare-earths"))
+            "…and the later failure does not overwrite it")
+        (is (empty? (mold/all-facts mm))))))
+
+  (testing "an absence the table no longer supports"
+    ;; `:absent` is the one derivation whose claim is about rows that are NOT
+    ;; there, so it is the only one a change in the data can turn into a lie
+    ;; while every other check still passes: same row count, same coarse column,
+    ;; same everything the manifest records. Sabotage found this — dropping the
+    ;; guard broke no test at all, because on the committed corpus the sentence
+    ;; comes out identical either way. Give USGS a United States gallium row and
+    ;; the fact has to refuse rather than restate.
+    (with-copy [d]
+      (let [f (io/file d "mineral-production.csv")]
+        (spit f (str/join "\n" (map #(if (str/starts-with? % "Gallium,Russia,")
+                                       (str/replace % "Gallium,Russia," "Gallium,United States,")
+                                       %)
+                                    (str/split-lines (slurp f))))))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            _  (corpus/import-corpus! st {:dir (.getPath d) :dry-run? false})
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (str/includes? (str (:error r)) "absent"))
+        (is (empty? (mold/all-facts mm))))))
+
+  (testing "a table that is no longer the one the manifest describes"
+    (with-copy [d]
+      (let [f  (io/file d "lead-phaseout.csv")
+            ls (str/split-lines (slurp f))]
+        (spit f (str/join "\n" (take 40 ls))))
+      (let [mm (fresh-memory)
+            st (sub/fresh-store)
+            r  (corpus/import-facts! st mm {:dir (.getPath d) :dry-run? false})]
+        (is (false? (:ok? r)))
+        (is (empty? (mold/all-facts mm))))))
+
+  (testing "no corpus at all"
+    (let [mm (fresh-memory)
+          r  (corpus/import-facts! (sub/fresh-store) mm {:dir "corpus-that-is-not-there"
+                                                         :dry-run? false})]
+      (is (false? (:ok? r)))
+      (is (empty? (mold/all-facts mm))))))
+
+(deftest every-declaration-names-something-the-manifest-carries
+  (let [tbl (set (map :file (tables)))
+        prs (set (map :file (prose-files)))]
+    (is (every? tbl (map :table corpus/derived))
+        "every derived fact reads a table the manifest describes")
+    (is (every? prs (map :doc corpus/quoted))
+        "every quoted fact quotes an extract the manifest describes")
+    (is (= tbl (set (map :table corpus/derived))) "and every table is read")
+    (is (= prs (set (map :doc corpus/quoted))) "and every extract is quoted")))
