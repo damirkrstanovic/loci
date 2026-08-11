@@ -335,6 +335,24 @@
                        border:1px solid var(--accent-line);border-radius:5px;padding:0 5px;cursor:pointer}
   .memfact .mergedlist .unmerge:hover{background:var(--accent-wash,transparent)}
   .memfact .mergedlist .unmerge[disabled]{opacity:.5;cursor:default}
+  /* A fact that does not age says so INSIDE the run that carries its age, and
+     that placement is the whole point: `365d ago` is still true for a durable
+     fact and no longer affects how it ranks, so left alone the number reads as
+     "buried" about a fact that is not. Ink rather than the run's muted grey —
+     it is the one segment here that changes what recall does with the row. */
+  .memfact .timeless{color:var(--ink)}
+  /* and it is revisable, so it is a real button — focusable and reachable
+     without a pointer, the same shape as .unmerge, which is the other act this
+     pane offers. Its OWN row rather than a segment inside .src: that run is a
+     line of `·`-separated statements about the fact, and a control sitting in it
+     reads as one more statement rather than as something to press — and its text
+     would land inside every assertion written about the run. */
+  .memfact .factact{margin-top:5px}
+  .memfact .agetoggle{font:inherit;font-family:var(--mono);font-size:10.5px;color:var(--accent);
+                      background:none;border:1px solid var(--accent-line);border-radius:5px;
+                      padding:0 5px;cursor:pointer}
+  .memfact .agetoggle:hover{background:var(--accent-wash,transparent)}
+  .memfact .agetoggle[disabled]{opacity:.5;cursor:default}
   /* the entity page — ONE renderer, three surfaces, so every rule here is drawn
      into the modal (before the subject is a citizen), into the molder (after),
      and into a notebook cell: materialize-entity! mints a notebook whose only
@@ -411,6 +429,16 @@ const API = {
   // answers with the two records, NOT a pane payload — it carries no q and no
   // space, so the caller refetches /api/memory with whatever it was showing
   memoryUnmerge: (survivor,absorbed) => POST('/api/memory-unmerge',{survivor,absorbed}),
+  // your judgement about whether a fact goes out of date — the one writer of
+  // `durable?` the agent may not revise. Answers with the ONE updated record and
+  // no pane payload, for memoryUnmerge's reason: this request carries no q and
+  // no space, so the caller refetches with whatever it was showing.
+  //
+  // `durable` travels as a boolean and never as a string: the server refuses
+  // anything else, because `weight` reads the value and "false" is truthy on the
+  // Clojure side — a fact stamped as YOURS and ranked as timeless when you said
+  // the opposite.
+  memoryDurable: (id,durable) => POST('/api/memory-durable',{id,durable}),
   // the subject page, in ONE payload the modal, the molder and a notebook cell all
   // draw. The raw string goes over the wire: `ent/normalize` is the server's, and a
   // second implementation of it in the page would be the thing that disagrees with it.
@@ -2114,6 +2142,19 @@ async function openMemory(qstr){
     // never a segment inside it: a fact naming no subject would otherwise leave a
     // dangling `·` there, in every combination of merged/relevance/via.
     const ents=factEntities(f);
+    // TRUTHY, not `===true`, because `weight` on the server is `(if (:durable? f)
+    // …)` and reads the value the same way: a hand-edited `"false"` ranks as
+    // timeless there, and a pane that called it decaying would disagree with the
+    // ranker about the one thing this row exists to say — and would offer the
+    // wrong repair, since the button below sends the opposite of what is drawn.
+    // and absent is not a third state to draw: nothing has judged an unjudged
+    // fact, and an unjudged fact decays — exactly what a `durable? false` one
+    // does. The distinction between them changes only whether loci.classify will
+    // judge it later, which is not something this row can act on.
+    const durable=!!f['durable?'];
+    // "you" or "agent", or nothing at all on a fact judged before the field
+    // existed — which is why the hover below is conditional
+    const by=f['durable-by'];
     h+='<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div>'+
       (ents.length?'<div class="ents">'+ents.map(e=>
         '<span class="ghostchip" data-entity="'+esc(e)+'">'+esc(e)+'</span>').join(' ')+'</div>':'')+
@@ -2121,7 +2162,16 @@ async function openMemory(qstr){
       (absorbed.length?' <span class="mergedtoggle" data-merged="'+i+'">+'+absorbed.length+' merged</span>':'')+' · '+
       (f.source&&f.source.obj?'<span class="ghostchip" data-open="'+esc(f.source.obj)+'">⌾ '+esc(f.source.obj)+'</span>'
                              :'⌾ '+esc((f.source&&f.source.space)||'workspace'))+
-      ' · '+(age<1?'today':age+'d ago')+(f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
+      ' · '+(age<1?'today':age+'d ago')+
+      // beside the age and before everything else, because the age is the number
+      // it corrects. Whose judgement it is rides on the hover: an agent's may be
+      // revised by the next distill of the same sentence and yours may not, so
+      // "who said this" is the difference between a call that will hold and one
+      // that might not.
+      (durable?' · <span class="timeless"'+
+               (by?' title="judged by '+(by==='you'?'you':'the agent')+'"':'')+
+               '>does not age</span>':'')+
+      (f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
       (via?' · '+via:'')+'</div>'+
       // …and undoable per entry, which is what makes reading it worth doing: a
       // merge you can see but not undo is a report, not a control. The survivor
@@ -2130,6 +2180,15 @@ async function openMemory(qstr){
       (absorbed.length?'<div class="mergedlist" id="merged-'+i+'" hidden>'+
         absorbed.map(a=>'<div>'+esc(a.fact)+' <span class="mid">'+esc(a.id)+'</span> '+
           '<button type="button" class="unmerge" data-survivor="'+esc(f.id)+'" data-absorbed="'+esc(a.id)+'">unmerge</button></div>').join('')+'</div>':'')+
+      // the act, under the run rather than in it. It says what clicking WILL do,
+      // not what the fact currently is — the marker above already says that, and
+      // a control repeating it would leave the reader guessing which of the two
+      // is the verb. Last, so revealing the merged list does not push it away
+      // from the `.mergedtoggle` in .src that opened it — with the list hidden,
+      // which is every fact's resting state, it sits directly under the run.
+      '<div class="factact"><button type="button" class="agetoggle" data-fact="'+esc(f.id)+
+        '" data-durable="'+(durable?'0':'1')+'">'+
+        (durable?'let it age':'stop ageing')+'</button></div>'+
       '</div>';
   });
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
@@ -2168,6 +2227,28 @@ async function openMemory(qstr){
     await openMemory(qstr||'');
     showToast(((res.restored&&res.restored.id)||el.dataset.absorbed)+
               ' is a fact again — awaiting an embedding');
+  }));
+  // The same shape as the handler above it, for the same reason: the answer is
+  // the ONE updated record — no facts, no q, no scope — so it cannot be rendered
+  // as a pane and must not be patched into one. The pane refetches with the query
+  // it was already showing, which under a query is also how the row picks up the
+  // ranking the judgement just changed.
+  modal.querySelectorAll('.agetoggle').forEach(el=>el.addEventListener('click',async ()=>{
+    el.disabled=true;                       // one judgement, not a double-click's two
+    // read off the button rather than recomputed from the row: `want` is what
+    // THIS control was drawn to ask for, so a stale render sends a stale value
+    // and gets the server's refusal, instead of sending whatever the DOM now
+    // happens to look like
+    const want=el.dataset.durable==='1', fid=el.dataset.fact;
+    let res;
+    try{ res=await API.memoryDurable(fid, want); }
+    catch(e){ el.disabled=false; showToast('could not reach the server — nothing was judged'); return; }
+    // a refusal is 200 with {error}: the pane keeps what it is showing and says
+    // the server's own sentence, rather than re-rendering as if it had worked
+    if(res.error){ el.disabled=false; showToast(res.error); return; }
+    await openMemory(qstr||'');
+    showToast((res.id||fid)+(want?' no longer ages — a year from now it ranks as it does today'
+                                 :' ages again — recall halves it about every 30 days'));
   }));
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));

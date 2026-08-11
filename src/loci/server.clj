@@ -2475,6 +2475,107 @@
           {:survivor (dissoc (:survivor r) :vec)
            :restored (dissoc (:restored r) :vec)})))))
 
+(defn- durable-refusal
+  "Why `id` cannot be judged, as a sentence a person can act on — or nil when it
+   can.
+
+   A sentence rather than a keyword, for `unmerge-refusal`'s reason: the only
+   caller is an endpoint whose only reader is a person, and \"no such fact\" and
+   \"that is a tombstone\" want two different next moves."
+  [facts id]
+  (let [f (get facts id)]
+    (cond
+      (nil? f)
+      (str "there is no fact " id " to judge")
+
+      ;; A merge appends a record carrying :merged-into rather than deleting a
+      ;; line, and every reader filters those out through `live`. Stamping one
+      ;; would write a judgement onto text nothing will ever rank, under an id
+      ;; whose live fact is somewhere else.
+      (:merged-into f)
+      (str id " is not a fact any more — it was absorbed into " (:merged-into f)
+           ", which is the fact that carries this text now. Judge that one.")
+
+      :else nil)))
+
+(defn memory-durable!
+  "POST /api/memory-durable — your judgement about whether a fact goes out of
+   date.
+
+   Request `{\"id\": \"mem-1\", \"durable\": true}`. Answers 200 with either the
+   updated record, or `{\"error\": \"…\"}` — the shape every other not-allowed
+   answer in this file uses, and `memory-unmerge!`'s exactly.
+
+   **The record itself, flat, and not a pane payload.** This request carries no
+   `q` and no `space`, and answering a scoped pane with the unscoped memory is
+   the one mistake a scope exists to prevent; the caller refetches `/api/memory`
+   with whatever it was already showing. Flat rather than under a key because
+   there is one record and a fact never carries `:error`, so the two shapes are
+   unambiguous — `memory-unmerge!` names its two because it has two to name. No
+   `:vec` on the way out, for the reason `memory-payload` drops them.
+
+   **It appends; it does not go through `mold/remember`.** `remember` would find
+   this fact as its own jaccard ≥ 0.6 duplicate, bump `:strength` and reset
+   `:ts` to now — and `:ts` is a multiplier in `weight`, so marking a fact *not*
+   durable would hand it a fresh 1.0 recency multiplier in the same breath as
+   recording that it ages. The 2026-08-09 repair documented this trap and
+   `loci.classify` walked past it a week ago; this is the third writer and the
+   same rule. `unmerge!` is the shape: take the atom and the file, swap, append
+   the record the swap landed on.
+
+   The write lives here rather than in `loci.memory` beside `unmerge!` because
+   there is no memory logic in it — one key and its provenance, where `unmerge!`
+   carries strength arithmetic, `:no-merge` and a four-way refusal. `loci.classify`
+   reaches for `{:keys [!facts file]}` from outside the namespace for the same
+   reason. The cost is real and is this: the set of things that write to the fact
+   log stops being enumerable from `loci.memory` alone — and where `loci.classify`
+   is a one-off that runs once and can be deleted, this one stays.
+
+   **`:durable-by \"you\"`, and that is the point of the endpoint.** `remember`
+   revises an agent's judgement and refuses to revise yours, so without the
+   stamp the next distiller pass over the same sentence silently reverts what
+   you did here — the failure `:no-merge` exists to prevent on the merge path,
+   reintroduced on a new one.
+
+   **`boolean?`, not merely present.** Ratified when the distiller and then
+   `loci.classify` met the same question: `weight` reads the VALUE, and the
+   string `\"false\"` is truthy in Clojure, so a hand-rolled POST carrying it
+   would mark a fact durable, stamp it as yours, and thereby make the
+   classification pass skip it forever. The pane always sends a boolean; this
+   guard is about everything that is not the pane.
+
+   Success is read off the record the swap produced rather than from
+   `identical?` on the two atom values: marking a fact durable when it already
+   is leaves the map unchanged (`assoc` returns the same map when the value is
+   already there), and an idempotent toggle is an ordinary success, not \"the
+   memory changed while this was being applied\"."
+  [m id durable]
+  (let [fid (str id)
+        {:keys [!facts file]} m]
+    (cond
+      (str/blank? fid) {:error "a judgement needs the id of the fact it is about"}
+
+      (not (boolean? durable))
+      {:error (str "durable must be true or false, not " (pr-str durable)
+                   " — a value that is neither is not a judgement, and this one would be "
+                   "recorded as yours and never revised by anything")}
+
+      :else
+      (or (when-let [why (durable-refusal @!facts fid)] {:error why})
+          (let [after (swap! !facts
+                             (fn [fs]
+                               ;; the same check again, inside the swap, on the
+                               ;; map the write will actually land on — a merge
+                               ;; may have absorbed this fact since the read above
+                               (if (durable-refusal fs fid)
+                                 fs
+                                 (update fs fid assoc :durable? durable :durable-by "you"))))]
+            (if-let [why (durable-refusal after fid)]
+              {:error why}
+              (let [rec (get after fid)]
+                (mem/append-line! file rec)
+                (dissoc rec :vec))))))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -2543,6 +2644,11 @@
                                       (json-resp (materialize-entity! st nm)))
       (= uri "/api/memory-unmerge")(let [{:keys [survivor absorbed]} (body-json req)]
                                      (json-resp (memory-unmerge! @mem/memory survivor absorbed)))
+      ;; `durable` is passed through raw — not coerced, not defaulted. JSON's
+      ;; true/false arrive as booleans and anything else is refused downstream by
+      ;; name, which is the only way a caller ever learns it sent nonsense.
+      (= uri "/api/memory-durable")(let [{:keys [id durable]} (body-json req)]
+                                     (json-resp (memory-durable! @mem/memory id durable)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]

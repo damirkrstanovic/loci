@@ -26,6 +26,10 @@ after(async () => { await browser?.close(); await server?.stop(); });
 // unmerge POST with a pane payload.
 const MEMORY_URL = /\/api\/memory(\?|$)/;
 const UNMERGE_URL = /\/api\/memory-unmerge$/;
+// and /api/memory-durable is the second URL that `(\?|$)` above keeps out of the
+// pane's route. There are two of them now, which is what turns that group from a
+// precaution into the reason this file works.
+const DURABLE_URL = /\/api\/memory-durable$/;
 
 // `body` may be a payload or a function of the ?q= the shell asked with — the
 // second is how one route serves a browse and then the query typed into it.
@@ -74,7 +78,24 @@ const statusLine = async (page) => {
 // What the eye reads: innerText, so anything display:none is out of it.
 const paneText = (page) => page.innerText('.modalcard');
 const rowTexts = (page) => page.$$eval('.memfact', els => els.map(e => e.innerText.trim()));
+// the `·`-separated run alone, without the controls under it — so a claim about
+// what the run says LAST stays a claim about the run
+const srcTexts = (page) => page.$$eval('.memfact .src', els => els.map(e => e.innerText.trim()));
 const statusTitle = async (page) => (await page.getAttribute('.memstat', 'title')) || '(no title)';
+
+// A gesture that reaches no endpoint at all fails HERE, in five seconds with a
+// sentence, instead of thirty seconds later in a waitForSelector whose only
+// message is that a selector never appeared — which hides every assertion
+// written below it. Three sabotages on this codebase have failed exactly that
+// way, with the guard written to catch them never running.
+const until = async (fn, why, ms = 5000) => {
+  const t0 = Date.now();
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() - t0 > ms) throw new Error(why);
+    await new Promise(r => setTimeout(r, 50));
+  }
+};
 
 // ── the status line ────────────────────────────────────────────────────────
 
@@ -231,7 +252,11 @@ test('found by both says words + meaning; found by one says only that one', asyn
 
     const rows = await rowTexts(page);
     assert.match(rows[0], /words \+ meaning/, `both retrievers ranked it: ${rows[0]}`);
-    assert.match(rows[1], /· words$/, `only the lexical half ranked it: ${rows[1]}`);
+    // the `.src` run and not the whole row: the row now ends with the ageing
+    // control under it, and the claim here is that `words` is the last thing the
+    // RUN says about how this fact was found
+    const srcs = await srcTexts(page);
+    assert.match(srcs[1], /· words$/, `only the lexical half ranked it: ${srcs[1]}`);
     assert.ok(!rows[1].includes('meaning'), `nothing semantic ranked it: ${rows[1]}`);
   });
 });
@@ -449,5 +474,202 @@ test('a refused unmerge keeps the pane and says the server’s own sentence', as
     assert.equal(rows.length, 2, `the pane still shows what it showed:\n${rows.join('\n---\n')}`);
     assert.match(rows[0], /\+2 merged/, `both entries are still absorbed: ${rows[0]}`);
     assert.equal(await statusLine(page), 'embed-qwen3-4b · 2 facts, all embedded');
+  });
+});
+
+// ── which facts age, and disagreeing with the answer ───────────────────────
+//
+// `weight` skips decay for a fact carrying `durable?`, so the age beside a
+// durable fact is still true and no longer says anything about how it ranks. A
+// reader seeing `365d ago` on Kepler's Third Law would reasonably conclude it is
+// buried, and it is not — so the distinction has to be in the TEXT, which is
+// what these assert. POST /api/memory-durable answers with the ONE updated
+// record and no pane payload, so the pane refetches, exactly as unmerge does.
+
+const YEAR_AGO = Date.now() - 365 * 86400000;
+
+// One pane holding all three states a fact can be in: judged timeless, judged
+// as-of-now, and never judged at all. The last two must render identically —
+// absent means decays, which is what every fact in the corpus did before any of
+// this existed.
+const AGEING_PANE = {
+  ...HEALTHY, total: 3,
+  facts: [
+    fact({ id: 'fact:kepler', fact: 'Kepler’s Third Law relates period and axis',
+           ts: YEAR_AGO, 'durable?': true, 'durable-by': 'you' }),
+    fact({ id: 'fact:capacity', fact: 'Lithography capacity is booked through 2027',
+           ts: YEAR_AGO, 'durable?': false, 'durable-by': 'agent' }),
+    fact({ id: 'fact:unjudged', fact: 'Uranus is the seventh planet from the Sun',
+           ts: YEAR_AGO }),
+  ],
+};
+
+// The endpoint's success shape, verbatim from the route's docstring: the record
+// itself, flat, with no `vec` and no pane payload around it.
+const durableOk = (b) => ({
+  id: b.id, fact: 'whatever this fact says', ts: YEAR_AGO, strength: 2,
+  'durable?': b.durable, 'durable-by': 'you',
+});
+
+// Records every POST body, so "the control named the right fact and asked for
+// the right value" is asserted on what went over the wire rather than on an
+// attribute in the DOM.
+const stubDurable = (page, reply) => {
+  const seen = [];
+  return page.route(DURABLE_URL, route => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    seen.push(body);
+    route.fulfill({ status: 200, contentType: 'application/json',
+                    body: JSON.stringify(reply(body)) });
+  }).then(() => seen);
+};
+
+// The one row whose visible text is this fact — clicking the control inside it
+// is how "per fact" is tested by behaviour instead of by counting elements.
+const controlFor = (page, text) =>
+  page.locator('.memfact', { hasText: text }).locator('.agetoggle');
+
+test('a fact that does not age says so beside its age; one that ages says only its age', async () => {
+  await withPage(browser, 'memory-durable-marker', async (page) => {
+    await bootedShell(page, server.url);
+    // browse, then the same facts ranked — the second is what the adjacency
+    // assertion at the bottom needs, because only a ranked hit has segments
+    // after the marker
+    await stub(page, q => (q
+      ? { ...AGEING_PANE, facts: AGEING_PANE.facts.map(f => ({ ...f, score: 0.91, via: ['lexical', 'semantic'] })) }
+      : AGEING_PANE));
+    await openPane(page);
+
+    const [kepler, capacity, unjudged] = await rowTexts(page);
+    // all three are a year old and all three still say so — the age is not
+    // hidden for a durable fact, it is corrected
+    for (const [row, id] of [[kepler, 'kepler'], [capacity, 'capacity'], [unjudged, 'unjudged']]) {
+      assert.match(row, /365d ago/, `${id} lost its age: ${row}`);
+    }
+    assert.match(kepler, /does not age/,
+      `a durable fact reads as buried unless the row says otherwise: ${kepler}`);
+    assert.ok(!capacity.includes('does not age'),
+      `this fact ages and the pane must not claim otherwise: ${capacity}`);
+    assert.ok(!unjudged.includes('does not age'),
+      `nothing has judged this fact, and an unjudged fact decays: ${unjudged}`);
+
+    // and the correction sits ON the number it corrects, not somewhere else in
+    // the card where a reader would not connect the two.
+    //
+    // Asserted under a QUERY, and that is not incidental: a browse run ends at
+    // the age, so `365d ago · does not age` holds there no matter where in the
+    // run the marker is appended — the assertion could not fail. A ranked hit
+    // has `relevance` and `words + meaning` after it, so adjacency to the age is
+    // a claim about placement rather than about being last.
+    await openPane(page, 'kepler');
+    const [src] = await srcTexts(page);
+    assert.match(src, /365d ago · does not age · relevance 0\.91 · words/,
+      `the marker belongs beside the age, which is the number it is about: ${src}`);
+
+    // whose call it is: an agent's may be revised by the next distill of the
+    // same sentence, and yours may not — so it is the difference between a
+    // judgement that will hold and one that might not
+    assert.equal(await page.getAttribute('.timeless', 'title'), 'judged by you');
+  });
+});
+
+test('marking a fact durable names it, sends true, and the pane comes back refetched', async () => {
+  await withPage(browser, 'memory-durable-mark', async (page) => {
+    await bootedShell(page, server.url);
+    let marked = false;
+    // one route, two states: the refetch must see the memory as it now is, which
+    // is the whole reason the pane refetches instead of patching the response in
+    await page.route(MEMORY_URL, route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify(marked
+        ? { ...AGEING_PANE, facts: AGEING_PANE.facts.map(f => f.id === 'fact:unjudged'
+            ? { ...f, 'durable?': true, 'durable-by': 'you' } : f) }
+        : AGEING_PANE),
+    }));
+    const seen = await stubDurable(page, b => { marked = true; return durableOk(b); });
+
+    await openPane(page);
+    // the THIRD row, not the first: a control that always sent the first fact's
+    // id would pass a click on any of them
+    await controlFor(page, 'Uranus is the seventh planet').click();
+
+    await until(async () => seen.length > 0,
+      'clicking the control reached no endpoint at all — nothing was POSTed');
+    assert.deepEqual(seen, [{ id: 'fact:unjudged', durable: true }],
+      'one request, naming the fact it was rendered under and the judgement it offered');
+
+    await until(async () => {
+      const r = await rowTexts(page);
+      return r.length === 3 && r[2].includes('does not age');
+    }, 'the pane never refetched — the third row still reads as a fact that ages');
+    const rows = await rowTexts(page);
+    assert.ok(!rows[1].includes('does not age'),
+      `only the fact that was clicked changed: ${rows[1]}`);
+    // the toast says what changed, in the terms the row now reads in. Fired
+    // AFTER the refetch, so `until` and not waitForSelector: a dropped refetch
+    // must fail on the sentence above rather than thirty seconds later here.
+    await until(async () => (await page.locator('.toast.on').count()) > 0,
+      'the judgement landed but nothing told the reader so');
+    assert.match((await page.textContent('.toast')).trim(), /fact:unjudged.*no longer ages/,
+      'the toast names the fact and what it now does');
+  });
+});
+
+test('letting a fact age again sends false — the control is not one hardcoded value', async () => {
+  await withPage(browser, 'memory-durable-unmark', async (page) => {
+    await bootedShell(page, server.url);
+    let aged = false;
+    await page.route(MEMORY_URL, route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify(aged
+        ? { ...AGEING_PANE, facts: AGEING_PANE.facts.map(f => f.id === 'fact:kepler'
+            ? { ...f, 'durable?': false } : f) }
+        : AGEING_PANE),
+    }));
+    const seen = await stubDurable(page, b => { aged = true; return durableOk(b); });
+
+    await openPane(page);
+    // the control on the durable row says what clicking it WILL do, which is the
+    // opposite of what the row currently says
+    assert.match(await controlFor(page, 'Kepler').innerText(), /let it age/,
+      'a control that repeated the state instead of naming the act would leave the reader guessing which is the verb');
+    await controlFor(page, 'Kepler').click();
+
+    await until(async () => seen.length > 0,
+      'clicking the control reached no endpoint at all — nothing was POSTed');
+    assert.deepEqual(seen, [{ id: 'fact:kepler', durable: false }],
+      'the value is the one this control was drawn for, not a constant');
+
+    await until(async () => !(await paneText(page)).includes('does not age'),
+      'the pane never refetched — it still claims this fact does not age');
+    const rows = await rowTexts(page);
+    assert.match(rows[0], /365d ago/, `and the age it always had is still there: ${rows[0]}`);
+  });
+});
+
+test('a refused judgement keeps the pane and says the server’s own sentence', async () => {
+  await withPage(browser, 'memory-durable-refused', async (page) => {
+    await bootedShell(page, server.url);
+    // 200 with {error}, which is how every not-allowed answer in server.clj reads
+    const REFUSED = 'fact:unjudged is not a fact any more — it was absorbed into fact:kepler, ' +
+      'which is the fact that carries this text now. Judge that one.';
+    await stub(page, AGEING_PANE);
+    const seen = await stubDurable(page, () => ({ error: REFUSED }));
+
+    await openPane(page);
+    await controlFor(page, 'Uranus is the seventh planet').click();
+
+    await until(async () => (await page.locator('.toast.on').count()) > 0,
+      'the server refused and the pane said nothing at all');
+    assert.ok((await page.textContent('.toast')).trim().includes(REFUSED),
+      `the server's reason is what the reader needs; anything else is a guess: ${await page.textContent('.toast')}`);
+    assert.equal(seen.length, 1);
+
+    // and nothing was re-rendered as if it had worked
+    const rows = await rowTexts(page);
+    assert.ok(!rows[2].includes('does not age'),
+      `a refused judgement must not be drawn as an accepted one: ${rows[2]}`);
+    assert.match(rows[0], /does not age/,
+      `nor may the refusal disturb the fact that was already durable: ${rows[0]}`);
   });
 });

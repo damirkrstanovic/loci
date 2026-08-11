@@ -1888,6 +1888,182 @@
         (is (= 2 (count (:facts p))))))))
 
 ;; ============================================================================
+;; POST /api/memory-durable — the judgement you make by hand
+;; ============================================================================
+;;
+;; The third and last writer of `:durable?`. The distiller proposes on every new
+;; fact, `loci.classify` proposed once over the corpus, and this is the one that
+;; overrides both and is never overridden — which is what `:durable-by "you"`
+;; buys and what the reinforcement test at the bottom of this section spends a
+;; whole round trip through `remember` to prove.
+
+(defn- unjudged-memory
+  "A throwaway memory holding two live facts nobody has judged and one
+   tombstone, as `[path m]`.
+
+   Written as records rather than through `remember` so that `:ts` and
+   `:strength` carry values the write under test could not have produced by
+   accident: `:ts 1000` is 1970 and `:strength 3` is not the 1 a fresh
+   `remember` writes. \"`:ts` and `:strength` are unchanged\" asserted against a
+   fact seeded a millisecond ago would pass against a route that went through
+   `remember` — which is the one break this endpoint most has to survive.
+
+   `mem-1` carries a `:vec` so \"no embedding goes out\" is an assertion and not
+   a tautology about a fact that never had one."
+  []
+  (let [path (tmpfile)]
+    (io/make-parents (io/file path))
+    (spit path (str/join "\n"
+                         [(pr-str {:id "mem-1" :fact "Kepler's Third Law states that T² ∝ a³."
+                                   :entities ["kepler"] :source {:obj "obj-1"}
+                                   :ts 1000 :strength 3
+                                   :vec [1.0 0.0] :model "embed-qwen3-0.6b" :dim 2})
+                          (pr-str {:id "mem-2" :fact "Lithography capacity is booked through 2027."
+                                   :entities ["asml"] :source {:obj "obj-2"}
+                                   :ts 2000 :strength 1})
+                          (pr-str {:id "mem-3" :fact "Most advanced chips are TSMC's."
+                                   :ts 2000 :merged-into "mem-2"})
+                          ""]))
+    [path (mem/file-memory path)]))
+
+(defn- fact-by-id [m id]
+  (first (filter #(= id (:id %)) (mem/all-facts m))))
+
+(deftest the-durable-endpoint-records-your-judgement-and-changes-nothing-else
+  (let [[_ m] (unjudged-memory)
+        r     (srv/memory-durable! m "mem-1" true)]
+    (is (= "mem-1" (:id r)) "the record, not a pane payload — this request carries no q and no scope")
+    (is (nil? (:facts r)) "and nothing that could be mistaken for one")
+    (is (true? (:durable? r)))
+    (is (= "you" (:durable-by r))
+        "the whole point of the field: a distiller re-deriving this sentence next week may revise the agent's answer and may not revise yours")
+    (is (nil? (:vec r))
+        "no embedding goes out, for the reason memory-payload drops them: ~1024 floats per fact")
+    ;; the `remember` trap, stated as an assertion. Going through `mold/remember`
+    ;; would find this fact as its own jaccard ≥ 0.6 duplicate, bump :strength and
+    ;; reset :ts to now — so marking a fact NOT durable would hand it a fresh 1.0
+    ;; recency multiplier in the same breath as recording that it ages.
+    (is (= 1000 (:ts r)) "the judgement is about the sentence, not a re-remembering of it")
+    (is (= 3 (:strength r)) "nothing here says this fact came up again")
+    (is (= "Kepler's Third Law states that T² ∝ a³." (:fact r)) "and the text is untouched")
+    (let [f (fact-by-id m "mem-1")]
+      (is (true? (:durable? f)) "and it is in the memory, not only in the answer")
+      (is (= "you" (:durable-by f)))
+      (is (= 1000 (:ts f)))
+      (is (= 3 (:strength f)))
+      (is (some? (:vec f))
+          "the vector is dropped from the ANSWER and kept in the store — the text did not change, so the embedding still describes it"))
+    (is (string? (json/write-str r))
+        "the response serialises — a route that 500s on its own answer is a route nobody can call")))
+
+(deftest the-durable-endpoint-toggles-back-and-the-judgement-stays-yours
+  (let [[_ m] (unjudged-memory)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [r (srv/memory-durable! m "mem-1" false)]
+      (is (false? (:durable? r))
+          "`false?` and not `(not (:durable? r))`: the second passes on a route that deleted the key, and an absent key is \"nothing has judged this\" rather than \"this one ages\"")
+      (is (= "you" (:durable-by r))
+          "changing your mind is still your judgement — a toggle that dropped the provenance would hand the next distiller pass permission to overwrite it")
+      (is (= 1000 (:ts r)) "and the second write re-stamps nothing either")
+      (is (= 3 (:strength r))))
+    ;; and again, to the same value it already holds: a no-op toggle is an
+    ;; ordinary success and not "the memory changed while this was being applied"
+    (let [r (srv/memory-durable! m "mem-1" false)]
+      (is (false? (:durable? r)))
+      (is (nil? (:error r))
+          "setting a flag to what it already says is idempotent, not a conflict"))))
+
+(deftest the-durable-endpoint-refuses-rather-than-throwing
+  (let [[_ m] (unjudged-memory)]
+    (is (string? (:error (srv/memory-durable! m "mem-404" true)))
+        "an id no fact has — a message, not a 500")
+    ;; and the sentence says the ID is missing rather than that no fact has it.
+    ;; `string?` alone could not fail here: drop the blank-id guard and a nil id
+    ;; still refuses, one clause later, with "there is no fact  to judge" — a
+    ;; message with a hole where the id should be, which is the one thing a
+    ;; refusal written as a sentence exists to avoid.
+    (is (re-find #"needs the id" (str (:error (srv/memory-durable! m nil true))))
+        "a missing id")
+    (is (re-find #"needs the id" (str (:error (srv/memory-durable! m "" true)))))
+    (is (string? (:error (srv/memory-durable! m "mem-3" true)))
+        "a tombstone: mem-3 was absorbed into mem-2, and stamping it would write a judgement onto a record only `live` saves every reader from")
+    ;; `boolean?` and not `contains?`, ratified when the distiller and then
+    ;; loci.classify met the same question. `weight` reads the VALUE, and the
+    ;; string "false" is truthy in Clojure — so a hand-rolled POST carrying it
+    ;; would mark a fact durable, stamp it `:durable-by "you"`, and thereby make
+    ;; `loci.classify` skip it forever. The pane always sends a boolean; this is
+    ;; about everything that is not the pane.
+    (is (string? (:error (srv/memory-durable! m "mem-1" "false")))
+        "a judgement that is neither true nor false is not a judgement")
+    (is (string? (:error (srv/memory-durable! m "mem-1" nil))))
+    (is (every? #(not (contains? % :durable?)) (mem/all-facts m))
+        "and none of that judged anything")))
+
+(deftest the-durable-endpoint-appends-and-rewrites-nothing
+  ;; The log is append-only and last-wins by :id — `next-id`'s tombstone
+  ;; reasoning depends on nothing ever being removed, so a route that rewrote
+  ;; the file in place would be correct today and reissue an id later.
+  (let [[path m] (unjudged-memory)
+        before   (slurp path)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [after (slurp path)]
+      (is (str/starts-with? after before)
+          "the prefix is byte-identical: this is one more line, not a rewritten file")
+      (is (= 1 (- (count (str/split-lines (str/trim after)))
+                  (count (str/split-lines (str/trim before)))))
+          "exactly one line per judgement")
+      (is (= 2 (count (mem/all-facts m)))
+          "and the memory still holds the two live facts it held — an append under an existing id replaces it, it does not add a fact"))))
+
+(deftest the-pane-payload-carries-the-judgement-it-is-asked-to-render
+  ;; The plan says no payload change should be needed. That is a claim about
+  ;; `memory-payload`, so it is checked here rather than assumed: it dissocs
+  ;; `:vec` and ships every other key, and the pane cannot render a distinction
+  ;; the payload drops.
+  (let [[_ m] (unjudged-memory)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [{:keys [env file]} (embed-env {})]
+      (with-redefs [embed/env env embed/from-file file]
+        (let [fs (into {} (map (juxt :id identity)) (:facts (srv/memory-payload m nil)))]
+          (is (true? (:durable? (fs "mem-1"))))
+          (is (= "you" (:durable-by (fs "mem-1")))
+              "whose judgement it is travels with it — the pane says so, and only the payload can tell it")
+          (is (nil? (:vec (fs "mem-1"))) "still no vectors, which is the one key that does not travel")
+          (is (false? (contains? (fs "mem-2") :durable?))
+              "and an unjudged fact arrives with no key at all — absent means it decays, which is today's behaviour and not a judgement that it ages"))))))
+
+(deftest a-later-reinforcement-does-not-revert-what-you-said-through-the-route
+  ;; Task 2 gave `remember` the guard and pinned it against a hand-stamped atom.
+  ;; This is the same rule through the real endpoint, which is the only place
+  ;; `"you"` is ever written: mark a fact by hand, then let a distiller pass
+  ;; re-derive the same sentence and say the opposite.
+  ;;
+  ;; Drop `:durable-by "you"` from the route and this is the test that fails —
+  ;; the flag survives on its own and the provenance is what protects it.
+  (let [[_ m] (unjudged-memory)
+        kepler "Kepler's Third Law states that T² ∝ a³."]
+    (srv/memory-durable! m "mem-1" true)
+    (mold/remember m kepler {:entities ["orbits"] :durable? false})
+    (let [f (fact-by-id m "mem-1")]
+      (is (true? (:durable? f))
+          (str "the agent re-derived the sentence and judged it as-of-now; you had already said otherwise. Got "
+               (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (= "you" (:durable-by f)) "and it is still yours, so the next pass is refused too")
+      ;; the other half of Task 2's correction: only the JUDGEMENT stands. A
+      ;; guard written as `(if (= "you" …) dup …)` would return the fact whole
+      ;; and freeze it at strength 1 with text that never updates.
+      (is (= 4 (:strength f))
+          "reinforcement still happened — the fact came up again and says so")
+      (is (contains? (set (:entities f)) "orbits")
+          "and the entities still union"))
+    ;; the mirror image: an agent judgement IS revisable, so the guard is about
+    ;; provenance and not about the flag being written once
+    (mold/remember m "Lithography capacity is booked through 2027." {:durable? true})
+    (let [f (fact-by-id m "mem-2")]
+      (is (true? (:durable? f)) "nobody had judged mem-2, so the agent's answer lands")
+      (is (= "agent" (:durable-by f))))))
+
+;; ============================================================================
 ;; memory scoped to one notebook's lineage (/api/memory?space=…)
 ;; ============================================================================
 
