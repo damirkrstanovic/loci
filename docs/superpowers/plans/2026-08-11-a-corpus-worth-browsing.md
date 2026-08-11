@@ -243,6 +243,25 @@ Screenshots where a sentence will not do.
       pre-Datalevin rollback and nothing in this plan should touch it
 - [ ] Every licence in `MANIFEST.edn` established, not assumed
 
+## Findings about loci, surfaced by Task 1 — recorded, deliberately NOT fixed
+
+Real data found three things the seeded corpus never could. None is fixed here; each is a
+predicate that several viewers hang off, and changing it would alter what every existing table
+molds as. **Task 6 should be able to see all three.**
+
+1. **`cat-col` takes the column with the SMALLEST distinct count in 2–12, so a boolean flag always
+   beats a real taxonomy.** MET's `Department` (10 distinct) and USGS's `Is critical mineral 2025`
+   (**2** distinct) would each have silently become the Pivot axis in preference to `era` and
+   `commodity`. "Coarsest wins" is implemented as "fewest wins", and for a real dataset those are
+   not the same thing. Task 1 guards against it *in the extract*; loci is unchanged.
+2. **`measure-col` punishes honest column names.** `Voter turnout of registered voters` is neither
+   name-matched as a rate nor year-like, so **Bar would have summed percentages**. Task 1 renamed
+   it to `turnout_pct` in the extract. A user importing their own CSV gets no such rename.
+3. **`line` has no series column for `country`.** It looks for a series among
+   `#{:tenure-band :dept :channel :region :stage}`, so the monthly table's ten economies will draw
+   as **one interleaved line**. This is the one most likely to look obviously wrong on screen, and
+   it is the reason a monthly table was included at all.
+
 ## Out of scope
 
 - **Scale.** See the opening section.
