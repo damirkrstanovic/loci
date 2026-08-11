@@ -210,11 +210,39 @@
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);z-index:80;background:var(--ink);color:var(--paper);font-size:12.5px;padding:9px 15px;border-radius:999px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;display:flex;gap:10px;align-items:center}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast .u{color:var(--accent-line);cursor:pointer;pointer-events:auto;font-weight:500}
-  .timebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:75;display:none;align-items:center;gap:12px;
-           background:var(--white);border:1px solid var(--accent-line);border-radius:999px;padding:8px 16px;box-shadow:0 20px 50px -30px rgba(20,30,25,.5);width:min(720px,92vw)}
+  /* TWO ROWS, and the split is the whole fix. The label sizes to its own text and
+     that text changes on every scrub — `now · 116 events` at one end, `event
+     65/116 · ＋ Geopolitical Shock Scenarios · 23/07/2026, 21:07:24` in the middle.
+     While it shared a row with the track inside this fixed-width pill, the track
+     absorbed the difference: measured 500.9px → 325.5px on the test fixture, live,
+     mid-drag. A pixel↔event scale that moves under the cursor is exactly what "it
+     changes size / I cannot do fine control / I slide a little and nothing happens"
+     feels like — three complaints, one mechanism.
+     Reserving a fixed width for the label (flex:0 0 288px) would also have held the
+     track still and been a smaller diff, but it spends 40% of the bar on text
+     forever and leaves ~4px per event. On its own row the label cannot reach the
+     track at all, and the track spans the pill: 686px measured, constant at every
+     position. The precision is the point, so the bar gets taller instead.
+     ↩ now moves up to the label row for the same reason — it is the same button in
+     the same corner, and leaving it beside the track would have cost 84px of it. */
+  .timebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:75;display:none;
+           flex-direction:column;gap:8px;
+           background:var(--white);border:1px solid var(--accent-line);border-radius:16px;padding:9px 16px 12px;box-shadow:0 20px 50px -30px rgba(20,30,25,.5);width:min(720px,92vw)}
   .timebar.on{display:flex}
-  .timebar input[type=range]{flex:1}
-  .timelabel{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;max-width:40%;overflow:hidden;text-overflow:ellipsis}
+  /* The toast lives at the bottom of the screen and so does this bar — and the bar
+     grew a row, so a message about the scrub landed ON the track it was about.
+     Measured: 72px tall at bottom:18px, so 102px clears it with room. `~` because
+     the toast follows .world in the markup, and .timemode is on .world already. */
+  .world.timemode ~ .toast{bottom:102px}
+  .timerow{display:flex;align-items:center;gap:12px}
+  .timebar input[type=range]{width:100%;margin:0;display:block}
+  /* min-width:0 or a long caption pushes the row wider than the pill instead of
+     ellipsizing — flex items refuse to shrink below their content by default */
+  .timelabel{flex:1 1 auto;min-width:0;font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* the keys are the real answer to "I cannot do fine control" — one press is one
+     event at any log length, where the mouse gets 5.9px. A key that works but is
+     never mentioned is a key nobody presses, so it is on the bar, not in a title. */
+  .timekeys{flex:0 0 auto;font-family:var(--mono);font-size:10.5px;color:var(--muted);opacity:.7;white-space:nowrap}
   .world.timemode .actions,.world.timemode .cellbar,.world.timemode .addrow,
   .world.timemode .mkcell,.world.timemode select[data-remold],
   .world.timemode #editbtn,.world.timemode #makebtn,.world.timemode .fnpal{display:none!important}
@@ -223,6 +251,10 @@
   .modalcard{width:100%;max-width:620px;max-height:76vh;display:flex;flex-direction:column;background:var(--white);border:1px solid var(--line);border-radius:14px;box-shadow:0 40px 80px -40px rgba(20,30,25,.6)}
   .modal-h{display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line-2);background:var(--panel)}
   .modal-h .q{font-size:13px;color:var(--muted)} .modal-h .q b{color:var(--ink)}
+  /* ANSWER / FUNCTIONS / MEMORY / SUGGEST / SUBJECT — five copies of six inline
+     declarations, which is five places for them to drift apart */
+  .modalbadge{font-family:var(--mono);font-size:11px;color:var(--accent);
+              border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px}
   .modal-b{padding:18px 20px;overflow:auto;font-size:14px;line-height:1.6;color:var(--ink-2)}
   .modal-b h3{font-family:'IBM Plex Serif',serif;font-weight:400;font-size:17px;margin:14px 0 6px;color:var(--ink)}
   .modal-b h4{font-size:14px;margin:12px 0 4px;color:var(--ink)}
@@ -278,6 +310,15 @@
   .memfact{border:1px solid var(--line);border-radius:9px;padding:9px 12px;margin-bottom:9px}
   .memfact .src{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:4px}
   .memfact .dots{color:var(--accent);letter-spacing:2px}
+  /* what a fact is ABOUT, on its own line between the fact and the .src run —
+     never inside that run, which is already six `·`-separated segments and would
+     grow a dangling separator the first time a fact named nothing. Mono, because
+     a chip reads `tsmc`: a normalized identity rather than a botched title, and
+     the same register .entname draws it in on the page the chip opens.
+     line-height, because several subjects wrap and inline-block chips on a
+     wrapped line otherwise touch. */
+  .memfact .ents{margin-top:6px;font-family:var(--mono);font-size:10.5px;line-height:2}
+  .memfact .ents .ghostchip{margin:0 4px 0 0}
   /* what the memory layer is doing, in the same mono/muted register as .src */
   .memstat{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:-6px 0 12px}
   .memfact .mergedtoggle{cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent-line)}
@@ -294,6 +335,37 @@
                        border:1px solid var(--accent-line);border-radius:5px;padding:0 5px;cursor:pointer}
   .memfact .mergedlist .unmerge:hover{background:var(--accent-wash,transparent)}
   .memfact .mergedlist .unmerge[disabled]{opacity:.5;cursor:default}
+  /* A fact that does not age says so INSIDE the run that carries its age, and
+     that placement is the whole point: `365d ago` is still true for a durable
+     fact and no longer affects how it ranks, so left alone the number reads as
+     "buried" about a fact that is not. Ink rather than the run's muted grey —
+     it is the one segment here that changes what recall does with the row. */
+  .memfact .timeless{color:var(--ink)}
+  /* and it is revisable, so it is a real button — focusable and reachable
+     without a pointer, the same shape as .unmerge, which is the other act this
+     pane offers. Its OWN row rather than a segment inside .src: that run is a
+     line of `·`-separated statements about the fact, and a control sitting in it
+     reads as one more statement rather than as something to press — and its text
+     would land inside every assertion written about the run. */
+  .memfact .factact{margin-top:5px}
+  .memfact .agetoggle{font:inherit;font-family:var(--mono);font-size:10.5px;color:var(--accent);
+                      background:none;border:1px solid var(--accent-line);border-radius:5px;
+                      padding:0 5px;cursor:pointer}
+  .memfact .agetoggle:hover{background:var(--accent-wash,transparent)}
+  .memfact .agetoggle[disabled]{opacity:.5;cursor:default}
+  /* the entity page — ONE renderer, three surfaces, so every rule here is drawn
+     into the modal (before the subject is a citizen), into the molder (after),
+     and into a notebook cell: materialize-entity! mints a notebook whose only
+     cell is the entity, which is where the reader lands the moment they act.
+     .entname is mono because `tsmc` is a normalized key and not a botched title:
+     in the mono register a lowercase token reads as an identity, which is what
+     it is, and nothing is tempted to re-case it. It reuses .memfact for the
+     facts themselves — they ARE memory facts, and a second box that looked
+     nearly like one would be the drift this page exists to avoid. */
+  .entname{font-family:var(--mono);font-size:15px;color:var(--ink)}
+  .entmeta{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:3px 0 12px}
+  .entmeta.warn{color:var(--attn)}
+  .entsrc{font-size:11.5px;color:var(--muted);margin-top:10px}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -318,9 +390,12 @@
 <div class="world" id="world"><svg class="edges" id="edges"></svg></div>
 <div class="toast" id="toast"></div>
 <div class="timebar" id="timebar">
-  <button class="btn ghost sm" id="timeNow">↩ now</button>
+  <div class="timerow">
+    <button class="btn ghost sm" id="timeNow">↩ now</button>
+    <div class="timelabel" id="timeLabel">—</div>
+    <div class="timekeys">← → one event</div>
+  </div>
   <input type="range" id="timeRange" min="0" max="0" value="0">
-  <div class="timelabel" id="timeLabel">—</div>
 </div>
 <div class="modal" id="modal"></div>
 
@@ -354,6 +429,33 @@ const API = {
   // answers with the two records, NOT a pane payload — it carries no q and no
   // space, so the caller refetches /api/memory with whatever it was showing
   memoryUnmerge: (survivor,absorbed) => POST('/api/memory-unmerge',{survivor,absorbed}),
+  // your judgement about whether a fact goes out of date — the one writer of
+  // `durable?` the agent may not revise. Answers with the ONE updated record and
+  // no pane payload, for memoryUnmerge's reason: this request carries no q and
+  // no space, so the caller refetches with whatever it was showing.
+  //
+  // `durable` travels as a boolean and never as a string: the server refuses
+  // anything else, because `weight` reads the value and "false" is truthy on the
+  // Clojure side — a fact stamped as YOURS and ranked as timeless when you said
+  // the opposite.
+  memoryDurable: (id,durable) => POST('/api/memory-durable',{id,durable}),
+  // the subject page, in ONE payload the modal, the molder and a notebook cell all
+  // draw. The raw string goes over the wire: `ent/normalize` is the server's, and a
+  // second implementation of it in the page would be the thing that disagrees with it.
+  //
+  // `at` travels because the SHORT-CIRCUIT in openEntity does: a payload carrying
+  // `object` is handed to openObject, which sends `?at=` of its own. Without it the
+  // two halves of one gesture read two different worlds — a subject materialized
+  // after the point you scrubbed to answers with an object id that does not exist
+  // there. Measured: a molder with an empty header and the word `null`, and further
+  // back an uncaught TypeError and a blank world.
+  //
+  // `at!=null`, not `at?`: 0 is the beginning of the log and a real place to stand.
+  // Every other `at`-taking entry here spells it the same way for the same reason.
+  entity: (name,at) => fetch('/api/entity?name='+encodeURIComponent(name)+(at!=null?'&at='+at:'')).then(r=>r.json()),
+  // one reversible commit — the :entity object AND the notebook about it. Answers
+  // {state, entity, spaceId}; `spaceId` is always a key and null is a real answer.
+  entityNotebook: name => POST('/api/entity-notebook',{name}),
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -852,7 +954,7 @@ function openSuggest(i,sp,proposals){
     '<b>'+esc(p.title)+'</b></label>'+
     '<input class="sgq" value="'+esc(p.query||'')+'"></div>').join('');
   modal.innerHTML='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
-    '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">SUGGEST</span>'+
+    '<span class="modalbadge">SUGGEST</span>'+
     '<span class="q">questions worth pursuing in “<b>'+esc(sp.title)+'</b>”</span></div>'+
     '<div class="modal-b">'+rows+'</div>'+
     '<div class="modal-f">'+
@@ -920,7 +1022,13 @@ async function openObject(id){
   const owner=STATE.spaces.findIndex(s=>s.members.includes(id));
   if(owner>=0 && (mode!=='focus' || focusIdx!==owner)){ focusIdx=owner; }
   mode='focus'; closeLeap();
-  const m=await API.object(id,tat());
+  const at=tat();
+  const m=await API.object(id,at);
+  // A scrub now re-opens what is open at every settle, so two of these can be in
+  // flight down one drag — and drawing whichever answers last would leave the
+  // molder showing a point in time the bar has already left. The same guard
+  // renderNotebook, deepen, pvSeq and scrubTo itself carry.
+  if(openId!==id||tat()!==at) return;
   renderDetail(focusIdx,m); layout();
 }
 async function remold(id,view){ const m=await API.mold(id,view,tat()); renderDetail(focusIdx,m); }
@@ -942,6 +1050,16 @@ function renderDetail(i,m){
   const eb=b.querySelector('#editbtn'); if(eb) eb.addEventListener('click',()=>startEdit(i,m));
   const mk=b.querySelector('#makebtn'); if(mk) mk.addEventListener('click',()=>startDo(i,m));
   b.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>openObject(el.dataset.open)));
+  // A notebook is not a document. renderBody and renderNotebook have carried this
+  // delegation all along; the molder had not needed it until an entity page drew a
+  // source chip for the SPACE a fact came from — and openObject on a notebook
+  // renders its {intent, cells} map as raw JSON, which is the same mistake act()'s
+  // semantic branch documents. Silence when the id is not in STATE.spaces, exactly
+  // as the other two are: with `?at=` now on /api/entity, the payload and STATE are
+  // read at the same point, so a miss is a race and not a routine outcome.
+  b.querySelectorAll('[data-space]').forEach(el=>el.addEventListener('click',()=>{
+    const j=STATE.spaces.findIndex(s=>s.id===el.dataset.space); if(j>=0) enter(j);
+  }));
   b.querySelectorAll('[data-gate]').forEach(el=>el.addEventListener('click',async ev=>{
     ev.stopPropagation();
     if(TIME){ showToast('time mode — ↩ now to decide'); return; }
@@ -1073,6 +1191,12 @@ function renderMold(m){
     case 'kpi':    return renderKPI(d);
     case 'applet': return '<div id="appletHost" style="min-height:340px"></div>';
     case 'flow':   return renderFlow(m.rendered, m.id);
+    // a subject — no viewers, and the shell draws the very page the modal draws,
+    // out of the very payload it draws it from. `m.title` goes with it because
+    // both of this function's callers wrap the result in a header carrying it —
+    // the molder's `.molder-h .t` and a notebook cell's `.cellmold .hd .t` — and
+    // renderEntityPage will not draw the name twice. See renderEntityPage.
+    case 'entity': return renderEntityPage(m.rendered, m.title);
     default:       return '<pre>'+esc(JSON.stringify(d,null,2))+'</pre>';
   }
 }
@@ -1348,8 +1472,19 @@ async function enterTime(){
   let ev; try{ ev=await API.events(); }catch(e){ showToast('time: network error'); return; }
   TIME={n:ev.total,total:ev.total,events:ev.events};
   timeRange.min=0; timeRange.max=ev.total; timeRange.value=ev.total;
-  closeModal();
-  timebar.classList.add('on'); overview(); rebuild(); paintTime();
+  // Entering time stands you at `now` — the world already on screen — so there is
+  // nothing to re-render, and no reason to throw away what you were reading. This
+  // used to be `overview(); rebuild()`, which closed the document you pressed ⏱
+  // while reading, for the same bad reason `scrubTo` did. A rebuild would in fact
+  // COST a round trip here: renderBody draws “loading…” for an open object, so it
+  // would need openObject to fetch a payload that is already drawn.
+  // closeLeap explicitly, because overview() used to do it and the palette's
+  // refusal to open in the past is documented as relying on that.
+  closeModal(); closeLeap();
+  timebar.classList.add('on'); paintTime();
+  // focus on the way in, or ← → do nothing until you have clicked the track —
+  // which is the gesture the keys are there to replace
+  timeRange.focus();
 }
 function timeCaption(){
   if(!TIME) return '—';
@@ -1365,6 +1500,31 @@ function paintTime(){
   // when clicked (with why), rather than being a control that quietly does nothing
   document.getElementById('undoBtn').classList.toggle('dim', !!TIME);
 }
+// Openable at a point in time: the object is in that state's `:objects` AND some
+// notebook there holds it. Both halves are load-bearing — the molder draws INSIDE
+// a notebook panel, and the seed puts every document before the spaces that
+// reference it, so there is a stretch of the log where a document exists with
+// nowhere to draw it (renderDetail would reach for a `#bodyN` that isn't there).
+function openableAt(s,id){
+  return !!id && s.objects.some(o=>o.id===id) && s.spaces.some(sp=>sp.members.includes(id));
+}
+// Draw the world `s` describes and keep what is open — if it is there to keep.
+// `where` names the point we just moved to, for the one case where it isn't.
+function restoreInto(s,where){
+  const was=openId, wasTitle=(STATE.objects[was]||{}).title||was;
+  applyState(s);
+  if(was && !openableAt(s,was)){
+    // An object open at event 90 may not exist at event 40, and the silent version
+    // of this is a known defect at another door: /api/object answers a missing
+    // object with {title:null, kind:"data", rendered:null} and the molder draws an
+    // empty header over the word `null`. So fall back LOUDLY — name what was
+    // dropped and say where it went.
+    openId=null; mode='overview'; rebuild();
+    showToast('“'+wasTitle+'” does not exist '+where+' — showing the overview');
+    return;
+  }
+  rebuild(); if(openId) openObject(openId);   // renderBody draws “loading…” until this lands
+}
 async function scrubTo(n){
   TIME.n=n; paintTime();
   clearTimeout(timeDeb);
@@ -1373,18 +1533,29 @@ async function scrubTo(n){
     const want=TIME.n;
     let s; try{ s=await API.state(want<TIME.total?want:undefined); }catch(e){ showToast('time: network error'); return; }
     if(!TIME||TIME.n!==want) return;                       // stale response
-    applyState(s); mode='overview'; openId=null; rebuild();
+    // This used to end `mode='overview'; openId=null`, so the first millimetre of
+    // drag closed whatever you were reading — and watching ONE thing change across
+    // the log is the main reason to have a scrubber at all. Keep it open and
+    // re-read it at the new `?at=`.
+    restoreInto(s,'at event '+want);
   },120);
 }
 async function exitTime(){
   let s; try{ s=await API.state(); }catch(e){ showToast('network error — still in the past'); return; }
   TIME=null; timebar.classList.remove('on'); world.classList.remove('timemode');
   document.getElementById('undoBtn').classList.remove('dim');   // the present is writable again
-  applyState(s); rebuild();
+  // ↩ now can land on something open, now that scrubbing keeps your place — and a
+  // document you opened in the past may have been deleted since. Same restore, and
+  // without it a bare `rebuild()` would leave the panel reading “loading…” forever.
+  restoreInto(s,'in the present');
 }
 document.getElementById('timeBtn').addEventListener('click',()=>TIME?exitTime():enterTime());
 document.getElementById('timeNow').addEventListener('click',exitTime);
 timeRange.addEventListener('input',()=>scrubTo(+timeRange.value));
+// Escape leaves the past — and now has to be caught HERE. The global handler sees
+// a focused INPUT in front of it and does the right thing for a text field: blur
+// and return. Without this, ⏱ would need two Escapes to close.
+timeRange.addEventListener('keydown',e=>{ if(e.key==='Escape'){ e.preventDefault(); exitTime(); } });
 
 // ---------------- LEAP filters the overview ----------------
 // Filtering is an entry in LEAP's own list rather than a mode: the dropdown
@@ -1600,7 +1771,7 @@ function composeLeap(keepSel){
   if(sel>=filtered.length) sel=0;
   if(!filtered.length){ results.innerHTML='<div class="group">no match</div>'; return; }
   let h='',last=null,flat=0;
-  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',memory:'Memory','views & functions':'Views & functions','by meaning':'By meaning'};
+  const gname={ask:'Ask',space:'Notebooks',viewer:'View verbs',create:'Create',filter:'Filter',prose:'In notebooks','in text':'In documents',subject:'Subjects',memory:'Memory','views & functions':'Views & functions','by meaning':'By meaning'};
   filtered.forEach(e=>{ const grp=gname[e.group]||'Content';
     if(grp!==last){h+='<div class="group">'+grp+'</div>';last=grp;}
     const i=flat++;
@@ -1608,10 +1779,27 @@ function composeLeap(keepSel){
     // found by meaning wears a notebook's mark — and act() enters it rather
     // than opening it as a document. The group header says how it was found.
     const sp=e.group==='space'||(e.group===DEEP_GROUP&&e.kind==='space');
+    // A subject takes no class of its own. `space` and `verb` are promises about
+    // what Enter does — go inside a notebook; do something rather than go
+    // somewhere — and a subject's Enter opens a page to read, which is what an
+    // undressed row promises already. A `.subject` rule would be a stylesheet
+    // grown for a distinction the heading and the mark make without one.
     const cls=e.note?'note':sp?'space':(e.group==='viewer'||e.group==='create'||e.group==='ask'||e.group==='filter')?'verb':'';
-    const ic=e.note?'⋯':sp?'▢':e.group==='ask'?'✦':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    // ◈ and not ⌾: ⌾ is memory's mark, a subject is where memory hangs, and the
+    // two groups appear in the same list — one query returns both.
+    const ic=e.note?'⋯':sp?'▢':e.group==='ask'?'✦':e.group==='viewer'?'▸':e.group==='create'?'✦':e.group==='filter'?'⊟':e.group==='subject'?'◈':e.group==='memory'?'⌾':e.group==='prose'?'¶':e.group==='in text'?'§':e.group==='views & functions'?'ƒ':'▤';
+    // The grey right-hand column says WHICH of several same-reading rows this is,
+    // and above a subject the heading has just said it — `subject:tsmc` there
+    // would be that heading plus the label again, in the one slot on the row
+    // whose job is to add something. What only this row can say is how much is
+    // behind the name, which is also what decides whether it is worth going to,
+    // and the only thing that tells two subjects apart. `:object` rides on the
+    // row too and is deliberately NOT drawn: it is a snapshot act() must not read
+    // (see there), and putting it on screen would advertise the very short-circuit
+    // the design refused.
+    const gp=e.group==='subject'?(e.count===1?'1 fact':(e.count||0)+' facts'):e.id;
     h+='<div class="res '+cls+(i===sel?' sel':'')+'" data-i="'+i+'"><span class="ic">'+ic+'</span>'+
-       '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(e.id)+'</span></div>'; });
+       '<span class="title">'+esc(e.label)+'</span><span class="gp">'+esc(gp)+'</span></div>'; });
   results.innerHTML=h;
   results.querySelectorAll('.res').forEach(r=>{ r.addEventListener('mousemove',()=>{sel=+r.dataset.i;paintSel();}); r.addEventListener('click',()=>{sel=+r.dataset.i;act();}); });
 }
@@ -1664,6 +1852,23 @@ async function act(){ const e=filtered[sel]; if(!e) return;
   else if(e.group===DEEP_GROUP){
     if(e.kind==='space'){ const i=STATE.spaces.findIndex(s=>s.id===e.id); if(i>=0) enter(i); }
     else openObject(e.id); }
+  // `e.name`, never `e.id`: `subject:<name>` is what the row IS and not where it
+  // goes, and picking the name back out of that string would be a second place
+  // that has to know how a subject id is spelled. `e.label`
+  // is the same string by construction and is only the fallback — openEntity(undefined)
+  // asks for a subject named “undefined”, which renders as a page and not as an error.
+  //
+  // The row's `:object` is informational and is NOT handed on as a short-cut. It is
+  // a snapshot from when the query ran, and `undo!` can remove that object between
+  // the keystroke and the Enter; the round trip is authoritative and costs one local
+  // request on the gesture that ENDS a keystroke sequence.
+  //
+  // No TIME guard, and none is missing: what act() guards is the branches that
+  // WRITE, and a subject is a destination like a notebook or a document, neither of
+  // which is guarded. Reading one in the past is fine, and openEntity's one writing
+  // control refuses there on its own. The palette does not open in the past anyway —
+  // q's focus handler turns it away, and enterTime closes it on the way in.
+  else if(e.group==='subject'){ closeLeap(); openEntity(e.name||e.label); }
   else { openObject(e.id); } }
 async function createSpace(prompt){
   closeLeap();
@@ -1754,7 +1959,7 @@ function mdToHtml(md){
 }
 function openModal(html,question,canKeep,scope){
   modal.innerHTML='<div class="modalcard"><div class="modal-h">'+
-    '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">ANSWER</span>'+
+    '<span class="modalbadge">ANSWER</span>'+
     '<span class="q">“<b>'+esc(question)+'</b>”</span></div>'+
     '<div class="modal-b">'+html+'</div>'+
     '<div class="modal-f">'+(canKeep?'<button class="btn sm" id="keepBtn">Keep as note here</button>':'')+
@@ -1770,7 +1975,7 @@ function closeModal(){ modal.classList.remove('on'); modal.innerHTML=''; }
 async function openFunctions(){
   const list=await API.functions();
   let h='<div class="modalcard" style="max-width:780px">'+
-    '<div class="modal-h"><span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">FUNCTIONS</span>'+
+    '<div class="modal-h"><span class="modalbadge">FUNCTIONS</span>'+
     '<span class="q">'+list.length+' in the substrate · each a reversible, inspectable object</span></div><div class="modal-b">';
   h+='<div class="sec-h">built-in library</div><div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">'+
     'Filter rows · Group &amp; aggregate · Pivot · Top N · Change vs previous row · Share of total — '+
@@ -1844,6 +2049,73 @@ function viaLabel(via){
   if(v.includes('semantic')) parts.push('meaning');
   return parts.join(' + ');
 }
+// What a fact is about, as the pane draws it.
+//
+// `:entities` are the raw strings the distiller wrote, and the design keeps them
+// that way — facts are never rewritten to point at entity ids. `absorb` then
+// unions them with `distinct` over those raw strings, so one survivor really can
+// carry ["tsmc","TSMC"," tsmc "]: three chips for one subject, all three opening
+// the same page. And a model's JSON puts "" and null in there, which are not
+// subjects at all.
+//
+// So fold before drawing: collapse whitespace, trim, lowercase, drop blanks, keep
+// first-seen order. That is loci.entities/normalize's rule, and this is a PORT of
+// it — the shell has no access to the real one, and there is no endpoint that
+// normalizes a list. An earlier draft called it an approximation and said a
+// disagreement would be "cosmetic". Both halves of that were wrong, and it is
+// worth saying how, because the correction is not the obvious one:
+//
+//   1. It is not cosmetic. A chip is drawn from the folded string AND opens it, so
+//      a fold that disagrees with the server's asks for a subject that is not the
+//      one the fact names. Measured on a fact whose only entity was "Nanjing﻿":
+//      the chip read `nanjing`, `/api/entity?name=nanjing` answered `{count:0}`,
+//      and the page said "Nothing is remembered about this yet" — a chip ON a fact
+//      opening a page that denies the fact exists, still offering ✦ New notebook
+//      about this, so you could commit a subject with no evidence behind it.
+//
+//   2. The obvious repair — swap `\s` for Java's `[\s\p{Z}]` — does not fix that
+//      case. `String.prototype.trim()` strips JS WhiteSpace, which carries U+FEFF,
+//      so a TRAILING BOM is still eaten after the collapse leaves it alone. And
+//      `clojure.string/trim` is not `String::trim` either: it walks
+//      `Character.isWhitespace`, which is false for NUL..U+0008 and true for
+//      U+001C..U+001F. After the collapse the only members of that set still
+//      standing are U+0020 and U+001C..U+001F, which is exactly the class below.
+//
+// Measured, not reasoned: every one of the 1,114,112 code points folded in three
+// positions (leading, internal, trailing) through both this function and
+// `ent/normalize` on the JVM. 3,336,192 cases, 0 disagreements. The shipped fold
+// had 11 (U+001C..U+001F at either end, U+FEFF anywhere); `[\s\p{Z}]` + `.trim()`
+// has 10. Lowercasing agrees everywhere, final sigma included, so `Locale/ROOT`
+// needs no counterpart here.
+//
+// Rejected: draw the raw string and deduplicate on the folded one. That makes the
+// pane pick a winner among six spellings and then show a chip whose text is not
+// the subject it opens.
+//
+// Uncapped, also deliberately. Measured on the live corpus: 84 facts, mean 2.5
+// subjects, widest 7 — and the thing that inflates the list, a merge unioning raw
+// spellings, is precisely what the fold above collapses. A cap would need a reveal
+// control to avoid truncating in silence (this project's rule), which is a second
+// disclosure widget beside .mergedtoggle for a case that has never occurred; and a
+// fact naming forty subjects is a distiller that over-extracted, which is
+// something this pane exists to make visible rather than to hide behind "+33 more".
+function factEntities(f){
+  const out=[], seen=new Set();
+  for(const e of ((f&&f.entities)||[])){
+    // `[\t\n\v\f\r\p{Z}]` is Java's `[\s\p{Z}]` spelled out — Java's `\s` is the six
+    // ASCII whitespace characters and nothing more, so JS's is a WIDER class, not
+    // the same one — and `[\u001c-\u0020]` is what clojure.string/trim still has
+    // left to remove once that collapse has run. Neither may be shortened to `\s`
+    // or to `.trim()`; see the note above for the 3.3M-case sweep that says so.
+    const k=String(e==null?'':e)
+      .replace(/[\t\n\v\f\r\p{Z}]+/gu,' ')
+      .replace(/^[\u001c-\u0020]+|[\u001c-\u0020]+$/g,'')
+      .toLowerCase();
+    if(!k||seen.has(k)) continue;
+    seen.add(k); out.push(k);
+  }
+  return out;
+}
 async function openMemory(qstr){
   const res=await API.memory(qstr||'');
   const facts=res.facts||[];
@@ -1852,7 +2124,7 @@ async function openMemory(qstr){
   const total=(typeof res.total==='number')?res.total:null;
   const st=memoryStatus(res,total);
   let h='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
-    '<span style="font-family:var(--mono);font-size:11px;color:var(--accent);border:1px solid var(--accent-line);border-radius:6px;padding:2px 7px">MEMORY</span>'+
+    '<span class="modalbadge">MEMORY</span>'+
     '<span class="q">'+facts.length+' remembered fact'+(facts.length===1?'':'s')+(qstr?' for “<b>'+esc(qstr)+'</b>”':'')+'</span></div>'+
     '<div class="modal-b"><input id="memq" placeholder="search memory…" value="'+esc(qstr||'')+'" style="width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;margin-bottom:12px">'+
     '<div class="memstat"'+(st.detail?' title="'+esc(st.detail)+'"':'')+'>'+esc(st.text)+'</div>';
@@ -1864,12 +2136,42 @@ async function openMemory(qstr){
     // erring-high threshold auditable rather than merely careful
     const absorbed=f['merged-from']||[];
     const via=qstr?viaLabel(f.via):'';
+    // the answer to "we remembered some facts about a game, but there is nothing
+    // pointing to this game" — the fact has always said what it is about, and this
+    // is where it finally says it out loud. Its own row above the `.src` run and
+    // never a segment inside it: a fact naming no subject would otherwise leave a
+    // dangling `·` there, in every combination of merged/relevance/via.
+    const ents=factEntities(f);
+    // TRUTHY, not `===true`, because `weight` on the server is `(if (:durable? f)
+    // …)` and reads the value the same way: a hand-edited `"false"` ranks as
+    // timeless there, and a pane that called it decaying would disagree with the
+    // ranker about the one thing this row exists to say — and would offer the
+    // wrong repair, since the button below sends the opposite of what is drawn.
+    // and absent is not a third state to draw: nothing has judged an unjudged
+    // fact, and an unjudged fact decays — exactly what a `durable? false` one
+    // does. The distinction between them changes only whether loci.classify will
+    // judge it later, which is not something this row can act on.
+    const durable=!!f['durable?'];
+    // "you" or "agent", or nothing at all on a fact judged before the field
+    // existed — which is why the hover below is conditional
+    const by=f['durable-by'];
     h+='<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div>'+
+      (ents.length?'<div class="ents">'+ents.map(e=>
+        '<span class="ghostchip" data-entity="'+esc(e)+'">'+esc(e)+'</span>').join(' ')+'</div>':'')+
       '<div class="src"><span class="dots">'+'●'.repeat(Math.min(5,f.strength||1))+'</span>'+
       (absorbed.length?' <span class="mergedtoggle" data-merged="'+i+'">+'+absorbed.length+' merged</span>':'')+' · '+
       (f.source&&f.source.obj?'<span class="ghostchip" data-open="'+esc(f.source.obj)+'">⌾ '+esc(f.source.obj)+'</span>'
                              :'⌾ '+esc((f.source&&f.source.space)||'workspace'))+
-      ' · '+(age<1?'today':age+'d ago')+(f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
+      ' · '+(age<1?'today':age+'d ago')+
+      // beside the age and before everything else, because the age is the number
+      // it corrects. Whose judgement it is rides on the hover: an agent's may be
+      // revised by the next distill of the same sentence and yours may not, so
+      // "who said this" is the difference between a call that will hold and one
+      // that might not.
+      (durable?' · <span class="timeless"'+
+               (by?' title="judged by '+(by==='you'?'you':'the agent')+'"':'')+
+               '>does not age</span>':'')+
+      (f.score!==undefined?' · relevance '+(+f.score).toFixed(2):'')+
       (via?' · '+via:'')+'</div>'+
       // …and undoable per entry, which is what makes reading it worth doing: a
       // merge you can see but not undo is a report, not a control. The survivor
@@ -1878,6 +2180,15 @@ async function openMemory(qstr){
       (absorbed.length?'<div class="mergedlist" id="merged-'+i+'" hidden>'+
         absorbed.map(a=>'<div>'+esc(a.fact)+' <span class="mid">'+esc(a.id)+'</span> '+
           '<button type="button" class="unmerge" data-survivor="'+esc(f.id)+'" data-absorbed="'+esc(a.id)+'">unmerge</button></div>').join('')+'</div>':'')+
+      // the act, under the run rather than in it. It says what clicking WILL do,
+      // not what the fact currently is — the marker above already says that, and
+      // a control repeating it would leave the reader guessing which of the two
+      // is the verb. Last, so revealing the merged list does not push it away
+      // from the `.mergedtoggle` in .src that opened it — with the list hidden,
+      // which is every fact's resting state, it sits directly under the run.
+      '<div class="factact"><button type="button" class="agetoggle" data-fact="'+esc(f.id)+
+        '" data-durable="'+(durable?'0':'1')+'">'+
+        (durable?'let it age':'stop ageing')+'</button></div>'+
       '</div>';
   });
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
@@ -1888,6 +2199,15 @@ async function openMemory(qstr){
   mq.focus();
   mq.addEventListener('keydown',e=>{ if(e.key==='Enter') openMemory(mq.value.trim()); });
   modal.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>{ closeModal(); openObject(el.dataset.open); }));
+  // A subject, not an object — `data-entity` and never `data-open`, because
+  // openEntity's own modal runs a [data-open] delegation of its own and a chip
+  // carrying both would be fetched as /api/object/tsmc, an id nothing has.
+  //
+  // closeModal() here rather than inside openEntity: a payload carrying `object`
+  // short-circuits to openObject and never touches the modal, so without this the
+  // pane would sit on top of the object the chip just sent the reader to.
+  modal.querySelectorAll('[data-entity]').forEach(el=>el.addEventListener('click',()=>{
+    closeModal(); openEntity(el.dataset.entity); }));
   modal.querySelectorAll('[data-merged]').forEach(el=>el.addEventListener('click',()=>{
     const list=modal.querySelector('#merged-'+el.dataset.merged);
     if(list) list.hidden=!list.hidden;
@@ -1908,9 +2228,173 @@ async function openMemory(qstr){
     showToast(((res.restored&&res.restored.id)||el.dataset.absorbed)+
               ' is a fact again — awaiting an embedding');
   }));
+  // The same shape as the handler above it, for the same reason: the answer is
+  // the ONE updated record — no facts, no q, no scope — so it cannot be rendered
+  // as a pane and must not be patched into one. The pane refetches with the query
+  // it was already showing, which under a query is also how the row picks up the
+  // ranking the judgement just changed.
+  modal.querySelectorAll('.agetoggle').forEach(el=>el.addEventListener('click',async ()=>{
+    el.disabled=true;                       // one judgement, not a double-click's two
+    // read off the button rather than recomputed from the row: `want` is what
+    // THIS control was drawn to ask for, so a stale render sends a stale value
+    // and gets the server's refusal, instead of sending whatever the DOM now
+    // happens to look like
+    const want=el.dataset.durable==='1', fid=el.dataset.fact;
+    let res;
+    try{ res=await API.memoryDurable(fid, want); }
+    catch(e){ el.disabled=false; showToast('could not reach the server — nothing was judged'); return; }
+    // a refusal is 200 with {error}: the pane keeps what it is showing and says
+    // the server's own sentence, rather than re-rendering as if it had worked
+    if(res.error){ el.disabled=false; showToast(res.error); return; }
+    await openMemory(qstr||'');
+    showToast((res.id||fid)+(want?' no longer ages — a year from now it ranks as it does today'
+                                 :' ages again — recall halves it about every 30 days'));
+  }));
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
 modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
+
+// ---------------- a subject, and the place it has ----------------
+//
+// The entity page. Drawn from `/api/entity?name=` into the modal before the
+// subject is a citizen of the substrate, and from `renderMold` once it is one —
+// which is TWO more surfaces, not one: the molder, and a notebook cell, because
+// `materialize-entity!` mints a notebook whose only cell is the entity and that
+// is where the reader lands the instant they act. ONE payload shape and ONE
+// renderer across all three, or the page quietly becomes three pages and the
+// drift is invisible until somebody materializes something and the page they had
+// been reading changes under them.
+//
+// `framedBy` is what the caller's own chrome already draws above this: the
+// molder's `.molder-h .t`, a cell's `.cellmold .hd .t`, nothing at all in the
+// modal. The name is the identity the facts hang on and it belongs on the page —
+// but `materialize-entity!` titles both the object and the notebook with it, so
+// after acting the reader met five lowercase `tsmc` in seven lines (crumb, panel
+// title, intent, cell header, and this), measured, in a strip whose other
+// notebooks read "The Solar System". So it is drawn when it adds something:
+// always in the modal, and in the other two exactly when the stored title has
+// diverged from the identity — which is the case the argument for drawing it was
+// always about. `entity-objects` matches `[:value :name]` alone and never the
+// title, so those two really can part company, and when they do, two strings on
+// screen beat one.
+function renderEntityPage(p,framedBy){
+  p=p||{};
+  // Both surfaces can be handed `{error}`: `/api/entity?name=` with a blank name,
+  // and `mold-payload` for an :entity object whose stored name normalizes to
+  // nothing. Handled once, here, for this function's whole reason for existing.
+  // Falling through would draw an unnamed subject reading "0 facts · Nothing is
+  // remembered about this yet" — a confident statement about a subject nobody
+  // named, which is an answer where a refusal belongs.
+  if(p.error) return '<div class="entmeta warn">'+esc(p.error)+'</div>';
+  const facts=p.facts||[], srcs=p.sources||[], n=facts.length;
+  // `count` is every live fact carrying the name; `facts` is the ranked page of
+  // at most fifty of them. The server keeps the two apart precisely so this line
+  // can say "50 of 137" instead of truncating in silence — the same rule the
+  // memory pane's status line follows for `total`, and for the same reason: a
+  // number derived from the page is a claim about the page wearing the clothes
+  // of a claim about the world.
+  //
+  // The "of" appears only when it is true. `count` can come back one SHORT of the
+  // page — `mem/all-facts` and `mold/recall` deref the fact map independently, so
+  // a `remember` landing between them is counted by one and not the other — and
+  // "49 of 48" is worse than saying nothing.
+  const tot=(typeof p.count==='number'&&p.count>n)?p.count:null;
+  let h=(framedBy===p.name?'':'<div class="entname">◈ '+esc(p.name)+'</div>')+
+    '<div class="entmeta">'+(tot?n+' of '+tot+' facts':n+' fact'+(n===1?'':'s'))+
+    // `absorb` unions the absorbed fact's entities onto the survivor, so two facts
+    // naming a subject become one and the evidence really does collapse back below
+    // the threshold. Say so, rather than let the page vanish under a reader.
+    //
+    // The threshold is NOT spelled out here. `promotion-threshold` is two because
+    // 68 of 104 measured names appear exactly once, and its own docstring says the
+    // number is measured — a page that hard-codes it is a second place that has to
+    // be remembered when it moves. And the merge half is left unsaid when there is
+    // nothing to have merged: "0 facts · a merge can collapse them back" describes
+    // a history this subject cannot have had.
+    (p.promoted?'':' · not yet a subject of its own'+
+      (n?' — too few facts name it, and a merge can take a promoted name back below the line':''))+
+    '</div>';
+  h+=n
+    ? facts.map(f=>'<div class="memfact"><div style="font-size:13px">'+esc(f.fact)+'</div></div>').join('')
+    : '<div style="color:var(--muted);font-size:13px">Nothing is remembered about this yet.</div>';
+  // `:kind` is on every source and it decides the GESTURE — the same rule act()'s
+  // semantic branch states: "openObject on a notebook would open a notebook as a
+  // document". Measured before this line existed: clicking a notebook chip drew its
+  // {intent, cells} map as raw JSON, under a crumb still naming somewhere else. And
+  // it is one click from any entity page with facts, because `memory-payload`'s
+  // `:source` names an object AND the space it sat in.
+  if(srcs.length) h+='<div class="entsrc">from '+srcs.map(s=>
+    '<span class="ghostchip" '+(s.kind==='space'?'data-space':'data-open')+'="'+esc(s.id)+'">'+
+    esc(s.title||s.id)+'</span>').join(' ')+'</div>';
+  return h;
+}
+// A subject, opened. ONE decision and the SERVER takes it: a payload carrying
+// `object` is a subject that is already a citizen, so we open the object and the
+// modal — which exists to offer materialization — never appears. The shell
+// working it out for itself would need the objects map, and would be wrong the
+// moment anything else materialized the name.
+//
+// A LEAP subject row carries `:object` too, and this deliberately does not take
+// it as an argument to shortcut with: that key is a snapshot from when the query
+// ran, and `undo!` can remove the object between the keystroke and the Enter.
+// One round trip on a click buys an answer that is true now, and leaves exactly
+// one path through this function instead of two with one of them untested.
+//
+// `at` goes with the name, because the short-circuit hands the answer to
+// openObject and openObject sends `?at=` whether we do or not. Scrub back past a
+// materialization without it and the live store says "citizen", the frozen one has
+// no such object, and the reader gets an empty molder — or, far enough back, a
+// blank world. Reading a subject in the past is fine; reading it out of two
+// different worlds at once is the defect.
+let entSeq=0;   // in-flight requests can resolve out of order — only the latest may draw
+async function openEntity(name){
+  const tok=++entSeq;
+  let p; try{ p=await API.entity(name,tat()); }
+  catch(e){ if(tok!==entSeq) return; showToast('subject: network error'); return; }
+  if(tok!==entSeq) return;   // a later subject was asked for while this one was in flight
+  if(p.object) return openObject(p.object);
+  modal.innerHTML='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
+    '<span class="modalbadge">SUBJECT</span>'+
+    (p.error?'':'<span class="q">derived from the agent’s memory — not an object yet</span>')+'</div>'+
+    '<div class="modal-b">'+renderEntityPage(p)+'</div>'+
+    '<div class="modal-f">'+(p.error?'':'<button class="btn sm" id="entNb">✦ New notebook about this</button>')+
+    '<button class="btn ghost sm" id="closeModal">Close</button>'+
+    '<span style="font-size:11.5px;color:var(--muted)">acting on a subject is what makes it real — reversibly</span></div></div>';
+  modal.classList.add('on');
+  modal.querySelector('#closeModal').addEventListener('click',closeModal);
+  // the modal has no renderDetail around it, so its source chips need the same
+  // delegations openMemory's do; the molder's are wired by renderDetail already.
+  // Two of them, because a source is a document or a NOTEBOOK and those are two
+  // different gestures — see the chip's own note in renderEntityPage.
+  modal.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>{
+    closeModal(); openObject(el.dataset.open); }));
+  modal.querySelectorAll('[data-space]').forEach(el=>el.addEventListener('click',()=>{
+    const j=STATE.spaces.findIndex(s=>s.id===el.dataset.space);
+    if(j>=0){ closeModal(); enter(j); }
+  }));
+  const nb=modal.querySelector('#entNb');
+  if(nb) nb.addEventListener('click',async()=>{
+    // never act into the past — refused BEFORE the POST, the way keepNote is,
+    // rather than reported after a commit has already landed
+    if(TIME){ showToast('time mode — ↩ now to make a notebook'); return; }
+    nb.disabled=true;                       // one subject cannot be minted twice
+    let r; try{ r=await API.entityNotebook(p.name); }
+    catch(e){ nb.disabled=false; showToast('subject: network error'); return; }
+    if(r.error){ nb.disabled=false; showToast(r.error); return; }
+    // …and scrubbing into the past while the POST was in flight must not yank the
+    // reader back into the present, which applyState would
+    if(TIME){ showToast('made — ↩ now to see it'); return; }
+    applyState(r.state); closeModal(); rebuild();
+    // `spaceId` is always a KEY and null is a real answer: the notebook about this
+    // subject may have been renamed or had its cell removed, and
+    // materialize-entity! answers nil rather than minting a second one on a stale
+    // click. The entity itself is always there, so land on that — a gesture that
+    // commits and then shows you nothing is worse than one that shows you less.
+    const i=r.spaceId?STATE.spaces.findIndex(s=>s.id===r.spaceId):-1;
+    if(i>=0) enter(i); else openObject(r.entity);
+    showToast('“'+p.name+'” is a subject in the world now — reversible', undo);
+  });
+}
 async function askAgent(prompt, space){
   closeLeap();
   const scope = space ? ((STATE.spaces.find(s=>s.id===space)||{}).title) : 'your whole workspace';

@@ -84,9 +84,22 @@
      opts an engine may honour: :k how many, :semantic? whether to spend a
      network round trip embedding the query (**false by default** — /api/leap
      calls this on every keystroke), :rerank? whether to let a reranker order
-     the head, :filter {:sources #{id …}} to narrow to facts recorded against
-     those ids. An engine that ignores an opt still answers; NaiveRecall below
-     ignores all of them, which is why it is a stub and not a store.")
+     the head, :subjects #{name …} the entity names the query is about — they
+     score against a fact's own names, which is the only way a multi-word
+     subject can match at all, since a query token is one word — and
+     :filter {:sources #{id …} :entities #{name …}} to narrow to facts recorded
+     against those ids OR carrying one of those names, a union: lineage is what
+     a deep dive inherits, subject is what an unrelated notebook shares, and
+     neither replaces the other.
+
+     **:subjects scores, :filter {:entities} scopes.** A subject raises a fact
+     that already passed the filter; it never lets one past it. To reach another
+     notebook's facts about a subject, name it in both — in :filter to make them
+     eligible, in :subjects to make them rank — because naming it only in
+     :subjects fails silently, as a scoped recall that answers with nothing.
+
+     An engine that ignores an opt still answers; NaiveRecall below ignores all
+     of them, which is why it is a stub and not a store.")
   (all-facts [this]
     "every stored fact, newest first — the browsable memory pane.
 

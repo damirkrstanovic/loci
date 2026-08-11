@@ -15,6 +15,7 @@
             [loci.config :as config]
             [loci.content :as c]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.fnlib :as fnlib]
             [loci.memory :as mem]
             [loci.mold :as mold]
@@ -22,6 +23,7 @@
             [loci.substrate :as sub]
             [loci.tools :as tools]
             [loci.viewspec :as vs])
+  (:import [java.util Locale])
   ;; :gen-class is what makes `java -jar` possible at all. AOT alone emits
   ;; loci/server$_main.class but no class *named* loci.server, so the uberjar's
   ;; Main-Class points at nothing and the jar dies with ClassNotFoundException
@@ -149,6 +151,202 @@
      ;; write — 2.2 ms this way against 3.9 ms on a 3003-event log
      :tag-colors (or (:value (get objm palette-id)) {})}))
 
+;; ---- the entity page ----
+;;
+;; Above `mold-payload` and not beside the other `/api/…` builders far below,
+;; because `mold-payload` calls `entity-payload` for a materialized entity's
+;; object page. A forward reference in Clojure is a compile error, not a warning.
+;; All any of it needs is the requires and `sub/objects`.
+
+(def ^:private entity-fact-cap
+  "How many of an entity's facts the page ranks and ships.
+
+   A cap, and deliberately **not a silent one**: `:count` on the payload counts
+   the live facts carrying the name out of the *index*, never out of this page,
+   so a subject with more facts than this renders \"50 of 137\" rather than
+   quietly looking like it has fifty. That is the whole reason the two are
+   separate keys instead of one number, and the reason a renderer is told about
+   both.
+
+   Fifty because this is a page load behind a modal and a fact is a sentence
+   plus its provenance — a few hundred bytes of JSON each. The alternative
+   considered was `:k (count (get idx nm))`, which removes the cap outright and
+   makes the two numbers always equal; rejected because it makes the size of a
+   page load a property of the corpus, and the corpus only grows."
+  50)
+
+(defn- entity-objects
+  "Normalized entity name → the object materializing it, out of an objects map
+   already in hand.
+
+   Keyed on `[:value :name]` and **never on the title**: the title is a display
+   string, and renaming `TSMC` to `TSMC (foundry)` must not re-identify the
+   entity or orphan every fact that mentions it.
+
+   The stored name is normalized here rather than trusted, for the reason
+   `ent/promoted` normalizes its own `materialized` argument instead of trusting
+   it. If this did not, an object carrying an un-normalized `TSMC` would make
+   `:promoted` true — through `promoted`, which normalizes — while `:object`
+   stayed absent, through this, which would not: one payload contradicting
+   itself about whether the entity has been materialized at all.
+
+   **The lexicographically least id wins a duplicate — which is not the same as
+   the first created**, and the rule is determinism, not recency. `\"ent:10\"`
+   sorts before `\"ent:2\"`, so past nine entities the survivor is not the older
+   object; do not read it as one. The id's shape is not this function's to know,
+   and parsing a numeric suffix out of it would make this the second place that
+   believes something about how entity ids are minted. What is actually needed
+   is that the answer not change between two JVMs: two objects for one name is a
+   race and not a normal state, but `vals` of an objects map is hash order, so
+   with no rule at all the page would name one of the two arbitrarily and
+   nothing in the log would explain which.
+
+   Takes the objects map, not the store. On the EDN stores `sub/object` re-folds
+   the whole event log per lookup, so one materialization shared between the
+   entity lookup, the promotion set and every source's title is 1.7–3.5× cheaper
+   there; on Datalevin, which is production, `object` is a map lookup and this
+   buys nothing. It is simpler either way, and either way it is about 2% of the
+   page — the two passes over the whole memory in `entity-payload` are the
+   cost."
+  [objm]
+  (reduce (fn [m o]
+            (let [n (ent/normalize (get-in o [:value :name]))]
+              (if (or (str/blank? n)
+                      (and (contains? m n) (neg? (compare (:id (get m n)) (:id o)))))
+                m
+                (assoc m n o))))
+          {}
+          (filter #(= :entity (:kind %)) (vals objm))))
+
+(defn entity-object
+  "The materialized object for a normalized entity name, or nil. Matched on
+   `[:value :name]`, never on the title — see `entity-objects`.
+
+   `nm` is expected already normalized, as every name that has been through
+   `ent/normalize` or `ent/detect` is. Handing it a raw one simply misses, which
+   is the silent failure `ent/detect`'s docstring names — so normalize at the
+   door, as `entity-payload` does, rather than here on every lookup.
+
+   **A store-taking convenience, and NOT the calling convention for anything
+   that looks up more than one name.** It rebuilds the whole objects map per
+   call, so a loop over it is one map per name: measured on an EDN store,
+   `leap-payload`'s subject group at 360 matching names over 900 objects cost
+   121.98 ms this way against 1.66 ms building `entity-objects` once. Every
+   production caller — `leap-payload`, `entity-payload`, `materialize-entity!` —
+   therefore calls `entity-objects` with a map already in hand, and this
+   survives for callers holding a store and wanting exactly one answer."
+  [st nm]
+  (get (entity-objects (sub/objects st)) nm))
+
+(defn materialized-names
+  "The normalized names that already have an object, so `ent/promoted` can be
+   told which entities never demote.
+
+   The same store-taking convenience `entity-object` is, with the same warning:
+   it builds the whole objects map, so a caller that also wants the objects
+   themselves is asking for two maps. `leap-payload` and `entity-payload` both
+   want both, so both bind `(entity-objects objm)` once and pass `(keys …)` to
+   `ent/promoted` — which is what `ent/promoted`'s docstring means by
+   \"`materialized` is normalized and blank-filtered here\", since those keys
+   already are. This is the one-line spelling for a caller that wants only the
+   names."
+  [st]
+  (set (keys (entity-objects (sub/objects st)))))
+
+(defn entity-payload
+  "The entity page: the subject, the live facts that mention it ranked by the
+   ordinary recall score, and the objects and notebooks those facts came from.
+
+   **One payload, two surfaces.** `GET /api/entity?name=…` serves it to the
+   modal you get before materializing; `mold-payload` returns the same map under
+   `:rendered` for the entity object's page afterwards. Two renderers would
+   drift, and the drift would be invisible until someone materialized something
+   and the page they had been reading changed under them.
+
+   `:semantic? false` — the candidate set is already exactly the facts carrying
+   this name, so meaning has nothing left to decide, and this is a page load:
+   embedding the query would be a 20–50 ms round trip to reorder facts that are
+   all on the subject already.
+
+   `:subjects` carries the name because a multi-word one matches no query token
+   — `taiwan semiconductor manufacturing` is three tokens to the scorer and one
+   name to the index — so without it a fact carrying only that name scores 0 on
+   the entity half and `recall` drops it for not being positive: an entity page
+   with facts behind it showing none. `:filter {:entities}` carries it too, and
+   the two are not the same thing (see `recall`'s `opts:` note): the filter
+   makes facts eligible, the subject makes them rank. Naming it in one and not
+   the other is the documented silent failure.
+
+   `:count` is how many live facts carry the name and `:facts` is the ranked
+   page of at most `entity-fact-cap` of them. **The cap is what normally
+   separates them** — the candidate set `recall` sees is exactly the index's own
+   set, and every fact in it scores above zero — which is what lets the page say
+   \"50 of 137\" instead of truncating in silence. One other thing can:
+   `mem/all-facts` and `mold/recall` deref the fact map independently, so a
+   `remember` landing between them is counted by one and not the other. Left
+   that way deliberately — the alternative is to hand `recall` a snapshot, which
+   would put this function inside `loci.memory`'s consistency model to make a
+   page load off by one for a moment.
+
+   `:promoted` false with facts present is a real state and must render: a merge
+   can push a name back below the threshold, and the page should say so rather
+   than vanish.
+
+   `:sources` is in the facts' rank order — the best fact's origins first —
+   deduped, with each fact's own ids sorted so nothing depends on the iteration
+   order of the set `mem/source-ids` hands back. An id with **no object, or no
+   real one**, is DROPPED rather than rendered as `{:title nil}`: a fact outlives
+   the document it was distilled from, and a chip with no name on it is worse
+   than no chip. Documents and notebooks share one list because a fact's `:source`
+   names both and the question the list answers — where did this come from — is
+   answered by either.
+
+   Cost: two passes over the whole memory — `ent/index` here for `:count` and
+   `:promoted`, and `recall`'s own `df-map` a moment later — plus one
+   materialization of the objects map, shared between the entity lookup, the
+   promotion set and every source's title. The same shape and the same reason as
+   `remembered-context`'s: sharing one index would mean handing `loci.memory` a
+   pre-built projection instead of a fact sequence, and this runs on a click, not
+   on a keystroke."
+  [st m raw-name]
+  ;; `nm`, not `name`: a local called `name` shadows clojure.core/name, which
+  ;; each source's `:kind` needs below.
+  (let [nm (ent/normalize raw-name)]
+    (if (str/blank? nm)
+      ;; ahead of `all-facts`, `ent/index` and the objects map — none of which
+      ;; has anything to answer for a request that named no subject, and the
+      ;; last of them walks every object in the store
+      {:error "no entity name given"}
+      (let [objm  (sub/objects st)
+            ments (entity-objects objm)
+            idx   (ent/index (mem/all-facts m))
+            obj   (get ments nm)
+            hits  (mold/recall m nm {:k entity-fact-cap :semantic? false
+                                     :subjects #{nm} :filter {:entities #{nm}}})
+            srcs  (->> hits (mapcat (comp sort mem/source-ids)) distinct
+                       ;; the guard is on `:kind`, not on the object's mere
+                       ;; presence. `apply-event` :assoc/:append against an id
+                       ;; with no prior :put materializes a husk — measured,
+                       ;; `{:note "x"}`, with neither a title nor a kind — and it
+                       ;; fails BOTH rules at once: `(name nil)` is an NPE, a 500
+                       ;; on a page load, and a husk that survived the NPE would
+                       ;; be rendered as a chip with no name on it, which is what
+                       ;; the drop below exists to prevent. One condition
+                       ;; answers both, and there is no object in this codebase
+                       ;; that legitimately lacks `:kind`: `state-payload` calls
+                       ;; `(name (:kind o))` on every one of them.
+                       (keep (fn [id]
+                               (let [o (get objm id)]
+                                 (when-let [k (:kind o)]
+                                   {:id id :title (:title o) :kind (name k)}))))
+                       vec)]
+        (cond-> {:name     nm
+                 :count    (count (get idx nm #{}))
+                 :promoted (contains? (ent/promoted idx (keys ments)) nm)
+                 :facts    (mapv #(dissoc % :vec) hits)
+                 :sources  srcs}
+          obj (assoc :object (:id obj)))))))
+
 (defn dynamic-views [st target]
   (->> (sub/objects st) vals
        (filter #(and (#{:viewspec :applet} (:kind %)) (= target (get-in % [:value :target]))))))
@@ -157,9 +355,62 @@
   (vec (concat (mapv (fn [[vid lbl]] [(kw->str vid) lbl]) (:alternatives (mold/mold (:value o))))
                (mapv (fn [v] [(:id v) (get-in v [:value :label])]) (dynamic-views st (:id o))))))
 
-(defn mold-payload [st id view]
+(defn mold-payload
+  "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
+   every `:ref` cell of a notebook payload is built out of.
+
+   **`m` is the memory — or a delay of one — and is FORCED ONLY on the entity
+   branch.** All seven call sites hand it `mem/memory` UNDEREFERENCED, which is
+   why five of them can: `notebook-payload`, `edit!`, `describe!`, `make-view!`
+   and `compute-clj!` have no memory of their own, and molding a doc, a table, a
+   flow or an applet through them must not be the thing that opens
+   `data/memory.edn`. The alternative the plan named — `@mem/memory` at all seven
+   — was rejected on the test seam it opens: it makes `(edit! st \"doc:a\" \"y\")`
+   in `edit-rejects-missing-id`, an assertion with nothing to say about memory,
+   force the singleton against the user's real data directory, and every future
+   test of those five functions after it.
+
+   Be precise about what guards that. `server_test`'s `no-memory` is a delay that
+   throws, and it catches the calls a test makes to THIS function directly — nine
+   tests, measured, when the force is hoisted out of the branch. It cannot see
+   through `edit!`, which passes `mem/memory` itself and would simply succeed
+   against the real file. That path is held shut by the shape of the code and by
+   nothing else.
+
+   `clojure.core/force` is identity on anything that is not a delay, so a caller
+   already holding a memory — every entity test, and anything that would rather
+   read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
+   pass it."
+  [st m id view]
   (let [o (sub/object st id)]
     (cond
+      ;; an ENTITY — no viewers, the shell draws the same page it draws before
+      ;; materialization, out of the same payload. A `mold/mold` viewer could not
+      ;; be this page: a viewer's `:render` only ever receives `(:value o)`,
+      ;; which here is `{:name "tsmc"}`, and has no way to reach the memory the
+      ;; facts live in. So this is the `:flow` mechanism — "no viewers, the shell
+      ;; renders it itself" — and for the same reason.
+      ;;
+      ;; `entity-payload` is handed THIS `st`, which under `?at=` is a frozen
+      ;; store: the source chips are the objects that existed at that point, and
+      ;; reading the live store here for them while everything else read the
+      ;; frozen one is the one thing that would be wrong. The facts are today's
+      ;; either way — the memory has no time dimension and `undo!` never touches
+      ;; a fact, so there is no past set to read. That is the memory's design,
+      ;; not an omission here.
+      ;;
+      ;; The branch is on the KIND and never on whether the name looks usable. A
+      ;; guard would be a second normalization living outside `ent/normalize`,
+      ;; and it would disagree with it — `str/blank?` is false for a lone U+00A0,
+      ;; which `ent/normalize` trims to nothing. An object carrying no usable
+      ;; name therefore renders `entity-payload`'s own `{:error …}`, which is the
+      ;; shape `GET /api/entity?name=` already answers a nameless request with:
+      ;; one renderer handles it on both surfaces rather than growing a case that
+      ;; exists only here.
+      (= :entity (:kind o))
+      (let [p (entity-payload st (force m) (get-in o [:value :name]))]
+        {:id id :title (:title o) :kind "entity" :view nil :label "entity"
+         :rendered p :alternatives []})
       ;; a flow — no viewers, the shell renders the live checklist itself
       (= :flow (:kind o))
       {:id id :title (:title o) :kind "flow" :view nil :label "flow"
@@ -176,11 +427,14 @@
             {:keys [kind rendered]} (vs/interpret (get-in vo [:value :spec]) (:value o))]
         {:id id :title (:title o) :kind (name kind) :view view
          :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)})
-      ;; a built-in viewer
+      ;; a built-in viewer. `mv`, not `m`: `m` is this function's MEMORY, and
+      ;; shadowing it here would be correct only for as long as this branch never
+      ;; needs the memory — which is exactly the assumption the entity branch
+      ;; above just stopped being able to make for the function as a whole.
       :else
-      (let [m (mold/mold (:value o) (when (seq view) (str->kw view)))]
-        {:id id :title (:title o) :kind (name (:kind m)) :view (when (:view m) (kw->str (:view m)))
-         :label (:label m) :rendered (:rendered m) :alternatives (alternatives st o)}))))
+      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
+        {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
+         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)}))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -315,10 +569,38 @@
           (pos? awaiting)
           (conj (deep-note (str awaiting " chunk(s) awaiting embedding") {:awaiting awaiting})))))))
 
+(defn- lower-root
+  "Lower-case under `Locale/ROOT` — the ONE case-folding LEAP is allowed to use.
+
+   `clojure.string/lower-case` is `.toLowerCase()` under the JVM's *default*
+   locale, and under a Turkish or Azeri one that maps `I` to a dotless `ı`. Every
+   comparison in `leap-payload` folds a query against a haystack, so a
+   locale-sensitive fold breaks them in two different ways at once, and both were
+   measured under `-Duser.language=tr` against one doc titled `IBM memo` and two
+   facts naming `IBM`:
+
+   - the query and an entity name are folded by *different* functions —
+     `str/lower-case` for `q`, `ent/normalize`'s `Locale/ROOT` for the name — so
+     `IBM` typed into the box became `ıbm` and matched the subject `ibm` never;
+   - `hit?` folds the HAYSTACK, so an already-lower-case `ibm` matched the doc
+     titled `IBM memo` never, because that title folded to `ıbm memo`.
+
+   Typing `IBM` returned the doc alone, losing the subject and the memory facts;
+   typing `ibm` returned the subject and the facts, losing the doc. Neither
+   query returned the page. Folding `q` alone with `Locale/ROOT` fixes the first
+   and leaves the second, which is why this is a function used at every site
+   rather than a one-line change at the top of `leap-payload`.
+
+   `ent/normalize` already made this argument for entity identity: `$LANG` is not
+   something a name's identity may depend on. LEAP is the same claim about
+   finding it."
+  ^String [s]
+  (.toLowerCase (str s) Locale/ROOT))
+
 (defn leap-payload
   "ONE incremental search across everything: objects, notebook prose, doc
-   bodies, memory facts, view verbs. Content groups only appear once there's
-   a query; each group is capped so it stays incremental-fast.
+   bodies, subjects, memory facts, view verbs. Content groups only appear once
+   there's a query; each group is capped so it stays incremental-fast.
 
    The three-argument form is the keystroke path and is lexical, exactly as it
    has always been. `{:deep? true :chunks cs}` adds the `by meaning` group on top
@@ -327,9 +609,13 @@
    anything."
   ([st mem q] (leap-payload st mem q nil))
   ([st mem q {:keys [deep? chunks]}]
-    (let [q    (str/lower-case (or q ""))
-          hit? (fn [& ss] (str/includes? (str/lower-case (str/join " " (map str ss))) q))
-          snip (fn [text] (let [i (or (str/index-of (str/lower-case text) q) 0)]
+    ;; `lower-root` at all three sites and `str/lower-case` at none — see its
+    ;; docstring. `q` and every haystack it is compared against must be folded by
+    ;; the SAME locale-independent function, or the two halves of one comparison
+    ;; disagree and a query finds some of its own page.
+    (let [q    (lower-root (or q ""))
+          hit? (fn [& ss] (str/includes? (lower-root (str/join " " (map str ss))) q))
+          snip (fn [text] (let [i (or (str/index-of (lower-root text) q) 0)]
                             (ell (subs text (max 0 (- i 20))) 70)))
           touched (last-touched st)
           ;; recency BEFORE the cap: taking "the first 8 encountered" dropped
@@ -337,8 +623,68 @@
           recent  (fn [e] (or (:touched e) 0))
           cap  (fn [xs] (->> xs (map #(assoc % :touched (touched (:id %) 0)))
                              (sort-by recent >) (take group-cap) vec))
-          objs  (->> (sub/objects st) vals
-                     (remove #(#{:viewspec :applet :fn :palette} (:kind %)))
+          ;; ONE materialization, shared by the object scan, `intext`, `made`
+          ;; and the subject group. Three reads of the store became one, and they
+          ;; were not merely wasteful: they were three *snapshots*. A doc
+          ;; committed between them whose TITLE matches `q` was offered by no
+          ;; group at all — `objs` read the older map and did not have it,
+          ;; `intext` read the newer one and excluded it precisely because its
+          ;; title hits. One map means one answer about what exists.
+          ;;
+          ;; A lexical payload is therefore two reads and not one: `nb/notebooks`
+          ;; inside `prose` still takes its own, so a NOTEBOOK committed
+          ;; mid-request can still be seen by one group and not another. Narrowed
+          ;; here and not closed, and said out loud rather than left to be
+          ;; rediscovered — closing it means threading `objm` through
+          ;; `nb/notebooks`, which is a change to `loci.notebook`'s interface and
+          ;; not to this payload.
+          ;;
+          ;; `materialized-names` and `entity-object` each rebuild the whole
+          ;; objects map, so the plain reading of the subject group —
+          ;; `entity-object` per promoted name — is N+1 of them **on every
+          ;; keystroke**, and N is every name the query matched, not the eight
+          ;; that survive `cap`: the row is built before the cap sees it.
+          ;; Measured on an EDN store (`objects` re-folds the whole log there),
+          ;; the group alone, naive against shared:
+          ;;
+          ;;   36 names,  42 objects     1.35 ms  →  0.27 ms
+          ;;   36 names, 900 objects    16.22 ms  →  0.80 ms
+          ;;  360 names, 900 objects   121.98 ms  →  1.66 ms
+          ;;
+          ;; Datalevin — production — makes `objects` an in-RAM map lookup and
+          ;; so removes the fold, but not the shape: `entity-objects` still
+          ;; walks every object to build its index, and N of those is still
+          ;; 0.36 ms × N at 900 objects. One map, once, is the fix in both.
+          objm  (sub/objects st)
+          objs  (->> objm vals
+                     ;; `:entity` is dropped HERE and deliberately not from
+                     ;; `state-payload`, and the asymmetry is a decision rather
+                     ;; than an oversight. The two lists answer different
+                     ;; questions. `state-payload` is *what exists*: it feeds
+                     ;; `STATE.objects`, out of which the shell draws every
+                     ;; notebook member — and a materialized entity is a member
+                     ;; of the very notebook `materialize-entity!` mints for it,
+                     ;; so dropping it there would draw that notebook's one cell
+                     ;; as a grey `ent:1 · ?`. LEAP is *what to offer you as a
+                     ;; destination*, and there the subject group's row already
+                     ;; is that destination: emitting this one too would put one
+                     ;; subject under two headings, which is the collision the
+                     ;; design split the groups to avoid.
+                     ;;
+                     ;; The exclusion is unconditional and the subject group is
+                     ;; `(seq q)`-guarded, so for the EMPTY query — and only
+                     ;; that one — a materialized entity is offered by no group
+                     ;; at all. That is the cost, stated rather than discovered:
+                     ;; "the subject row is already that destination" is true of
+                     ;; every query except the one that has no subject rows.
+                     ;; Left as is because nothing becomes unreachable — the
+                     ;; notebook `materialize-entity!` mints is listed, and it
+                     ;; holds the entity as its one cell — and because gating
+                     ;; this on `(seq q)` would put `ent:` rows back into an
+                     ;; opened palette under a heading no renderer has, which is
+                     ;; the state Task 6 removed. Revisit with the shell, not
+                     ;; here.
+                     (remove #(#{:entity :viewspec :applet :fn :palette} (:kind %)))
                      (filter #(or (= q "") (hit? (:title %) (:id %) (name (:kind %)))))
                      (map (fn [o] {:id (:id o) :label (:title o) :group (name (:kind o))})))
           verbs (->> @mold/registry
@@ -349,12 +695,12 @@
                         :when (and (:text c) (hit? (:text c)))]
                     {:id (:id o) :label (str (:title o) " · " (snip (:text c))) :group "prose"}))
           intext (when (seq q)
-                   (for [o (vals (sub/objects st))
+                   (for [o (vals objm)
                          :when (and (= :doc (:kind o)) (string? (:value o))
                                     (hit? (:value o)) (not (hit? (:title o) (:id o))))]
                      {:id (:id o) :label (str (:title o) " · …" (snip (:value o))) :group "in text"}))
           made  (when (seq q)
-                  (for [o (vals (sub/objects st))
+                  (for [o (vals objm)
                         :when (and (#{:applet :viewspec :fn} (:kind o))
                                    (hit? (:title o) (:id o) (get-in o [:value :label])))]
                     {:id (:id o)
@@ -362,10 +708,87 @@
                                  " · on " (or (get-in o [:value :target]) (get-in o [:value :source]) "?"))
                      :group "views & functions"
                      :target (or (get-in o [:value :target]) (get-in o [:value :source]))}))
+          ;; The subject group — promoted entities only. A name with one fact
+          ;; behind it is still matched by `ent/detect` for recall, but it is not
+          ;; yet a place, and 68 of 104 names on the measured corpus have exactly
+          ;; one fact: a group made of every extracted string would be
+          ;; two-thirds noise on the one surface that must stay scannable.
+          ;;
+          ;; **Its own group, not merged into the objects.** Entity names collide
+          ;; with object titles by construction — `materialize-entity!` titles the
+          ;; notebook it mints with the entity's own name — and a subject and a
+          ;; document that read the same are two different places to go. Two rows
+          ;; under two headings is the answer; one row that guesses which you
+          ;; meant is not, and suppressing either would hide a destination.
+          ;;
+          ;; `:object` rides on the row when the entity is materialized, so the
+          ;; shell has ONE thing to decide on rather than two. The KEY is absent
+          ;; when it is not — `{:object nil}` reads as an answer where no key
+          ;; reads as "not yet", and JSON gives the shell no third state.
+          ;;
+          ;; `mem` is this function's memory ARGUMENT and `mem/` is the
+          ;; `loci.memory` alias. Both are correct and both appear on the next
+          ;; line: a qualified symbol resolves through the ns aliases and is
+          ;; never shadowed by a local.
+          ;;
+          ;; The id is `subject:<name>` and never the object's, even when there
+          ;; is one. It is what the row IS, not where it takes you: `cap` looks
+          ;; recency up by `:id`, and handing it `ent:1` would let a materialized
+          ;; subject outrank the rest of the group by an event that touched the
+          ;; object rather than by anything about the subject. Nothing ever
+          ;; touches a `subject:` id, so every row here scores 0, `sort-by` is
+          ;; stable, and the alphabetical order survives the cap.
+          ;;
+          ;; **Cost, because this runs on every keystroke.** `ent/index` walks
+          ;; every live fact, and it is the second such walk in this function —
+          ;; `recall` builds its own `ent/df-map` a few lines down. Measured
+          ;; (mean of 200, EDN store, throwaway memory; two runs, so the totals
+          ;; are given to the precision they reproduce at and not to five
+          ;; digits):
+          ;;
+          ;;    80 facts / 104 names    group 0.18 ms   leap-payload ~1.1 ms
+          ;;   800 facts / 1040 names   group 1.5 ms    leap-payload ~7.5 ms
+          ;;
+          ;; Fine at both, and not fine forever: at 800 facts the whole payload
+          ;; is ~7.5 ms of which `recall` is ~5, so the ceiling this approaches is
+          ;; the memory layer's and not this group's. Sharing one index between
+          ;; the two would mean handing `loci.memory` a pre-built projection
+          ;; instead of a fact sequence — the same trade `entity-payload` and
+          ;; `remembered-context` both declined. Revisit when a keystroke costs
+          ;; ~16 ms, which is a frame; at today's growth that is a few thousand
+          ;; facts away, and the fix is one index passed down, not a cache.
+          subs (when (seq q)
+                 (let [idx   (ent/index (mem/all-facts mem))
+                       ments (entity-objects objm)]
+                   (->> (ent/promoted idx (keys ments))
+                        ;; Like against like on both axes. `q` was folded by
+                        ;; `lower-root` and every name by `ent/normalize`, and
+                        ;; those are the same `Locale/ROOT` fold — which they
+                        ;; were NOT before this group existed. `q` used
+                        ;; `str/lower-case`, so under a Turkish locale a typed
+                        ;; `IBM` arrived here as `ıbm` and matched the subject
+                        ;; `ibm` never. That was not a gap peculiar to this
+                        ;; group: `hit?` folded its haystacks the same way and
+                        ;; lost the doc titled `IBM memo` for the opposite
+                        ;; query, and `mold/recall` was handed the mangled `q`
+                        ;; and lost the facts. See `lower-root`.
+                        ;;
+                        ;; It does NOT trim — no group here does, and the shell
+                        ;; trims before it asks.
+                        (filter #(str/includes? % q))
+                        sort
+                        (map (fn [n]
+                               (let [o (get ments n)]
+                                 (cond-> {:id (str "subject:" n) :label n
+                                          :group "subject" :name n
+                                          :count (count (get idx n #{}))}
+                                   o (assoc :object (:id o)))))))))
           mems (when (seq q)
                  (map (fn [f] {:id "__memory__" :label (:fact f) :group "memory"})
                       (mold/recall mem q {:k 8})))
-          lex  (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap mems)))
+          ;; subjects before memory: a subject is a place you go to and a memory
+          ;; hit is text you read, and the one that is a destination goes first.
+          lex  (vec (concat (cap objs) (cap prose) (cap intext) (cap made) (cap subs) (cap mems)))
           ;; An empty query embeds nothing even with ?deep=1: there is no meaning
           ;; in "" to search by, and asking would be a request per opened palette.
           deep (when (and deep? chunks (seq q))
@@ -388,7 +811,7 @@
                                 :also-in (get also-in (:ref c))
                                 :from (:from (sub/object st (:ref c)))
                                 :via  (:via (sub/object st (:ref c)))}
-                               (mold-payload st (:ref c) (:view c)))
+                               (mold-payload st mem/memory (:ref c) (:view c)))
                         :else {:i i :type "missing" :ref (:ref c)}))
                     (nb/cells-of o)))]
     {:id id :title (:title o) :intent (get-in o [:value :intent])
@@ -608,11 +1031,19 @@
       {:state (state-payload st) :notebook (notebook-payload st space)})))
 
 ;; ---- writes (every one a substrate event) ----
+;;
+;; Forward-declared because the minting below starts ~500 lines before these are
+;; defined, down beside the entity work `next-id-in` was split out for. Both are
+;; 1 + the highest existing suffix. Every unguarded count-based minter in this
+;; file now goes through one of them; `import-csv!` is the one holdout, and it
+;; still carries the `(rand-int 9999)` suffix the forensics addendum argues about.
+(declare next-id next-id-in)
+
 (defn edit! [st id value]
   (if-not (and id (sub/object st id))
     {:error (str "no such object: " id)}
     (do (sub/commit! st {:op :assoc :id id :path [:value] :value value})
-        {:state (state-payload st) :object (mold-payload st id nil)})))
+        {:state (state-payload st) :object (mold-payload st mem/memory id nil)})))
 
 ;; (1) molding-by-description — the agent emits a view-spec stored as a
 ;; reversible object; it then appears in the object's "view this as…" menu.
@@ -622,12 +1053,16 @@
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "describe works on tables"}
         (let [spec (agent/describe-view (mapv name (keys (first rows))) (take 2 rows) prompt)
-              n (count (filter #(= :viewspec (:kind %)) (vals (sub/objects st))))
-              vid (str "view:" (subs id (inc (str/index-of id ":"))) "-" (inc n))
+              ;; max+1 over this source's own run, not `(inc (count :viewspec))`
+              ;; over the store — the count form is what overwrote three notebooks
+              ;; in July, and `:put` would replace an occupied `view:` in the same
+              ;; silence. `next-id` rather than `next-id-in` because the id must be
+              ;; minted AFTER `describe-view`'s network call, not before it.
+              vid (next-id st (str "view:" (subs id (inc (str/index-of id ":"))) "-"))
               vobj {:id vid :kind :viewspec :title (str "view: " (:label spec))
                     :value {:target id :label (or (:label spec) prompt) :spec spec}}]
           (sub/commit! st {:op :put :id vid :value vobj})
-          (assoc (mold-payload st id vid) :events (count (sub/history st))))))
+          (assoc (mold-payload st mem/memory id vid) :events (count (sub/history st))))))
     (catch Exception e {:error (.getMessage e)})))
 
 ;; (1b) molding-by-CODE — the agent writes a self-contained JS applet that runs
@@ -641,14 +1076,14 @@
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "code views work on tables"}
         (let [code (agent/make-applet (mapv name (keys (first rows))) (take 3 rows) prompt)
-              n (count (filter #(= :applet (:kind %)) (vals (sub/objects st))))
               p (str/trim prompt)
-              vid (str "app:" (subs id (inc (str/index-of id ":"))) "-" (inc n))
+              ;; max+1 per source, for `describe!`'s reason directly above
+              vid (next-id st (str "app:" (subs id (inc (str/index-of id ":"))) "-"))
               vobj {:id vid :kind :applet :title (str "app: " p)
                     :value {:target id :code code
                             :label (str "▶ " (if (> (count p) 26) (str (subs p 0 26) "…") p))}}]
           (sub/commit! st {:op :put :id vid :value vobj})
-          (assoc (mold-payload st id vid) :events (count (sub/history st))))))
+          (assoc (mold-payload st mem/memory id vid) :events (count (sub/history st))))))
     (catch Exception e {:error (.getMessage e)})))
 
 ;; (1d) function-as-substrate-object, BACKEND flavour — the agent writes a pure
@@ -694,11 +1129,23 @@
               out  (:rows r)]
           (if (:error r)
             {:error (str "compute failed: " (:error r))}
-            (let [nf (count (filter #(= :fn (:kind %)) (vals (sub/objects st))))
-                  nt (count (filter #(= :table (:kind %)) (vals (sub/objects st))))
-                  p  (str/trim prompt)
-                  fid (str "fn:" (subs id (inc (str/index-of id ":"))) "-" (inc nf))
-                  nid (str "tbl:derived-" (inc nt))
+            ;; max+1, not count+1. Counting is how three notebooks died on
+            ;; 2026-07-23: `space:dd-` was minted `(inc (count …))` over a store
+            ;; that had booted 49 of 80 events, so it re-minted 16/17/18 onto
+            ;; live notebooks and `:put` — `assoc-in`, no occupancy check —
+            ;; replaced them in silence. These two had neither the
+            ;; `(rand-int 9999)` suffix that saved `tbl:extract-14-677` nor an
+            ;; existence check, and `fn-apply!` below already minted
+            ;; `tbl:derived-` through `next-id`: one prefix, two rules. A count
+            ;; also falls with nothing wrong at all — remove a derived table and
+            ;; the next compute re-mints the id of one still sitting there.
+            ;; `next-id-in` over ONE `sub/objects` rather than `next-id` twice:
+            ;; each call re-folds the whole log on the EDN stores (2.334 ms vs
+            ;; 1.135 ms at 3003 events), and both ids come from one snapshot.
+            (let [objm (sub/objects st)
+                  p    (str/trim prompt)
+                  fid  (next-id-in objm (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
+                  nid  (next-id-in objm "tbl:derived-")
                   ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
                   fobj {:id fid :kind :fn :title (str "fn: " p)
                         :value {:source id :prompt p :lang "clojure" :code code}}
@@ -708,7 +1155,7 @@
                         (and space (space? st space))
                         (conj (nb/append-cell-event st space {:ref nid})))]
               (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid :object (mold-payload st nid nil)})))))
+              {:state (state-payload st) :openId nid :object (mold-payload st mem/memory nid nil)})))))
     (catch Exception e {:error (str "compute failed: " (.getMessage e))})))
 
 ;; the functions living in the substrate, with their code — an inspector for the
@@ -728,8 +1175,6 @@
 
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
-(declare next-id)
-
 (defn- table-rows [st id]
   (let [rows (:value (sub/object st id))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
@@ -882,8 +1327,20 @@
           title (or (not-empty (:title spec)) prompt)
           intent (or (not-empty (:intent spec)) prompt)
           members (vec (filter ids (or (:members spec) [])))
-          n (count (filter #(= :space (:kind %)) (vals (sub/objects st))))
-          sid (str "space:new-" (inc n))]
+          ;; max+1 over `space:new-`, and this one is not merely the SHAPE that
+          ;; destroyed `space:dd-16/17/18` on 2026-07-23 — it is the same form,
+          ;; `(inc (count …))` over `:space`, minting a notebook id. `fresh-dd-id`
+          ;; does not reach it: that matches `^space:dd-(\d+)$` and this prefix is
+          ;; `space:new-`. `:put` is `assoc-in` with no occupancy check, so a count
+          ;; that has fallen — a delete, or an event the store cannot see — replaces
+          ;; a LIVE notebook's title, intent, cells and lineage and reports success.
+          ;; A view or an applet can be re-made from its target; a notebook cannot.
+          ;;
+          ;; Read at mint time, not from the `objects` fold above: `plan-space` is a
+          ;; network call, and taking the id before it would age the snapshot by
+          ;; however long the model takes. That is why this is `next-id` and not
+          ;; `next-id-in` over a map already in hand.
+          sid (next-id st "space:new-")]
       (sub/commit! st {:op :put :id sid
                        :value {:id sid :kind :space :title title
                                :value {:intent intent :members members}}})
@@ -1085,6 +1542,82 @@
   [st space]
   (into (descendant-sources st space) (ancestor-sources st space)))
 
+(defn subject-set
+  "The subjects a recall is about: **the names `prompt` names, and nothing
+   else.** Used for both jobs `recall` separates —
+   `:filter {:entities}`, which decides what may be a candidate, and
+   `:subjects`, which decides what raises one. One value, because after
+   2026-08-09 there is no longer anything for the two to disagree about.
+
+   **This deliberately departs from design §5**, which defines the subject set
+   as \"entities detected in the prompt ∪ entities of facts already in this
+   lineage\". The second half is gone. Do not restore it — it was built, shipped,
+   measured on the real corpus, and it made things worse; the record is
+   `docs/superpowers/specs/2026-08-08-entities-recall-measured.md`.
+
+   What the measurement found, over 12 prompts a person would actually type:
+   **7 got worse, and all 7 were prompts typed into a notebook that has a
+   lineage.** `space:semis`, asked \"What are the chokepoints in the
+   semiconductor supply chain?\", came back with six facts about Jupiter, Saturn
+   and Mercury, replacing all six on-subject ones. The EUV notebook lost every
+   EUV fact; the EDA notebook displaced the US EDA export ban itself.
+
+   The cause was the lineage half, in both of the shapes it was tried:
+
+   - **Unrestricted**, every name the lineage carries scores, so every local
+     fact's entity half saturates at 1.0 and they all tie at 0.4000 — the union
+     never out-scores anything, it ties and loses the tie-break to recency.
+   - **Restricted** to names something outside the lineage also carries — the
+     fix for that tie — it deletes precisely the names the notebook is *about*.
+     `tsmc`, `taiwan`, `asml`, `synopsys` live in the semis family and nowhere
+     else, which is what it MEANS for a research hub to have a subject, so all
+     four were stripped and `:score` for a semiconductor question came out as
+     `(\"earth\" \"japan\" \"jupiter\" \"mars\" \"mercury\" \"neptune\" \"saturn\"
+     \"sun\" \"terrestrial planets\" \"venus\")`. This is structural, not a bad
+     corpus: **the larger a notebook's lineage, the fewer of its own subjects
+     survive**, and `space:semis` holds 56 of 80 facts.
+
+   Driving the union from the prompt alone was probed against the same corpus
+   before it was adopted — baseline ids retained in the top 6, shipped-then
+   versus this:
+
+     P1 chokepoints   0/6 → 6/6      P5 blockade cost  1/6 → 3/6 (still worse)
+     P2 EUV           1/6 → 6/6      P6 capacity       4/6 → 6/6
+     P3 TSMC/Taiwan   3/6 → 6/6      P7 AI customers   3/6 → 5/6
+     P4 EDA controls  0/6 → 5/6      P10/P11/P12       all three wins kept
+
+   One prompt degrades instead of seven, and the case the feature exists for —
+   a brand-new notebook, where the agent used to be told nothing at all — is
+   untouched.
+
+   **The cost, named and accepted: a deep dive no longer inherits its parent's
+   SUBJECTS.** Ask a child notebook a question that names nothing, and no fact
+   is pulled in from outside its lineage on the strength of what the family
+   happens to be about. It still inherits its parent's **facts**, through
+   `:filter {:sources}` and `lineage-sources`, exactly as it always has — that
+   is a different mechanism and this change does not touch it.
+
+   A consequence worth knowing: **when the prompt names no name the corpus
+   knows, this returns `#{}` and the whole feature is inert** — `:subjects` is
+   empty so `qs` is just the query tokens, `:filter {:entities}` is empty so it
+   admits nothing, and recall is character for character what it was before any
+   of this existed. The feature costs nothing when it has nothing to say.
+
+   Names come back normalized and non-blank; `ent/detect` guarantees both.
+
+   Public so a test can call it without going through an LLM."
+  [m prompt]
+  ;; The name set is built here rather than with `(keys (ent/index …))`. The two
+  ;; are the same set by construction — `index` normalizes each `:entities` entry
+  ;; and drops the blanks, character for character what this does — but `index`
+  ;; also accumulates a set of fact ids under every name, and this would then
+  ;; throw all of them away. Measured at 800 facts: 0.700 ms → 0.333 ms.
+  (ent/detect (into #{} (comp (mapcat :entities)
+                              (map ent/normalize)
+                              (remove str/blank?))
+                    (mem/all-facts m))
+              prompt))
+
 ;; ---- the recall seam, used by every agent flow ----
 ;; remembered-context injects what the agent already learned (cited);
 ;; distill! writes new memory AFTER a flow — async, best-effort, never undone.
@@ -1111,16 +1644,46 @@
    A notebook with nothing in scope yet gets nil — no REMEMBERED block at all.
    That is what a brand-new notebook looks like, and it is a normal state.
 
-   The cost of the scope, decided 2026-08-08 and not overstated: notebooks that
-   share a SUBJECT but not a LINEAGE go blind to each other. On the live corpus
-   `space:semis` and its six deep-dive children are one lineage holding 56 of
-   80 facts, but `Serbia — open economic data` and `World economies — output
-   and prices` are separate roots, so neither will offer the other anything.
-   Lineage is what the substrate computes; subject is what tags record."
+   **The scope is no longer lineage alone.** This paragraph REPLACES the one
+   dated 2026-08-08 that accepted a cost — \"notebooks that share a SUBJECT but
+   not a LINEAGE go blind to each other\", with `Serbia — open economic data`
+   and `World economies — output and prices` named as two roots that would never
+   offer each other anything. That cost is what this fixes, and the old
+   paragraph is gone rather than kept beside this one, so nothing here reads as
+   still live when it is not. Candidates are now the lineage's facts UNION the
+   facts carrying a name the PROMPT named, and that one set does both jobs
+   `recall` keeps separate: `:filter {:entities}` makes an unrelated root's fact
+   eligible, `:subjects` makes it rank. Naming a subject in only one of the two
+   is the quiet failure `recall`'s own opts comment describes.
+
+   **What widens the scope is the question, never the notebook's habits.** An
+   earlier shape of this also unioned in every name the lineage already carried
+   — design §5's second half — and it was measured on the real corpus and
+   removed on 2026-08-09: it degraded 7 of 12 real prompts, every one of them a
+   prompt typed into a notebook that has a lineage. `subject-set`'s docstring
+   carries the numbers and the accepted cost. Two consequences to keep in view
+   here:
+
+   - `k` stays 6 and the ranking is unchanged, so the block does not grow, it
+     competes — a fact from another root has to out-score the local facts on
+     the question actually asked.
+   - When the prompt names nothing the corpus knows, `subs` is empty and this
+     is inert: no name is added to the scope, no name is added to the scoring,
+     and the block is exactly what it was before entities existed.
+
+   Cost: one extra pass over the whole memory per agent turn (`all-facts` and a
+   name set built from it), which `recall` then walks again for itself.
+   Measured, mean of 300, on a synthetic corpus of the live shape: **0.23 ms at
+   80 facts** — the live size — 1.37 ms at 500 and 6.8 ms at 3000, so linear and
+   about a seventh of the `recall` it feeds (1.7 / 7.0 / 41.6 ms at those
+   sizes), all of it in front of an LLM call that takes seconds. Sharing one
+   pass would mean handing `loci.memory` a pre-built projection instead of a
+   fact sequence, and that is a seam worth 0.23 ms not to open."
   [st prompt space]
-  (let [opts (cond-> {:k 6 :semantic? true}
-               (and space (sub/object st space))
-               (assoc :filter {:sources (lineage-sources st space)}))
+  (let [sources (when (and space (sub/object st space)) (lineage-sources st space))
+        subs    (subject-set @mem/memory prompt)
+        opts    (cond-> {:k 6 :semantic? true :subjects subs}
+                  sources (assoc :filter {:sources sources :entities subs}))
         facts (try (mold/recall @mem/memory prompt opts)
                    (catch Exception _ nil))]
     (when (seq facts)
@@ -1132,9 +1695,30 @@
 (defn- distill! [prompt text obj-id space]
   (future
     (try
-      (doseq [{:keys [fact entities]} (agent/distill-facts prompt text)]
-        (mold/remember @mem/memory fact {:entities (mapv str entities)
-                                         :source {:obj obj-id :space space}}))
+      (doseq [{:keys [fact entities] :as f} (agent/distill-facts prompt text)]
+        (mold/remember @mem/memory fact
+                       ;; A judgement passes ONLY if it is one — `boolean?`, on
+                       ;; the whole map, and never a `{:keys [durable]}`
+                       ;; destructure. `remember` keys on `contains?`, so
+                       ;; `:durable? nil` reads as an answer rather than as
+                       ;; silence, and every unjudged fact would land stamped
+                       ;; `:durable-by "agent"`: judged by nobody, and past the
+                       ;; guard that lets a later agent pass revise its own calls.
+                       ;;
+                       ;; `boolean?` and not `contains?` because a MALFORMED answer
+                       ;; is worse than a missing one, and in the same direction:
+                       ;; a model answering the string "false" would be truthy, so
+                       ;; `weight` would skip decay on the fact it just declined to
+                       ;; call timeless — a wrong judgement, stamped, that only a
+                       ;; hand toggle can undo. Anything that is not true or false
+                       ;; is treated as not having answered, which is the state the
+                       ;; whole corpus is in and costs nothing to be in.
+                       ;;
+                       ;; Renamed on the way through: the model is asked for
+                       ;; "durable", the record keys on :durable?.
+                       (cond-> {:entities (mapv str entities)
+                                :source {:obj obj-id :space space}}
+                         (boolean? (:durable f)) (assoc :durable? (:durable f)))))
       (catch Exception _))))
 
 (defn suggest-tags!
@@ -1202,17 +1786,211 @@
       {:state (state-payload st) :openId nid})
     (catch Exception e {:error (.getMessage e)})))
 
-(defn- next-id
-  "Mint '<prefix>N' with N = 1 + the highest existing numeric suffix across the
-   WHOLE store. Counting a notebook's refs collides after a cell remove — a
-   removed ref lowers the count while the object lives on."
-  [st prefix]
-  (let [n (->> (keys (sub/objects st))
+(defn- next-id-in
+  "`next-id` over an objects map already in hand.
+
+   Split out for the caller that mints TWO ids before one commit
+   (`materialize-entity!`). On the EDN stores `sub/objects` re-folds the whole
+   event log, so minting twice from the store folds it twice — measured at 3003
+   events: `sub/objects` alone 0.717 ms, one `next-id` 1.135 ms, two 2.334 ms.
+   That work sat inside a monitor, which is the one place where halving it is
+   worth a three-line split."
+  [objm prefix]
+  (let [n (->> (keys objm)
                (keep #(when (str/starts-with? % prefix)
                         (try (Long/parseLong (subs % (count prefix)))
                              (catch Exception _ nil))))
                (reduce max 0))]
     (str prefix (inc n))))
+
+(defn next-id
+  "Mint '<prefix>N' with N = 1 + the highest existing numeric suffix across the
+   WHOLE store. Counting a notebook's refs collides after a cell remove — a
+   removed ref lowers the count while the object lives on.
+
+   Public for `loci.repair`, which mints a restored findings document and must
+   mint it by exactly this rule. A repair carrying its own copy of the rule is
+   how one prefix comes to have two counters, neither of which can see all the
+   ids under it — the failure § 7 of the 2026-08-09 forensics is about."
+  [st prefix]
+  (next-id-in (sub/objects st) prefix))
+
+(defn findings-prefix
+  "The `find:` prefix a notebook's findings documents are minted under:
+   `space:dd-35` → `find:dd-35-`.
+
+   A function rather than the expression inlined at its one call site, because
+   there are now two call sites — `research!` and `loci.repair`, which restores
+   a findings document that `research!` originally wrote. Two copies of this
+   would let a repaired document be named by a rule the server no longer uses."
+  [space]
+  (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
+
+;; ---- materializing an entity: the one action on the entity page ----
+;;
+;; ONE global monitor, which is the opposite of `notebook-locks` above and
+;; deliberately so. What is serialised here is not one entity's cell vector but
+;; `next-id`, a read of the WHOLE store's keys: a per-name lock would let two
+;; different names mint the same `ent:1` and the second `:put` would silently
+;; replace the first. Measured before this lock, over ten rounds: 8 concurrent
+;; materializations of 8 different names left **1 to 3** entity objects, and 32
+;; left 8 to 11 — 8 commits every time, each one overwriting the last, so the
+;; log says the work happened and the world says it did not. The second half of
+;; that measurement is the one to keep in mind: the notebook ids collide too, so
+;; several callers were handed the SAME notebook and a user asking about one
+;; subject is walked into another's. With the lock: 8 of 8 over ten rounds, 32
+;; of 32 over five.
+;;
+;; It also makes "materializing twice mints nothing" true rather than nearly
+;; true. Check-then-commit is a read-modify-write, and two clicks on one name
+;; are a plain TOCTOU race without it — measured, 4 to 7 phantom commits and
+;; **two objects for one name**, which is exactly what `entity-objects` calls a
+;; coin toss. With the lock, one object and one commit every round.
+;;
+;; Both figures are from the EDN store, where `commit!` is one `swap!`;
+;; Datalevin's takes a lock and writes to LMDB, which only widens the window.
+;;
+;; Contention is one click on a modal against another click on a modal, so there
+;; is nothing to gain by being clever here and a whole class of loss by being
+;; wrong. `locking` is a monitor and not a distributed lock — loci is a single
+;; process, which is the whole scope of the problem; a second server against the
+;; same store would still race, exactly as `notebook-op!` records.
+(defonce ^:private materialize-lock (Object.))
+
+(defn- about-notebook
+  "The id of the notebook that is about the entity `eid`, named `nm` — one whose
+   cells reference it — or nil, out of an objects map already in hand.
+
+   **A notebook titled for the entity wins; ties and the rest go to the
+   lexicographically least id; nil is a real answer.**
+
+   The two rules answer two different questions, and it is worth keeping them
+   apart:
+
+   *The title preference is about being right.* Several notebooks holding one
+   entity is not a race — it is the ordinary consequence of adding a subject to
+   somebody else's notebook, and one of the candidates is then plainly the
+   better answer: the one this materialization made, which `materialize-entity!`
+   titles with the name. Least id alone gets that wrong the moment the entity's
+   own notebook is not the oldest — materialize `asml`, then `tsmc`, then drop
+   `tsmc` into `asml`'s notebook, and `space:about-1` beats `space:about-2` for
+   an entity it merely holds. The comparison is on the title and NOT on the id,
+   for `entity-objects`' reason: a rule that preferred a `space:about-` prefix
+   would make this the second place that believes something about how notebook
+   ids are minted.
+
+   The title is a display string, so this is a *preference* and never an
+   identity — `entity-objects` still matches on `[:value :name]` alone. Rename
+   the notebook and you lose the preference, not the entity; the answer falls
+   back to least id, which is deterministic and no longer necessarily the one
+   you wanted.
+
+   *Least id is only about being the same answer twice.* `vals` of an objects
+   map is hash order, so with no tie-break at all two equally-titled candidates
+   would be answered arbitrarily and nothing in the log would explain which.
+   That is the same purpose as `entity-objects`' tie-break but not the same
+   situation: there, a duplicate is a race artefact and either answer is equally
+   wrong, so determinism is all there is to want. Here both candidates are
+   legitimate, which is exactly why determinism alone was not enough and the
+   preference above exists.
+
+   nil because an entity can genuinely have no notebook: the cell is an ordinary
+   cell and can be removed, the notebook is an ordinary object and can be
+   deleted, and `undo!` can pop the very commit that made both while an *older*
+   materialization of the same name survives. The caller ships the nil rather
+   than hiding the key, so a shell can open the entity object instead of trying
+   to enter nothing."
+  [objm eid nm]
+  (->> (vals objm)
+       (filter #(and (= :space (:kind %)) (contains? (nb/refs-of %) eid)))
+       (sort-by (juxt #(if (= nm (:title %)) 0 1) :id))
+       first
+       :id))
+
+(defn materialize-entity!
+  "POST /api/entity-notebook {\"name\": \"tsmc\"} — the entity becomes a citizen.
+
+   ONE `:tx`: the `:entity` object carrying the normalized name, the notebook
+   about it, and the cell that puts one in the other. `undo!` pops one commit, so
+   the gesture is reversed whole. Two `commit!`s would need two undos, and the
+   state between them — a notebook about an entity that no longer exists — is one
+   the shell has no way to draw and nobody asked for.
+
+   Read that precisely: `undo!` pops the LAST commit, not this one. The `:tx` is
+   what makes the gesture *atomic*; it does not make it *addressable*. Commit
+   anything at all in between and the next `undo!` takes that instead, leaving
+   the entity and its notebook standing. Measured, and true of every gesture in
+   loci that toasts with an undo — `new-space!`, `connect!`, `keep-note!` — so it
+   is the substrate's model of undo and not a shortcoming here. What the `:tx`
+   rules out is the halfway state, which is the part that was ours to prevent.
+
+   **No fact is touched, and no fact learns this object's id.** A fact references
+   the identity — the normalized name — so undoing this returns the entity to
+   being a projection with nothing left dangling. That is the whole reason the
+   model is derived, and it is the invariant to protect in review. Today the
+   argument list enforces it: this function is never handed the memory, so it
+   *cannot* rewrite a fact. Keep it that way; the day it takes a memory is the
+   day the invariant becomes a convention.
+
+   Materializing an already-materialized name is not an error and mints nothing:
+   it answers with the object that is already there. The page is reached by name,
+   and two objects for one name would make `entity-object` a coin toss. It does
+   NOT mint a fresh notebook when the old one is gone either — the gesture is
+   reached from a modal the shell only draws for an unmaterialized name (Task 8
+   opens the object directly when the payload carries one), so this branch is a
+   stale click or a race, and answering it by spawning a notebook per stale click
+   is a worse failure than answering `nil`.
+
+   The payload, which is the contract Task 8 draws against:
+
+     :entity   the object id. Always present — the entity is a citizen either way.
+     :spaceId  the notebook to enter, or **nil**. The key is always there; nil
+               means there is no notebook about this and the shell should open
+               `:entity` instead. See `about-notebook`.
+     :state    always, including on the branch that committed nothing. That
+               branch is reached precisely when the client's world is stale —
+               someone else materialized this name, or this client's own earlier
+               POST landed and the reply was lost — so \"nothing changed\" is
+               true of the store and false of the caller. The cost is one walk
+               over every object plus one fold over the whole log for recency,
+               measured beside `state-payload` itself at 2.2 ms on a 3003-event
+               log (cheaper on Datalevin, where the objects map is already
+               materialized and only the recency fold remains). Omitting it
+               would buy that back by making the shell branch on which of two
+               shapes it got — a worse trade for a gesture that happens on a
+               click.
+
+   `nm`, not `name`: a local called `name` shadows `clojure.core/name`, which
+   nothing here happens to need today and which the next edit to this function
+   would find missing for no visible reason. `entity-payload` renamed for the
+   same reason."
+  [st name*]
+  (let [nm (ent/normalize name*)]
+    (if (str/blank? nm)
+      {:error "no entity name given"}
+      ;; Nothing but the reads and the commit is inside the monitor — the payload
+      ;; is built after it, and no agent call and no further I/O may move in. The
+      ;; commit itself IS I/O on the production store: `DatalevinStore/commit!`
+      ;; takes its own lock and writes to LMDB before publishing, so this monitor
+      ;; holds across a disk write by construction. Nesting order is
+      ;; `materialize-lock` → dlv lock, the same direction `notebook-op!` nests,
+      ;; and dlv is innermost and never calls back into this namespace — so the
+      ;; two monitors cannot deadlock against each other.
+      (let [[eid sid]
+            (locking materialize-lock
+              (let [objm (sub/objects st)]
+                (if-let [o (get (entity-objects objm) nm)]
+                  [(:id o) (about-notebook objm (:id o) nm)]
+                  (let [eid  (next-id-in objm "ent:")
+                        sid  (next-id-in objm "space:about-")
+                        eobj {:id eid :kind :entity :title nm :value {:name nm}}
+                        sobj {:id sid :kind :space :title nm
+                              :value {:intent (str "everything about " nm)
+                                      :cells [{:ref eid}]}}]
+                    (sub/commit! st {:op :tx :events [{:op :put :id eid :value eobj}
+                                                      {:op :put :id sid :value sobj}]})
+                    [eid sid]))))]
+        {:state (state-payload st) :entity eid :spaceId sid}))))
 
 (defn keep-note! [st space title text]
   (let [sp  (sub/object st space)
@@ -1306,7 +2084,7 @@
                         (:saved_as (tools/save-table!
                                     st (str "Extracted — " (if (> (count p) 40) (str (subs p 0 40) "…") p))
                                     rows space))))
-              fid (next-id st (str "find:" (subs space (inc (str/index-of space ":"))) "-"))
+              fid (next-id st (findings-prefix space))
               title (str "Findings — " (if (> (count p) 44) (str (subs p 0 44) "…") p))]
           (sub/commit! st {:op :tx :events [{:op :put :id fid :value {:id fid :kind :doc :title title :value text}}
                                             (nb/append-cell-event st space {:ref fid})]})
@@ -1337,13 +2115,17 @@
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
     (catch Exception e {:error (.getMessage e)})))
 
-(defn- fresh-dd-id
+(defn fresh-dd-id
   "One past the highest space:dd-N, and never one that already exists. The old
    form derived the id from the TOTAL notebook count, which had nothing to do
    with the dd sequence; two notebooks in the store mint \"space:dd-3\", so the
    day anything deletes a notebook that :put would overwrite a live notebook in
    silence. The existence loop terminates: n only rises, and the store holds
-   finitely many objects."
+   finitely many objects.
+
+   Public for `loci.repair`, which restores the three notebooks the count form
+   destroyed and must mint their new ids by the rule that replaced it — see
+   `next-id` for why the repair does not carry its own copy."
   [st]
   (let [highest (->> (nb/notebooks st)
                      (keep #(some->> (:id %) (re-find #"^space:dd-(\d+)$") second parse-long))
@@ -1693,6 +2475,107 @@
           {:survivor (dissoc (:survivor r) :vec)
            :restored (dissoc (:restored r) :vec)})))))
 
+(defn- durable-refusal
+  "Why `id` cannot be judged, as a sentence a person can act on — or nil when it
+   can.
+
+   A sentence rather than a keyword, for `unmerge-refusal`'s reason: the only
+   caller is an endpoint whose only reader is a person, and \"no such fact\" and
+   \"that is a tombstone\" want two different next moves."
+  [facts id]
+  (let [f (get facts id)]
+    (cond
+      (nil? f)
+      (str "there is no fact " id " to judge")
+
+      ;; A merge appends a record carrying :merged-into rather than deleting a
+      ;; line, and every reader filters those out through `live`. Stamping one
+      ;; would write a judgement onto text nothing will ever rank, under an id
+      ;; whose live fact is somewhere else.
+      (:merged-into f)
+      (str id " is not a fact any more — it was absorbed into " (:merged-into f)
+           ", which is the fact that carries this text now. Judge that one.")
+
+      :else nil)))
+
+(defn memory-durable!
+  "POST /api/memory-durable — your judgement about whether a fact goes out of
+   date.
+
+   Request `{\"id\": \"mem-1\", \"durable\": true}`. Answers 200 with either the
+   updated record, or `{\"error\": \"…\"}` — the shape every other not-allowed
+   answer in this file uses, and `memory-unmerge!`'s exactly.
+
+   **The record itself, flat, and not a pane payload.** This request carries no
+   `q` and no `space`, and answering a scoped pane with the unscoped memory is
+   the one mistake a scope exists to prevent; the caller refetches `/api/memory`
+   with whatever it was already showing. Flat rather than under a key because
+   there is one record and a fact never carries `:error`, so the two shapes are
+   unambiguous — `memory-unmerge!` names its two because it has two to name. No
+   `:vec` on the way out, for the reason `memory-payload` drops them.
+
+   **It appends; it does not go through `mold/remember`.** `remember` would find
+   this fact as its own jaccard ≥ 0.6 duplicate, bump `:strength` and reset
+   `:ts` to now — and `:ts` is a multiplier in `weight`, so marking a fact *not*
+   durable would hand it a fresh 1.0 recency multiplier in the same breath as
+   recording that it ages. The 2026-08-09 repair documented this trap and
+   `loci.classify` walked past it a week ago; this is the third writer and the
+   same rule. `unmerge!` is the shape: take the atom and the file, swap, append
+   the record the swap landed on.
+
+   The write lives here rather than in `loci.memory` beside `unmerge!` because
+   there is no memory logic in it — one key and its provenance, where `unmerge!`
+   carries strength arithmetic, `:no-merge` and a four-way refusal. `loci.classify`
+   reaches for `{:keys [!facts file]}` from outside the namespace for the same
+   reason. The cost is real and is this: the set of things that write to the fact
+   log stops being enumerable from `loci.memory` alone — and where `loci.classify`
+   is a one-off that runs once and can be deleted, this one stays.
+
+   **`:durable-by \"you\"`, and that is the point of the endpoint.** `remember`
+   revises an agent's judgement and refuses to revise yours, so without the
+   stamp the next distiller pass over the same sentence silently reverts what
+   you did here — the failure `:no-merge` exists to prevent on the merge path,
+   reintroduced on a new one.
+
+   **`boolean?`, not merely present.** Ratified when the distiller and then
+   `loci.classify` met the same question: `weight` reads the VALUE, and the
+   string `\"false\"` is truthy in Clojure, so a hand-rolled POST carrying it
+   would mark a fact durable, stamp it as yours, and thereby make the
+   classification pass skip it forever. The pane always sends a boolean; this
+   guard is about everything that is not the pane.
+
+   Success is read off the record the swap produced rather than from
+   `identical?` on the two atom values: marking a fact durable when it already
+   is leaves the map unchanged (`assoc` returns the same map when the value is
+   already there), and an idempotent toggle is an ordinary success, not \"the
+   memory changed while this was being applied\"."
+  [m id durable]
+  (let [fid (str id)
+        {:keys [!facts file]} m]
+    (cond
+      (str/blank? fid) {:error "a judgement needs the id of the fact it is about"}
+
+      (not (boolean? durable))
+      {:error (str "durable must be true or false, not " (pr-str durable)
+                   " — a value that is neither is not a judgement, and this one would be "
+                   "recorded as yours and never revised by anything")}
+
+      :else
+      (or (when-let [why (durable-refusal @!facts fid)] {:error why})
+          (let [after (swap! !facts
+                             (fn [fs]
+                               ;; the same check again, inside the swap, on the
+                               ;; map the write will actually land on — a merge
+                               ;; may have absorbed this fact since the read above
+                               (if (durable-refusal fs fid)
+                                 fs
+                                 (update fs fid assoc :durable? durable :durable-by "you"))))]
+            (if-let [why (durable-refusal after fid)]
+              {:error why}
+              (let [rec (get after fid)]
+                (mem/append-line! file rec)
+                (dissoc rec :vec))))))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -1701,7 +2584,8 @@
       (= uri "/")            {:status 200 :headers {"Content-Type" "text/html; charset=utf-8"}
                               :body (slurp (io/resource "public/index.html"))}
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
-      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) (params "id") (params "view")))
+      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) mem/memory
+                                                     (params "id") (params "view")))
       (= uri "/api/events")  (json-resp (events-payload st))
       ;; `?deep=1` is the pause/Enter request, and the ONLY one that embeds. The
       ;; chunk singleton is forced here rather than in the params map so a
@@ -1743,14 +2627,34 @@
                                                {:error (str "not a notebook: " space)})))
       (= uri "/api/links")   (json-resp (nb/links (store-at st (params "at")) (params "space")))
       (= uri "/api/memory")  (json-resp (memory-request st @mem/memory (params "q") (params "space")))
+      ;; `store-at`, like every other read route — and `mold-payload`'s entity
+      ;; branch already reasons at length about why the source chips must be the
+      ;; objects that existed at `?at=`. This route simply did not honour it, and
+      ;; the asymmetry was reachable: the shell hands a payload's `:object`
+      ;; straight to `/api/object/…?at=`, so under `?at=` the live store answering
+      ;; "citizen" sent it to fetch an object the frozen store does not have.
+      ;; Measured in a browser — an empty molder showing the word `null`, and far
+      ;; enough back an uncaught TypeError and a blank world.
+      (= uri "/api/entity")  (json-resp (entity-payload (store-at st (params "at"))
+                                                        @mem/memory (params "name")))
+      ;; `{nm :name}` and not `{:keys [name]}`: a local called `name` shadows
+      ;; `clojure.core/name` for the rest of this branch, in a `cond` where the
+      ;; branch above it is one edit away from needing it.
+      (= uri "/api/entity-notebook")(let [{nm :name} (body-json req)]
+                                      (json-resp (materialize-entity! st nm)))
       (= uri "/api/memory-unmerge")(let [{:keys [survivor absorbed]} (body-json req)]
                                      (json-resp (memory-unmerge! @mem/memory survivor absorbed)))
+      ;; `durable` is passed through raw — not coerced, not defaulted. JSON's
+      ;; true/false arrive as booleans and anything else is refused downstream by
+      ;; name, which is the only way a caller ever learns it sent nonsense.
+      (= uri "/api/memory-durable")(let [{:keys [id durable]} (body-json req)]
+                                     (json-resp (memory-durable! @mem/memory id durable)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
                                   (json-resp (suggest-run-start! st space items destination)))
       (str/starts-with? uri "/api/object/")
-      (json-resp (mold-payload (store-at st (params "at"))
+      (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
       :else {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})))
 

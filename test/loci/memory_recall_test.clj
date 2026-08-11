@@ -298,6 +298,182 @@
                                                     :filter {:sources #{"space:sky"}}}))
                 "scoped elsewhere, it does not — the filter is applied before either retriever")))))))
 
+;; ---- subject: the union, and what a name is worth ----
+
+(def ^:private mendev  "Areelu Vorlesh masterminds a crusade against Mendev.")
+(def ^:private euv     "EUV scanners ship from Veldhoven to Hsinchu and to Chandler.")
+(def ^:private rapidus "Rapidus targets two-nanometre production by 2027.")
+
+(defn- ubiquity-memory
+  "Seven facts shaped like the measured corpus: two that name `asml` (2 live
+   facts) and six that name `taiwan` and `united states` (6 each).
+
+   `euv` and `rapidus` both match the query token `asml` on the entity half and
+   NEITHER of them contains the word — so the keyword half is 0 for both and the
+   only thing that can order them is what their *other* entities are worth.
+   `euv`'s other two names are everywhere in this corpus; `rapidus`'s other name
+   is nowhere else. That is the whole experiment.
+
+   The five fillers score 0 and never appear: no shared word, no shared name."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m euv {:entities ["asml" "taiwan" "united states"]
+                          :source   {:obj "find:euv-1" :space "space:euv"}})
+    (mold/remember m rapidus {:entities ["asml" "rapidus"]
+                              :source   {:obj "find:rap-1" :space "space:rapidus"}})
+    (doseq [t ["Export controls tightened again in October."
+               "A defence pact was signed last spring."
+               "Tourism recovered to pre-pandemic levels."
+               "Undersea cables were repaired within a week."
+               "Currency reserves grew by nine percent."]]
+      (mold/remember m t {:entities ["taiwan" "united states"]
+                          :source   {:space "space:filler"}}))
+    m))
+
+(deftest a-fact-that-shares-a-subject-is-reachable-without-sharing-a-lineage
+  (let [m (remember-all! (mem/file-memory (tmpfile)))
+        q "inflation orbit taiwan"
+        r (set (facts-of (mold/recall m q {:k 5 :filter {:sources  #{"space:sky"}
+                                                         :entities #{"tsmc"}}})))]
+    (is (contains? r taiwan)
+        "the semis fact is in no lineage of space:sky and answers anyway — it carries tsmc")
+    (is (not (contains? r serbia))
+        "and the fact that shares neither the lineage nor the subject stays out")
+    (is (contains? r neptune)
+        "the union does not REPLACE lineage: space:sky's own fact carries no tsmc and is still here")
+    (is (= #{taiwan neptune} r)
+        "and those two are the whole answer — the union widens the scope, it does not remove it")
+
+    (testing "an empty :sources with no :entities is still an empty result"
+      (is (= [] (mold/recall m q {:k 5 :filter {:sources #{}}}))
+          "the scope owns nothing, and the whole memory is not the answer to that"))
+
+    (testing "an empty :sources beside an :entities set is that entities set"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:sources  #{}
+                                                                :entities #{"tsmc"}}})))
+          "a caller whose lineage is empty can still ask about a subject"))
+
+    (testing ":entities with no :sources key at all is a scope in its own right"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:entities #{"tsmc"}}})))
+          "the subject alone narrows — this is the shape an entity page asks in, and it is not no-filter"))
+
+    (testing "the caller's names are normalized, not taken on trust"
+      (is (= [taiwan] (facts-of (mold/recall m q {:k 5 :filter {:entities #{"TSMC"}}})))
+          (str "`GET /api/entity?name=TSMC` must not answer with an empty page. An "
+               "un-normalized name would simply never match and the scope would look "
+               "like a corpus with no such facts in it")))
+
+    (testing ":subjects scores, :filter {:entities} scopes — and the difference is silent"
+      (is (= [] (mold/recall m "tsmc" {:k 5 :subjects #{"tsmc"}
+                                       :filter   {:sources #{"space:sky"}}}))
+          (str "the semis fact carries tsmc and is named as a subject, and it still does not "
+               "answer: a subject raises a fact that already passed the filter, it never "
+               "lets one past it"))
+      (is (= [taiwan] (facts-of (mold/recall m "tsmc" {:k 5 :filter {:sources  #{"space:sky"}
+                                                                     :entities #{"tsmc"}}})))
+          "the same name in :filter is what makes it eligible — a caller reaching out of its lineage needs both"))))
+
+(deftest a-multi-word-subject-scores-where-a-query-token-never-could
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m mendev {:entities ["wrath of the righteous"]
+                             :source   {:obj "doc:wotr" :space "space:games"}})
+    (is (= [] (facts-of (mold/recall m "what about the ending" {:k 5})))
+        "not one word of the query is in the fact, and `wrath of the righteous` is not a token")
+    (let [r (mold/recall m "what about the ending" {:k 5 :subjects #{"wrath of the righteous"}})]
+      (is (= [mendev] (facts-of r))
+          "named as a subject it scores — this is the half of the scorer that finds a fact by what it is about")
+      ;; `(:score … 0)` rather than a bare lookup: when this regresses the hit is
+      ;; absent, and a missing fact should read as a score of zero rather than
+      ;; throwing an NPE over the assertion that was about to say so.
+      (is (pos? (:score (first r) 0))))
+    (is (= [mendev] (facts-of (mold/recall m "what about the ending"
+                                           {:k 5 :subjects #{"  Wrath of the   Righteous "}})))
+        "and the subject set is normalized on the way in, so a caller's casing cannot make it miss")))
+
+(deftest a-blank-subject-is-not-a-subject-and-matches-nothing
+  ;; Task 3 builds the subject set as "entities detected in the prompt ∪ entities
+  ;; of facts already in this lineage". `ent/detect` cannot emit a blank, but the
+  ;; lineage half is raw `:entities` off facts and those come from a model — so a
+  ;; blank subject is a thing that will be asked for. It must match nothing: a
+  ;; blank that matched would match every fact the distiller left junk on.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m neptune {:entities ["neptune" nil ""]
+                              :source   {:obj "doc:neptune" :space "space:sky"}})
+    (doseq [s [#{nil} #{""} #{"   "} #{nil "" "  "}]]
+      (is (= [] (mold/recall m "unrelated words entirely" {:k 5 :subjects s}))
+          (str "a blank subject names nothing, so it raises nothing: " (pr-str s))))
+    (is (= [neptune] (facts-of (mold/recall m "unrelated words entirely"
+                                            {:k 5 :subjects #{"neptune" nil ""}})))
+        "and a real name beside the blanks still works — the blanks are dropped, not the set")))
+
+(deftest a-fact-s-own-names-are-normalized-the-way-every-other-entity-name-is
+  ;; The distiller writes `:entities` and nothing ever rewrites them, so a padded
+  ;; or oddly-cased name is what is actually on disk. Both new paths look a fact's
+  ;; names up against normalized ones — the filter's set, and the df map's keys —
+  ;; and a name keyed one way and compared the other misses in silence: the fact
+  ;; simply never scores, and a weight of 1.0 quietly calls it the rarest name
+  ;; there is.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "Veldhoven ships scanners." {:entities ["  ASML  "]
+                                                  :source   {:space "space:euv"}})
+    (is (= ["Veldhoven ships scanners."] (facts-of (mold/recall m "asml" {:k 5})))
+        "the scorer matches the query token against the normalized name, not the stored one")
+    (is (= ["Veldhoven ships scanners."]
+           (facts-of (mold/recall m "asml" {:k 5 :filter {:sources #{} :entities #{"asml"}}})))
+        "and so does the scope filter — otherwise a subject union silently skips its own facts")))
+
+(deftest a-blank-entity-name-is-not-the-rarest-name-there-is
+  ;; `ent/index` drops blanks, so `df-map` never keys one — and an unfiltered
+  ;; blank would therefore take the `(get dfm e 1)` default and be weighed 1.0,
+  ;; a LARGER weight than any real name. The distiller writes `:entities`
+  ;; straight off a model's JSON, so `""` and `nil` are values that arrive here.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m taiwan {:entities ["tsmc" "" nil "   "]
+                             :source   {:obj "find:semis-1" :space "space:semis"}})
+    (let [r (mold/recall m "tsmc" {:k 5})]
+      (is (= [taiwan] (facts-of r)))
+      (is (< (Math/abs (- 0.5 (:score (first r)))) 1e-4)
+          (str "0.6 × 1/6 for the word plus the full 0.4 for the one name this fact "
+               "actually has — exactly what `[\"tsmc\"]` alone scores. Left in, the three "
+               "blanks normalize to one \"\" that halves the entity half and makes this 0.3, "
+               "and at the corpus's real df for tsmc it would be 0.09 against 1.0: "
+               (:score (first r)))))))
+
+(deftest a-name-everything-carries-is-worth-less-than-a-name-two-facts-carry
+  (let [m (ubiquity-memory)]
+    (is (= 7 (count (mold/all-facts m)))
+        "seven distinct facts — nothing was reinforced into anything else")
+    (is (= [euv rapidus] (facts-of (mold/recall m "asml" {:k 10})))
+        (str "both match `asml` on the entity half and neither on the words. `euv` also names "
+             "taiwan and united states, 6 facts each; `rapidus` also names rapidus, 1 fact. "
+             "Counting names equally makes it 1-of-3 against 1-of-2 and puts rapidus FIRST; "
+             "weighting each name by 1/df makes it 0.60 against 0.33. A rare name a fact does "
+             "not match is evidence it is about something else; a ubiquitous one is not."))))
+
+(deftest document-frequency-is-global-and-not-the-scope-s
+  (let [m (ubiquity-memory)]
+    (is (= [euv rapidus]
+           (facts-of (mold/recall m "asml" {:k 10 :filter {:sources #{"space:euv" "space:rapidus"}}})))
+        (str "the same two facts, now alone inside a scope. Counted over the CANDIDATES, "
+             "taiwan and united states occur once each in here and look as rare as rapidus — "
+             "the ordering inverts and `united states` is an anchor again inside the one "
+             "notebook that talks about it. df is counted over every live fact."))))
+
+(deftest an-ordinary-query-scores-exactly-what-it-scored-before
+  (let [m (remember-all! (mem/file-memory (tmpfile)))]
+    (let [r (mold/recall m "inflation orbit taiwan" {:k 5})]
+      (is (= [taiwan neptune serbia] (facts-of r))
+          "one word of the query in each fact, and the ranking is the jaccard of each against it")
+      (is (< (Math/abs (- 0.075 (:score (first r)))) 1e-4)
+          (str "0.6 × jaccard(3 query tokens, 6 fact tokens sharing one) = 0.6 × 1/8, "
+               "entity half 0 — the scorer's own arithmetic: " (:score (first r)))))
+    (let [r (mold/recall m "tsmc" {:k 5})]
+      (is (= [taiwan] (facts-of r)))
+      (is (< (Math/abs (- 0.5 (:score (first r)))) 1e-4)
+          (str "0.6 × 1/6 for the word plus 0.4 × 1 for the only entity there is, and with every "
+               "name equally frequent the weighted entity half is the plain fraction it replaced: "
+               (:score (first r)))))))
+
 ;; ---- degradation ----
 
 (deftest an-unreachable-embedder-degrades-recall-to-words-and-says-so
@@ -329,3 +505,273 @@
             (is (= :off (:semantic (meta r))))
             (is (nil? (:degraded (meta r)))
                 "recall is exactly what it was before any of this existed")))))))
+
+;; ---- ties: the lexical path's ordering, which used to be a hash order ----
+
+(defn- tied-memory
+  "`n` facts that score EXACTLY equal against the query `\"qq\"`, in ids
+   `mem-1 … mem-n`.
+
+   Equal to the last bit, not merely close, and every term is arranged for it:
+
+   - one entity each, the same one, so the inverse-frequency entity half is
+     `w/w` = 1.0 for all of them whatever `n` is;
+   - texts sharing no token with each other or with the query, so the keyword
+     half is 0 for all of them — and so `remember`'s 0.6-jaccard reinforcement
+     never fires and there really are `n` facts;
+   - one stamped `:ts`, because `weight` multiplies by `decay(ts, now)` and two
+     facts written a millisecond apart do NOT tie. A distiller pass writing a
+     dozen facts inside one millisecond is the live shape of this; the stamp
+     only makes it reproducible.
+
+   What was left was the sort. `sort-by` is stable, so with no tiebreaker these
+   came back in the order of `(vals @!facts)` — the fact map's hash order,
+   measured as `qq10 qq4 qq3 qq9 qq5 qq8 qq0 qq11 qq7 qq1 qq6 qq2`. Deterministic
+   and meaningless."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n)]
+      (mold/remember m (str "qq" i " rr" i " ss" i " tt" i)
+                     {:entities ["qq"] :source {:obj "doc:q" :space "space:q"}}))
+    (swap! (:!facts m) update-vals #(assoc % :ts 1700000000000))
+    m))
+
+(deftest facts-that-tie-exactly-come-back-by-id-and-not-in-a-hash-order
+  (let [hits (mold/recall (tied-memory 12) "qq" {:k 20})]
+    (is (= 12 (count hits)) "no fact was reinforced away — there are twelve to order")
+    (is (= 1 (count (distinct (map :score hits))))
+        "they tie EXACTLY: one distinct score, so nothing below is really testing the scorer")
+    ;; `:id` sorts lexicographically and these ids are `mem-<n>`, so `mem-10`
+    ;; precedes `mem-2`. That is NOT insertion order and this assertion is
+    ;; written out in full rather than generated, so nobody can read it as one.
+    ;; It matches `(sort-by (juxt (comp - :score) :id))` on the fused path
+    ;; character for character, and one arbitrary-but-stated rule on both paths
+    ;; beats two different ones.
+    (is (= ["mem-1" "mem-10" "mem-11" "mem-12" "mem-2" "mem-3"
+            "mem-4" "mem-5" "mem-6" "mem-7" "mem-8" "mem-9"]
+           (mapv :id hits)))))
+
+(deftest a-tiebreaker-never-outranks-a-score
+  ;; The other half of the change, and the one that would go wrong quietly:
+  ;; `(juxt (comp - :score) :id)` must still sort by score FIRST. `mem-2` here
+  ;; says the query word and `mem-1` does not, so id order and score order are
+  ;; opposites and only one of them can be the answer.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m "zz1 yy1 xx1 ww1"      {:entities ["qq"]})
+    (mold/remember m "qq is said out loud"  {:entities ["qq"]})
+    (let [hits (mold/recall m "qq" {:k 20})]
+      (is (= ["mem-2" "mem-1"] (mapv :id hits))
+          "score first, id only where the scores are equal")
+      (is (apply > (map :score hits))))))
+
+;; ---- what ages, and what does not ----
+;;
+;; `weight` is the only place `decay` is consulted, so these call it directly
+;; rather than through `recall`: the arithmetic is the subject, and a fixture
+;; that had to score a query against a corpus first would make every number
+;; below a product of two things instead of one.
+
+(def ^:private day-ms 86400000)
+
+(def ^:private t-now
+  "A fixed `now`. `weight` takes the clock as an argument, so nothing here
+   depends on when the suite runs or on how long it took to get to this line."
+  1700000000000)
+
+(defn- aged
+  "A fact `d` days old at `t-now`, carrying `extra` — `:durable?`, `:strength`,
+   or neither. Only `:ts` and `extra` matter to `weight`; `:fact` is here so the
+   map is a fact rather than a pair of keys that happens to weigh something."
+  [d extra]
+  (merge {:id "mem-1" :fact "a claim" :ts (- t-now (* d day-ms))} extra))
+
+(defn- weight-of [f] (#'mem/weight t-now f))
+
+(deftest a-durable-fact-weighs-the-same-at-any-age
+  (let [w0    (weight-of (aged 0    {:durable? true}))
+        w365  (weight-of (aged 365  {:durable? true}))
+        w3650 (weight-of (aged 3650 {:durable? true}))]
+    (is (= 1.0 w0 w365 w3650)
+        (str "Kepler's Third Law is as true in ten years as it is today. Decay would rank "
+             "the ten-year-old copy at " (weight-of (aged 3650 {})) " of the fresh one — "
+             "a law of physics deleted by arithmetic. Got: " [w0 w365 w3650]))))
+
+(deftest an-ordinary-fact-decays-exactly-as-it-always-has
+  ;; The curve, pinned with literal numbers rather than by calling `decay` again:
+  ;; a test that recomputes the thing it is testing agrees with any refactor of
+  ;; it, including a wrong one. These four numbers are the behaviour every fact
+  ;; in the corpus has today, and after this change every fact that nothing has
+  ;; judged still has.
+  (is (= 1.0 (weight-of (aged 0 {})))
+      "written now: there is no age to charge for yet")
+  (is (= 0.5 (weight-of (aged 30 {})))
+      "halved after ~30 days, which is the entire claim of the 30-day constant")
+  (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {})))) 1e-9)
+      (str "a year old and worth 7.6% of itself — the number this plan exists to answer. Got: "
+           (weight-of (aged 365 {}))))
+  (is (< (Math/abs (- 0.008152174 (weight-of (aged 3650 {})))) 1e-9)
+      (str "ten years, and effectively gone. Got: " (weight-of (aged 3650 {})))))
+
+(deftest a-fact-judged-not-durable-still-ages
+  ;; `false` and absent must both decay, and they are separate tests on purpose:
+  ;; `(if (:durable? f) …)` and `(if (contains? f :durable?) …)` agree on `true`
+  ;; and on absent, and disagree only here. Only one of them is right, and this
+  ;; is the assertion that says which.
+  (let [decayed (weight-of (aged 365 {}))]
+    (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {:durable? false})))) 1e-9)
+        (str "\"this one really is as-of-now\" is a judgement that the fact ages, not merely a "
+             "record that somebody looked at it. Got: "
+             (weight-of (aged 365 {:durable? false}))))
+    ;; the literal above and the comparison below are not the same assertion: the
+    ;; first would still hold if `false` were special-cased into some third
+    ;; behaviour that happened to land on the same number, the second says a
+    ;; judged-not-durable fact is weighed by the identical branch an unjudged one
+    ;; is. Written relative-only, this test survived the "return 1.0
+    ;; unconditionally" sabotage, because both sides moved together.
+    (is (= decayed (weight-of (aged 365 {:durable? false})))
+        (str "and by the same arithmetic the unjudged fact gets: " decayed))))
+
+(deftest a-fact-nothing-has-judged-still-ages
+  ;; Absent means decays: the whole corpus is unjudged the moment this ships, so
+  ;; if this fails, every fact in the memory just changed rank without anyone
+  ;; deciding anything about it.
+  (is (< (Math/abs (- 0.075949367 (weight-of (aged 365 {})))) 1e-9)
+      (str "no :durable? key at all is today's behaviour, unchanged. Got: "
+           (weight-of (aged 365 {})))))
+
+(deftest the-strength-bonus-still-multiplies-a-durable-fact
+  ;; "it keeps coming up" is orthogonal to "it ages". Folding the strength bonus
+  ;; into the durable branch — returning a flat 1.0 for a durable fact — would be
+  ;; a second change hiding inside this one, and a fact recalled three times would
+  ;; stop outranking one recalled once the moment it was judged timeless.
+  (is (= 1.5 (weight-of (aged 3650 {:durable? true :strength 3})))
+      (str "1.0 + 0.25 × (3 - 1), undecayed. Got: "
+           (weight-of (aged 3650 {:durable? true :strength 3}))))
+  (is (= 1.0 (weight-of (aged 3650 {:durable? true :strength 1})))
+      "and a strength of 1 is the bonus's identity, so the 1.5 above is the bonus and not the age")
+  (is (= (* 1.5 (weight-of (aged 365 {}))) (weight-of (aged 365 {:strength 3})))
+      "the bonus multiplies a decaying fact exactly as it did before, too"))
+
+;; ---- who wrote the judgement, and who may overwrite it ----
+;;
+;; `remember` has two branches and they carry the flag differently. The new-fact
+;; branch takes whatever `opts` says and writes NOTHING when `opts` says nothing;
+;; the reinforcement branch may overwrite an agent's judgement and may never
+;; overwrite yours. These go through `mold/remember` on a real `FileMemory` under
+;; java.io.tmpdir: `remember` is a protocol method, so `with-redefs` cannot reach
+;; it, and stubbing the thing under test would be pointless here anyway.
+
+(defn- one-fact
+  "The single fact in `m`, as it was actually stored. Fails loudly rather than
+   returning nil if there is more than one — a fixture whose two sentences did
+   not reinforce into one is the way every assertion below goes vacuous."
+  [m]
+  (let [fs (mold/all-facts m)]
+    (assert (= 1 (count fs)) (str "fixture expected one fact, got " (mapv :fact fs)))
+    (first fs)))
+
+(def ^:private kepler
+  "Reinforced by remembering it a second time: `remember` treats a jaccard of
+   0.6 or more as the same fact, and the same sentence scores 1.0. This is the
+   real case — auto-distill re-derives the same wording from the same work."
+  "Kepler's third law says the square of the period goes as the cube of the axis")
+
+(deftest a-fact-nothing-has-judged-carries-no-judgement
+  ;; `:durable? nil` would be a key that is present and false-y, and then
+  ;; `(:durable? f)` and `(contains? f :durable?)` stop agreeing — the same shape
+  ;; `memory-payload`'s `:degraded` is absent-when-healthy to avoid. `weight`
+  ;; distinguishes `false` from absent, so "nothing has judged this" has to be a
+  ;; state the record can actually be in.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:entities ["Kepler"]})
+    (let [f (one-fact m)]
+      (is (false? (contains? f :durable?))
+          (str "no key at all, not a nil one — got " (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (false? (contains? f :durable-by))
+          "and no provenance for a judgement nobody made"))))
+
+(deftest a-new-fact-can-arrive-already-judged
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? true})
+    (let [f (one-fact m)]
+      (is (true? (:durable? f)) "the distiller's judgement, carried through")
+      (is (= "agent" (:durable-by f))
+          "…stamped as the agent's, because that is who may later be overruled")))
+  ;; `false` is a judgement too, and it is the one a `(when (:durable? opts) …)`
+  ;; implementation drops on the floor: the fact would come back unjudged and
+  ;; indistinguishable from one nothing had looked at.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (let [f (one-fact m)]
+      ;; `false?` and not `(not (:durable? f))`: the second passes on a fact the
+      ;; branch never wrote to at all, which is the whole defect being tested.
+      (is (false? (:durable? f)) "\"this one really is as-of-now\" is an answer, not a silence")
+      (is (= "agent" (:durable-by f))))))
+
+(deftest reinforcement-may-change-the-agents-own-mind
+  ;; The permitted direction. A later pass with better context is allowed to
+  ;; correct an earlier one — it is the same author.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (mold/remember m kepler {:durable? true})
+    (let [f (one-fact m)]
+      (is (= 2 (:strength f))
+          "the second remember REINFORCED rather than adding a fact — without this the rest is vacuous")
+      (is (true? (:durable? f)) "the newer agent judgement wins")
+      (is (= "agent" (:durable-by f))))))
+
+(deftest reinforcement-never-reverts-your-judgement
+  ;; The whole reason `:durable-by` exists. Nothing writes `"you"` until the
+  ;; memory pane's toggle lands, so the fixture stamps it the way that route
+  ;; will: the record, by id, in the atom the pane's append would also update.
+  (let [m (mem/file-memory (tmpfile))]
+    (mold/remember m kepler {:durable? false})
+    (swap! (:!facts m) update "mem-1" assoc :durable? true :durable-by "you")
+    ;; the incoming opts say the OPPOSITE of what you said. An implementation
+    ;; that only skipped agreeing judgements would pass a weaker version of this.
+    (mold/remember m kepler {:durable? false})
+    (let [f (one-fact m)]
+      (is (= 2 (:strength f))
+          (str "the reinforcement branch really ran — this fixture proves the flag survived a "
+               "rewrite rather than that `remember` never found the duplicate"))
+      (is (true? (:durable? f))
+          (str "you said this fact is timeless; an agent re-deriving it next week does not get to "
+               "quietly disagree. Got " (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (= "you" (:durable-by f)) "…and it is still your judgement, not laundered into the agent's"))))
+
+(deftest reinforcement-with-no-judgement-leaves-the-flag-where-it-was
+  ;; Distillation does not always answer — an older model, or a refusal. Silence
+  ;; must not read as `false`, under either provenance.
+  (testing "an agent's judgement"
+    (let [m (mem/file-memory (tmpfile))]
+      (mold/remember m kepler {:durable? true})
+      (mold/remember m kepler {:entities ["Kepler"]})
+      (let [f (one-fact m)]
+        (is (= 2 (:strength f)) "reinforced, not added")
+        (is (true? (:durable? f)) "no answer is not the answer `false`")
+        (is (= "agent" (:durable-by f)) "…and it did not change hands"))))
+  (testing "yours"
+    (let [m (mem/file-memory (tmpfile))]
+      (mold/remember m kepler {:durable? true})
+      (swap! (:!facts m) update "mem-1" assoc :durable-by "you")
+      (mold/remember m kepler {:entities ["Kepler"]})
+      (let [f (one-fact m)]
+        (is (= 2 (:strength f)) "reinforced, not added")
+        (is (true? (:durable? f))
+            "the value survives too — dropping BOTH guards at once would clear it to nil here")
+        (is (= "you" (:durable-by f)) "silence does not relabel your judgement as the agent's")))))
+
+(deftest the-judgement-is-on-the-line-that-was-appended
+  ;; `!facts` and the file are written from the same record, so this is one
+  ;; assertion about `append-line!` rather than a second about `remember` — but
+  ;; the file is what survives a restart, and a flag that only lived in RAM would
+  ;; be a fact that quietly starts decaying again the next time loci boots.
+  (let [path (tmpfile)
+        m    (mem/file-memory path)]
+    (mold/remember m kepler {:durable? true})
+    (mold/remember m "alpha beta gamma delta epsilon" {})
+    (let [reopened (into {} (map (juxt :id identity)) (mold/all-facts (mem/file-memory path)))]
+      (is (true? (:durable? (reopened "mem-1"))) "read back off disk")
+      (is (= "agent" (:durable-by (reopened "mem-1"))))
+      (is (false? (contains? (reopened "mem-2") :durable?))
+          "and the unjudged fact is unjudged on disk too, not `nil` there"))))

@@ -225,13 +225,52 @@
                    :key-fn keyword)))
 
 (defn distill-facts
-  "Post-flow memory distillation: pull 1-5 durable, atomic facts out of what an
-   agent flow produced. Returns [{:fact string :entities [string]} …]."
+  "Post-flow memory distillation: pull 1-5 atomic facts out of what an agent
+   flow produced. Returns [{:fact string :entities [string]} …], each fact
+   also carrying `:durable` true/false — or **not carrying the key at all**,
+   which is a third state and the one the rest of this docstring is about.
+
+   Each sentence is told to name its own subject: a fact is read later with
+   no notebook around it, so 'the Aeon path locks out the Lich ending' has to
+   say which game. `context` already tells the model what the subject is —
+   this only makes saying so part of the sentence. Applies to new facts only;
+   the ones already on file are not retroactively rewritten (see entities
+   design doc §6) — that would be a silent rewrite of what was recorded,
+   which is a different act from reinforcing it.
+
+   `:durable` is the model's answer to a second question: does this claim go
+   out of date? A law, a definition or a historical record does not; a
+   measurement of a world that moves does. `weight` reads it (as `:durable?`)
+   to skip decay, so a fact like T² ∝ a³ stops being ranked into oblivion by
+   arithmetic. The prompt teaches the axis BY EXAMPLE, because \"durable\" is
+   no more self-explanatory to a model than it was to us — naming the field
+   and leaving it undefined would get an answer, just not one about this.
+
+   **`:durable` is absent, not false, when the model did not answer** — an
+   older model, a refusal, a malformed line. Nothing here coerces it: absent
+   means *nobody has judged this yet*, which is the state the whole corpus is
+   in, and `remember` writes neither key for it. `distill!` (server.clj) keeps
+   the distinction on the way through.
+
+   The word 'durable' has been dropped from the first sentence, where it used
+   to mean 'worth remembering'. Leaving it was the alternative, and it would
+   have put the same word in front of the model twice in one prompt with two
+   different meanings — the exact ambiguity a field this terse cannot afford.
+   'worth remembering' was already there and carries what was lost."
   [context text]
-  (let [sys (str "Extract 1-5 durable, atomic facts worth remembering from this work — "
+  (let [sys (str "Extract 1-5 atomic facts worth remembering from this work — "
                  "figures, causal claims, named entities. One sentence each; skip process "
-                 "notes and pleasantries. Respond ONLY as JSON "
-                 "{\"facts\":[{\"fact\":\"…\",\"entities\":[\"lowercase\",…]}]}."
+                 "notes and pleasantries. **Each sentence must name its own subject** — it "
+                 "will be read on its own, with no notebook around it, so \"the Aeon path "
+                 "locks out the Lich ending\" must say which game. "
+                 "For each fact also judge whether it is DURABLE: true if the claim will "
+                 "never go out of date — a law, a definition, a historical record — and "
+                 "false if it carries an implicit \"as of now\", so that re-checking the "
+                 "world later could change it. \"Kepler's Third Law states that T² ∝ a³\" "
+                 "is durable; \"lithography capacity is booked through 2027\" is not. "
+                 "Respond ONLY as JSON "
+                 "{\"facts\":[{\"fact\":\"…\",\"entities\":[\"lowercase\",…],"
+                 "\"durable\":true|false}]}."
                  (when (seq (str context)) (str "\nThe work was about: " context)))]
     (:facts (json/read-str (chat [{:role "system" :content sys}
                                   {:role "user" :content (str text)}] :json? true)

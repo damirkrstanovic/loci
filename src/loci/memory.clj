@@ -3,11 +3,14 @@
    engine behind the loci.mold/Recall protocol.
 
    A fact is {:id :fact :entities :source :ts :strength}, and once embedded it
-   also carries {:vec :model :dim}. remember reinforces near-duplicates instead
-   of duplicating; recall fuses keyword, entity, recency and strength signals,
-   and — when asked for it with `:semantic? true` — cosine against the query's
-   embedding, by reciprocal rank. This is the agent's domain: revisable and
-   decaying — deliberately NOT the substrate, and never touched by undo.
+   also carries {:vec :model :dim}. Once something has judged whether the claim
+   ages it also carries {:durable? :durable-by} — absent means nobody has, which
+   is why the pair is listed apart rather than folded into the shape above.
+   remember reinforces near-duplicates instead of duplicating; recall fuses
+   keyword, entity, recency and strength signals, and — when asked for it with
+   `:semantic? true` — cosine against the query's embedding, by reciprocal rank.
+   This is the agent's domain: revisable and decaying — deliberately NOT the
+   substrate, and never touched by undo.
 
    Persistence is an append-only EDN-lines file; reinforcement appends the
    updated fact under the same :id and load is last-wins by :id. **Embedding is
@@ -34,6 +37,7 @@
             [clojure.set :as set]
             [clojure.string :as str]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.mold :as mold]
             [loci.substrate :as sub])
   (:import [java.util.concurrent ArrayBlockingQueue TimeUnit]))
@@ -55,29 +59,109 @@
   (/ 1.0 (+ 1.0 (/ (max 0 (- now ts)) (* 30.0 86400000.0)))))
 
 (defn- relevance
-  "How well `f` matches the query tokens, before recency and strength: 0.6 of the
+  "How well `f` matches the query, before recency and strength: 0.6 of the
    keyword overlap plus 0.4 of the entity overlap, in [0, 1].
 
    Split out of `score` so the two halves can be applied at different moments.
    Fusion ranks by this and multiplies by `weight` once at the end; multiplying
-   inside the ranking too would decay every fused fact twice."
-  [qt f]
+   inside the ranking too would decay every fused fact twice.
+
+   The entity half is weighted by **inverse document frequency**: each name
+   counts 1/(live facts carrying it), so `united states` — 6 facts across three
+   unrelated subjects on the measured corpus — stops acting as an anchor and a
+   name mentioned twice dominates. The weighting is a ratio *within one fact*,
+   so what it really governs is dilution: a fact that matches a rare name and
+   otherwise mentions only ubiquitous ones keeps almost all of its entity score,
+   while a fact that matches the ubiquitous one and otherwise names something
+   rare loses most of it — which is the right reading, because a rare name a
+   fact does NOT match is evidence the fact is about something else.
+
+   With every name equally frequent this is exactly the fraction it replaced
+   (`|qt ∩ es| / |es|`, since a common factor cancels out of numerator and
+   denominator), which is why nothing else had to move. An empty `es` gives a
+   zero total and scores 0.0, exactly as the explicit `(empty? es)` branch did.
+
+   Names are normalized through `ent/normalize` rather than merely lowercased,
+   because `dfm`'s keys are, and a name keyed one way and looked up the other
+   would silently weigh 1.0 — \"as rare as anything gets\" — for every fact whose
+   distiller left it padded or non-breaking-spaced.
+
+   **Blank names are dropped, exactly as `ent/index` drops them**, and that is
+   what makes the sentence above true rather than nearly true. `df-map` never
+   keys a blank, so a blank left in `es` would take the `(get dfm e 1)` default
+   and be weighed 1.0 — a *larger* weight than any real name, so a single `\"\"`
+   off the distiller would swamp the fact's actual subjects: at the corpus's
+   measured frequencies `[\"tsmc\" \"taiwan\" \"\"]` scores 0.08 on the entity half
+   where `[\"tsmc\" \"taiwan\"]` scores 0.33. `server.clj` stores whatever the
+   model's JSON put in `:entities`, so `\"\"` is a value that reaches here.
+   Filtering it is also what makes that `1` default *unreachable*: after this,
+   every name `es` can contain is one `df-map` indexed.
+
+   A fact's entities are matched against `qs` — the query tokens UNION the
+   subject set, built once in `recall` rather than per candidate. The subject
+   half is what carries a multi-word name: query tokens are single words, so
+   `wrath of the righteous` could never match one and the fact it identifies
+   would score 0 on the half that exists to find it. `qt` is still passed
+   separately because the keyword half is a jaccard against the tokens alone —
+   a subject is not a word the fact has to contain."
+  [qt qs dfm f]
   (let [kw  (jaccard qt (tokens (:fact f)))
-        es  (set (map str/lower-case (:entities f)))
-        ent (if (empty? es) 0.0
-                (/ (count (set/intersection qt es)) (double (count es))))]
+        es  (into #{} (comp (map ent/normalize) (remove str/blank?)) (:entities f))
+        ;; `(max 1 …)` stays although `df-map` cannot produce a value below 1:
+        ;; `dfm` is a plain map parameter, and `(/ 1.0 0.0)` in Clojure is
+        ;; Infinity rather than a throw, so a hand-built or future-derived map
+        ;; with a zero count would make `tot` Infinity and `ent` NaN — and a NaN
+        ;; score does not merely rank wrong, it makes `sort-by` inconsistent.
+        ;; A clamp on a hot path is cheaper than that failure being findable.
+        w   (fn [e] (/ 1.0 (double (max 1 (get dfm e 1)))))
+        tot (reduce + 0.0 (map w es))
+        hit (set/intersection es qs)
+        ent (if (pos? tot) (/ (reduce + 0.0 (map w hit)) tot) 0.0)]
     (+ (* 0.6 kw) (* 0.4 ent))))
 
 (defn- weight
   "Recency times the strength bonus — the part of a fact's score that has nothing
-   to do with the query. Applied exactly once on every path."
+   to do with the query. Applied exactly once on every path.
+
+   A fact marked `:durable?` skips the recency half entirely. Decay reads every
+   fact as carrying an implicit \"as of now\", and most do: *\"lithography capacity
+   is booked through 2027\"* is worth less each month, correctly. But `T² ∝ a³` is
+   not a measurement of a world that moves, and at 365 days decay ranks it at
+   0.076 of itself and at 730 days 0.039 — a law of physics deleted by
+   arithmetic. That is what this branch is for.
+
+   **Absent means decays**, not the other way round, so `(:durable? f)` and not
+   `(contains? f :durable?)`: the whole corpus is unjudged until something
+   classifies it, and an unjudged fact must rank exactly where it ranked
+   yesterday. `false` is then a real judgement — *\"this one is as-of-now\"* — and
+   weighs the same as never having been asked, which is the honest reading of it.
+
+   The alternative considered was a per-fact half-life, richer and probably
+   truer. It was rejected in brainstorming: every extra number is a place to be
+   wrong, and nothing yet says a binary is insufficient.
+
+   The strength bonus is deliberately OUTSIDE the branch and still applies to a
+   durable fact. \"It keeps coming up\" is orthogonal to \"it ages\", and returning a
+   flat 1.0 here would be a second change hiding inside this one — a fact
+   recalled three times would stop outranking one recalled once, the moment
+   somebody judged it timeless."
   [now f]
-  (* (decay (:ts f) now)
+  (* (if (:durable? f) 1.0 (decay (:ts f) now))
      (+ 1.0 (* 0.25 (dec (:strength f 1))))))
 
-(defn- score [qt now f] (* (relevance qt f) (weight now f)))
+(defn- score [qt qs dfm now f] (* (relevance qt qs dfm f) (weight now f)))
 
-(defn- append-line! [file rec]
+(defn append-line!
+  "One record, appended. The only way anything in this namespace writes a fact:
+   the log is append-only and last-wins by :id, so a change to a fact is the
+   fact written again, never a line edited in place — `next-id`'s tombstone
+   reasoning depends on nothing ever being removed.
+
+   Public for `loci.repair`, which re-files fifteen facts whose notebooks were
+   overwritten. It appends the way `store-vector!` and `unmerge!` do rather than
+   going through `remember`, which would re-stamp `:ts` and bump `:strength`;
+   sharing this function is what keeps \"appended\" meaning one thing."
+  [file rec]
   (io/make-parents (io/file file))
   (spit file (str (pr-str rec) "\n") :append true))
 
@@ -814,29 +898,71 @@
   "Whether `f` was recorded against one of `sources`.
 
    Public because the memory pane browses without a query — `all-facts`, not
-   `recall` — and a scoped browse must be narrowed by exactly the rule a scoped
-   query is narrowed by. Two copies of “what a `:source` names” would drift, and
-   the one that drifted would be the one showing facts a scope excluded."
+   `recall` — and a scoped browse must be narrowed by exactly the rule the
+   *lineage half* of a scoped query is narrowed by. Two copies of “what a
+   `:source` names” would drift, and the one that drifted would be the one
+   showing facts a scope excluded.
+
+   Only that half. `scoped` is now a union of lineage and subject, and this is
+   not the subject half and does not know about it — so a browse scoped through
+   here shows a notebook's lineage and NOT the facts a recall in that notebook
+   would also reach by shared subject. That is deliberate while the pane has no
+   way to ask for a subject; the moment it grows one, it needs the union and not
+   another call to this."
   [sources f]
   (boolean (some sources (source-ids f))))
 
+(defn- shares-entity?
+  "Whether `f` carries one of `names` — normalized entity names, as `scoped`
+   normalizes them on the way in.
+
+   The fact's side is normalized here because its `:entities` are stored exactly
+   as the distiller wrote them and are never rewritten; the caller's side is
+   normalized in `scoped` rather than trusted, for the reason `ent/detect` gives
+   about its own `names`: trusting it would fail *silently* rather than loudly.
+   An un-normalized name simply never matches, so a subject scope looks like it
+   ran and returns nothing — and the caller this is being built for is
+   `GET /api/entity?name=United%20States`, where the answer to a capitalised
+   name would be an entity page with no facts on it, no error and nothing
+   degraded to notice."
+  [names f]
+  (boolean (some names (map ent/normalize (:entities f)))))
+
 (defn- scoped
-  "The facts a query is allowed to see. `{:filter {:sources #{…}}}` narrows to
-   facts recorded against one of those ids; no `:sources` key means no filter.
+  "The facts a query is allowed to see.
+
+   `{:filter {:sources #{…}}}` narrows to facts recorded against one of those
+   ids; `:entities` widens that back out to facts sharing a subject, and the two
+   are a UNION — dropping lineage would stop a deep-dive child inheriting its
+   parent's facts, an immediate regression. No `:filter` at all is no filter.
 
    `loci.memory` takes ids rather than a notebook id on purpose — it holds no
    store and cannot walk the substrate's links, and giving it one would put the
    record half inside the recall half. The caller that has the store does the
    traversal and passes the result.
 
-   **An empty set is an empty result.** The caller asked for the facts belonging
-   to a scope that owns none; answering with the whole memory instead would be a
-   scoped recall quietly returning unscoped facts, which is the one failure a
-   scope exists to prevent."
+   **An empty `:sources` set is still an empty result** (with no `:entities`
+   beside it): the caller asked for the facts belonging to a scope that owns
+   none, and answering with the whole memory is the one failure a scope exists
+   to prevent. That survives here because an empty set is truthy in Clojure and
+   `(in-sources? #{} f)` is false for every fact — so do NOT \"tidy\" the
+   `(and sources …)` into a `seq` check, which would turn the empty scope back
+   into no scope at all. An `:entities` set that normalizes away to nothing —
+   `#{}`, or `#{\"  \"}` — answers the same way and for the same reason: the
+   caller named no subject that is one.
+
+   `:entities` is normalized and blank-filtered here rather than taken on trust,
+   so that `#{\"ASML\"}` and `#{\"asml\"}` are the same scope; see
+   `shares-entity?` for what the trusting version costs."
   [facts opts]
-  (if-let [sources (get-in opts [:filter :sources])]
-    (filterv #(in-sources? sources %) facts)
-    (vec facts)))
+  (let [{:keys [sources entities]} (:filter opts)
+        entities (some->> entities (into #{} (comp (map ent/normalize)
+                                                   (remove str/blank?))))]
+    (if (or sources entities)
+      (filterv (fn [f] (or (and sources (in-sources? sources f))
+                           (and entities (shares-entity? entities f))))
+               facts)
+      (vec facts))))
 
 (defn- semantic-ranking
   "Facts ordered by cosine against the query's embedding, best first. Returns
@@ -959,14 +1085,43 @@
                   ;; vector; different wording drops it, so the next pass
                   ;; re-embeds rather than leaving a vector pointing at a
                   ;; sentence that is no longer stored.
-                  (not= fact (:fact dup)) (dissoc :vec :model :dim))
-                {:id (next-id @!facts)
-                 :fact fact :entities (vec (:entities opts))
-                 :source (:source opts) :ts (System/currentTimeMillis) :strength 1})]
+                  (not= fact (:fact dup)) (dissoc :vec :model :dim)
+                  ;; A judgement about whether the claim ages, and WHOSE it was.
+                  ;; Reinforcement may overwrite the agent's own earlier answer —
+                  ;; same author, later context — and may never overwrite yours:
+                  ;; without that, the agent re-deriving this sentence next week
+                  ;; silently reverts a call you made by hand, which is exactly
+                  ;; the failure `:no-merge` exists to prevent on the merge path.
+                  ;;
+                  ;; `contains?` and not `(:durable? opts)`, so silence stays
+                  ;; silence. A distiller that answered nothing — an older model,
+                  ;; a refusal — must not be read as having answered `false`.
+                  (and (contains? opts :durable?)
+                       (not= "you" (:durable-by dup)))
+                  (assoc :durable? (:durable? opts) :durable-by "agent"))
+                (cond-> {:id (next-id @!facts)
+                         :fact fact :entities (vec (:entities opts))
+                         :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
+                  ;; Absent, not nil. A key that is always present and usually
+                  ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
+                  ;; disagree — the shape `memory-payload`'s `:degraded` is
+                  ;; absent-when-healthy to avoid — and `weight` reads the value,
+                  ;; so absent has to keep meaning "nothing has judged this yet".
+                  (contains? opts :durable?)
+                  (assoc :durable? (:durable? opts) :durable-by "agent")))]
       (append-line! file rec)
       (swap! !facts assoc (:id rec) rec)
       :ok))
-  ;; opts: {:k 6 :semantic? false :rerank? false :filter {:sources #{id …}}}
+  ;; opts: {:k 6 :semantic? false :rerank? false :subjects #{name …}
+  ;;        :filter {:sources #{id …} :entities #{name …}}}
+  ;;
+  ;; :subjects SCORES, :filter {:entities} SCOPES, and they are separate on
+  ;; purpose. A name in :subjects raises a fact that already survived the filter;
+  ;; it cannot let a fact past one. A caller that wants an unrelated notebook's
+  ;; facts about a subject has to name it in BOTH — :filter to make it eligible,
+  ;; :subjects to make it rank. Naming it only in :subjects is the quiet failure:
+  ;; a scoped recall that answers with nothing and looks like a corpus with no
+  ;; such facts in it.
   ;;
   ;; :semantic? is false by DEFAULT and that is the whole shape of this function.
   ;; /api/leap calls recall on every keystroke, and embedding a query is a 20–50
@@ -984,12 +1139,42 @@
     (let [now        (System/currentTimeMillis)
           k          (or (:k opts) 6)
           qt         (tokens query)
-          candidates (scoped (live (vals @!facts)) opts)
-          ;; today's scorer, unchanged, over the eligible facts
+          all        (live (vals @!facts))
+          ;; df over ALL live facts, never over `candidates` — see ent/df-map.
+          ;; Counted inside a scope, the names that scope is *about* look rare
+          ;; there and go straight back to being anchors.
+          dfm        (ent/df-map all)
+          ;; The query side of the entity half, unioned ONCE rather than per
+          ;; candidate — it is the same set for every fact scored, and rebuilding
+          ;; it 80 times a keystroke measured 1.012 → 0.849 ms. Blanks are
+          ;; filtered out of `:subjects` for the reason `relevance` drops them
+          ;; from a fact's own names: the lineage half of Task 3's subject set is
+          ;; raw `:entities` off facts, so one blank in one fact would otherwise
+          ;; be a subject that every junk-entity fact in the corpus matches.
+          subjects   (into #{} (comp (map ent/normalize) (remove str/blank?))
+                           (:subjects opts))
+          qs         (set/union qt subjects)
+          candidates (scoped all opts)
+          ;; the scorer over the eligible facts
+          ;; `(juxt (comp - :score) :id)` and not `:score >`, character for
+          ;; character what the fused path below already sorts by. Facts tie
+          ;; *exactly* far more often than the arithmetic suggests — a distiller
+          ;; pass writes a dozen facts in one millisecond, so `decay` is
+          ;; identical, and any two of them carrying the same single name and
+          ;; not repeating it in their text score the same to the last bit.
+          ;; `sort-by` is stable, so with no tiebreaker their order is the order
+          ;; of `(vals @!facts)`: the fact map's HASH order. Deterministic, and
+          ;; meaningless — `qq10 qq4 qq3 qq9 qq5 qq8 …` for twelve facts written
+          ;; in sequence. By `:id` it is at least a rule a reader can state.
+          ;;
+          ;; `:id` sorts lexicographically, so `mem-10` precedes `mem-2`; that
+          ;; is not insertion order and must not be read as one. It matches the
+          ;; fused path, and one arbitrary-but-stated rule on both paths beats
+          ;; two different ones.
           lex        (->> candidates
-                          (map #(assoc % :score (score qt now %)))
+                          (map #(assoc % :score (score qt qs dfm now %)))
                           (filter #(pos? (:score %)))
-                          (sort-by :score >)
+                          (sort-by (juxt (comp - :score) :id))
                           vec)
           ;; One retriever has nothing to fuse with. Running RRF over a single
           ;; ranking would replace the scorer's relevance with its rank and throw

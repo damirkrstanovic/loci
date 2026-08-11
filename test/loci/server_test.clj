@@ -4,15 +4,37 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.agent :as agent]
+            [loci.content :as c]
             [loci.embed :as embed]
+            [loci.entities :as ent]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub])
+  (:import [java.util Locale]))
 
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))
+
+(def ^:private no-memory
+  "The memory `mold-payload` must not open — a delay that throws if it is forced.
+
+   `mold-payload` takes a memory because a `:kind :entity` object's page IS
+   `entity-payload`'s answer, and it forces that argument on the entity branch
+   and on no other. Every object molded with this one is a doc, a table or a
+   flow, so passing a poison delay costs nothing to write and turns \"it happens
+   not to need the memory\" into an assertion: hoist the force out of the branch
+   and these stop rendering and start throwing.
+
+   It is also HALF the reason the in-process callers may pass `mem/memory`
+   undereferenced, and only half — say which half. Hoisting the force catches
+   nine tests through this def. It does not catch `(srv/edit! st \"doc:a\" \"y\")`
+   below, which reaches `mold-payload` through `edit!` and so would force the
+   real `mem/memory`, read the user's `data/memory.edn` and pass. That is the
+   seam the laziness exists for and the seam no test can watch; this one watches
+   the other."
+  (delay (throw (ex-info "mold-payload forced the memory to render a non-entity" {}))))
 
 (deftest leap-searches-everything
   (let [st (sub/fresh-store)
@@ -566,6 +588,163 @@
       (is (str/starts-with? (:error r) "compute failed:"))
       (is (= before (count (sub/history st)))))))         ; nothing committed
 
+;; ---- the two ids compute mints, and why they are max+1 and not count+1 ----
+;;
+;; 2026-07-23: `space:dd-` was minted `(inc (count (nb/notebooks st)))` over a
+;; store that had silently booted 49 of 80 events, so it re-minted 16, 17 and 18
+;; onto three LIVE astronomy notebooks. `:put` is `assoc-in` with no occupancy
+;; check, so it overwrote them with no error anywhere and three notebooks were
+;; gone. `compute-clj!` minted BOTH its ids the same way, with neither the
+;; `(inc (rand-int 9999))` suffix that saved `tbl:extract-14-677` from doing the
+;; same to `tbl:extract-14-588` nor an existence check — and `server.clj` was
+;; already minting `tbl:derived-` through `next-id` sixty lines further down, so
+;; one prefix had two rules.
+;;
+;; The fixture below is the collision shape and nothing else: FEWER live objects
+;; of each kind than the highest suffix already taken. Count and max must
+;; genuinely disagree or the test passes under the bug.
+
+(defn- store-with-a-gap-between-count-and-max
+  "One live object of each minted kind, but `-5` is taken for every prefix: a
+   count-based mint says `-2` (`-3` for tables, which have `tbl:x` too), a
+   max-based one says `-6`. Every kind `compute-clj!`, `describe!` and
+   `make-view!` mint over is in here, because all three took their number from
+   a store-wide count of their own kind."
+  []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value trows}})
+    (sub/commit! st {:op :put :id "tbl:derived-5"
+                     :value {:id "tbl:derived-5" :kind :table :title "the fifth derived table"
+                             :value trows}})
+    (sub/commit! st {:op :put :id "fn:x-5"
+                     :value {:id "fn:x-5" :kind :fn :title "fn: the fifth function"
+                             :value {:source "tbl:x" :prompt "five" :lang "clojure"
+                                     :code "(fn [rows] rows)"}}})
+    (sub/commit! st {:op :put :id "view:x-5"
+                     :value {:id "view:x-5" :kind :viewspec :title "view: the fifth view"
+                             :value {:target "tbl:x" :label "the fifth view"
+                                     :spec {:kind "table"}}}})
+    (sub/commit! st {:op :put :id "app:x-5"
+                     :value {:id "app:x-5" :kind :applet :title "app: the fifth applet"
+                             :value {:target "tbl:x" :code "el.textContent='5'" :label "▶ five"}}})
+    st))
+
+(deftest compute-mints-past-the-highest-id-not-past-the-count
+  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+    (let [st     (store-with-a-gap-between-count-and-max)
+          before (count (sub/history st))
+          r      (srv/compute-clj! st "tbl:x" "add x" nil)
+          fid    (:via (sub/object st (:openId r)))]
+      (is (nil? (:error r)))
+      (is (= "tbl:derived-6" (:openId r)))                 ; two tables live → count said -3
+      (is (= "fn:x-6" fid))                                ; one :fn live → count said -2
+      ;; the assertion the July notebooks would have wanted: the occupants live
+      (is (= "the fifth derived table" (:title (sub/object st "tbl:derived-5"))))
+      (is (= "fn: the fifth function" (:title (sub/object st "fn:x-5"))))
+      ;; the :fn and its table are ONE :tx, so one undo reverses both
+      (is (= (inc before) (count (sub/history st))))
+      (sub/undo! st)
+      (is (nil? (sub/object st "tbl:derived-6")))
+      (is (nil? (sub/object st "fn:x-6"))))))
+
+(deftest compute-numbers-functions-per-source-not-across-the-store
+  ;; `fn:` carries the source's local name — `fn:<src>-N` — so the sequence is
+  ;; per-source, and `next-id`'s prefix has to carry that name too. A store-wide
+  ;; count numbered every source's functions off one running total, so the FIRST
+  ;; function over a brand-new table came out `fn:y-2`. Two sources, because one
+  ;; source cannot tell "counts the store" from "counts this source".
+  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+    (let [st (store-with-a-gap-between-count-and-max)]
+      (sub/commit! st {:op :put :id "tbl:y"
+                       :value {:id "tbl:y" :kind :table :title "Y" :value trows}})
+      (let [ry (srv/compute-clj! st "tbl:y" "add x" nil)]
+        (is (= "fn:y-1" (:via (sub/object st (:openId ry)))))  ; store-wide count said -2
+        (is (= "tbl:derived-6" (:openId ry))))
+      (let [rx (srv/compute-clj! st "tbl:x" "add x again" nil)]
+        (is (= "fn:x-6" (:via (sub/object st (:openId rx)))))  ; fn:x- keeps its own run
+        (is (= "tbl:derived-7" (:openId rx)))))))              ; tbl:derived- keeps one run
+
+;; ---- and the three minters the forensics table missed ----
+;;
+;; `new-space!`, `describe!` and `make-view!` each took `(inc (count <kind>))`
+;; over the whole store, with no random suffix and no existence check, landing
+;; via `:put`. `new-space!` is the one that matters: it counts `:space` and
+;; mints a NOTEBOOK id, which is `(inc (count (nb/notebooks st)))` under a
+;; different prefix — the identical form that destroyed `space:dd-16/17/18`,
+;; not merely the same shape. `fresh-dd-id` does not reach it: it matches
+;; `^space:dd-(\d+)$`, and this prefix is `space:new-`. A view or an applet can
+;; be re-made from its target; a notebook carries cells, prose and lineage that
+;; nothing else holds.
+
+(defn- store-with-an-occupied-space-new
+  "TWO spaces live and `space:new-3` among them, so `(inc (count :space))` is
+   exactly 3 — the count form lands on the occupied id rather than merely near
+   it. That is the July defect and not an analogy to it: the notebook the mint
+   overwrites is here, with a title, cells and lineage to lose."
+  []
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:cosmos"
+                     :value {:id "space:cosmos" :kind :space :title "Cosmos"
+                             :value {:intent "the solar system, end to end" :cells []}}})
+    (sub/commit! st {:op :put :id "space:new-3"
+                     :value {:id "space:new-3" :kind :space :title "Inner vs. Outer Planets"
+                             :value {:intent "Compare the terrestrial and giant planets."
+                                     :cells [{:ref "tbl:planets"}]
+                                     :spawned-by {:space "space:cosmos"}}}})
+    st))
+
+(deftest new-space-mints-past-the-highest-id-and-leaves-the-occupant-alone
+  (with-redefs [agent/plan-space (fn [& _] {:title "World economies"
+                                            :intent "output and prices" :members []})]
+    (let [st (store-with-an-occupied-space-new)
+          r  (srv/new-space! st "world economies")]
+      (is (= "space:new-4" (:spaceId r)))                  ; two spaces live → count said -3
+      (is (= "World economies" (:title (sub/object st "space:new-4"))))
+      ;; the July defect, reproduced rather than argued: under the count form
+      ;; every one of these four is the semiconductor notebook's data
+      (let [occupant (sub/object st "space:new-3")]
+        (is (= "Inner vs. Outer Planets" (:title occupant)))
+        (is (= "Compare the terrestrial and giant planets." (get-in occupant [:value :intent])))
+        (is (= [{:ref "tbl:planets"}] (get-in occupant [:value :cells])))
+        (is (= "space:cosmos" (get-in occupant [:value :spawned-by :space])))))))
+
+(deftest describe-and-make-view-mint-past-the-highest-id-not-past-the-count
+  (with-redefs [agent/describe-view (fn [& _] {:label "by region" :kind "table"})
+                agent/make-applet   (fn [& _] "el.textContent = data.length")]
+    (let [st     (store-with-a-gap-between-count-and-max)
+          before (count (sub/history st))]
+      (srv/describe! st "tbl:x" "chart it")
+      (srv/make-view! st "tbl:x" "draw it")
+      (is (= (+ 2 before) (count (sub/history st))))       ; one commit each, and they happened
+      (is (= "view: by region" (:title (sub/object st "view:x-6"))))  ; count said view:x-2
+      (is (= "app: draw it" (:title (sub/object st "app:x-6"))))      ; count said app:x-2
+      (is (nil? (sub/object st "view:x-2")))
+      (is (nil? (sub/object st "app:x-2")))
+      ;; the occupants of -5, which a count form walks toward with every mint
+      (is (= "view: the fifth view" (:title (sub/object st "view:x-5"))))
+      (is (= "app: the fifth applet" (:title (sub/object st "app:x-5")))))))
+
+(deftest view-and-app-ids-number-per-source-not-across-the-store
+  ;; same argument as `fn:` above: `view:<src>-N` and `app:<src>-N` carry the
+  ;; source's local name, so each source owns its own run. A store-wide count
+  ;; numbered them off one running total, so the FIRST view over a brand-new
+  ;; table came out `view:y-2`. Two sources, because one cannot tell "counts
+  ;; the store" from "counts this source".
+  (with-redefs [agent/describe-view (fn [& _] {:label "by region" :kind "table"})
+                agent/make-applet   (fn [& _] "el.textContent = data.length")]
+    (let [st (store-with-a-gap-between-count-and-max)]
+      (sub/commit! st {:op :put :id "tbl:y"
+                       :value {:id "tbl:y" :kind :table :title "Y" :value trows}})
+      (srv/describe! st "tbl:y" "chart it")
+      (srv/make-view! st "tbl:y" "draw it")
+      (is (= "view: by region" (:title (sub/object st "view:y-1"))))  ; count said view:y-2
+      (is (= "app: draw it" (:title (sub/object st "app:y-1"))))      ; count said app:y-2
+      (srv/describe! st "tbl:x" "chart it")
+      (srv/make-view! st "tbl:x" "draw it")
+      (is (= "view: by region" (:title (sub/object st "view:x-6"))))  ; view:x- keeps its own run
+      (is (= "app: draw it" (:title (sub/object st "app:x-6")))))))
+
 (deftest flow-step-refs-walk-back-past-outputless-steps
   ;; the live-fire bug: the planner counted 1-based, so "$1" hit the GATE
   ;; (no :out) and the literal "$1" reached compute. $N now means "the
@@ -667,7 +846,7 @@
   (let [st (flow-store)]
     (is (:error (srv/flow-start! st "nope" "g")))                  ; not a notebook → sync error
     (let [fid (srv/flow-create! st "space:f" "g" [{:verb "draft" :args {} :note "" :status "pending"}])
-          m   (srv/mold-payload st fid nil)]
+          m   (srv/mold-payload st no-memory fid nil)]
       (is (= "flow" (:kind m)))
       (is (= "g" (get-in m [:rendered :goal]))))))
 
@@ -700,12 +879,12 @@
   (let [st (gappy-store)]
     (doseq [v ["table/rows" "table/summary" "table/cards" "table/pivot"
                "table/bar" "table/hist"]]
-      (is (some? (:rendered (srv/mold-payload st "tbl:gappy" v)))
+      (is (some? (:rendered (srv/mold-payload st no-memory "tbl:gappy" v)))
           (str v " threw or rendered nothing on a table with gaps")))))
 
 (deftest aggregates-ignore-gaps-rather-than-counting-them
   (let [st (gappy-store)
-        summ (:rendered (srv/mold-payload st "tbl:gappy" "table/summary"))
+        summ (:rendered (srv/mold-payload st no-memory "tbl:gappy" "table/summary"))
         gdp  (first (filter #(= "gdp" (:column %)) summ))]
     (is (= 3 (:n gdp)) "n must count the values that exist, not the rows")
     (is (= 60.0 (:sum gdp)))
@@ -720,7 +899,7 @@
                      :value {:id "tbl:lead" :kind :table :title "Leading gap"
                              :value [{:name "A" :score ""} {:name "B" :score 5.0}
                                      {:name "C" :score 7.0}]}})
-    (let [summ (:rendered (srv/mold-payload st "tbl:lead" "table/summary"))]
+    (let [summ (:rendered (srv/mold-payload st no-memory "tbl:lead" "table/summary"))]
       (is (= ["score"] (mapv :column summ)))
       (is (= 12.0 (:sum (first summ)))))))
 
@@ -733,7 +912,7 @@
 ;; to come from what the column MEANS.
 
 (defn- charted [st id]
-  (:rendered (srv/mold-payload st id "table/bar")))
+  (:rendered (srv/mold-payload st no-memory id "table/bar")))
 
 (deftest bar-prefers-a-quantity-over-a-rate-whatever-the-key-order
   (let [st (sub/fresh-store)
@@ -787,7 +966,7 @@
                 :age_65_plus_pct 12.0 :note "x"})]
     (sub/commit! st {:op :put :id "tbl:pop"
                      :value {:id "tbl:pop" :kind :table :title "Pop" :value (vec rows)}})
-    (let [c (:rendered (srv/mold-payload st "tbl:pop" "table/bar"))]
+    (let [c (:rendered (srv/mold-payload st no-memory "tbl:pop" "table/bar"))]
       (is (= "population" (:y c)) (str "charted " (:y c)))
       (is (= "sum" (:agg c))))))
 
@@ -1709,6 +1888,182 @@
         (is (= 2 (count (:facts p))))))))
 
 ;; ============================================================================
+;; POST /api/memory-durable — the judgement you make by hand
+;; ============================================================================
+;;
+;; The third and last writer of `:durable?`. The distiller proposes on every new
+;; fact, `loci.classify` proposed once over the corpus, and this is the one that
+;; overrides both and is never overridden — which is what `:durable-by "you"`
+;; buys and what the reinforcement test at the bottom of this section spends a
+;; whole round trip through `remember` to prove.
+
+(defn- unjudged-memory
+  "A throwaway memory holding two live facts nobody has judged and one
+   tombstone, as `[path m]`.
+
+   Written as records rather than through `remember` so that `:ts` and
+   `:strength` carry values the write under test could not have produced by
+   accident: `:ts 1000` is 1970 and `:strength 3` is not the 1 a fresh
+   `remember` writes. \"`:ts` and `:strength` are unchanged\" asserted against a
+   fact seeded a millisecond ago would pass against a route that went through
+   `remember` — which is the one break this endpoint most has to survive.
+
+   `mem-1` carries a `:vec` so \"no embedding goes out\" is an assertion and not
+   a tautology about a fact that never had one."
+  []
+  (let [path (tmpfile)]
+    (io/make-parents (io/file path))
+    (spit path (str/join "\n"
+                         [(pr-str {:id "mem-1" :fact "Kepler's Third Law states that T² ∝ a³."
+                                   :entities ["kepler"] :source {:obj "obj-1"}
+                                   :ts 1000 :strength 3
+                                   :vec [1.0 0.0] :model "embed-qwen3-0.6b" :dim 2})
+                          (pr-str {:id "mem-2" :fact "Lithography capacity is booked through 2027."
+                                   :entities ["asml"] :source {:obj "obj-2"}
+                                   :ts 2000 :strength 1})
+                          (pr-str {:id "mem-3" :fact "Most advanced chips are TSMC's."
+                                   :ts 2000 :merged-into "mem-2"})
+                          ""]))
+    [path (mem/file-memory path)]))
+
+(defn- fact-by-id [m id]
+  (first (filter #(= id (:id %)) (mem/all-facts m))))
+
+(deftest the-durable-endpoint-records-your-judgement-and-changes-nothing-else
+  (let [[_ m] (unjudged-memory)
+        r     (srv/memory-durable! m "mem-1" true)]
+    (is (= "mem-1" (:id r)) "the record, not a pane payload — this request carries no q and no scope")
+    (is (nil? (:facts r)) "and nothing that could be mistaken for one")
+    (is (true? (:durable? r)))
+    (is (= "you" (:durable-by r))
+        "the whole point of the field: a distiller re-deriving this sentence next week may revise the agent's answer and may not revise yours")
+    (is (nil? (:vec r))
+        "no embedding goes out, for the reason memory-payload drops them: ~1024 floats per fact")
+    ;; the `remember` trap, stated as an assertion. Going through `mold/remember`
+    ;; would find this fact as its own jaccard ≥ 0.6 duplicate, bump :strength and
+    ;; reset :ts to now — so marking a fact NOT durable would hand it a fresh 1.0
+    ;; recency multiplier in the same breath as recording that it ages.
+    (is (= 1000 (:ts r)) "the judgement is about the sentence, not a re-remembering of it")
+    (is (= 3 (:strength r)) "nothing here says this fact came up again")
+    (is (= "Kepler's Third Law states that T² ∝ a³." (:fact r)) "and the text is untouched")
+    (let [f (fact-by-id m "mem-1")]
+      (is (true? (:durable? f)) "and it is in the memory, not only in the answer")
+      (is (= "you" (:durable-by f)))
+      (is (= 1000 (:ts f)))
+      (is (= 3 (:strength f)))
+      (is (some? (:vec f))
+          "the vector is dropped from the ANSWER and kept in the store — the text did not change, so the embedding still describes it"))
+    (is (string? (json/write-str r))
+        "the response serialises — a route that 500s on its own answer is a route nobody can call")))
+
+(deftest the-durable-endpoint-toggles-back-and-the-judgement-stays-yours
+  (let [[_ m] (unjudged-memory)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [r (srv/memory-durable! m "mem-1" false)]
+      (is (false? (:durable? r))
+          "`false?` and not `(not (:durable? r))`: the second passes on a route that deleted the key, and an absent key is \"nothing has judged this\" rather than \"this one ages\"")
+      (is (= "you" (:durable-by r))
+          "changing your mind is still your judgement — a toggle that dropped the provenance would hand the next distiller pass permission to overwrite it")
+      (is (= 1000 (:ts r)) "and the second write re-stamps nothing either")
+      (is (= 3 (:strength r))))
+    ;; and again, to the same value it already holds: a no-op toggle is an
+    ;; ordinary success and not "the memory changed while this was being applied"
+    (let [r (srv/memory-durable! m "mem-1" false)]
+      (is (false? (:durable? r)))
+      (is (nil? (:error r))
+          "setting a flag to what it already says is idempotent, not a conflict"))))
+
+(deftest the-durable-endpoint-refuses-rather-than-throwing
+  (let [[_ m] (unjudged-memory)]
+    (is (string? (:error (srv/memory-durable! m "mem-404" true)))
+        "an id no fact has — a message, not a 500")
+    ;; and the sentence says the ID is missing rather than that no fact has it.
+    ;; `string?` alone could not fail here: drop the blank-id guard and a nil id
+    ;; still refuses, one clause later, with "there is no fact  to judge" — a
+    ;; message with a hole where the id should be, which is the one thing a
+    ;; refusal written as a sentence exists to avoid.
+    (is (re-find #"needs the id" (str (:error (srv/memory-durable! m nil true))))
+        "a missing id")
+    (is (re-find #"needs the id" (str (:error (srv/memory-durable! m "" true)))))
+    (is (string? (:error (srv/memory-durable! m "mem-3" true)))
+        "a tombstone: mem-3 was absorbed into mem-2, and stamping it would write a judgement onto a record only `live` saves every reader from")
+    ;; `boolean?` and not `contains?`, ratified when the distiller and then
+    ;; loci.classify met the same question. `weight` reads the VALUE, and the
+    ;; string "false" is truthy in Clojure — so a hand-rolled POST carrying it
+    ;; would mark a fact durable, stamp it `:durable-by "you"`, and thereby make
+    ;; `loci.classify` skip it forever. The pane always sends a boolean; this is
+    ;; about everything that is not the pane.
+    (is (string? (:error (srv/memory-durable! m "mem-1" "false")))
+        "a judgement that is neither true nor false is not a judgement")
+    (is (string? (:error (srv/memory-durable! m "mem-1" nil))))
+    (is (every? #(not (contains? % :durable?)) (mem/all-facts m))
+        "and none of that judged anything")))
+
+(deftest the-durable-endpoint-appends-and-rewrites-nothing
+  ;; The log is append-only and last-wins by :id — `next-id`'s tombstone
+  ;; reasoning depends on nothing ever being removed, so a route that rewrote
+  ;; the file in place would be correct today and reissue an id later.
+  (let [[path m] (unjudged-memory)
+        before   (slurp path)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [after (slurp path)]
+      (is (str/starts-with? after before)
+          "the prefix is byte-identical: this is one more line, not a rewritten file")
+      (is (= 1 (- (count (str/split-lines (str/trim after)))
+                  (count (str/split-lines (str/trim before)))))
+          "exactly one line per judgement")
+      (is (= 2 (count (mem/all-facts m)))
+          "and the memory still holds the two live facts it held — an append under an existing id replaces it, it does not add a fact"))))
+
+(deftest the-pane-payload-carries-the-judgement-it-is-asked-to-render
+  ;; The plan says no payload change should be needed. That is a claim about
+  ;; `memory-payload`, so it is checked here rather than assumed: it dissocs
+  ;; `:vec` and ships every other key, and the pane cannot render a distinction
+  ;; the payload drops.
+  (let [[_ m] (unjudged-memory)]
+    (srv/memory-durable! m "mem-1" true)
+    (let [{:keys [env file]} (embed-env {})]
+      (with-redefs [embed/env env embed/from-file file]
+        (let [fs (into {} (map (juxt :id identity)) (:facts (srv/memory-payload m nil)))]
+          (is (true? (:durable? (fs "mem-1"))))
+          (is (= "you" (:durable-by (fs "mem-1")))
+              "whose judgement it is travels with it — the pane says so, and only the payload can tell it")
+          (is (nil? (:vec (fs "mem-1"))) "still no vectors, which is the one key that does not travel")
+          (is (false? (contains? (fs "mem-2") :durable?))
+              "and an unjudged fact arrives with no key at all — absent means it decays, which is today's behaviour and not a judgement that it ages"))))))
+
+(deftest a-later-reinforcement-does-not-revert-what-you-said-through-the-route
+  ;; Task 2 gave `remember` the guard and pinned it against a hand-stamped atom.
+  ;; This is the same rule through the real endpoint, which is the only place
+  ;; `"you"` is ever written: mark a fact by hand, then let a distiller pass
+  ;; re-derive the same sentence and say the opposite.
+  ;;
+  ;; Drop `:durable-by "you"` from the route and this is the test that fails —
+  ;; the flag survives on its own and the provenance is what protects it.
+  (let [[_ m] (unjudged-memory)
+        kepler "Kepler's Third Law states that T² ∝ a³."]
+    (srv/memory-durable! m "mem-1" true)
+    (mold/remember m kepler {:entities ["orbits"] :durable? false})
+    (let [f (fact-by-id m "mem-1")]
+      (is (true? (:durable? f))
+          (str "the agent re-derived the sentence and judged it as-of-now; you had already said otherwise. Got "
+               (pr-str (select-keys f [:durable? :durable-by]))))
+      (is (= "you" (:durable-by f)) "and it is still yours, so the next pass is refused too")
+      ;; the other half of Task 2's correction: only the JUDGEMENT stands. A
+      ;; guard written as `(if (= "you" …) dup …)` would return the fact whole
+      ;; and freeze it at strength 1 with text that never updates.
+      (is (= 4 (:strength f))
+          "reinforcement still happened — the fact came up again and says so")
+      (is (contains? (set (:entities f)) "orbits")
+          "and the entities still union"))
+    ;; the mirror image: an agent judgement IS revisable, so the guard is about
+    ;; provenance and not about the flag being written once
+    (mold/remember m "Lithography capacity is booked through 2027." {:durable? true})
+    (let [f (fact-by-id m "mem-2")]
+      (is (true? (:durable? f)) "nobody had judged mem-2, so the agent's answer lands")
+      (is (= "agent" (:durable-by f))))))
+
+;; ============================================================================
 ;; memory scoped to one notebook's lineage (/api/memory?space=…)
 ;; ============================================================================
 
@@ -2116,8 +2471,14 @@
   ;; A FRESH store per flow: ✎ Draft and 🔍 Research each append a cell to the
   ;; notebook, which legitimately widens the next call's scope. Reusing one
   ;; store would compare each flow against a stale expectation.
-  (let [want {:k 6 :semantic? true
-              :filter {:sources (srv/lineage-sources (lineage-fixture) "space:kid")}}
+  ;; The two empty sets are NOT noise. `recall-spy` answers `all-facts` with [],
+  ;; so `subject-set` has no names to detect and no lineage facts to read, and
+  ;; the opts show that honestly: this caller asked about subjects and found
+  ;; none. An absent key would mean something else — "this caller does not do
+  ;; subjects at all", which is what /api/leap and the memory pane still say.
+  (let [want {:k 6 :semantic? true :subjects #{}
+              :filter {:sources (srv/lineage-sources (lineage-fixture) "space:kid")
+                       :entities #{}}}
         opts (fn [f]
                (let [st   (lineage-fixture)
                      seen (atom [])]
@@ -2132,5 +2493,1521 @@
     (is (= [want] (opts #(srv/research! % "space:kid" "chips"))) "🔍 Research")
     (is (= [want] (opts #(srv/suggest! % "space:kid"))) "✧ Suggest")
     ;; and with no notebook, ✦ Ask asks for no filter at all
-    (is (= [{:k 6 :semantic? true}] (opts #(srv/ask! % "chips" nil)))
+    (is (= [{:k 6 :semantic? true :subjects #{}}] (opts #(srv/ask! % "chips" nil)))
         "space nil → no :filter key, exactly as before this change")))
+
+;; ============================================================================
+;; the subject set — what a recall in this notebook is ABOUT, and not merely
+;; where it stands (Task 3 of the entities plan)
+;; ============================================================================
+
+(defn- subject-fixture
+  "Two unrelated roots and a brand-new notebook — the shape the subject union
+   exists for:
+
+     space:semis   a root that has been working on chips
+       space:kid     spawned-by semis
+     space:econ    a DIFFERENT root, sharing no ancestor with semis
+     space:new     just created, holding nothing
+
+   `space:econ` is the notebook `remembered-context`'s 2026-08-08 note called
+   blind: no lineage reaches it from `space:semis` in either direction, so
+   before this change nothing either one learned could ever reach the other.
+   Modelled on the live corpus's `Serbia — open economic data` sitting beside
+   the `Semiconductors` hub."
+  []
+  (let [st (sub/fresh-store)]
+    (put-space! st "space:semis" "Semis" "find:semis-1" "chips fabs" {})
+    (put-space! st "space:kid"   "Kid"   "find:kid-1"   "chips euv"
+                {:spawned-by {:space "space:semis" :prompt "go deeper"}})
+    (put-space! st "space:econ"  "Econ"  "find:econ-1"  "other work" {})
+    (sub/commit! st {:op :put :id "space:new"
+                     :value {:id "space:new" :kind :space :title "New"
+                             :value {:intent "just made" :cells []}}})
+    st))
+
+(defn- subject-memory
+  "Facts carrying real `:entities`, worded so each assertion below can pass for
+   exactly one reason.
+
+   Neither fact recalled BY SUBJECT here shares one token with the prompt that
+   reaches it. That is the point of the wording: `relevance` is
+   `0.6·keywords + 0.4·entities`, so a fact with a word in common would score on
+   the keyword half alone and the assertion would stay green with every line of
+   the subject machinery deleted. `lineage-memory` above cannot be reused for
+   the same reason — its six facts all say \"chips\", which makes it a good
+   fixture for a *filter* and a useless one for a *subject*.
+
+   **The six findings in `space:semis` are the reason this fixture is twelve
+   facts and not five.** They are perfectly ordinary notebook contents, they
+   carry names nothing outside the lineage has ever used, and with fewer than
+   `k`=6 candidates a test cannot see what they do: under a subject set that
+   scores lineage-only names, all six take an identical 0.4000 and fill the
+   whole block, pushing out both the fact the union exists to deliver and the
+   notebook's own child's. A test with three candidates and six slots passes
+   either way, which is certifying rather than testing.
+
+   Their token counts are deliberately all different (8, 7, 5, 6, 9, 10) and
+   none of them contains `of`, `is`, `long`, `how`, `wrath` or `righteous`, so
+   each scores a distinct keyword jaccard against the game prompt and no
+   assertion below depends on how a tie is broken.
+
+   The Serbia fact is the negative control: it shares three of the game
+   prompt's tokens (`the`, `long`, `is`) and would rank THIRD if it were ever a
+   candidate, so its absence is a competitive exclusion and not an artefact of
+   `k`. It is in neither the lineage nor the subject set.
+
+   Written lineage-last so the six findings are the NEWEST facts: recency is the
+   tie-break, and a fixture where the flattening's victims happen to be newer
+   would hide it."
+  []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[nb obj txt ents]
+            [["space:econ"  "find:econ-1"  "A full playthrough takes roughly 120 hours." ["Wrath of the Righteous"]]
+             ["space:econ"  "find:econ-1"  "Mythic paths branch at the third act."       ["Wrath of the Righteous" "Pathfinder"]]
+             ["space:econ"  "find:econ-1"  "The long series is published quarterly."     ["Serbia"]]
+             ["space:econ"  "find:econ-1"  "Fewer than sixty units ship a year."         ["ASML"]]
+             ["space:kid"   "find:kid-1"   "One vendor ships every scanner."             ["EUV" "ASML"]]
+             ["space:semis" "find:semis-1" "Fabrication concentrates on one island."     ["TSMC" "Taiwan"]]
+             ;; the six ordinary findings — lineage-only names, all of them
+             ["space:semis" "find:semis-1" "Output fell by two percent over the quarter."         ["output"]]
+             ["space:semis" "find:semis-1" "Rainfall was unusually heavy through the summer."     ["rainfall"]]
+             ["space:semis" "find:semis-1" "Yields improved after the retool."                    ["yield"]]
+             ["space:semis" "find:semis-1" "Prices doubled through the spring quarter."           ["price"]]
+             ["space:semis" "find:semis-1" "Export permits were renewed in the autumn without incident." ["export permits"]]
+             ["space:semis" "find:semis-1" "Board members approved the new campus on its northern edge." ["campus"]]]]
+      (mold/remember m txt {:entities ents :source {:obj obj :space nb}}))
+    m))
+
+(def ^:private game-prompt "how long is Wrath of the Righteous?")
+
+(defn- lineage-only-findings
+  "The six ordinary `space:semis` findings, by text. Named once so a test can
+   say \"none of these\" without listing them and quietly listing five."
+  []
+  ["Output fell by two percent over the quarter."
+   "Rainfall was unusually heavy through the summer."
+   "Yields improved after the retool."
+   "Prices doubled through the spring quarter."
+   "Export permits were renewed in the autumn without incident."
+   "Board members approved the new campus on its northern edge."])
+
+(defn- remembered-lines
+  "The fact lines of a REMEMBERED block, in order, bullet stripped. nil for no
+   block at all, so \"nothing was recalled\" and \"an empty block was built\"
+   stay different answers."
+  [ctx]
+  (when ctx
+    (into [] (keep #(when (str/starts-with? % "- ") (subs % 2)))
+          (str/split-lines ctx))))
+
+(def ^:private semis-names
+  "Every name the `space:semis` lineage carries — its own findings and its
+   child's. All but `asml` are used nowhere else in the corpus.
+
+   Kept as a NEGATIVE: after 2026-08-09 none of these may reach the subject set
+   unless the prompt names it, so this is the set the assertions below check is
+   absent, not present."
+  #{"tsmc" "taiwan" "euv" "asml"
+    "output" "rainfall" "yield" "price" "export permits" "campus"})
+
+(deftest the-subject-set-is-what-the-prompt-NAMES-and-never-what-the-notebook-holds
+  ;; WHAT CHANGED, AND WHY. This test replaces two —
+  ;; `the-scope-set-takes-every-name-this-lineage-carries` and
+  ;; `the-score-set-drops-the-names-only-this-lineage-has-ever-used` — which
+  ;; between them pinned design §5's subject set: the prompt's names UNION the
+  ;; names this lineage already carries, with the second half restricted to
+  ;; names something outside the lineage also carries.
+  ;;
+  ;; That was built, shipped, and measured on the real corpus on 2026-08-09
+  ;; (`docs/superpowers/specs/2026-08-08-entities-recall-measured.md`). It
+  ;; degraded 7 of 12 real prompts — every single prompt typed into a notebook
+  ;; that has a lineage. The restriction deletes exactly the names a notebook is
+  ;; ABOUT, because those live in its family and nowhere else, so a
+  ;; semiconductor question got a subject set made of planets. The user's
+  ;; decision: drive the union from the prompt alone.
+  ;;
+  ;; So `subject-set` no longer takes `sources` at all — there is nothing left
+  ;; for it to do with them — and the two sets that used to differ are one.
+  ;; Please do not "restore" §5 here; it is the thing that was measured wrong.
+  (let [m (subject-memory)]
+    (is (= #{"wrath of the righteous"} (srv/subject-set m game-prompt))
+        "a multi-word name the corpus knows, detected in the prompt and normalized")
+    (is (= #{} (srv/subject-set m "how long is this going to take"))
+        "a prompt naming nothing is no subject at all — and the whole feature is then inert")
+    (is (= #{} (srv/subject-set m "chips"))
+        "`chips` is a word this corpus never made a NAME of, so it names nothing — which is the case the old lineage half existed to rescue and the measurement said not to")))
+
+(deftest no-name-the-notebook-merely-holds-reaches-the-subject-set
+  ;; The pin that goes red if the lineage half is ever put back. `space:semis`
+  ;; carries ten names across its own findings and its child's; a prompt that
+  ;; names none of them must produce none of them, however much the notebook has
+  ;; been working on them.
+  (let [m (subject-memory)]
+    (is (not-any? (srv/subject-set m "chips") semis-names)
+        "not one of the notebook's ten names, because the question named none of them")
+    (is (not-any? (srv/subject-set m game-prompt) semis-names)
+        "and naming a DIFFERENT subject does not drag them in either")
+    (is (= #{"asml"} (srv/subject-set m "how many ASML units ship in a year?"))
+        "…while a prompt that DOES name one gets exactly that one — the union is driven by the question")))
+
+(deftest the-subject-set-does-not-depend-on-where-you-are-standing
+  ;; It reads `all-facts` for the corpus's known names and the prompt for which
+  ;; of them was asked about. No notebook, no lineage, no scope enters it — which
+  ;; is why it takes a memory and a prompt and nothing else, and why the same
+  ;; question asked anywhere gets the same subjects.
+  (let [m (subject-memory)]
+    (is (= (srv/subject-set m game-prompt) (srv/subject-set m (str "  " game-prompt "  ")))
+        "normalization is `ent/detect`'s and the answer does not drift with whitespace")
+    (is (= #{"wrath of the righteous"} (srv/subject-set m "WRATH OF THE RIGHTEOUS, how long?"))
+        "case and punctuation are not part of a name")))
+
+(defn- recall-spy-over
+  "A `recall-spy` that still answers `all-facts` from a real memory `m`.
+
+   `subject-set` reads `all-facts` off the very memory `remembered-context` then
+   recalls from, so the plain `recall-spy` — which answers `[]` — would build an
+   empty subject set no matter what the code under test does, and an assertion
+   on those opts would certify rather than test.
+
+   And the spy has to be a `reify`, not a `with-redefs` of `mold/recall` as the
+   plan's Step 1 suggested: `recall` is a protocol method, the compiler turns
+   the call into a cached callsite straight to the implementing class, and the
+   rebinding is silently ignored. See `recall-spy` above, which says the same
+   thing and has said it since the memory pane was written."
+  [m seen]
+  (reify mold/Recall
+    (remember  [_ f o] (mold/remember m f o))
+    (all-facts [_] (mold/all-facts m))
+    (recall    [_ q opts] (swap! seen conj [q opts]) [])))
+
+(defn- recall-opts
+  "The opts `remembered-context` asks recall for, with `m` standing in for the
+   server's memory singleton."
+  [st m prompt space]
+  (let [seen (atom [])]
+    (with-redefs [mem/memory (delay (recall-spy-over m seen))]
+      (#'srv/remembered-context st prompt space))
+    (second (first @seen))))
+
+(deftest a-scoped-recall-asks-for-the-lineage-AND-the-subject
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    ;; from a brand-new notebook: nothing in the lineage, one name in the prompt
+    (is (= {:k 6 :semantic? true
+            :subjects #{"wrath of the righteous"}
+            :filter {:sources #{"space:new"} :entities #{"wrath of the righteous"}}}
+           (recall-opts st m game-prompt "space:new"))
+        "BOTH keys: :filter to make the other root's fact eligible, :subjects to make it rank — naming it in only one of the two is the quiet failure `recall`'s own comment warns about")))
+
+(deftest one-subject-set-does-both-jobs-and-carries-no-lineage-name
+  ;; WHAT CHANGED. This replaces `the-two-subject-sets-reach-recall-as-two-
+  ;; different-values`, which asserted that `:filter {:entities}` and
+  ;; `:subjects` receive DIFFERENT sets — the scope being §5's prompt-∪-lineage
+  ;; union and the score being that union restricted. The 2026-08-09 measurement
+  ;; removed the lineage half from both, so there is nothing left for them to
+  ;; differ about and a distinction that no longer distinguishes is worse than
+  ;; none. What still matters, and is asserted here, is that BOTH keys are sent:
+  ;; `:filter` to make another root's fact eligible, `:subjects` to make it rank.
+  (let [st   (subject-fixture)
+        m    (subject-memory)
+        opts (recall-opts st m game-prompt "space:semis")]
+    (is (= {:k 6 :semantic? true
+            :subjects #{"wrath of the righteous"}
+            :filter {:sources (srv/lineage-sources st "space:semis")
+                     :entities #{"wrath of the righteous"}}}
+           opts)
+        "the prompt's one name, in both places, beside the unchanged lineage filter")
+    (is (= (:subjects opts) (:entities (:filter opts)))
+        "one value, two jobs — naming a subject in only one of them is the quiet failure `recall`'s opts comment describes")
+    (is (not-any? (:subjects opts) semis-names)
+        "and not one of the ten names this notebook has been working on, because the question named none of them")))
+
+(deftest with-no-notebook-recall-still-asks-for-no-filter-at-all
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= {:k 6 :semantic? true :subjects #{"wrath of the righteous"}}
+           (recall-opts st m game-prompt nil))
+        "no :filter key — the whole memory is the candidate set, exactly as before this change")))
+
+(deftest asking-about-a-subject-anywhere-brings-the-subjects-facts-back
+  ;; THE REPORTED CASE, and the paragraph `remembered-context` used to accept as
+  ;; a cost: `space:new` shares no lineage with `space:econ` and never will.
+  ;;
+  ;; Asserted as the WHOLE block, in order, rather than as three `includes?`
+  ;; calls: what matters here is not only that the game's facts arrive but that
+  ;; nothing else does, and a membership test cannot say that.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= ["A full playthrough takes roughly 120 hours. (⌾ find:econ-1)"
+            "Mythic paths branch at the third act. (⌾ find:econ-1)"]
+           (remembered-lines (remembered st m game-prompt "space:new")))
+        "both of the other root's facts about the game, best first, cited as always — and NOTHING else out of twelve, in particular not `The long series is published quarterly.`, which shares three of the prompt's words and would rank second if the subject union had opened the door instead of widening it")))
+
+(deftest a-notebook-no-longer-inherits-its-lineages-SUBJECTS
+  ;; WHAT CHANGED, AND WHY — read this one before changing anything here.
+  ;;
+  ;; This test used to be called `a-notebook-that-has-been-working-on-something-
+  ;; keeps-reaching-it`, and it asserted the opposite of what it asserts now:
+  ;; asking `chips` in `space:semis` — a prompt naming no entity at all — pulled
+  ;; `space:econ`'s ASML fact across, because `asml` was among the names semis'
+  ;; own facts already carried. That was design §5's second half working as
+  ;; specified.
+  ;;
+  ;; Measured on the real corpus on 2026-08-09, that half degraded 7 of 12 real
+  ;; prompts — every prompt typed into a notebook with a lineage — and the user
+  ;; decided to drop it. `space:semis` asked about chokepoints was returning six
+  ;; facts about Jupiter and Saturn.
+  ;;
+  ;; So the rule now: **the question widens the scope, the notebook's habits
+  ;; never do.** A prompt that names nothing gets nothing from outside its
+  ;; lineage, and gets from inside it only what the words actually match — which
+  ;; here is nothing, so there is no block at all.
+  ;;
+  ;; The six ordinary findings still earn their place in the fixture: they are in
+  ;; the lineage and therefore candidates, and if a lineage name ever leaks back
+  ;; into the subject set they will score 0.4000 apiece and this returns a block
+  ;; of six instead of nil.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (nil? (remembered st m "chips" "space:semis"))
+        "no name in the prompt, no word in common with anything in scope → no REMEMBERED block, exactly as before entities existed")
+    (is (= ["Fewer than sixty units ship a year. (⌾ find:econ-1)"        ; 0.6182 — named subject AND four words
+            "One vendor ships every scanner. (⌾ find:kid-1)"             ; 0.1333 — its own child, on `asml` alone
+            "Export permits were renewed in the autumn without incident. (⌾ find:semis-1)"] ; 0.0375 — on the word `in`
+           (remembered-lines (remembered st m "how many ASML units ship in a year?" "space:semis")))
+        "…and the moment the QUESTION names the subject, the other root's fact about it comes across and leads — which is the feature, driven by the prompt rather than by the notebook")))
+
+(deftest a-prompt-naming-nothing-recalls-exactly-what-it-did-before-entities
+  ;; `subject-set` claims in its docstring that when the prompt names no name the
+  ;; corpus knows, the whole feature is INERT — `:subjects` empty leaves `qs` as
+  ;; the query tokens, `:filter {:entities}` empty admits nothing, and the block
+  ;; is character for character what df26e2b produced. That is a claim about
+  ;; every prompt that does not happen to name a subject, which after
+  ;; 2026-08-09 is most of them, so it is pinned rather than asserted in prose.
+  ;;
+  ;; The comparison is against the OLD opts, built here exactly as df26e2b's
+  ;; `remembered-context` built them: `{:k 6 :semantic? true :filter {:sources …}}`
+  ;; and no subject keys at all.
+  (let [st (subject-fixture)
+        m  (subject-memory)
+        q  "yields improved through the quarter"
+        {:keys [env file]} (embed-env {})]
+    (with-redefs [embed/env env embed/from-file file mem/memory (delay m)]
+      (is (= #{} (srv/subject-set m q))
+          "the premise: `yield` is a name this corpus knows and `yields` is not one — `ent/detect` will not match inside a longer word")
+      (is (= (mapv :fact (mold/recall m q {:k 6 :semantic? true
+                                           :filter {:sources (srv/lineage-sources st "space:semis")}}))
+             (mapv #(str/replace % #" \(⌾ [^)]*\)$" "")
+                   (remembered-lines (#'srv/remembered-context st q "space:semis"))))
+          "six facts, same order, same texts — the entity work costs nothing on a prompt it has nothing to say about"))))
+
+(deftest a-fact-wholly-about-the-subject-outranks-one-only-partly-about-it
+  ;; RECORDED, NOT FIXED. `relevance`'s entity half is a within-fact ratio, so it
+  ;; asks "how much of this fact is about what you asked": the fact whose only
+  ;; name is `wrath of the righteous` scores 0.4000, and the one that also names
+  ;; `pathfinder` scores 0.1795 — for the same matched name.
+  ;;
+  ;; Task 12 measured this saturating on the real corpus: 38 of 39 top-6 slots
+  ;; scored ent = 1.000 against a keyword half worth 0.004–0.114, up to 100:1, so
+  ;; the entity term decides membership rather than order. The weighting is
+  ;; deliberately unchanged — this test is the pin to argue with if that is ever
+  ;; revisited, not a thing to quietly update.
+  ;;
+  ;; This used to be `a-remote-fact-wholly-on-subject-outranks-a-local-one-partly-
+  ;; on-it`, phrased as local-versus-remote. That framing died with the lineage
+  ;; half — both facts here are remote — but the ratio it was really about did
+  ;; not, so the test is rewritten rather than dropped.
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (= ["A full playthrough takes roughly 120 hours. (⌾ find:econ-1)"
+            "Mythic paths branch at the third act. (⌾ find:econ-1)"]
+           (remembered-lines (remembered st m game-prompt "space:new")))
+        "the fact that is wholly about the named subject leads the one that is half about it")))
+
+(deftest a-fact-overlapping-on-neither-half-stays-out-of-a-FULL-block
+  ;; §8 asked for this and nothing pinned it: a fact in neither the lineage nor
+  ;; the subject set must stay out. Asserted with the block SATURATED — eight
+  ;; facts score above zero and `k` is 6 — so the exclusion is competitive and
+  ;; not an artefact of there being room for everything.
+  ;;
+  ;; `The long series is published quarterly.` shares `the`, `long` and `is`
+  ;; with the prompt and would score 0.1800, third of the block, displacing
+  ;; `Output fell by two percent over the quarter.` at 0.0429. It is excluded
+  ;; because its only name is `serbia`, which the prompt does not name.
+  (let [st    (subject-fixture)
+        m     (subject-memory)
+        lines (remembered-lines (remembered st m game-prompt "space:semis"))]
+    (is (= 6 (count lines)) "the block is full — `k` is not hiding anything")
+    (is (= ["A full playthrough takes roughly 120 hours. (⌾ find:econ-1)"     ; 0.4000  named subject
+            "Mythic paths branch at the third act. (⌾ find:econ-1)"           ; 0.1795  named subject
+            "Yields improved after the retool. (⌾ find:semis-1)"              ; 0.0545  lineage, one word
+            "Prices doubled through the spring quarter. (⌾ find:semis-1)"     ; 0.0500  lineage, one word
+            "Rainfall was unusually heavy through the summer. (⌾ find:semis-1)" ; 0.0462
+            "Output fell by two percent over the quarter. (⌾ find:semis-1)"]  ; 0.0429
+           lines)
+        "the two facts the prompt's subject reached, then this notebook's own findings on the words alone")
+    (is (not-any? #(str/includes? % "The long series is published quarterly.") lines)
+        "the fact with no overlap on EITHER half is out, though it would have ranked third of six")
+    (is (not-any? #(str/includes? % "Fewer than sixty units ship a year.") lines)
+        "and so is the ASML fact this lineage used to inherit — `asml` is a name the notebook holds, not one the question asked")))
+
+(deftest an-empty-notebook-with-a-subjectless-prompt-still-brings-nothing
+  ;; unchanged, and the state a brand-new notebook is normally in
+  (let [st (subject-fixture)
+        m  (subject-memory)]
+    (is (nil? (remembered st m "how long is this going to take" "space:new"))
+        "no lineage facts and no name in the prompt → no candidates, no REMEMBERED block")
+    (is (= 12 (count (mem/all-facts m))) "…while memory itself is full")))
+
+;; ============================================================================
+;; the entity page — ONE payload, served to the modal and to the object page
+;; ============================================================================
+
+(def ^:private entity-rows
+  "The corpus behind the entity-page tests: `[text entities source]`, in the
+   order it is written.
+
+   **The write order is neither the ranked order nor its reverse**, and that is
+   the point of it. Ranked by `recall`, the four `TSMC` facts come back
+   F1 F2 F3 F4; written, they land F3 F1 F4 F2, so `:ts` ascending gives
+   F3 F1 F4 F2 and `:ts` descending gives F2 F4 F1 F3. A fixture written in
+   ranked order would pass with the ranking replaced by the log.
+
+   The scores are arranged, not observed. `relevance` is
+   `0.6·jaccard(query tokens, fact tokens) + 0.4·(inverse-frequency entity
+   overlap)`, the query here is the name itself, and every name's document
+   frequency is fixed by this table — tsmc 4, taiwan 3, asml 2, arizona 1 — so
+   for `?name=tsmc`:
+
+     F1  0.5200   says `tsmc` in five words, and carries only `tsmc`
+     F2  0.4000   carries only `tsmc`, and shares no word with the query
+     F3  0.1714   carries `tsmc` and `taiwan`, so the name is diluted
+     F4  0.0480   carries four names, three of them rarer than `tsmc`
+
+   Four scores, each separated from the next in the first or second decimal
+   place, against a `decay` spread of about two parts in a million — see
+   `stamp-ts!`. No assertion on this name depends on how a tie breaks, because
+   there are no ties.
+
+   `doc:gone` is a source with **no object behind it**: a fact outlives the
+   document it was distilled from, and the page must drop the id rather than
+   render a chip reading `null`.
+
+   The last two facts carry a MULTI-WORD name and share no word with it. Query
+   tokens are single words, so `taiwan semiconductor manufacturing` is three
+   tokens to the scorer and one name to the index: without `:subjects` both
+   score exactly 0 on both halves and `recall` drops them for not being
+   positive. That is the case `:subjects` exists for, and this is where it is
+   pinned."
+  [;; F3 — mem-1
+   ["a second advanced packaging site opens next spring"
+    ["TSMC" "Taiwan"] {:obj "doc:gone" :space "space:semis"}]
+   ;; F1 — mem-2
+   ["tsmc leads at three nanometres"
+    ["TSMC"] {:obj "doc:fab" :space "space:semis"}]
+   ;; F4 — mem-3
+   ["the arizona plant hires from four local colleges"
+    ["TSMC" "Taiwan" "ASML" "Arizona"] {:obj "doc:az" :space "space:az"}]
+   ;; F2 — mem-4
+   ["the foundry raised capital spending for the coming year"
+    ["TSMC"] {:obj "doc:fab" :space "space:semis"}]
+   ;; the rest of the corpus, which exists to fix the document frequencies
+   ["the island exports more than it imports each quarter"
+    ["Taiwan"] {:obj "doc:fab" :space "space:semis"}]
+   ["one vendor ships every extreme ultraviolet scanner"
+    ["ASML"] {:obj "doc:fab" :space "space:semis"}]
+   ;; the multi-word pair — G3 then G4, so G4 is the newer of the two
+   ["the board approved a new packaging campus on its northern edge"
+    ["Taiwan Semiconductor Manufacturing"] {:obj "doc:az" :space "space:az"}]
+   ["wafer starts held steady through the winter months"
+    ["Taiwan Semiconductor Manufacturing"] {:obj "doc:az" :space "space:az"}]])
+
+(defn- stamp-ts!
+  "Give every fact a distinct timestamp, one second apart, in the order it was
+   written.
+
+   `remember` stamps `System/currentTimeMillis`, and a fixture written in a
+   `doseq` lands several facts in the SAME millisecond. `sort-by` is stable, so
+   sorting a same-`:ts` corpus by `:ts` is a **no-op** — and the sabotage this
+   fixture exists to fail, ranking the page by recency instead of by score,
+   would leave the order untouched and the test would pass with the bug in
+   place. A test that cannot fail is worse than no test.
+
+   One second apart and a minute ago, so `decay` moves the scores by about two
+   parts in a million: enough to break a tie deterministically (the multi-word
+   pair below ties exactly on relevance, and the newer must lead), far too
+   little to reorder facts whose relevances differ in the second decimal place."
+  [m]
+  (let [base (- (System/currentTimeMillis) 60000)]
+    (swap! (:!facts m)
+           (fn [fs]
+             (reduce-kv (fn [acc id f]
+                          (assoc acc id (assoc f :ts (+ base (* 1000 (parse-long (subs id 4)))))))
+                        {} fs))))
+  m)
+
+(defn- entity-memory []
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [[txt ents src] entity-rows]
+      (mold/remember m txt {:entities ents :source src}))
+    (stamp-ts! m)))
+
+(defn- entity-fixture
+  "The objects the facts above were recorded against — minus `doc:gone`, which
+   is the point of it."
+  []
+  (let [st (sub/fresh-store)]
+    (doseq [o [{:id "doc:fab" :kind :doc :title "Fab notes" :value "…"}
+               {:id "doc:az" :kind :doc :title "Arizona plans" :value "…"}
+               {:id "space:semis" :kind :space :title "Semiconductors"
+                :value {:intent "the supply chain" :cells []}}
+               {:id "space:az" :kind :space :title "Arizona build"
+                :value {:intent "the fab" :cells []}}]]
+      (sub/commit! st {:op :put :id (:id o) :value o}))
+    st))
+
+(defn- materialize!
+  "Hand-commit the object Task 5 will commit: `:kind :entity`, the NORMALIZED
+   name under `[:value :name]`, and a title that is deliberately not the name —
+   matching on the title would make every one of these lookups miss."
+  [st id nm title]
+  (sub/commit! st {:op :put :id id
+                   :value {:id id :kind :entity :title title :value {:name nm}}})
+  st)
+
+(def ^:private tsmc-ranked
+  "The four `tsmc` facts in the order `entity-payload` must return them, best
+   first. See `entity-rows` for the arithmetic."
+  ["tsmc leads at three nanometres"                        ; 0.5200
+   "the foundry raised capital spending for the coming year" ; 0.4000
+   "a second advanced packaging site opens next spring"     ; 0.1714
+   "the arizona plant hires from four local colleges"])     ; 0.0480
+
+(deftest an-entity-page-is-its-facts-ranked-and-not-its-facts-logged
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= "tsmc" (:name p)))
+    (is (= 4 (:count p)) "every live fact carrying the name, from the index")
+    (is (true? (:promoted p)) "four facts is well past the threshold")
+    (is (nil? (:object p)) "and nothing has been materialized")
+    (is (= tsmc-ranked (mapv :fact (:facts p)))
+        "RANKED, not logged — written F3 F1 F4 F2, so neither :ts order is this")
+    ;; the claim above is only worth something if the two orders really differ
+    (is (not= tsmc-ranked (mapv :fact (sort-by :ts > (:facts p))))
+        "newest-first is a different order…")
+    (is (not= tsmc-ranked (mapv :fact (sort-by :ts (:facts p))))
+        "…and so is oldest-first")))
+
+(deftest an-entity-page-names-where-its-facts-came-from
+  ;; Documents AND notebooks in one list: a fact's `:source` names both (see
+  ;; `mem/source-ids`), and the page is asking "where did this come from",
+  ;; which either answers. Design §3: "the notebooks and documents those facts
+  ;; came from."
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= [{:id "doc:fab" :title "Fab notes" :kind "doc"}
+            {:id "space:semis" :title "Semiconductors" :kind "space"}
+            {:id "doc:az" :title "Arizona plans" :kind "doc"}
+            {:id "space:az" :title "Arizona build" :kind "space"}]
+           (:sources p))
+        "in the FACTS' rank order, deduped, and with `doc:gone` — a source whose object is gone — dropped rather than rendered as a chip with no title")
+    (is (not-any? #(nil? (:title %)) (:sources p)))))
+
+(deftest a-source-that-is-a-HUSK-and-not-an-object-is-dropped-not-drawn
+  ;; `apply-event` :assoc/:append against an id with no prior :put writes under
+  ;; `[:objects id]` anyway, so the store answers with `{:note "x"}` — an entry
+  ;; that is present but is not an object. It fails both of `:sources`' rules at
+  ;; once: `(name (:kind o))` on it is an NPE, which is a 500 on a page load,
+  ;; and a husk that survived would be drawn as a chip with no name on it.
+  (let [st (sub/fresh-store)
+        m  (mem/file-memory (tmpfile))]
+    (sub/commit! st {:op :put :id "doc:real"
+                     :value {:id "doc:real" :kind :doc :title "A real document" :value "…"}})
+    (sub/commit! st {:op :assoc :id "doc:husk" :path [:note] :value "x"})
+    (is (= {:note "x"} (sub/object st "doc:husk"))
+        "the husk is real — this is what the substrate actually holds, not a hypothetical")
+    ;; word-disjoint, or `remember` reinforces the second into the first at a
+    ;; 0.83 jaccard and there is only one fact to find sources for
+    (mold/remember m "zebra lantern pivot marsh" {:entities ["husk"] :source {:obj "doc:husk"}})
+    (mold/remember m "walnut cradle sundial thicket" {:entities ["husk"] :source {:obj "doc:real"}})
+    (let [p (srv/entity-payload st m "husk")]
+      (is (= 2 (:count p)) "both facts are on the page")
+      (is (= [{:id "doc:real" :title "A real document" :kind "doc"}] (:sources p))
+          "…and only the source that is an object is named"))))
+
+(deftest one-fact-is-not-a-place-yet-but-the-page-still-renders
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "arizona")]
+    (is (= 1 (:count p)))
+    (is (false? (:promoted p)) "one live fact is below the threshold")
+    (is (= ["the arizona plant hires from four local colleges"] (mapv :fact (:facts p)))
+        "…and the page renders anyway: `:promoted` false with facts present is a real state, not a reason to vanish")))
+
+(deftest a-name-nothing-was-ever-recorded-about-is-empty-and-not-an-error
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "graphene")]
+    (is (nil? (:error p)) "asking about a subject with no facts is a normal question")
+    (is (= "graphene" (:name p)))
+    (is (= 0 (:count p)))
+    (is (= [] (:facts p)))
+    (is (= [] (:sources p)))
+    (is (false? (:promoted p)))))
+
+(deftest no-name-at-all-is-an-error-and-never-a-500
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    ;; the last is a non-breaking space, spelled as an escape: `ent/normalize`
+    ;; collapses `[\\s\\p{Z}]+` and not bare `\\s`, so this trims to "" too — and
+    ;; a name that is only a U+00A0 is exactly as absent as one that is nothing
+    (doseq [absent [nil "" "   " "\u00a0"]]
+      (is (= {:error "no entity name given"} (srv/entity-payload st m absent))
+          (str "…for " (pr-str absent))))))
+
+(deftest a-multi-word-name-finds-its-own-facts
+  ;; The case `:subjects` exists for. Query tokens are single words, so
+  ;; `taiwan semiconductor manufacturing` can never match one; without the name
+  ;; in `:subjects` both facts score 0 on the entity half, 0 on the keyword half
+  ;; (neither text uses any of the three words), and `recall` drops them for not
+  ;; being positive — an entity page with facts behind it that shows none.
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (srv/entity-payload st m "Taiwan Semiconductor Manufacturing")]
+    (is (= "taiwan semiconductor manufacturing" (:name p)))
+    (is (= 2 (:count p)))
+    (is (true? (:promoted p)))
+    (is (= ["wafer starts held steady through the winter months"
+            "the board approved a new packaging campus on its northern edge"]
+           (mapv :fact (:facts p)))
+        "both of them, newer first — they tie exactly on relevance and `decay` breaks it")))
+
+(defn- but-scores
+  "A payload with the recall scores dropped.
+
+   Two calls a millisecond apart cannot produce equal payloads and never could:
+   `weight` multiplies relevance by `decay(ts, now)` with `now` read afresh
+   inside each `recall`, so the scores differ in the eleventh decimal place —
+   measured, `0.5199883642572858` against `0.5199883640566775`. What is under
+   test is that two spellings of one name answer with the same PAGE: the same
+   facts in the same order, the same counts, the same sources. Not that a float
+   computed twice off two readings of the clock agrees with itself."
+  [p]
+  (update p :facts #(mapv (fn [f] (dissoc f :score)) %)))
+
+(deftest a-name-is-normalized-at-the-door
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        p  (but-scores (srv/entity-payload st m "tsmc"))
+        pay (fn [n] (but-scores (srv/entity-payload st m n)))]
+    (is (= p (pay "TSMC")))
+    (is (= p (pay "  tsmc  ")))
+    ;; spelled as an escape rather than pasted, so it is readable as one: a
+    ;; literal U+00A0 in the source looks exactly like a space and the next edit
+    ;; through this file would "tidy" it into one without noticing
+    (is (= p (pay "\u00a0TSMC\u00a0"))
+        "…including a non-breaking space, which is what a pasted PDF hands you and what a bare \\s would never have stripped")))
+
+(deftest the-entity-route-answers-the-same-payload-through-the-URL
+  ;; The route is otherwise untested, and Task 8 finds a missing one only at
+  ;; runtime. `c/store` and `mem/memory` are both delays behind ordinary vars,
+  ;; so rebinding them means neither the user's Datalevin store nor
+  ;; `data/memory.edn` is ever opened.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        get! (fn [qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri "/api/entity" :query-string qs}))
+                                :key-fn keyword)))]
+    (is (= 4 (:count (get! "name=tsmc"))))
+    (is (= tsmc-ranked (mapv :fact (:facts (get! "name=tsmc"))))
+        "the route serves the same ranked page the modal and the object page get")
+    (is (= (but-scores (get! "name=tsmc"))
+           (but-scores (get! "name=TSMC"))
+           (but-scores (get! "name=%20tsmc%20")))
+        "?name=TSMC and ?name=%20tsmc%20 answer identically — %20 is `parse-query`'s to decode and the surrounding space is `ent/normalize`'s to trim")
+    (is (= "no entity name given" (:error (get! nil))))
+    (is (= "no entity name given" (:error (get! "name="))))))
+
+(deftest the-entity-route-freezes-at-the-point-it-was-asked-for
+  ;; `/api/mold` and `/api/object/…` have always gone through `store-at`; this one
+  ;; did not, and the shell's short-circuit made that reachable. Measured in a
+  ;; browser: materialize `tsmc`, scrub to one event before the materialization,
+  ;; click the subject chip. The route read the LIVE store, answered
+  ;; `:object "ent:1"`, and the shell — which trusts that key completely — asked
+  ;; `/api/object/ent:1?at=35` for an object that does not exist there. On screen: a
+  ;; molder with an empty header and the single word `null`; scrubbed further back,
+  ;; an uncaught TypeError and a blank world.
+  ;;
+  ;; The facts are today's on both pages, and that is not an oversight: the memory
+  ;; has no time dimension and `undo!` never touches a fact, so there is no past set
+  ;; to read. What `?at=` governs is everything the page reads out of the SUBSTRATE.
+  (let [st   (entity-fixture)
+        m    (entity-memory)
+        n    (count (sub/history st))
+        _    (srv/materialize-entity! st "tsmc")
+        get! (fn [qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri "/api/entity" :query-string qs}))
+                                :key-fn keyword)))
+        now  (get! "name=tsmc")
+        past (get! (str "name=tsmc&at=" n))]
+    (is (some? (:object now))
+        "live, the subject is a citizen — without this the assertion below is vacuous")
+    (is (nil? (:object past))
+        "frozen before the materialization it is a projection again, so the shell opens the modal instead of an object that is not there yet")
+    (is (= (:count now) (:count past) 4)
+        "the facts are today's on both pages: the memory has no time dimension")
+    (is (true? (:promoted past))
+        "…so the past page is a real page with real evidence on it, and not an empty one")))
+
+(deftest a-materialized-entity-carries-its-object-and-never-demotes
+  (let [st (-> (entity-fixture)
+               (materialize! "ent:tsmc" "tsmc" "TSMC — the foundry")
+               (materialize! "ent:az" "arizona" "The Arizona build"))
+        m  (entity-memory)]
+    (is (= "ent:tsmc" (:object (srv/entity-payload st m "tsmc")))
+        "the page is now that object's page")
+    (is (= 4 (:count (srv/entity-payload st m "tsmc"))) "and says exactly what it said before")
+    (let [az (srv/entity-payload st m "arizona")]
+      (is (= "ent:az" (:object az)))
+      (is (true? (:promoted az))
+          "ONE fact and promoted: a materialized entity never demotes — it is yours, not the evidence's"))
+    (is (nil? (:object (srv/entity-payload st m "taiwan")))
+        "…and an entity nobody materialized still has none")))
+
+(deftest an-object-storing-a-RAW-name-is-still-that-entity
+  ;; The one thing standing between an entity object that did NOT come from
+  ;; Task 5 — hand-committed, migrated, imported, restored from an older log —
+  ;; and a payload that contradicts itself. `ent/promoted` normalizes the names
+  ;; it is handed; if `entity-objects` matched raw, the two halves of one answer
+  ;; would disagree about the same entity: `:promoted` true, through `promoted`,
+  ;; and `:object` absent, through the raw match. Nothing in the page would say
+  ;; which half was lying.
+  ;;
+  ;; Pinned precisely BECAUSE Task 5 will always write a normalized name: "Task
+  ;; 5 always writes normalized names" is the argument for deleting the
+  ;; normalization, and the objects Task 5 did not write are the ones it does
+  ;; not cover.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "  TSMC  " "TSMC")
+        m  (entity-memory)
+        p  (srv/entity-payload st m "tsmc")]
+    (is (= "ent:tsmc" (:object p))
+        "a stored name that was never normalized still identifies the entity")
+    (is (true? (:promoted p)) "…and both halves of the payload agree that it is materialized")
+    (is (= "ent:tsmc" (:id (srv/entity-object st "tsmc"))))
+    (is (= #{"tsmc"} (srv/materialized-names st))
+        "reported normalized, which is the only form `ent/promoted` can compare")))
+
+(deftest an-entity-is-identified-by-its-name-and-never-by-its-title
+  ;; The title is a display string. An edit to it must not re-identify the
+  ;; entity, or every fact that mentions the name is orphaned by a rename.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "tsmc" "TSMC — the foundry")]
+    (is (= "ent:tsmc" (:id (srv/entity-object st "tsmc"))))
+    (is (nil? (srv/entity-object st "tsmc — the foundry")) "the title identifies nothing")
+    (is (nil? (srv/entity-object st "graphene")))
+    (is (= #{"tsmc"} (srv/materialized-names st)))
+    (is (= #{} (srv/materialized-names (entity-fixture)))
+        "a store with no entity objects in it names none")))
+
+(defn- bulk-entity-memory
+  "`n` facts all carrying one name and sharing no word with each other.
+
+   Word-disjoint on purpose: `remember` reinforces an existing fact rather than
+   adding one when their token sets overlap by 0.6 or more, so the obvious
+   fixture — \"note one\", \"note two\" — would collapse into a handful of facts
+   with high `:strength` and the cap would never be reached."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n)]
+      (mold/remember m (str "alpha" i " beta" i " gamma" i " delta" i)
+                     {:entities ["Bulk"] :source {:obj "doc:bulk" :space "space:bulk"}}))
+    m))
+
+(deftest the-page-is-capped-and-says-so-out-loud
+  ;; `:count` and `(count :facts)` are two numbers on purpose, and this is the
+  ;; only way they can differ: `:count` comes from the index and is every live
+  ;; fact carrying the name, `:facts` is what `recall` returned at `:k 50`. With
+  ;; one number the page would truncate in silence; with two it can say
+  ;; "50 of 55" — which is what makes this a cap and not a lie.
+  (let [st (sub/fresh-store)
+        m  (bulk-entity-memory 55)
+        p  (srv/entity-payload st m "bulk")]
+    (is (= 55 (:count p)) "every live fact carrying the name")
+    (is (= 50 (count (:facts p))) "…of which the page ships fifty")
+    (is (< (count (:facts p)) (:count p))
+        "the two numbers differ, and a renderer has everything it needs to say so")))
+
+;; ============================================================================
+;; materialization — one object, one notebook, one undo
+;; ============================================================================
+
+(defn- entity-objects-in
+  "Every `:kind :entity` object in the store, by id. The store is the only place
+   that can answer \"how many objects claim this name\", and that count is what
+   separates \"materializing twice mints nothing\" from \"materializing twice
+   happens to answer the same id\"."
+  [st]
+  (into {} (filter #(= :entity (:kind (val %)))) (sub/objects st)))
+
+(deftest materializing-is-one-commit-and-one-undo
+  (let [st  (entity-fixture)
+        n0  (count (sub/history st))
+        r   (srv/materialize-entity! st "tsmc")
+        eid (:entity r)
+        sid (:spaceId r)]
+    (is (= (inc n0) (count (sub/history st)))
+        "ONE commit, not two — `undo!` pops one, so two would leave a notebook about an entity that no longer exists")
+    (is (= (inc n0) (:events (:state r)))
+        "…and the payload's state is the state after the write, not before it")
+    (is (= :entity (:kind (sub/object st eid))))
+    (is (= :space (:kind (sub/object st sid))))
+    (is (= #{eid} (nb/refs-of (sub/object st sid)))
+        "the cell that puts one in the other")
+    (sub/undo! st)
+    (is (= n0 (count (sub/history st))) "one undo, and the log is where it started")
+    (is (nil? (sub/object st eid)) "the entity object is gone…")
+    (is (nil? (sub/object st sid)) "…and so is the notebook — one gesture, one undo")
+    (is (empty? (entity-objects-in st)))))
+
+(deftest materialization-touches-no-fact-and-no-fact-learns-the-object-id
+  ;; THE INVARIANT. A fact references an entity by its normalized name and never
+  ;; by an object id, which is the whole reason the model is derived: `undo!` of
+  ;; a materialization returns the entity to being a projection with nothing left
+  ;; dangling. The moment a fact stores `ent:1`, undo dangles it.
+  ;;
+  ;; `materialize-entity!` is not even handed the memory, so today the invariant
+  ;; is enforced by the argument list. This asserts it anyway, because the
+  ;; argument list is one refactor from changing and this is the property that
+  ;; would silently stop holding.
+  (let [st     (entity-fixture)
+        m      (entity-memory)
+        before (vec (mem/all-facts m))]
+    (is (= 8 (count before)) "the fixture really has facts that could be rewritten")
+    (is (= 4 (count (filter #(contains? (set (map ent/normalize (:entities %))) "tsmc") before)))
+        "…four of them carrying the very name about to be materialized")
+    (let [r      (srv/materialize-entity! st "tsmc")
+          during (vec (mem/all-facts m))
+          _      (sub/undo! st)
+          after  (vec (mem/all-facts m))]
+      (is (= before during) "materializing rewrote no fact")
+      (is (= before after) "…and undoing it rewrote none back")
+      (is (= (pr-str before) (pr-str during) (pr-str after))
+          "byte-identical and not merely `=`: a fact that gained a key, or lost one, or had a value replaced by an equal-printing-differently one, compares unequal here and only here")
+      (is (not (str/includes? (pr-str after) (:entity r)))
+          (str "no fact carries " (:entity r) " — the id undo is about to make dangle"))
+      (is (not (str/includes? (pr-str after) "ent:"))
+          "…nor any other entity object id, under any key, at any depth"))))
+
+(deftest materializing-twice-mints-nothing
+  (let [st (entity-fixture)
+        a  (srv/materialize-entity! st "TSMC")
+        n1 (count (sub/history st))
+        b  (srv/materialize-entity! st "  tsmc  ")]
+    (is (= (:entity a) (:entity b)) "the object that is already there, not a second one")
+    (is (= (:spaceId a) (:spaceId b)) "…and the notebook that is already about it")
+    (is (= n1 (count (sub/history st))) "and not one event was written")
+    (is (= 1 (count (entity-objects-in st)))
+        "ONE object for one name — the page is reached BY NAME, and two objects would make `entity-object` a coin toss")))
+
+(deftest the-object-carries-the-normalized-name-whatever-was-typed
+  ;; Spelled with a non-breaking space, which is what a pasted PDF and a model's
+  ;; JSON both hand you: `ent/normalize` collapses `[\s\p{Z}]+`, so this is one
+  ;; name, and an object storing the raw string would be an entity no fact and no
+  ;; chip could ever reach.
+  (let [st (entity-fixture)
+        r  (srv/materialize-entity! st "  TSMC\u00a0Arizona ")
+        o  (sub/object st (:entity r))
+        sp (sub/object st (:spaceId r))]
+    (is (= "tsmc arizona" (get-in o [:value :name])) "the identity is the normalized name")
+    (is (= "tsmc arizona" (:title o)))
+    (is (= (:entity r) (:id o)) "and the object knows its own id")
+    (is (= (:entity r) (:id (srv/entity-object st "tsmc arizona")))
+        "…so the page reached by name finds it")
+    (is (= "tsmc arizona" (:title sp)))
+    (is (= "everything about tsmc arizona" (get-in sp [:value :intent])))
+    (is (= #{"tsmc arizona"} (srv/materialized-names st)))))
+
+(deftest a-blank-name-materializes-nothing
+  (let [st (entity-fixture)
+        n0 (count (sub/history st))]
+    (doseq [absent [nil "" "   " "\u00a0"]]
+      (is (= {:error "no entity name given"} (srv/materialize-entity! st absent))
+          (str "…for " (pr-str absent)))
+      (is (= n0 (count (sub/history st))) (str "and nothing was written for " (pr-str absent))))
+    (is (empty? (entity-objects-in st)))))
+
+(deftest a-materialized-entity-never-demotes-and-undo-returns-it-to-a-projection
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        idx (ent/index (mem/all-facts m))
+        up? (fn [n] (contains? (ent/promoted idx (srv/materialized-names st)) n))]
+    (is (= 1 (count (get idx "arizona"))) "one fact — below the threshold on the evidence alone")
+    (is (false? (up? "arizona")) "so on the evidence alone it is not a place")
+    (srv/materialize-entity! st "Arizona")
+    (is (= #{"arizona"} (srv/materialized-names st)) "reported normalized, the only form `promoted` can compare")
+    (is (true? (up? "arizona")) "a materialized entity never demotes — it is yours, not the evidence's")
+    (sub/undo! st)
+    (is (= #{} (srv/materialized-names st)))
+    (is (false? (up? "arizona")) "and undo returns it to being a projection: one fact, not a place")
+    ;; the other half, and the one that says what "returns to a projection"
+    ;; means: undo takes away the object, never the evidence. A name that was a
+    ;; place before anyone materialized it is still one afterwards.
+    (is (= 4 (count (get idx "tsmc"))))
+    (is (true? (up? "tsmc")) "four facts — a place on its own evidence, before any object exists")
+    (srv/materialize-entity! st "TSMC")
+    (is (true? (up? "tsmc")))
+    (sub/undo! st)
+    (is (= #{} (srv/materialized-names st)) "the object is gone…")
+    (is (true? (up? "tsmc")) "…and the projection still says yes, because the facts never moved")))
+
+(deftest the-already-materialized-answer-is-honest-about-its-notebook
+  (let [st  (entity-fixture)
+        a   (srv/materialize-entity! st "tsmc")
+        sid (:spaceId a)]
+    (is (= sid (:spaceId (srv/materialize-entity! st "tsmc")))
+        "the notebook that is about it, found by its cells and not by its id's shape")
+    ;; a notebook is an ordinary object and its cells are ordinary edits — the
+    ;; user can take the entity back out of the notebook they were just given
+    (sub/commit! st (nb/set-cells-event sid []))
+    (let [b (srv/materialize-entity! st "tsmc")]
+      (is (= (:entity a) (:entity b)) "still that entity, and still nothing minted")
+      (is (contains? b :spaceId) "the key is THERE…")
+      (is (nil? (:spaceId b))
+          "…and null: there is no notebook about this any more, and a shell told `null` opens the entity object instead of entering nothing"))))
+
+(deftest the-notebook-answered-is-the-one-that-is-about-this-entity
+  ;; Several notebooks holding one entity is not a race — it is what happens when
+  ;; you drop a subject into somebody else's notebook — so one candidate is
+  ;; plainly the better answer and determinism alone is not enough. Every id here
+  ;; is one this codebase really mints: least id ALONE answers `space:about-1`
+  ;; for an entity that notebook merely holds, and sends the user into asml's
+  ;; notebook when they asked about tsmc.
+  (let [st (entity-fixture)
+        a  (srv/materialize-entity! st "asml")
+        b  (srv/materialize-entity! st "tsmc")]
+    (is (= ["space:about-1" "space:about-2"] [(:spaceId a) (:spaceId b)])
+        "minted in that order, so the lower id is NOT tsmc's own — without which this test could not fail")
+    (sub/commit! st (nb/append-cell-event st (:spaceId a) {:ref (:entity b)}))
+    (is (= #{(:entity a) (:entity b)} (nb/refs-of (sub/object st (:spaceId a))))
+        "asml's notebook now holds tsmc too — an ordinary cell, added by an ordinary gesture")
+    (is (= (:spaceId b) (:spaceId (srv/materialize-entity! st "tsmc")))
+        "the notebook that is ABOUT tsmc, not the lower-id one that merely holds it")
+    (is (= (:spaceId a) (:spaceId (srv/materialize-entity! st "asml")))
+        "…and asml's own is still asml's own")
+    ;; The title is a display string. An edit to it must not re-identify the
+    ;; entity — and it does not: it costs the preference and nothing else.
+    (sub/commit! st {:op :assoc :id (:spaceId b) :path [:title] :value "TSMC — the foundry"})
+    (is (= (:entity b) (:id (srv/entity-object st "tsmc")))
+        "the entity is still reached by name, because identity is `[:value :name]` and never the title")
+    (is (= (:spaceId a) (:spaceId (srv/materialize-entity! st "tsmc")))
+        "…while the notebook answer falls back to least id: deterministic, and no longer the one you wanted")))
+
+(deftest the-notebook-answered-does-not-depend-on-the-objects-maps-order
+  ;; `vals` of an objects map is iteration order, not a rule, so `first` over it
+  ;; is not an answer. Asking the same store twice cannot show this — it is the
+  ;; same map in the same JVM and it iterates the same way every time — so the
+  ;; two candidates are handed over in both orders and the answer must not move.
+  (let [about {:id "space:about-2" :kind :space :title "tsmc"
+               :value {:intent "everything about tsmc" :cells [{:ref "ent:2"}]}}
+        holds {:id "space:about-1" :kind :space :title "asml"
+               :value {:intent "everything about asml" :cells [{:ref "ent:1"} {:ref "ent:2"}]}}
+        objm  (fn [os] (into {} (map (juxt :id identity)) os))
+        pick  #'srv/about-notebook]
+    (is (not= (mapv :id (vals (objm [about holds])))
+              (mapv :id (vals (objm [holds about]))))
+        "the two maps really do iterate differently — without this the two assertions below could not disagree, whatever the rule")
+    (is (= "space:about-2" (pick (objm [about holds]) "ent:2" "tsmc")))
+    (is (= "space:about-2" (pick (objm [holds about]) "ent:2" "tsmc"))
+        "…and the same answer from the other order")
+    ;; …and when the preference TIES — two notebooks titled for one entity, which
+    ;; is what renaming a second notebook into the name produces — least id has
+    ;; to decide. `sort-by` is stable, so with no tie-break the winner would be
+    ;; whichever the map happened to iterate first, which is the whole defect.
+    (let [twin {:id "space:new-1" :kind :space :title "tsmc"
+                :value {:intent "also about tsmc" :cells [{:ref "ent:2"}]}}]
+      (is (= "space:about-2" (pick (objm [about twin]) "ent:2" "tsmc")))
+      (is (= "space:about-2" (pick (objm [twin about]) "ent:2" "tsmc"))
+          "…decided by the tie-break and not by the iteration order"))))
+
+(deftest concurrent-materializations-mint-distinct-ids
+  ;; `next-id` reads the whole store's keys and mints from the highest suffix, so
+  ;; two materializations that both read before either commits both mint `ent:1`
+  ;; — and the second `:put` REPLACES the first. One object for two names, a user
+  ;; taken to a notebook about somebody else's subject, and an entity that was
+  ;; materialized and then silently was not. This is `nb/append-cell-event`'s
+  ;; defect in a new place: 24 concurrent appends once left 6 cells.
+  ;;
+  ;; It is also what makes "materializing twice mints nothing" true rather than
+  ;; nearly true: the check and the commit are a read-modify-write, and without
+  ;; the lock two clicks on one name are a plain TOCTOU race.
+  (let [st      (entity-fixture)
+        n0      (count (sub/history st))
+        names   (mapv #(str "subject " %) (range 8))
+        latch   (java.util.concurrent.CountDownLatch. 1)
+        results (atom [])
+        ts      (mapv (fn [n]
+                        (doto (Thread. #(do (.await latch)
+                                            (swap! results conj (srv/materialize-entity! st n))))
+                          (.start)))
+                      names)]
+    (.countDown latch)
+    (doseq [t ts] (.join t))
+    (let [ents (vals (entity-objects-in st))]
+      (is (= 8 (count ents)) "eight names, eight objects — none replaced by another")
+      (is (= (set names) (set (map #(get-in % [:value :name]) ents)))
+          "…and each object carries its own name"))
+    (is (= 8 (count (set (map :entity @results)))) "eight distinct object ids answered")
+    (is (= 8 (count (set (map :spaceId @results)))) "eight distinct notebooks answered")
+    (is (every? #(= :space (:kind (sub/object st (:spaceId %)))) @results)
+        "and every notebook a caller was sent to is really there")
+    (is (= (+ n0 8) (count (sub/history st)))
+        "eight `:tx`s on top of the fixture — one commit each, and no thread wrote twice")))
+
+(deftest the-materialize-route-answers-through-the-URL
+  ;; The route is otherwise untested, and Task 8 finds a missing one only at
+  ;; runtime. `c/store` is a delay behind an ordinary var, so rebinding it means
+  ;; the user's Datalevin store is never opened.
+  (let [st    (entity-fixture)
+        n0    (count (sub/history st))
+        post! (fn [body]
+                (with-redefs [c/store (delay st)]
+                  (json/read-str (:body (srv/handler
+                                         {:uri "/api/entity-notebook" :request-method :post
+                                          :body (java.io.StringReader. (json/write-str body))}))
+                                 :key-fn keyword)))
+        r     (post! {:name "  TSMC "})]
+    (is (= "tsmc" (get-in (sub/object st (:entity r)) [:value :name])))
+    (is (= :space (:kind (sub/object st (:spaceId r)))))
+    (is (= (inc n0) (:events (:state r))) "the state comes back with the write in it")
+    (let [again (post! {:name "tsmc"})]
+      (is (= (:entity r) (:entity again)) "a second POST mints nothing")
+      (is (= (:spaceId r) (:spaceId again))))
+    (is (= "no entity name given" (:error (post! {}))) "a body with no name is a message, never a 500")
+    (is (= "no entity name given" (:error (post! {:name "   "}))))))
+
+;; ============================================================================
+;; the entity object's page — one payload, two surfaces
+;; ============================================================================
+
+(deftest a-materialized-entity-molds-to-its-own-page
+  ;; §4 of the design: once materialized, "the page is that object's page —
+  ;; moldable, undoable, a citizen like any other". A `mold/mold` viewer cannot
+  ;; be that page — a viewer's `:render` only ever receives `(:value o)`, which
+  ;; here is `{:name "tsmc"}`, and has no way to reach the memory the facts live
+  ;; in. So `mold-payload` branches on the kind and says "no viewers, the shell
+  ;; renders this itself", exactly as it already does for `:flow`.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        eid (:entity (srv/materialize-entity! st "tsmc"))
+        ;; a viewspec aimed at the entity, so `(alternatives st o)` would return
+        ;; something. Without it the `:alternatives` assertion below cannot fail
+        ;; — no built-in viewer's `pred` accepts `{:name "tsmc"}` and there are
+        ;; no dynamic views, so `alternatives` and the literal `[]` agree even
+        ;; when the branch hands back the wrong one.
+        _   (sub/commit! st {:op :put :id "view:ent-1"
+                             :value {:id "view:ent-1" :kind :viewspec :title "view: as a card"
+                                     :value {:target eid :label "as a card" :spec {}}}})
+        p   (srv/mold-payload st m eid nil)]
+    (is (= eid (:id p)))
+    (is (= "entity" (:kind p)) "its own branch, and not whatever `mold/mold` makes of `{:name \"tsmc\"}`")
+    (is (nil? (:view p)))
+    (is (= [] (:alternatives p))
+        "and nothing to view it as, even with a view-spec aimed at it: a subject has one page")
+    (let [r (:rendered p)]
+      (is (= "tsmc" (:name r)))
+      (is (= 4 (:count r)) "every live fact carrying the name")
+      (is (= tsmc-ranked (mapv :fact (:facts r))) "ranked, and ranked exactly as the modal ranks them")
+      (is (= #{"doc:fab" "doc:az" "space:semis" "space:az"} (set (map :id (:sources r))))
+          "the objects and notebooks the facts came from — `doc:gone` dropped, as it has no object")
+      (is (= eid (:object r))
+          "…and the page carries the id of the object whose page it is, which is what tells the shell not to offer materialization again"))))
+
+(deftest the-molder-header-is-the-objects-title-and-never-the-entitys-name
+  ;; `:title` is what `renderDetail` draws above the molded body, and Task 8 is
+  ;; about to depend on it. Nothing pinned it: `materialize-entity!` titles the
+  ;; object WITH the name, so on everything it mints `(:title o)` and `(:name p)`
+  ;; are the same string and the assertion could not tell a correct branch from
+  ;; one reading the payload instead of the object.
+  ;;
+  ;; So this uses the hand-committed shape `materialize!` exists for — an object
+  ;; whose title diverges from its name, which is what a rename produces and what
+  ;; a migrated or restored object may always have carried. A rename must be able
+  ;; to change the header without re-identifying the entity; that is the whole
+  ;; reason `entity-objects` matches on the name and never on the title.
+  (let [st (materialize! (entity-fixture) "ent:az" "arizona" "The Arizona build")
+        m  (entity-memory)
+        p  (srv/mold-payload st m "ent:az" nil)]
+    (is (= "The Arizona build" (:title p))
+        "the header is the OBJECT's title")
+    (is (= "arizona" (:name (:rendered p)))
+        "…while the page underneath is still keyed on the name, and the two are different strings here on purpose")
+    (is (= "ent:az" (:object (:rendered p)))
+        "and the payload still identifies the object whose page this is")))
+
+(deftest the-object-page-and-the-modal-are-one-payload
+  ;; The claim the whole task exists to make. Two renderers would drift, and the
+  ;; drift would be invisible until somebody materialized something and the page
+  ;; they had been reading changed under them.
+  ;;
+  ;; `but-scores` on both sides, because an exact `=` here would be flaky by
+  ;; construction and not by luck: `weight` multiplies relevance by
+  ;; `decay(ts, now)` with `now` read afresh inside each `recall`, so two calls a
+  ;; millisecond apart differ in the eleventh decimal place. What is under test
+  ;; is that the two surfaces answer the same PAGE — same keys, same facts, same
+  ;; order, same counts, same sources — not that a float computed twice off two
+  ;; readings of the clock agrees with itself.
+  (let [st   (entity-fixture)
+        m    (entity-memory)
+        eid  (:entity (srv/materialize-entity! st "tsmc"))
+        get! (fn [uri qs]
+               (with-redefs [c/store (delay st) mem/memory (delay m)]
+                 (json/read-str (:body (srv/handler {:uri uri :query-string qs}))
+                                :key-fn keyword)))
+        modal (but-scores (get! "/api/entity" "name=tsmc"))
+        page  (but-scores (:rendered (get! "/api/mold" (str "id=" eid))))]
+    (is (= modal page)
+        "key for key, through the two URLs the shell actually calls")
+    ;; the two comparisons above and below are not the same test. JSON flattens
+    ;; a set and a vector to the same array and a keyword to its name, so an
+    ;; in-process `=` is the one that would catch `:rendered` being assembled
+    ;; rather than passed through.
+    (is (= (but-scores (srv/entity-payload st m "tsmc"))
+           (but-scores (:rendered (srv/mold-payload st m eid nil))))
+        "and in process, where a set and a vector are still different things")
+    ;; without these, two empty maps would agree and the test would certify it
+    (is (= 4 (:count page)))
+    (is (= 4 (count (:facts page))))
+    (is (seq (:sources page)))))
+
+(deftest a-past-entity-page-reads-todays-facts-and-that-days-objects
+  ;; `?at=` hands `mold-payload` a frozen store. Memory has no time dimension
+  ;; and `undo!` never touches a fact, so there is no past set of facts to read;
+  ;; what the frozen store must still govern is everything the page reads out of
+  ;; the SUBSTRATE — the source chips especially. Reading the live store for the
+  ;; object while reading the frozen one for everything else is the specific
+  ;; mistake this pins.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        eid (:entity (srv/materialize-entity! st "tsmc"))
+        n   (count (sub/history st))]
+    ;; a source arrives AFTER the point we freeze at — and so does a fact
+    (sub/commit! st {:op :put :id "doc:gone"
+                     :value {:id "doc:gone" :kind :doc :title "The missing memo" :value "…"}})
+    ;; word-disjoint from every fact in `entity-rows`, or `remember` reinforces
+    ;; an existing one at a 0.6 jaccard instead of adding this
+    (mold/remember m "quarry lantern zither mulberry drawbridge"
+                   {:entities ["TSMC"] :source {:obj "doc:fab"}})
+    (let [now  (:rendered (srv/mold-payload st m eid nil))
+          past (:rendered (srv/mold-payload (srv/store-at st (str n)) m eid nil))]
+      (is (some #(= "doc:gone" (:id %)) (:sources now))
+          "live, the memo is an object and its chip has a name on it")
+      (is (not-any? #(= "doc:gone" (:id %)) (:sources past))
+          "frozen a commit earlier it is not an object yet, so the chip is dropped — the source list came from the store it was handed")
+      ;; the fact half, and phrased so it can actually fail: a fact remembered
+      ;; after the freeze must still be on the past page. `(= facts facts)`
+      ;; would have passed under every sabotage of this file, including the two
+      ;; that delete the branch outright, because nil equals nil.
+      (is (= 5 (:count now) (:count past))
+          "the fact recorded after the freeze is on BOTH pages: the memory has no time dimension and `undo!` never touches a fact, so there is no past set to read")
+      (is (contains? (set (mapv :fact (:facts past))) "quarry lantern zither mulberry drawbridge")
+          "…named, and not merely counted"))))
+
+(deftest an-entity-object-with-no-usable-name-molds-to-the-error-the-modal-gets
+  ;; A hand-committed, migrated or half-restored object. The branch is on the
+  ;; KIND, as `:flow`'s is, and never on whether the name looks usable — a guard
+  ;; here would be a second normalization living outside `ent/normalize`, and it
+  ;; would disagree with it: `str/blank?` is false for a lone U+00A0, which
+  ;; `ent/normalize` trims to nothing.
+  ;;
+  ;; So the page is `entity-payload`'s own answer for a nameless request, which
+  ;; is the shape `GET /api/entity?name=` already hands the modal. Task 8 writes
+  ;; ONE renderer that handles it, rather than a case that exists only here.
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    ;; the middle one is a lone non-breaking space, spelled as an escape so it
+    ;; reads as one \u2014 pasted, it looks exactly like a space. It is also the case
+    ;; a `str/blank?` guard on this branch would get wrong: `str/blank?` is
+    ;; FALSE for U+00A0, which `ent/normalize` trims to nothing.
+    (doseq [[id nm] [["ent:blank" "   "] ["ent:nbsp" "\u00a0"] ["ent:missing" nil]]]
+      (sub/commit! st {:op :put :id id
+                       :value {:id id :kind :entity :title "?" :value (when nm {:name nm})}})
+      (let [p (srv/mold-payload st m id nil)]
+        (is (= "entity" (:kind p)) (str id " must still mold as an entity"))
+        (is (= {:error "no entity name given"} (:rendered p))
+            (str id " — the same error shape /api/entity answers a nameless request with"))))))
+
+(deftest molding-a-doc-a-table-and-a-flow-is-what-it-always-was
+  ;; The arity changed on every caller, so one of each surviving shape is pinned
+  ;; here. `no-memory` is the second half: it throws if forced, so this also
+  ;; asserts that the memory argument is consulted on the entity branch and
+  ;; nowhere else.
+  (let [st (entity-fixture)]
+    (sub/commit! st {:op :put :id "tbl:t"
+                     :value {:id "tbl:t" :kind :table :title "T" :value [{:a 1} {:a 2}]}})
+    (sub/commit! st {:op :put :id "doc:d"
+                     :value {:id "doc:d" :kind :doc :title "D" :value "# Heading\n\nbody text"}})
+    (sub/commit! st {:op :put :id "flow:f"
+                     :value {:id "flow:f" :kind :flow :title "F" :value {:goal "g" :steps []}}})
+    (let [mold (fn [id] (srv/mold-payload st no-memory id nil))
+          d (mold "doc:d") t (mold "tbl:t") f (mold "flow:f")]
+      (is (= ["text" "doc/raw" "# Heading\n\nbody text"] [(:kind d) (:view d) (:rendered d)]))
+      (is (= ["table" "table/rows" [{:a 1} {:a 2}]] [(:kind t) (:view t) (:rendered t)]))
+      (is (seq (:alternatives t)) "a table still offers its other viewers")
+      (is (= ["flow" nil {:goal "g" :steps []} []]
+             [(:kind f) (:view f) (:rendered f) (:alternatives f)])))))
+
+(deftest leap-does-not-offer-a-materialized-entity-under-its-own-kind
+  ;; The object scan drops `:entity`, because Task 7's subject group is already
+  ;; the destination for a subject and the same name under two headings is the
+  ;; collision the design split the groups to avoid. The positive half — that it
+  ;; gets exactly one row, under "subject" — belongs to Task 7, which is what
+  ;; creates that row.
+  ;;
+  ;; NOT the same decision as `state-payload`, which keeps entity objects: that
+  ;; payload is *what exists* and feeds `STATE.objects`, out of which the shell
+  ;; draws each notebook member — and a materialized entity is a member of the
+  ;; very notebook materialization mints for it.
+  (let [st (entity-fixture)]
+    (sub/commit! st {:op :put :id "doc:teardown"
+                     :value {:id "doc:teardown" :kind :doc :title "TSMC teardown" :value "…"}})
+    (let [m    (entity-memory)
+          r    (srv/materialize-entity! st "tsmc")
+          eid  (:entity r)
+          rows (srv/leap-payload st m "tsmc")]
+      ;; the controls come first: an empty result would satisfy every assertion
+      ;; below it, and this fixture is built so that it cannot be empty
+      (is (some #(= "doc:teardown" (:id %)) rows)
+          "the object scan is alive — a doc whose title carries the name is still offered")
+      (is (some #(and (= (:spaceId r) (:id %)) (= "space" (:group %))) rows)
+          "…and so is the notebook the materialization minted, which IS where a subject sends you")
+      (is (empty? (filter #(= "entity" (:group %)) rows))
+          "no row is grouped `entity`")
+      (is (empty? (filter #(= eid (:id %)) rows))
+          "…and the object itself is offered by no group at all"))))
+
+;; ============================================================================
+;; LEAP's subject group — a subject is a place, and its own kind of place
+;; ============================================================================
+
+(defn- subject-rows
+  "The `subject` group out of a LEAP payload, in payload order."
+  [rows]
+  (filterv #(= "subject" (:group %)) rows))
+
+(deftest leap-takes-you-to-a-subject-and-not-only-to-a-document
+  ;; Design §3: "Typing a subject takes you to its place, alongside notebooks
+  ;; and objects." The document below exists so the assertions have a control —
+  ;; an object row that matches the same query proves the subject row is an
+  ;; ADDITION to the lexical pass and not a replacement for it.
+  (let [st (entity-fixture)
+        m  (entity-memory)]
+    (sub/commit! st {:op :put :id "doc:teardown"
+                     :value {:id "doc:teardown" :kind :doc :title "TSMC teardown" :value "…"}})
+    (let [rows (srv/leap-payload st m "tsmc")
+          subs (subject-rows rows)]
+      (is (some #(= "doc:teardown" (:id %)) rows)
+          "control: the object scan still answers, so an empty payload cannot pass this test")
+      (is (= [{:id "subject:tsmc" :label "tsmc" :group "subject" :name "tsmc"
+               :count 4 :touched 0}]
+             subs)
+          "one row: the name is the label, the live facts behind it are the count, and `subject:` is a pseudo-id no object ever wore")
+      ;; `[false]` and not `(not (contains? …))`: `(contains? nil :object)` is
+      ;; false, so the negative spelling would pass over an EMPTY group and
+      ;; certify a subject row that was never built
+      (is (= [false] (mapv #(contains? % :object) subs))
+          "no `:object` KEY at all — not a nil one. The shell decides on presence, and `{:object nil}` is a different answer to \"has this been materialized\" than an absent key")
+      ;; where it sits, which is a decision and not an accident: a subject is a
+      ;; place you go to, a memory hit is text you read. Both indices are
+      ;; asserted non-negative, or an absent subject group would score -1 and
+      ;; sort before everything — passing loudest exactly when it is missing.
+      (let [gs (mapv :group rows)
+            i  (.indexOf ^java.util.List gs "subject")
+            j  (.indexOf ^java.util.List gs "memory")]
+        (is (and (nat-int? i) (nat-int? j) (< i j))
+            (str "the subject group is offered before the memory group — at " i " and " j))))))
+
+(deftest a-name-with-one-fact-behind-it-is-not-yet-a-place
+  ;; The whole reason `promoted` exists: 68 of 104 names on the measured corpus
+  ;; carry exactly one fact, and a LEAP list made of every extracted string is
+  ;; two-thirds noise. `arizona` is still a name the index knows and `ent/detect`
+  ;; still matches it for recall — it is just not somewhere to go yet.
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        rows (srv/leap-payload st m "arizona")]
+    (is (some #(= "doc:az" (:id %)) rows)
+        "control: `Arizona plans` is a document and the query plainly finds things")
+    (is (= 1 (count (get (ent/index (mem/all-facts m)) "arizona")))
+        "…and `arizona` is a name the index knows, with exactly one fact behind it")
+    (is (empty? (subject-rows rows))
+        "one live fact is a name, not a subject")))
+
+(deftest a-materialized-subject-carries-its-object-and-never-demotes
+  ;; One fact, and a place regardless: materializing is yours, not the evidence's,
+  ;; so nothing that happens to the corpus takes the destination away again.
+  (let [st (materialize! (entity-fixture) "ent:az" "arizona" "The Arizona build")
+        m  (entity-memory)
+        subs (subject-rows (srv/leap-payload st m "arizona"))
+        row  (first subs)]
+    (is (= 1 (count subs)))
+    (is (= "ent:az" (:object row))
+        "`:object` on the row, so the shell has ONE thing to decide on rather than two")
+    (is (= 1 (:count row))
+        "one fact — the count is what the evidence says, and the row is here anyway")
+    ;; The one fixture in the suite that can tell a name from a title: every
+    ;; entity `materialize-entity!` mints is TITLED with its own normalized name,
+    ;; so `:label (or (:title o) n)` is indistinguishable from `:label n` on all
+    ;; of them. This object is titled `The Arizona build`.
+    (is (= "arizona" (:label row))
+        "the label is the NAME and never the object's title — a rename must not change what you type to find the subject, which is the whole reason `entity-objects` matches on `[:value :name]`")
+    (is (= "subject:arizona" (:id row))
+        "the row is still the SUBJECT's, not the object's: the object is where it takes you, not what it is")
+    (is (= 0 (:touched row))
+        "`cap` looks up `subject:arizona`, which no event ever touched — not `ent:az`, which this fixture's `:put` did")))
+
+(deftest a-materialized-subject-is-one-subject-plus-the-notebook-about-it
+  ;; The other half of `leap-does-not-offer-a-materialized-entity-under-its-own-kind`.
+  ;;
+  ;; TWO rows read `tsmc` after materialization, and both are correct: the
+  ;; subject, which is its facts, and the notebook `materialize-entity!` minted,
+  ;; which is its cells. Design §3 splits the groups precisely because "entity
+  ;; names can collide with object titles" — a subject and a document with the
+  ;; same name are two different places to go, and the group heading is what says
+  ;; which is which. What must NOT appear is a third row for the entity object
+  ;; itself, because the subject row is already that destination.
+  (let [st  (entity-fixture)
+        m   (entity-memory)
+        r   (srv/materialize-entity! st "tsmc")
+        eid (:entity r)
+        sid (:spaceId r)
+        rows (srv/leap-payload st m "tsmc")
+        subs (subject-rows rows)]
+    (is (= 1 (count subs)) "exactly one subject row")
+    (is (= "tsmc" (:label (first subs))))
+    (is (= eid (:object (first subs))) "…pointing at the object that was minted")
+    (is (empty? (filter #(= eid (:id %)) rows))
+        "and NO row for the entity object itself, in any group — the subject row is where it takes you")
+    (is (= 1 (count (filter #(and (= sid (:id %)) (= "space" (:group %))) rows)))
+        "the notebook about it is offered, once, under `space` — a different destination, deliberately not suppressed")))
+
+(deftest an-empty-query-offers-no-subjects
+  ;; Like every other content group. Without the `(seq q)` guard `str/includes?`
+  ;; against "" is true of every name, so an opened palette would list every
+  ;; promoted subject in the corpus before a key is pressed — and would walk the
+  ;; whole memory to build the list.
+  (let [st (materialize! (entity-fixture) "ent:tsmc" "tsmc" "TSMC")
+        m  (entity-memory)
+        rows (srv/leap-payload st m "")]
+    (is (some #(= "doc:fab" (:id %)) rows)
+        "control: an empty query still lists the objects, so this payload is not empty")
+    (is (empty? (subject-rows rows))
+        "…and offers no subjects, materialized or not")))
+
+(defn- many-subjects-memory
+  "`n` promoted names sharing one substring — two word-disjoint facts each.
+
+   Two facts because one is below the promotion threshold and would leave the
+   name out of the group entirely. Word-disjoint for `bulk-entity-memory`'s
+   reason: `remember` reinforces an existing fact rather than adding one when
+   their token sets overlap by 0.6 or more, and two facts that collapsed into one
+   would silently unpromote the name and leave the cap with nothing to cut."
+  [n]
+  (let [m (mem/file-memory (tmpfile))]
+    (doseq [i (range n), j [0 1]]
+      (mold/remember m (str "alpha" i "x" j " beta" i "x" j " gamma" i "x" j " delta" i "x" j)
+                     {:entities [(format "zorp%02d" i)] :source {:obj "doc:bulk"}}))
+    m))
+
+(deftest the-subject-group-is-capped-and-alphabetical-under-the-cap
+  ;; Twelve against a `group-cap` of eight, so the cap has four names to cut and
+  ;; the assertion can actually fail. Zero-padded so alphabetical and numerical
+  ;; order are the same and the expectation reads as one.
+  (let [st   (sub/fresh-store)
+        m    (many-subjects-memory 12)
+        idx  (ent/index (mem/all-facts m))
+        subs (subject-rows (srv/leap-payload st m "zorp"))]
+    (is (= 12 (count (ent/promoted idx #{})))
+        "control: twelve names are promoted — two facts each, none of them reinforced away")
+    (is (= 8 (count subs))
+        "capped at `group-cap`, like every other group")
+    (is (= ["zorp00" "zorp01" "zorp02" "zorp03" "zorp04" "zorp05" "zorp06" "zorp07"]
+           (mapv :label subs))
+        "alphabetical, and the cap takes the first eight of THAT order: `promoted` answers a set in hash order, the group sorts it, and `cap`'s `sort-by :touched` is stable over rows whose `:touched` is 0 to a name")))
+
+(defrecord CountingStore [inner !n]
+  ;; Every read delegates; `objects` also counts. A spy and not a stub — the
+  ;; payload under it is the real one, so a miscount cannot hide behind an
+  ;; answer nothing checked.
+  sub/Store
+  (commit! [_ event] (sub/commit! inner event))
+  (state   [_]       (sub/state inner))
+  (objects [_]       (swap! !n inc) (sub/objects inner))
+  (object  [_ id]    (sub/object inner id))
+  (history [_]       (sub/history inner))
+  (undo!   [_]       (sub/undo! inner))
+  (as-of   [_ n]     (sub/as-of inner n)))
+
+(defrecord MutatingStore [inner !n after]
+  ;; Commits `after` the moment the FIRST `objects` read has been answered, so
+  ;; the second read of one request sees a world the first did not. That is the
+  ;; race, made deterministic — a real one needs another thread committing
+  ;; between two reads of the same payload, which is a normal Tuesday on a store
+  ;; an agent flow is also writing to.
+  sub/Store
+  (commit! [_ event] (sub/commit! inner event))
+  (state   [_]       (sub/state inner))
+  (objects [_]       (let [m (sub/objects inner)]
+                       (when (= 1 (swap! !n inc)) (sub/commit! inner after))
+                       m))
+  (object  [_ id]    (sub/object inner id))
+  (history [_]       (sub/history inner))
+  (undo!   [_]       (sub/undo! inner))
+  (as-of   [_ n]     (sub/as-of inner n)))
+
+(deftest one-payload-reads-the-objects-once-and-so-answers-about-one-world
+  ;; `objs`, `intext` and `made` each used to call `sub/objects` for themselves,
+  ;; which is three reads of a store anything else may be writing to — and the
+  ;; halves disagree in a way that loses rows rather than duplicating them. The
+  ;; document below appears between the first read and the second: the old shape
+  ;; showed it under `in text` while the object scan, which read the older world,
+  ;; had never heard of it.
+  ;;
+  ;; The property is not "the new document is offered" — a request may honestly
+  ;; predate it. It is that ONE request answers about ONE world: a document is
+  ;; either in this payload or not in it, never present to one group and absent
+  ;; from another.
+  (let [inner (sub/fresh-store)
+        m     (mem/file-memory (tmpfile))
+        late  {:op :put :id "doc:late"
+               ;; a title that does NOT match, so `intext` would not exclude it,
+               ;; and a body that does — the shape that made the old skew visible
+               :value {:id "doc:late" :kind :doc :title "Memo" :value "the zzz body"}}
+        st    (->MutatingStore inner (atom 0) late)
+        rows  (srv/leap-payload st m "zzz")]
+    (is (some? (sub/object inner "doc:late"))
+        "control: the store really did grow mid-request — the spy committed it")
+    (is (empty? (filter #(= "doc:late" (:id %)) rows))
+        "the document that arrived after this request read the world is in NO group of it, rather than in `in text` and nowhere else")))
+
+(deftest the-subject-group-builds-one-objects-map-and-not-one-per-name
+  ;; `entity-object` per promoted name and `materialized-names` beside it is N+1
+  ;; whole objects maps **on a keystroke** — and N is every name the query
+  ;; matched, not the eight `cap` keeps, because the row is built before the cap
+  ;; sees it. Measured on an EDN store, the group alone: 36 names over 900
+  ;; objects, 16.2 ms naive against 0.80 ms shared; 360 names over 900 objects,
+  ;; 122 ms against 1.7 ms.
+  ;;
+  ;; Nothing about the payload's CONTENT notices, which is why this is asserted
+  ;; on the store instead: one store, two memories, and the number of objects
+  ;; maps built must not move when the number of subjects does. A count pinned
+  ;; to a literal would instead break every time an unrelated line in
+  ;; `leap-payload` read the store, and would say nothing about this.
+  (let [st  (sub/fresh-store)
+        n3  (atom 0)
+        n12 (atom 0)
+        m3  (many-subjects-memory 3)
+        m12 (many-subjects-memory 12)]
+    (is (= 3 (count (subject-rows (srv/leap-payload st m3 "zorp"))))
+        "control: three subjects match…")
+    (is (= 8 (count (subject-rows (srv/leap-payload st m12 "zorp"))))
+        "…and twelve do, capped to eight — four times the rows built")
+    (srv/leap-payload (->CountingStore st n3) m3 "zorp")
+    (srv/leap-payload (->CountingStore st n12) m12 "zorp")
+    (is (pos? @n3) "control: the spy is wired in and the payload does read the store")
+    (is (= @n3 @n12)
+        (str "the same number of objects maps either way — " @n3 " and " @n12))))
+
+(deftest a-subject-is-matched-the-way-every-other-group-is-matched
+  (let [st (entity-fixture)
+        m  (entity-memory)
+        labels (fn [q] (mapv :label (subject-rows (srv/leap-payload st m q))))]
+    (is (= ["tsmc"] (labels "TSMC"))
+        "`leap-payload` lower-cases the query and `ent/normalize` lower-cased the names, so the two sides meet")
+    ;; INFIX, and that word is load-bearing: both names below start with
+    ;; `taiwan`, so the assertion under them holds verbatim under a
+    ;; `str/starts-with?` filter and says nothing about substrings. These two do
+    ;; not — `semiconductor` is in the middle of one name and `sml` is inside
+    ;; `asml` — and a prefix filter answers `[]` to each.
+    (is (= ["taiwan semiconductor manufacturing"] (labels "semiconductor"))
+        "a match INSIDE a name, not at its front: LEAP is a substring search and a subject is found the way a document is")
+    (is (= ["asml"] (labels "sml"))
+        "…including inside a single word")
+    (is (= ["taiwan" "taiwan semiconductor manufacturing"] (labels "taiwan"))
+        "two matches for one query, alphabetical between them")
+    (is (= [] (labels " tsmc "))
+        "a query with surrounding space finds nothing here — exactly as it finds nothing in any other group, because `leap-payload` lower-cases `q` and deliberately does not trim it, and the shell trims before it asks")))
+
+(deftest leap-folds-case-with-the-locale-entity-identity-uses-and-not-the-JVMs
+  ;; Measured under `-Duser.language=tr`, one doc titled `IBM memo` and two facts
+  ;; naming `IBM`. Before the fix NEITHER spelling of the query returned the
+  ;; page, and they failed in opposite directions:
+  ;;
+  ;;   q="IBM"  →  the doc alone. `q` folded to `ıbm` through `str/lower-case`,
+  ;;               so it matched neither the subject `ibm` — folded by
+  ;;               `ent/normalize` under `Locale/ROOT` — nor the facts, since
+  ;;               `mold/recall` was handed the mangled query too.
+  ;;   q="ibm"  →  the subject and the facts, and NOT the doc: `hit?` folds the
+  ;;               HAYSTACK, so the title became `ıbm memo` and an
+  ;;               already-lower-case query lost it.
+  ;;
+  ;; This test changes the default locale instead of constructing the mismatch
+  ;; out of strings, and that is the point rather than a shortcut: under an
+  ;; English locale `str/lower-case` and `Locale/ROOT` agree on every input, so
+  ;; NO payload this function can produce tells the broken code from the fixed
+  ;; one. That is why 453 tests and 1810 assertions passed over the bug, and why
+  ;; a string-level assertion here would join them. The only test that can fail
+  ;; is one that runs where the two disagree.
+  ;;
+  ;; `setDefault` is JVM-global, so it is restored in a `finally` — which runs
+  ;; on a failing `is` too, because `is` records rather than throws — and the
+  ;; runner is sequential.
+  (let [was (Locale/getDefault)]
+    (try
+      (Locale/setDefault (Locale/forLanguageTag "tr"))
+      (is (not= "ibm" (str/lower-case "IBM"))
+          "control: this JVM is folding `I` to a dotless `ı` right now — without it the rest of this test proves nothing")
+      (let [st (sub/fresh-store)
+            m  (mem/file-memory (tmpfile))]
+        (sub/commit! st {:op :put :id "doc:memo"
+                         :value {:id "doc:memo" :kind :doc :title "IBM memo" :value "…"}})
+        ;; two facts, so `ibm` is promoted; word-disjoint, so `remember`
+        ;; reinforces neither into the other and both survive as facts
+        (mold/remember m "the mainframe division posted another quarter"
+                       {:entities ["IBM"] :source {:obj "doc:memo"}})
+        (mold/remember m "quantum roadmap slips by eighteen months"
+                       {:entities ["IBM"] :source {:obj "doc:memo"}})
+        (let [rows  (fn [q] (set (map (juxt :group :id :label) (srv/leap-payload st m q))))
+              upper (rows "IBM")
+              lower (rows "ibm")]
+          (is (contains? upper ["subject" "subject:ibm" "ibm"])
+              "typing the name as it is written finds the subject — folding `q` under the default locale lost it")
+          (is (contains? lower ["doc" "doc:memo" "IBM memo"])
+              "…and typing it lower-case still finds the document — folding the TITLE under the default locale lost that")
+          (is (= upper lower)
+              "the two spellings answer the same page, which is the whole property: one locale-independent fold on both sides of every comparison")
+          (is (some (fn [[g]] (= "memory" g)) upper)
+              "including the facts, which `mold/recall` never saw for a mangled query")))
+      (finally (Locale/setDefault was)))))
+
+(deftest the-mold-route-reads-the-past-when-asked-and-the-present-when-not
+  ;; `?at=` on /api/mold is otherwise untested: deleting `store-at` from that one
+  ;; route leaves every mold assertion in this file green, because they all call
+  ;; `mold-payload` directly. Task 6 reasons at length about WHICH store the
+  ;; entity branch is handed under `?at=`; nothing pinned that the route hands it
+  ;; one at all.
+  (let [st   (sub/fresh-store)
+        m    (entity-memory)
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory (delay m)]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))]
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "first"}})
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "second"}})
+    (is (= "second" (:rendered (get! "id=doc:d")))
+        "no ?at= reads the live store")
+    (is (= "first" (:rendered (get! "id=doc:d&at=1")))
+        "?at=1 is the world after one event — the route passes the store through `store-at`, and nothing else can produce this")
+    (is (= "second" (:rendered (get! "id=doc:d&at=99")))
+        "…clamped to the log's length rather than answering an empty world")))
