@@ -2,6 +2,10 @@
 # .tavily-key are real (gitignored) secrets in the repo root, and anything the
 # build context carries can be baked into a layer that survives docker push.
 data/
+# corpus/ is the raw source material the import reads once, not something the
+# running image needs: `loci.corpus` turns it into events against a store, and
+# the image ships the jar and the store, not the CSVs it was built from.
+corpus/
 target/
 node_modules/
 .git/

@@ -1,0 +1,309 @@
+;; corpus/MANIFEST.edn — what is in corpus/, where it came from, under what licence.
+;;
+;; The rule this file exists to enforce: CC0, US public domain, or CC BY only.
+;; Anything whose licence could not be *established* — by reading the publisher's
+;; own statement, not by inferring one from the kind of institution — is not here.
+;; The BIS central-bank policy-rate dataset (data.bis.org, WS_CBPOL) was the
+;; natural first choice for the monthly table and was REJECTED on exactly that
+;; rule; see :rejected at the foot of this file.
+;;
+;; Every table carries a coarse column of 2-12 distinct values, computed here at
+;; fetch time, because `cat-col` (src/loci/content.clj) picks the *coarsest*
+;; string column in that range and a raw `country` column (49-171 values) never
+;; molds as Pivot or Bar. Exactly one table has a column literally named `month`,
+;; because `timeseries?` keys on that name; the rest are annual and stay annual —
+;; the gap between them is a finding about loci, not a defect in the data.
+;;
+;; :rows records source count -> committed count, and :filter the reduction, so a
+;; reader can tell an extract from a sample and reproduce it.
+;;
+;; This file is plain EDN: every value is a literal, nothing here needs eval.
+
+{:generated   "2026-08-11"
+ :retrieved   "2026-08-11"
+ :licence-bar #{"CC0-1.0" "US-public-domain" "CC-BY-4.0"}
+
+ :files
+ [{:file    "art-objects.csv"
+   :title   "The Metropolitan Museum of Art — 352 objects across eight eras"
+   :domain  :arts
+   :source  {:publisher "The Metropolitan Museum of Art"
+             :dataset   "MET Open Access — MetObjects.csv"
+             :url       "https://github.com/metmuseum/openaccess"
+             :download  "https://media.githubusercontent.com/media/metmuseum/openaccess/master/MetObjects.csv"
+             :retrieved "2026-08-11"}
+   :licence {:id  "CC0-1.0"
+             :url "https://creativecommons.org/publicdomain/zero/1.0/"
+             :established
+             "The repository ships the full CC0 1.0 Universal text as its LICENSE file, and its
+README states: \"The Metropolitan Museum of Art provides select datasets of information on more
+than 470,000 artworks in its Collection for unrestricted commercial and noncommercial use. To the
+extent possible under law, The Metropolitan Museum of Art has waived all copyright and related or
+neighboring rights to this dataset using Creative Commons Zero.\" Both were read directly at
+https://raw.githubusercontent.com/metmuseum/openaccess/master/LICENSE and .../README.md on
+2026-08-11."
+             :attribution "The Metropolitan Museum of Art, Open Access (CC0 1.0)"}
+   :rows    {:source 484956 :committed 352 :source-rows-examined 309710}
+   :filter
+   "A row qualifies if it has a non-blank Title (not \"untitled\" or \"unknown\"), a non-blank
+Medium, and an Object Begin Date that parses as an integer in [-4000, 2030] and is not 0.
+Qualifying rows are offered, in file order, to fourteen themed quotas, and the first N matches of
+each are kept; an object is used at most once, by the first theme that claims it. Quotas:
+  cobalt 45                    — Medium or Title contains \"cobalt\"
+  dutch masters 55             — Artist Display Name matches one of 21 Dutch Golden Age names
+                                 (rembrandt, vermeer, frans hals, ruisdael, jan steen, cuyp,
+                                  claesz, hobbema, ter borch, de hooch, van goyen, gerard dou,
+                                  gabriel metsu, avercamp, van heemskerck, maerten, jan van huysum,
+                                  willem kalf, ambrosius bosschaert, adriaen van ostade,
+                                  van de velde)
+  dutch and netherlandish 30   — Culture contains \"dutch\" or \"netherlandish\", and an artist is named
+  delft 25                     — Culture, Title or Medium contains \"delft\"
+  chinese porcelain 45         — Culture contains \"china\" and Medium contains \"porcelain\"
+  lead-bearing media 40        — Medium matches the word \"lead\", or \"lead-glaz\", \"white lead\",
+                                 \"lead white\"
+  breadth 14 per era bucket    — the row's era bucket, sampled at a stride of every 977th source
+                                 row, so the corpus is not all seventeenth-century Holland
+The scan stops once every quota is full, which happened at source row 309710 of 484956. Output is
+sorted by (year, Title)."
+   :columns {:passthrough ["Title" "Artist Display Name" "Culture" "Country" "Medium"]
+             :computed    {"era"  "bucketed from Object Begin Date"
+                           "year" "Object Begin Date, renamed"}
+             :dropped     ["Department"]}
+   :coarse-column "era"
+   :coarse-values ["Before 500 CE" "500-1399" "1400-1599" "1600-1699"
+                   "1700-1799" "1800-1899" "1900-1945" "After 1945"]
+   :notes
+   "MET's `Department` was fetched and then DROPPED: it has 10 distinct values in this extract, and
+`cat-col` takes the coarsest 2-12-value string column, so Department would have quietly become the
+Pivot axis instead of `era`.
+`year` is a rename of `Object Begin Date`. Under the original header the column is neither
+name-matched as a rate nor year-like (this extract spans -1900 to 2003), so `measure-col` would
+treat it as a summable quantity and the Bar viewer would chart the SUM of object dates.
+Titles and artist names keep MET's own `|` separator — between the Chinese and the English title,
+and between co-authors. That is how the source writes them and it was left alone."
+   :entangles ["cobalt" "china" "netherlands" "lead" "united states" "egypt" "iran"]}
+
+  {:file    "mineral-production.csv"
+   :title   "USGS Mineral Commodity Summaries 2026 — world production, nine commodities"
+   :domain  :sciences
+   :source  {:publisher "U.S. Geological Survey, National Minerals Information Center"
+             :dataset   "Mineral Commodity Summaries 2026 Data Release — MCS2026_Commodities_Data.csv"
+             :url       "https://www.sciencebase.gov/catalog/item/696a75d5d4be0228872d3bf8"
+             :doi       "https://doi.org/10.3133/mcs2026"
+             :retrieved "2026-08-11"}
+   :licence {:id  "CC0-1.0"
+             :url "https://creativecommons.org/publicdomain/zero/1.0/"
+             :established
+             "The ScienceBase catalogue item carries a machine-readable rights field, read on
+2026-08-11 from https://www.sciencebase.gov/catalog/item/696a75d5d4be0228872d3bf8?format=json —
+\"This work is marked with the Creative Commons Zero v1.0 Universal (CC0-1.0) public domain
+dedication; https://creativecommons.org/publicdomain/zero/1.0/.\" That per-item dedication is
+stronger and more specific than the general USGS public-domain policy, and is what was relied on."
+             :attribution "U.S. Geological Survey, Mineral Commodity Summaries 2026 (CC0 1.0)"}
+   :rows    {:source 8886 :committed 214}
+   :filter
+   "Commodity in {Cobalt, Copper, Gallium, Graphite (Natural), Lead, Lithium, Nickel, Rare Earths,
+Silicon}; Section contains \"World\" (the world-production sections, not the United-States salient
+statistics); Statistics = \"Production\"; Country not in {World total, Other countries, blank};
+Year and Value both parse as numbers. Values are stripped of thousands separators and converted to
+metric tons (kilograms x 0.001, thousand metric tons x 1000). Where USGS lists a mine and a
+refinery figure under the same commodity/country/year, the larger is kept. Country names
+normalised: \"Congo (Kinshasa)\" -> \"Democratic Republic of Congo\", \"Korea, Republic of\" ->
+\"South Korea\", \"Korea, North\" -> \"North Korea\", \"Burma\" -> \"Myanmar\". Sorted by
+(Commodity, Country, year)."
+   :columns {:passthrough ["Commodity" "Country" "Unit"]
+             :computed    {"year"              "Year, parsed"
+                           "production_tonnes" "Value, comma-stripped and unit-normalised to metric tons"}
+             :dropped     ["Is critical mineral 2025" "MCS chapter" "Section" "Statistics"
+                           "Statistics_detail" "Notes" "Other notes"]}
+   :coarse-column "Commodity"
+   :coarse-values ["Cobalt" "Copper" "Gallium" "Graphite (Natural)" "Lead"
+                   "Lithium" "Nickel" "Rare Earths" "Silicon"]
+   :notes
+   "USGS's `Is critical mineral 2025` column was dropped for the same reason as MET's Department:
+it holds two values (Yes/No) and would have out-ranked `Commodity` as the coarse column. `Unit` is
+kept although constant, so the table says what its numbers are in; a one-value column cannot be a
+cat-col, so it is harmless.
+The source file is cp1252-encoded, not UTF-8 — its Section values contain an em dash that decodes
+to U+FFFD if you assume UTF-8 — and its Value cells carry thousands separators (\"226,000\"), which
+loci's ->val would leave as a string rather than parse as a number. Both are handled here."
+   :entangles ["cobalt" "gallium" "china" "democratic republic of congo" "lead"
+               "united states" "silicon" "rare earths"]}
+
+  {:file    "lead-phaseout.csv"
+   :title   "The global phase-out of leaded petrol — year of ban, by country"
+   :domain  :politics
+   :source  {:publisher "Our World in Data"
+             :dataset   "Leaded petrol bans in road vehicles (lead_petrol_banned)"
+             :url       "https://ourworldindata.org/grapher/lead-petrol-ban"
+             :download  "https://ourworldindata.org/grapher/lead-petrol-ban.csv"
+             :regions   "https://ourworldindata.org/grapher/continents-according-to-our-world-in-data.csv"
+             :retrieved "2026-08-11"}
+   :licence {:id  "CC-BY-4.0"
+             :url "https://creativecommons.org/licenses/by/4.0/"
+             :established
+             "OWID's FAQ, read on 2026-08-11 at https://ourworldindata.org/faqs: \"Some of the data
+on our site is produced by us ... Data produced by us falls under our permissive CC BY license; you
+have permission to use, reproduce, and distribute it, provided that you cite us.\" This dataset IS
+produced by OWID — the indicator metadata at
+https://api.ourworldindata.org/v1/indicators/1208075.metadata.json gives origin producer \"Various
+sources\", citationFull \"Our World in Data (2021). Leaded petrol bans in road vehicles, based on
+multiple sources.\", and description \"This dataset was built by Our World in Data based on
+published dates from multiple sources.\" The `World region according to OWID` column is likewise
+OWID's own construction. Both therefore fall under OWID's CC BY."
+             :attribution "Our World in Data (2021), Leaded petrol bans in road vehicles — CC BY 4.0"}
+   :rows    {:source 4644 :committed 129}
+   :filter
+   "The source is one Yes/No row per country per year, 1986-2021. Reduced to one row per country:
+the earliest year whose answer is \"Yes\". Countries with no OWID world region (aggregates and
+small territories) are dropped. Sorted by country."
+   :columns {:passthrough ["Entity" "Code" "World region according to OWID"]
+             :computed    {"ban_year" "earliest Year whose ban answer is Yes"}}
+   :coarse-column "World region according to OWID"
+   :coarse-values ["Africa" "Asia" "Europe" "North America" "Oceania" "South America"]
+   :notes
+   "OWID's header is kept verbatim, spaces and all. `col-kw` turns it into
+:world_region_according_to_owid, which was the point of leaving it alone: this corpus is the first
+real test of that normalisation against headers nobody sanitised."
+   :entangles ["lead" "netherlands" "united states" "china"]}
+
+  {:file    "elections-turnout.csv"
+   :title   "Voter turnout of registered voters — most recent national election per country"
+   :domain  :politics
+   :source  {:publisher "V-Dem, processed by Our World in Data"
+             :dataset   "V-Dem Country-Year (Full + Others) v16, indicator v2eltrnout"
+             :url       "https://ourworldindata.org/grapher/voter-turnout-of-registered-voters"
+             :download  "https://ourworldindata.org/grapher/voter-turnout-of-registered-voters.csv"
+             :regions   "https://ourworldindata.org/grapher/continents-according-to-our-world-in-data.csv"
+             :retrieved "2026-08-11"}
+   :licence {:id  "CC-BY-4.0"
+             :url "https://creativecommons.org/licenses/by/4.0/"
+             :established
+             "Machine-readable, from the indicator's own origins block at
+https://api.ourworldindata.org/v1/indicators/1210039.metadata.json, read on 2026-08-11:
+origins[0].license = {\"name\": \"CC BY 4.0\", \"url\":
+\"https://creativecommons.org/licenses/by/4.0/\"}, producer \"V-Dem\", versionProducer \"v16\".
+OWID's processing on top of it is CC BY by its own FAQ."
+             :attribution
+             "V-Dem (2026), Democracy report v16, processed by Our World in Data — CC BY 4.0.
+Coppedge, Michael, et al. 2026. \"V-Dem [Country-Year/Country-Date] Dataset v16\", Varieties of
+Democracy (V-Dem) Project, https://doi.org/10.23696/vdemds26"}
+   :rows    {:source 4392 :committed 171}
+   :filter
+   "Rows with a blank turnout, and entities with no OWID world region (World and regional
+aggregates), are dropped. For each remaining country, elections from 2000 onward are counted, and
+the most recent supplies `year` and `turnout_pct`. Countries with no election since 2000 are
+dropped. Sorted by country."
+   :columns {:passthrough ["Entity" "Code" "World region according to OWID"]
+             :computed    {"year"                 "year of the most recent election since 2000"
+                           "turnout_pct"          "its turnout, from `Voter turnout of registered voters`"
+                           "elections_since_2000" "how many elections with turnout data since 2000"}}
+   :coarse-column "World region according to OWID"
+   :coarse-values ["Africa" "Asia" "Europe" "North America" "Oceania" "South America"]
+   :notes
+   "`Voter turnout of registered voters` was renamed to `turnout_pct` rather than passed through.
+Under its own name the column is neither name-matched as a rate nor year-like, so `measure-col`
+would pick it as the table's summable quantity and the Bar viewer would add percentages together.
+`elections_since_2000` exists so the table has one honestly summable number for Bar and Pivot to
+measure."
+   :entangles ["united states" "netherlands" "china"]}
+
+  {:file    "interest-rates-monthly.csv"
+   :title   "Three-month money-market interest rates, monthly, ten economies"
+   :domain  :finance
+   :source  {:publisher "Eurostat"
+             :dataset   "irt_st_m — money market interest rates, monthly (series IRT_M3)"
+             :url       "https://ec.europa.eu/eurostat/databrowser/view/irt_st_m"
+             :download  "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/irt_st_m/?format=SDMX-CSV&startPeriod=2020-01"
+             :retrieved "2026-08-11"}
+   :licence {:id  "CC-BY-4.0"
+             :url "https://creativecommons.org/licenses/by/4.0/"
+             :established
+             "Eurostat's copyright notice, read on 2026-08-11 at
+https://ec.europa.eu/eurostat/web/main/help/copyright-notice: \"The copyright for the editorial
+content of this website, which is owned by the EU, is licensed under the Creative Commons
+Attribution 4.0 International licence\", and, for data specifically, \"Reuse of statistical data,
+metadata, publications, and other dissemination tools published on this website for commercial or
+non-commercial purposes is authorised provided the source is acknowledged\", implemented by
+Commission Decision 2011/833/EU. Attribution only: no share-alike, no non-commercial clause.
+The honest edge, recorded rather than smoothed over: the literal string \"CC BY 4.0\" is attached
+to site content, while the grant over the statistical data is worded as unrestricted attributed
+reuse rather than badged with a CC identifier. It clears the bar on substance; a reader should know
+it is worded, not badged."
+             :attribution "Source: Eurostat, irt_st_m (© European Union, reuse authorised with attribution)"}
+   :rows    {:source 2978 :committed 445}
+   :filter
+   "int_rt = IRT_M3 (the three-month rate, the one series comparable across all these economies);
+geo in the ten with IRT_M3 coverage {CZ DK EA HU JP PL RO SE UK US}; TIME_PERIOD between 2020-01
+and 2024-12 inclusive; non-blank OBS_VALUE. Geo codes expanded to names so `united states` is
+findable as itself. The source row count is of the API response for startPeriod=2020-01, not of the
+whole dataflow. Coverage is genuinely ragged — Japan ends 2023-01, the UK 2024-03, the US 2024-09 —
+and the holes are left in. Sorted by (month, country)."
+   :columns {:passthrough []
+             :computed    {"month"    "TIME_PERIOD, renamed — `timeseries?` keys on this exact name"
+                           "country"  "geo code expanded to a country name"
+                           "rate_pct" "OBS_VALUE"}}
+   :coarse-column "country"
+   :coarse-values ["Czechia" "Denmark" "Euro area" "Hungary" "Japan" "Poland"
+                   "Romania" "Sweden" "United Kingdom" "United States"]
+   :notes
+   "This is the ONLY table with a `month` column, and so the only one that molds as Over time or
+Headline. The other four are annual and were left annual on purpose: `timeseries?` keys on a column
+literally named :month, so annual data never charts however obviously temporal it is, and that gap
+is a finding to see rather than paper over.
+The BIS's central-bank policy rate dataset (WS_CBPOL) is the better fit for the word \"policy\" and
+was rejected on licence — see :rejected below. Eurostat's three-month money-market rate is what an
+attributable source offers, and it tracks policy closely: the US series runs 0.22% in 2021-01 to
+5.36% in 2024-08.
+Known wart, and not a defect in the data: `line` looks for a series column among #{:tenure-band
+:dept :channel :region :stage}, and `country` is not one of them, so Over time draws all ten
+economies as a single interleaved line."
+   :entangles ["united states" "japan" "euro area" "united kingdom"]}]
+
+ :entanglement
+ {"cobalt"        {:arts     "45 rows whose Medium or Title names cobalt — chiefly Jingdezhen porcelain painted in underglaze cobalt blue from 1300 onward, plus Delft tin-glaze"
+                   :sciences "cobalt world production 2024-2025; Democratic Republic of Congo 226,000 t (2024), 230,000 t (2025)"}
+  "lead"          {:arts     "44 rows with lead in the Medium — lead-glazed earthenware, cast lead sculpture, leaded glass"
+                   :politics "129 countries' leaded-petrol ban years, 1986-2021"
+                   :sciences "lead world production 2024-2025"}
+  "gallium"       {:sciences "China 839 t (2024), 900 t (2025) — the export-control commodity"}
+  "china"         {:arts     "86 objects with Culture China; blue-and-white porcelain from the Yuan onward"
+                   :sciences "gallium, rare earths, graphite, silicon, lead, copper"}
+  "netherlands"   {:arts     "10 objects with Country Netherlands, 55 with Dutch culture or a Dutch master's name, 25 Delft"
+                   :politics "leaded petrol banned 1998; 2025 election, 78.3% turnout"}
+  "united states" {:arts     "objects with Country United States"
+                   :sciences "US production across all nine commodities"
+                   :politics "leaded petrol banned 1996; 2024 election, 70.75% turnout"
+                   :finance  "the 2021-2024 rate cycle, 0.22% to 5.36%"}}
+
+ :checksums
+ {"art-objects.csv"            "219697bcf48d274716dc1af1e05ae096"
+  "elections-turnout.csv"      "9915ce536f71d363f2b74e2508156256"
+  "interest-rates-monthly.csv" "1db55036a6cb301de4b4dc8b3c4fc81f"
+  "lead-phaseout.csv"          "1e4c98ab6741f41734418f17089e88ef"
+  "mineral-production.csv"     "83c3a139f96f8d87fdfb90792db2c414"}
+
+ ;; measured 2026-08-11 with loci.tools/parse-csv + loci.mold/viewers-for
+ :molds-as
+ {"art-objects.csv"            [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
+  "elections-turnout.csv"      [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
+  "lead-phaseout.csv"          [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
+  "mineral-production.csv"     [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist]
+  "interest-rates-monthly.csv" [:table/rows :table/summary :table/cards :table/pivot :table/bar :table/hist
+                                :table/line :table/kpi]}
+
+ :rejected
+ [{:source "BIS Data Portal — central bank policy rates (WS_CBPOL), monthly, 38 economies"
+   :url    "https://data.bis.org/topics/CBPOL"
+   :reason
+   "Shape-perfect for the monthly table, and rejected on licence. https://data.bis.org/help/legal,
+read 2026-08-11: \"The use of the statistics is unrestricted, provided that ... if the statistics
+will be used in a commercial publication or product, their inclusion in the publication or product
+will not result in any additional charge to subscribers or other users ... No other use is
+permissible.\" That commercial condition is a restriction CC BY does not impose, so it is not CC BY
+however permissive it reads."}
+  {:source "MET Collection API — https://collectionapi.metmuseum.org/public/collection/v1"
+   :reason
+   "Same CC0 data, different transport. It began returning HTTP 403 to this host part way through
+the fetch — rate limiting, not a licence problem. Switched to the full MetObjects.csv over Git LFS,
+which is the canonical distribution anyway, and reduced from there."}]}

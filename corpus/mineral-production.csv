@@ -1,0 +1,215 @@
+Commodity,Country,Unit,year,production_tonnes
+Cobalt,Australia,metric tons,2024,4780.0
+Cobalt,Australia,metric tons,2025,3700.0
+Cobalt,Canada,metric tons,2024,3350.0
+Cobalt,Canada,metric tons,2025,3500.0
+Cobalt,China,metric tons,2024,2000.0
+Cobalt,China,metric tons,2025,2000.0
+Cobalt,Cuba,metric tons,2024,3450.0
+Cobalt,Cuba,metric tons,2025,2000.0
+Cobalt,Democratic Republic of Congo,metric tons,2024,226000.0
+Cobalt,Democratic Republic of Congo,metric tons,2025,230000.0
+Cobalt,Indonesia,metric tons,2024,35000.0
+Cobalt,Indonesia,metric tons,2025,44000.0
+Cobalt,Madagascar,metric tons,2024,3100.0
+Cobalt,Madagascar,metric tons,2025,3900.0
+Cobalt,Papua New Guinea,metric tons,2024,2630.0
+Cobalt,Papua New Guinea,metric tons,2025,2800.0
+Cobalt,Philippines,metric tons,2024,3100.0
+Cobalt,Philippines,metric tons,2025,3700.0
+Cobalt,Russia,metric tons,2024,8000.0
+Cobalt,Russia,metric tons,2025,7700.0
+Cobalt,Turkey,metric tons,2024,2200.0
+Cobalt,Turkey,metric tons,2025,1900.0
+Cobalt,United States,metric tons,2024,200.0
+Cobalt,United States,metric tons,2025,300.0
+Copper,Australia,metric tons,2024,765000.0
+Copper,Australia,metric tons,2025,730000.0
+Copper,Canada,metric tons,2024,515000.0
+Copper,Canada,metric tons,2025,500000.0
+Copper,Chile,metric tons,2024,5510000.0
+Copper,Chile,metric tons,2025,5300000.0
+Copper,China,metric tons,2024,12400000.0
+Copper,China,metric tons,2025,14000000.0
+Copper,Democratic Republic of Congo,metric tons,2024,2990000.0
+Copper,Democratic Republic of Congo,metric tons,2025,3200000.0
+Copper,Germany,metric tons,2024,597000.0
+Copper,Germany,metric tons,2025,610000.0
+Copper,India,metric tons,2024,545000.0
+Copper,India,metric tons,2025,620000.0
+Copper,Indonesia,metric tons,2024,1010000.0
+Copper,Indonesia,metric tons,2025,710000.0
+Copper,Japan,metric tons,2024,1570000.0
+Copper,Japan,metric tons,2025,1400000.0
+Copper,Kazakhstan,metric tons,2024,724000.0
+Copper,Kazakhstan,metric tons,2025,710000.0
+Copper,Mexico,metric tons,2024,717000.0
+Copper,Mexico,metric tons,2025,690000.0
+Copper,Peru,metric tons,2024,2740000.0
+Copper,Peru,metric tons,2025,2700000.0
+Copper,Poland,metric tons,2024,589000.0
+Copper,Poland,metric tons,2025,560000.0
+Copper,Russia,metric tons,2024,1020000.0
+Copper,Russia,metric tons,2025,1300000.0
+Copper,South Korea,metric tons,2024,604000.0
+Copper,South Korea,metric tons,2025,610000.0
+Copper,United States,metric tons,2024,1050000.0
+Copper,United States,metric tons,2025,1000000.0
+Copper,Zambia,metric tons,2024,823000.0
+Copper,Zambia,metric tons,2025,940000.0
+Gallium,China,metric tons,2024,839.0
+Gallium,China,metric tons,2025,900.0
+Gallium,Japan,metric tons,2024,3.0
+Gallium,Japan,metric tons,2025,3.0
+Gallium,Russia,metric tons,2024,6.0
+Gallium,Russia,metric tons,2025,6.0
+Graphite (Natural),Austria,metric tons,2024,100.0
+Graphite (Natural),Austria,metric tons,2025,200.0
+Graphite (Natural),Brazil,metric tons,2024,58000.0
+Graphite (Natural),Brazil,metric tons,2025,65000.0
+Graphite (Natural),Canada,metric tons,2024,11700.0
+Graphite (Natural),Canada,metric tons,2025,8000.0
+Graphite (Natural),China,metric tons,2024,1270000.0
+Graphite (Natural),China,metric tons,2025,1400000.0
+Graphite (Natural),Germany,metric tons,2024,140.0
+Graphite (Natural),Germany,metric tons,2025,140.0
+Graphite (Natural),India,metric tons,2024,17600.0
+Graphite (Natural),India,metric tons,2025,17000.0
+Graphite (Natural),Madagascar,metric tons,2024,85000.0
+Graphite (Natural),Madagascar,metric tons,2025,80000.0
+Graphite (Natural),Mexico,metric tons,2024,706.0
+Graphite (Natural),Mexico,metric tons,2025,740.0
+Graphite (Natural),Mozambique,metric tons,2024,39000.0
+Graphite (Natural),Mozambique,metric tons,2025,60000.0
+Graphite (Natural),North Korea,metric tons,2024,8100.0
+Graphite (Natural),North Korea,metric tons,2025,8000.0
+Graphite (Natural),Norway,metric tons,2024,5340.0
+Graphite (Natural),Norway,metric tons,2025,6600.0
+Graphite (Natural),Russia,metric tons,2024,20000.0
+Graphite (Natural),Russia,metric tons,2025,25000.0
+Graphite (Natural),South Korea,metric tons,2024,1000.0
+Graphite (Natural),South Korea,metric tons,2025,500.0
+Graphite (Natural),Sri Lanka,metric tons,2024,3000.0
+Graphite (Natural),Sri Lanka,metric tons,2025,3200.0
+Graphite (Natural),Tanzania,metric tons,2024,27000.0
+Graphite (Natural),Tanzania,metric tons,2025,75000.0
+Graphite (Natural),Turkey,metric tons,2024,2600.0
+Graphite (Natural),Turkey,metric tons,2025,2200.0
+Graphite (Natural),Ukraine,metric tons,2024,900.0
+Graphite (Natural),Ukraine,metric tons,2025,800.0
+Graphite (Natural),Vietnam,metric tons,2024,500.0
+Graphite (Natural),Vietnam,metric tons,2025,500.0
+Lead,Australia,metric tons,2024,481000.0
+Lead,Australia,metric tons,2025,480000.0
+Lead,Bolivia,metric tons,2024,110000.0
+Lead,Bolivia,metric tons,2025,100000.0
+Lead,China,metric tons,2024,1940000.0
+Lead,China,metric tons,2025,1900000.0
+Lead,India,metric tons,2024,226000.0
+Lead,India,metric tons,2025,220000.0
+Lead,Iran,metric tons,2024,70000.0
+Lead,Iran,metric tons,2025,70000.0
+Lead,Mexico,metric tons,2024,240000.0
+Lead,Mexico,metric tons,2025,200000.0
+Lead,Peru,metric tons,2024,291000.0
+Lead,Peru,metric tons,2025,290000.0
+Lead,Russia,metric tons,2024,260000.0
+Lead,Russia,metric tons,2025,260000.0
+Lead,Sweden,metric tons,2024,75000.0
+Lead,Sweden,metric tons,2025,70000.0
+Lead,Tajikistan,metric tons,2024,39000.0
+Lead,Tajikistan,metric tons,2025,40000.0
+Lead,Turkey,metric tons,2024,66000.0
+Lead,Turkey,metric tons,2025,70000.0
+Lead,United States,metric tons,2024,304000.0
+Lead,United States,metric tons,2025,280000.0
+Lithium,Argentina,metric tons,2024,13800.0
+Lithium,Argentina,metric tons,2025,23000.0
+Lithium,Australia,metric tons,2024,82700.0
+Lithium,Australia,metric tons,2025,92000.0
+Lithium,Brazil,metric tons,2024,10200.0
+Lithium,Brazil,metric tons,2025,12000.0
+Lithium,Canada,metric tons,2024,4820.0
+Lithium,Canada,metric tons,2025,5600.0
+Lithium,Chile,metric tons,2024,48900.0
+Lithium,Chile,metric tons,2025,56000.0
+Lithium,China,metric tons,2024,41400.0
+Lithium,China,metric tons,2025,62000.0
+Lithium,Mali,metric tons,2024,770.0
+Lithium,Mali,metric tons,2025,9400.0
+Lithium,Portugal,metric tons,2024,380.0
+Lithium,Portugal,metric tons,2025,380.0
+Lithium,Zimbabwe,metric tons,2024,20000.0
+Lithium,Zimbabwe,metric tons,2025,28000.0
+Nickel,Australia,metric tons,2024,98000.0
+Nickel,Australia,metric tons,2025,45000.0
+Nickel,Brazil,metric tons,2024,67500.0
+Nickel,Brazil,metric tons,2025,70000.0
+Nickel,Canada,metric tons,2024,125000.0
+Nickel,Canada,metric tons,2025,140000.0
+Nickel,China,metric tons,2024,115000.0
+Nickel,China,metric tons,2025,120000.0
+Nickel,Indonesia,metric tons,2024,2310000.0
+Nickel,Indonesia,metric tons,2025,2600000.0
+Nickel,New Caledonia,metric tons,2024,116000.0
+Nickel,New Caledonia,metric tons,2025,140000.0
+Nickel,Philippines,metric tons,2024,354000.0
+Nickel,Philippines,metric tons,2025,270000.0
+Nickel,Russia,metric tons,2024,205000.0
+Nickel,Russia,metric tons,2025,200000.0
+Nickel,United States,metric tons,2024,7490.0
+Nickel,United States,metric tons,2025,10000.0
+Rare Earths,Australia,metric tons,2024,29000.0
+Rare Earths,Australia,metric tons,2025,29000.0
+Rare Earths,Brazil,metric tons,2024,560.0
+Rare Earths,Brazil,metric tons,2025,2000.0
+Rare Earths,China,metric tons,2024,270000.0
+Rare Earths,China,metric tons,2025,270000.0
+Rare Earths,India,metric tons,2024,2900.0
+Rare Earths,India,metric tons,2025,2900.0
+Rare Earths,Madagascar,metric tons,2024,1400.0
+Rare Earths,Madagascar,metric tons,2025,2700.0
+Rare Earths,Malaysia,metric tons,2024,140.0
+Rare Earths,Malaysia,metric tons,2025,110.0
+Rare Earths,Myanmar,metric tons,2024,27000.0
+Rare Earths,Myanmar,metric tons,2025,22000.0
+Rare Earths,Nigeria,metric tons,2024,1500.0
+Rare Earths,Nigeria,metric tons,2025,1500.0
+Rare Earths,Russia,metric tons,2024,2600.0
+Rare Earths,Russia,metric tons,2025,2600.0
+Rare Earths,Thailand,metric tons,2024,2100.0
+Rare Earths,Thailand,metric tons,2025,4800.0
+Rare Earths,United States,metric tons,2024,45500.0
+Rare Earths,United States,metric tons,2025,51000.0
+Rare Earths,Vietnam,metric tons,2024,300.0
+Rare Earths,Vietnam,metric tons,2025,150.0
+Silicon,Australia,metric tons,2024,47000.0
+Silicon,Australia,metric tons,2025,47000.0
+Silicon,Bhutan,metric tons,2024,98000.0
+Silicon,Bhutan,metric tons,2025,98000.0
+Silicon,Brazil,metric tons,2024,190000.0
+Silicon,Brazil,metric tons,2025,180000.0
+Silicon,Canada,metric tons,2024,34000.0
+Silicon,Canada,metric tons,2025,34000.0
+Silicon,China,metric tons,2024,4800000.0
+Silicon,China,metric tons,2025,4000000.0
+Silicon,France,metric tons,2024,90000.0
+Silicon,France,metric tons,2025,68000.0
+Silicon,Germany,metric tons,2024,29000.0
+Silicon,Germany,metric tons,2025,13000.0
+Silicon,Iceland,metric tons,2024,90000.0
+Silicon,Iceland,metric tons,2025,72000.0
+Silicon,India,metric tons,2024,59000.0
+Silicon,India,metric tons,2025,59000.0
+Silicon,Kazakhstan,metric tons,2024,120000.0
+Silicon,Kazakhstan,metric tons,2025,120000.0
+Silicon,Malaysia,metric tons,2024,120000.0
+Silicon,Malaysia,metric tons,2025,120000.0
+Silicon,Norway,metric tons,2024,160000.0
+Silicon,Norway,metric tons,2025,150000.0
+Silicon,Russia,metric tons,2024,420000.0
+Silicon,Russia,metric tons,2025,420000.0
+Silicon,South Africa,metric tons,2024,36000.0
+Silicon,South Africa,metric tons,2025,35000.0
+Silicon,Spain,metric tons,2024,41000.0
+Silicon,Spain,metric tons,2025,40000.0

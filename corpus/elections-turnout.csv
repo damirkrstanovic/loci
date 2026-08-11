@@ -1,0 +1,172 @@
+Entity,Code,World region according to OWID,year,turnout_pct,elections_since_2000
+Afghanistan,AFG,Asia,2019,19.0,7
+Albania,ALB,Europe,2025,43.28,7
+Algeria,DZA,Africa,2024,46.1,10
+Angola,AGO,Africa,2022,44.82,4
+Argentina,ARG,South America,2025,67.92,13
+Armenia,ARM,Asia,2021,49.41,8
+Australia,AUS,Oceania,2025,90.67,9
+Austria,AUT,Europe,2024,76.25,11
+Azerbaijan,AZE,Asia,2024,76.68,10
+Bahrain,BHR,Asia,2022,73.0,6
+Bangladesh,BGD,Asia,2024,41.8,5
+Barbados,BRB,North America,2022,41.73,5
+Belarus,BLR,Europe,2025,85.7,13
+Belgium,BEL,Europe,2024,87.42,6
+Benin,BEN,Africa,2023,37.79,10
+Bhutan,BTN,Asia,2024,65.6,5
+Bolivia,BOL,South America,2025,86.95,8
+Bosnia and Herzegovina,BIH,Europe,2022,51.45,7
+Botswana,BWA,Africa,2024,81.42,5
+Brazil,BRA,South America,2022,79.42,6
+Bulgaria,BGR,Europe,2024,38.94,13
+Burkina Faso,BFA,Africa,2020,50.79,7
+Burundi,BDI,Africa,2025,98.88,5
+Cambodia,KHM,Asia,2023,84.59,5
+Cameroon,CMR,Africa,2025,57.76,8
+Canada,CAN,North America,2025,68.7,9
+Cape Verde,CPV,Africa,2021,57.46,5
+Central African Republic,CAF,Africa,2025,52.42,7
+Chad,TCD,Africa,2024,75.89,7
+Chile,CHL,South America,2025,85.12,11
+Colombia,COL,South America,2022,58.1,6
+Comoros,COM,Africa,2025,66.27,9
+Congo,COG,Africa,2021,67.17,5
+Costa Rica,CRI,North America,2022,59.96,6
+Cote d'Ivoire,CIV,Africa,2025,50.1,8
+Croatia,HRV,Europe,2025,44.18,14
+Cuba,CUB,North America,2023,75.87,5
+Cyprus,CYP,Europe,2023,72.45,10
+Czechia,CZE,Europe,2025,68.95,9
+Democratic Republic of Congo,COD,Africa,2018,45.4,3
+Denmark,DNK,Europe,2022,84.16,7
+Djibouti,DJI,Africa,2023,74.01,9
+Dominican Republic,DOM,North America,2024,54.37,10
+East Timor,TLS,Asia,2023,79.28,8
+Ecuador,ECU,South America,2025,82.95,10
+Egypt,EGY,Africa,2023,66.8,9
+El Salvador,SLV,North America,2024,52.6,12
+Equatorial Guinea,GNQ,Africa,2022,98.41,6
+Estonia,EST,Europe,2023,63.53,6
+Eswatini,SWZ,Africa,2018,60.5,1
+Ethiopia,ETH,Africa,2021,93.64,5
+Fiji,FJI,Oceania,2022,68.3,5
+Finland,FIN,Europe,2024,71.55,11
+France,FRA,Europe,2024,66.71,6
+Gabon,GAB,Africa,2025,70.69,7
+Gambia,GMB,Africa,2022,51.21,10
+Georgia,GEO,Asia,2024,58.73,10
+Germany,DEU,Europe,2025,82.54,7
+Ghana,GHA,Africa,2024,60.88,7
+Greece,GRC,Europe,2023,61.1,8
+Guatemala,GTM,North America,2023,59.45,6
+Guinea,GIN,Africa,2020,78.88,6
+Guinea-Bissau,GNB,Africa,2025,60.73,10
+Guyana,GUY,South America,2025,58.41,6
+Haiti,HTI,North America,2016,18.11,6
+Honduras,HND,North America,2021,69.09,6
+Hong Kong,HKG,Asia,2021,30.0,6
+Hungary,HUN,Europe,2022,69.59,6
+Iceland,ISL,Europe,2024,80.78,11
+India,IND,Asia,2024,65.79,5
+Indonesia,IDN,Asia,2024,82.39,5
+Iran,IRN,Asia,2024,40.64,12
+Iraq,IRQ,Asia,2025,56.04,8
+Ireland,IRL,Europe,2025,45.83,8
+Israel,ISR,Asia,2022,70.63,10
+Italy,ITA,Europe,2022,63.79,6
+Jamaica,JAM,North America,2025,39.96,6
+Japan,JPN,Asia,2024,53.8,9
+Jordan,JOR,Asia,2024,31.25,7
+Kazakhstan,KAZ,Asia,2023,54.15,11
+Kenya,KEN,Africa,2022,64.77,5
+Kosovo,OWID_KOS,Europe,2025,47.46,8
+Kuwait,KWT,Asia,2024,62.1,10
+Kyrgyzstan,KGZ,Asia,2025,36.9,11
+Laos,LAO,Asia,2021,98.02,5
+Latvia,LVA,Europe,2022,59.43,7
+Lebanon,LBN,Asia,2022,49.19,5
+Lesotho,LSO,Africa,2022,37.44,6
+Liberia,LBR,Africa,2023,78.86,4
+Libya,LBY,Africa,2014,49.7,2
+Lithuania,LTU,Europe,2024,59.95,12
+Luxembourg,LUX,Europe,2023,87.18,5
+Madagascar,MDG,Africa,2024,46.66,8
+Malawi,MWI,Africa,2025,76.4,6
+Malaysia,MYS,Asia,2022,73.89,5
+Maldives,MDV,Asia,2024,73.91,10
+Mali,MLI,Africa,2020,35.58,5
+Malta,MLT,Europe,2022,85.63,5
+Mauritania,MRT,Africa,2024,55.39,11
+Mauritius,MUS,Africa,2024,79.3,6
+Mexico,MEX,North America,2024,60.54,9
+Moldova,MDA,Europe,2025,52.21,11
+Mongolia,MNG,Asia,2024,69.83,13
+Montenegro,MNE,Europe,2023,70.14,11
+Morocco,MAR,Africa,2021,50.18,5
+Mozambique,MOZ,Africa,2024,51.41,5
+Myanmar,MMR,Asia,2020,71.89,3
+Namibia,NAM,Africa,2024,76.86,4
+Nepal,NPL,Asia,2022,61.35,4
+Netherlands,NLD,Europe,2025,78.3,9
+New Zealand,NZL,Oceania,2023,78.2,8
+Nicaragua,NIC,North America,2021,66.24,5
+Niger,NER,Africa,2021,62.91,6
+Nigeria,NGA,Africa,2023,26.71,6
+North Korea,PRK,Asia,2019,99.99,4
+North Macedonia,MKD,Europe,2024,55.44,11
+Norway,NOR,Europe,2025,80.12,7
+Oman,OMN,Asia,2023,65.85,5
+Pakistan,PAK,Asia,2024,47.28,5
+Panama,PAN,North America,2024,77.65,5
+Papua New Guinea,PNG,Oceania,2017,51.62,2
+Paraguay,PRY,South America,2023,62.86,5
+Peru,PER,South America,2021,74.57,7
+Philippines,PHL,Asia,2025,83.4,9
+Poland,POL,Europe,2025,71.63,11
+Portugal,PRT,Europe,2025,58.23,13
+Qatar,QAT,Asia,2021,63.5,1
+Romania,ROU,Europe,2025,64.69,11
+Russia,RUS,Europe,2024,77.49,11
+Rwanda,RWA,Africa,2024,98.2,7
+Sao Tome and Principe,STP,Africa,2022,65.67,10
+Senegal,SEN,Africa,2024,61.3,8
+Serbia,SRB,Europe,2023,58.77,13
+Seychelles,SYC,Africa,2025,84.09,9
+Sierra Leone,SLE,Africa,2023,83.0,5
+Singapore,SGP,Asia,2025,92.83,7
+Slovakia,SVK,Europe,2024,61.12,12
+Slovenia,SVN,Europe,2022,70.97,11
+Solomon Islands,SLB,Oceania,2024,82.35,6
+South Africa,ZAF,Africa,2024,58.64,5
+South Korea,KOR,Asia,2025,79.38,12
+South Sudan,SSD,Africa,2010,72.0,1
+Spain,ESP,Europe,2023,66.59,8
+Sri Lanka,LKA,Asia,2024,75.0,9
+Sudan,SDN,Africa,2015,46.4,2
+Suriname,SUR,South America,2025,69.36,6
+Sweden,SWE,Europe,2022,84.21,6
+Switzerland,CHE,Europe,2023,46.64,6
+Syria,SYR,Asia,2024,38.16,9
+Taiwan,TWN,Asia,2024,71.86,10
+Tajikistan,TJK,Asia,2025,85.35,8
+Tanzania,TZA,Africa,2020,50.72,5
+Thailand,THA,Asia,2023,75.71,7
+Togo,TGO,Africa,2024,61.0,10
+Trinidad and Tobago,TTO,North America,2025,53.92,8
+Tunisia,TUN,Africa,2024,11.4,8
+Turkey,TUR,Asia,2023,87.04,7
+Turkmenistan,TKM,Asia,2023,91.12,9
+Uganda,UGA,Africa,2021,55.23,5
+Ukraine,UKR,Europe,2019,63.78,8
+United Arab Emirates,ARE,Asia,2019,34.81,3
+United Kingdom,GBR,Europe,2024,59.76,7
+United States,USA,North America,2024,70.75,13
+Uruguay,URY,South America,2024,89.52,5
+Uzbekistan,UZB,Asia,2024,75.35,12
+Vanuatu,VUT,Oceania,2025,69.09,8
+Venezuela,VEN,South America,2025,42.6,12
+Vietnam,VNM,Asia,2021,95.6,5
+Yemen,YEM,Asia,2012,64.78,3
+Zambia,ZMB,Africa,2021,70.61,7
+Zimbabwe,ZWE,Africa,2023,68.86,7

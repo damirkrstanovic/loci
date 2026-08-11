@@ -1,0 +1,130 @@
+Entity,Code,World region according to OWID,ban_year
+Afghanistan,AFG,Asia,2016
+Algeria,DZA,Africa,2021
+Angola,AGO,Africa,2006
+Argentina,ARG,South America,1998
+Australia,AUS,Oceania,2002
+Austria,AUT,Europe,1989
+Azerbaijan,AZE,Asia,1997
+Bangladesh,BGD,Asia,1999
+Belarus,BLR,Europe,1998
+Belgium,BEL,Europe,2000
+Benin,BEN,Africa,2005
+Bolivia,BOL,South America,1995
+Bosnia and Herzegovina,BIH,Europe,2009
+Botswana,BWA,Africa,2006
+Brazil,BRA,South America,1989
+Bulgaria,BGR,Europe,2004
+Burkina Faso,BFA,Africa,2005
+Burundi,BDI,Africa,2006
+Cameroon,CMR,Africa,2005
+Canada,CAN,North America,1990
+Cape Verde,CPV,Africa,2006
+Central African Republic,CAF,Africa,2005
+Chad,TCD,Africa,2005
+Chile,CHL,South America,2001
+China,CHN,Asia,2000
+Colombia,COL,South America,1991
+Comoros,COM,Africa,2006
+Congo,COG,Africa,2005
+Cote d'Ivoire,CIV,Africa,2005
+Croatia,HRV,Europe,2006
+Czechia,CZE,Europe,2001
+Democratic Republic of Congo,COD,Africa,2005
+Denmark,DNK,Europe,1994
+Ecuador,ECU,South America,1997
+Equatorial Guinea,GNQ,Africa,2006
+Eritrea,ERI,Africa,2004
+Estonia,EST,Europe,2001
+Eswatini,SWZ,Africa,2006
+Ethiopia,ETH,Africa,2004
+Finland,FIN,Europe,1994
+France,FRA,Europe,2000
+Gabon,GAB,Africa,2006
+Georgia,GEO,Asia,2000
+Germany,DEU,Europe,1996
+Ghana,GHA,Africa,2004
+Greece,GRC,Europe,2002
+Guam,GUM,Oceania,1996
+Guinea,GIN,Africa,2006
+Guinea-Bissau,GNB,Africa,2006
+Hong Kong,HKG,Asia,1999
+Hungary,HUN,Europe,1999
+Iceland,ISL,Europe,2001
+India,IND,Asia,2000
+Indonesia,IDN,Asia,2006
+Iran,IRN,Asia,2003
+Iraq,IRQ,Asia,2018
+Ireland,IRL,Europe,2000
+Italy,ITA,Europe,2002
+Japan,JPN,Asia,1986
+Kenya,KEN,Africa,2006
+Kyrgyzstan,KGZ,Asia,2002
+Latvia,LVA,Europe,2001
+Lesotho,LSO,Africa,2006
+Liberia,LBR,Africa,2006
+Lithuania,LTU,Europe,2001
+Madagascar,MDG,Africa,2006
+Malawi,MWI,Africa,2006
+Malaysia,MYS,Asia,2000
+Mali,MLI,Africa,2006
+Malta,MLT,Europe,2003
+Mauritania,MRT,Africa,2004
+Mauritius,MUS,Africa,2006
+Mexico,MEX,North America,1998
+Monaco,MCO,Europe,2000
+Morocco,MAR,Africa,2006
+Mozambique,MOZ,Africa,2006
+Myanmar,MMR,Asia,2016
+Namibia,NAM,Africa,2006
+Nepal,NPL,Asia,2000
+Netherlands,NLD,Europe,1998
+New Zealand,NZL,Oceania,1996
+Niger,NER,Africa,2006
+Nigeria,NGA,Africa,2004
+North Korea,PRK,Asia,2016
+Norway,NOR,Europe,1997
+Oman,OMN,Asia,2001
+Pakistan,PAK,Asia,2001
+Peru,PER,South America,2004
+Philippines,PHL,Asia,2000
+Poland,POL,Europe,2000
+Portugal,PRT,Europe,1999
+Romania,ROU,Europe,2005
+Russia,RUS,Europe,2003
+Rwanda,RWA,Africa,2004
+Sao Tome and Principe,STP,Africa,2006
+Saudi Arabia,SAU,Asia,2001
+Senegal,SEN,Africa,2005
+Serbia,SRB,Europe,2010
+Seychelles,SYC,Africa,2006
+Sierra Leone,SLE,Africa,2006
+Singapore,SGP,Asia,1998
+Slovakia,SVK,Europe,1995
+Slovenia,SVN,Europe,2001
+Somalia,SOM,Africa,2006
+South Africa,ZAF,Africa,2006
+South Korea,KOR,Asia,1993
+South Sudan,SSD,Africa,2000
+Spain,ESP,Europe,2001
+Sri Lanka,LKA,Asia,1999
+Sudan,SDN,Africa,2000
+Sweden,SWE,Europe,1992
+Switzerland,CHE,Europe,2000
+Taiwan,TWN,Asia,2000
+Tanzania,TZA,Africa,2006
+Thailand,THA,Asia,1996
+Togo,TGO,Africa,2005
+Trinidad and Tobago,TTO,North America,2000
+Turkey,TUR,Asia,2006
+Uganda,UGA,Africa,2006
+Ukraine,UKR,Europe,2003
+United Arab Emirates,ARE,Asia,2003
+United Kingdom,GBR,Europe,2000
+United States,USA,North America,1996
+Uruguay,URY,South America,2004
+Venezuela,VEN,South America,2005
+Vietnam,VNM,Asia,2001
+Yemen,YEM,Asia,2018
+Zambia,ZMB,Africa,2006
+Zimbabwe,ZWE,Africa,2006
