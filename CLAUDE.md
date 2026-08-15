@@ -60,6 +60,34 @@ than it saved: on 2026-08-15 it produced checksum verification in every single s
 prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
 until a server was stopped — all to guard data the user regards as disposable.
 
+## Don't build for a requirement nobody stated
+
+Before treating something as a constraint and engineering around it: **check the docs and
+specs. If they don't say, and it isn't obvious, ask.** An assumption that generates work is
+a question, not a premise.
+
+Two from 2026-08-15, both mine, both expensive:
+
+- **Fact ids are `mem-<n>`, so I defended the sequence.** Nothing asked for it. Exactly one
+  place uses the ordinal semantically — `older`, breaking a `:ts` tie — and its docstring
+  already handles non-sequential ids. Defending it produced `mint-id!` on a protocol, a
+  high-water atom, a durable counter, a seeding path, a lock, and a transaction. Measured:
+  `(random-uuid)` passes the same tests and deletes all of it. (The counter stays; the
+  point is that nobody was asked whether it should.)
+- **I wrote "cross-process safety" into my own spec, then built a two-JVM harness to test
+  it.** loci is single-writer and always was. A closed loop with no outside input.
+
+The tells, in order of how loudly they should stop you:
+
+1. You are **measuring how often your own mechanism corrupts data**. It should not exist.
+2. You are **testing a requirement you wrote yourself**. Ask whose it is.
+3. You are **building infrastructure to preserve a property** — an id shape, an ordering, a
+   format — that nothing in the docs asks for.
+
+Ask. One question costs a message; a side-quest costs an afternoon and lands work nobody
+wanted. This is the same rule as "answer the question that was asked" above, one step
+earlier: before the work starts, not after it has run long.
+
 ## One writer. Three ways to reach storage, and a fourth that is a mistake
 
 loci is **single-writer**. One process owns the store. Reach it by:
