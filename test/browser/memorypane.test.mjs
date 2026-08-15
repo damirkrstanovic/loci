@@ -673,3 +673,103 @@ test('a refused judgement keeps the pane and says the server’s own sentence', 
       `nor may the refusal disturb the fact that was already durable: ${rows[0]}`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// forget — the one control in this pane with no inverse
+// ---------------------------------------------------------------------------
+//
+// /api/memory-forget also begins with /api/memory, so it depends on the same
+// `(\?|$)` group that keeps unmerge and durable out of the pane's route. That
+// group is now load-bearing three times over.
+const FORGET_URL = /\/api\/memory-forget$/;
+
+const forgetRoute = (page, reply) => {
+  const seen = [];
+  return page.route(FORGET_URL, route => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    seen.push(body);
+    route.fulfill({ status: 200, contentType: 'application/json',
+                    body: JSON.stringify(reply(body)) });
+  }).then(() => seen);
+};
+
+const forgetFor = (page, text) =>
+  page.locator('.memfact', { hasText: text }).locator('.forget');
+
+test('forgetting sends the id and names the text that went, with no confirm step', async () => {
+  await withPage(browser, 'memory-forget-sends-and-names', async (page) => {
+    await bootedShell(page, server.url);
+    await stub(page, { ...HEALTHY, facts: [fact()], total: 1 });
+    const seen = await forgetRoute(page, ({ id }) =>
+      ({ forgotten: id, fact: 'Neptune is the eighth planet from the Sun', also: [] }));
+    await openPane(page);
+
+    await forgetFor(page, 'Neptune').click();
+
+    // no dialog intercepted, no second click: one gesture is the whole act
+    assert.deepEqual(seen, [{ id: 'fact:neptune' }],
+      `forget sent the wrong body: ${JSON.stringify(seen)}`);
+    // the toast carries the TEXT, because after this call it exists nowhere
+    // else the reader can reach — an id cannot be typed back in
+    await page.waitForSelector('.toast.on');
+    const toast = (await page.textContent('.toast')).trim();
+    assert.match(toast, /Neptune is the eighth planet/,
+      `the toast must name what went, not just its id: ${toast}`);
+  });
+});
+
+test('forgetting a survivor says the merge group went too', async () => {
+  await withPage(browser, 'memory-forget-cascade', async (page) => {
+    await bootedShell(page, server.url);
+    await stub(page, { ...HEALTHY, total: 1, facts: [fact({
+      'merged-from': [{ id: 'fact:older', fact: 'An older way of saying it' }] })] });
+    await forgetRoute(page, ({ id }) =>
+      ({ forgotten: id, fact: 'Neptune is the eighth planet from the Sun',
+         also: ['fact:older'] }));
+    await openPane(page);
+
+    // said before the click, on the control itself
+    assert.match(await forgetFor(page, 'Neptune').getAttribute('title'),
+      /also forgets the 1 fact merged into this one/);
+
+    await forgetFor(page, 'Neptune').click();
+    await page.waitForSelector('.toast.on');
+    const toast = (await page.textContent('.toast')).trim();
+    assert.match(toast, /and the 1 fact merged into it/,
+      `the cascade must be stated after the fact as well as before: ${toast}`);
+  });
+});
+
+test('a refused forget keeps the row and says the server sentence', async () => {
+  await withPage(browser, 'memory-forget-refused', async (page) => {
+    await bootedShell(page, server.url);
+    await stub(page, { ...HEALTHY, facts: [fact()], total: 1 });
+    await forgetRoute(page, () =>
+      ({ error: 'fact:neptune is not a fact any more — it was absorbed into fact:other.' }));
+    await openPane(page);
+
+    await forgetFor(page, 'Neptune').click();
+    await page.waitForSelector('.toast.on');
+    const toast = (await page.textContent('.toast')).trim();
+    assert.match(toast, /absorbed into fact:other/, `the refusal was swallowed: ${toast}`);
+    // the pane keeps what it was showing rather than re-rendering as if it worked
+    const rows = await rowTexts(page);
+    assert.equal(rows.length, 1, 'a refusal must not remove the row');
+    assert.match(rows[0], /Neptune/);
+  });
+});
+
+test('the pane says forgetting is permanent, once, in the footer', async () => {
+  await withPage(browser, 'memory-forget-footer-note', async (page) => {
+    await bootedShell(page, server.url);
+    await stub(page, { ...HEALTHY, facts: [fact()], total: 1 });
+    await openPane(page);
+
+    const modal = await page.locator('.modalcard').first().textContent();
+    assert.match(modal, /forget is permanent/,
+      `the terms must be stated somewhere in the pane: ${modal}`);
+    // and the sentence forget made false must be gone
+    assert.ok(!modal.includes('never undone'),
+      'the footer still claims the memory is never undone, which forget made false');
+  });
+});

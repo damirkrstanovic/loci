@@ -353,6 +353,14 @@
                       padding:0 5px;cursor:pointer}
   .memfact .agetoggle:hover{background:var(--accent-wash,transparent)}
   .memfact .agetoggle[disabled]{opacity:.5;cursor:default}
+  /* Muted, not red. This is an ordinary action that happens to be permanent —
+     the note in the footer says so once, and a row that shouted it every time
+     would make the pane feel dangerous to read rather than to use. */
+  .memfact .forget{font:inherit;font-family:var(--mono);font-size:10.5px;color:var(--muted);
+    background:none;border:1px solid var(--line);border-radius:6px;padding:1px 7px;
+    cursor:pointer;margin-left:6px}
+  .memfact .forget:hover{color:var(--danger,#a33);border-color:var(--danger,#a33)}
+  .memfact .forget[disabled]{opacity:.5;cursor:default}
   /* the entity page — ONE renderer, three surfaces, so every rule here is drawn
      into the modal (before the subject is a citizen), into the molder (after),
      and into a notebook cell: materialize-entity! mints a notebook whose only
@@ -439,6 +447,10 @@ const API = {
   // Clojure side — a fact stamped as YOURS and ranked as timeless when you said
   // the opposite.
   memoryDurable: (id,durable) => POST('/api/memory-durable',{id,durable}),
+  // The only irreversible call in this file. The server answers with the text it
+  // removed, which is the last reachable copy of it — the toast below is what
+  // makes that worth returning.
+  memoryForget: id => POST('/api/memory-forget',{id}),
   // the subject page, in ONE payload the modal, the molder and a notebook cell all
   // draw. The raw string goes over the wire: `ent/normalize` is the server's, and a
   // second implementation of it in the page would be the thing that disagrees with it.
@@ -2188,11 +2200,22 @@ async function openMemory(qstr){
       // which is every fact's resting state, it sits directly under the run.
       '<div class="factact"><button type="button" class="agetoggle" data-fact="'+esc(f.id)+
         '" data-durable="'+(durable?'0':'1')+'">'+
-        (durable?'let it age':'stop ageing')+'</button></div>'+
+        (durable?'let it age':'stop ageing')+'</button>'+
+        // No confirm dialog. Forget means forget, and a modal asking twice would
+        // imply the second click is the real one. The footer states the terms
+        // once, for the whole pane; the toast afterwards names what went, which
+        // is the only recovery there is — you can read it and type it back in.
+        '<button type="button" class="forget" data-forget="'+esc(f.id)+'"'+
+          (absorbed.length?' title="also forgets the '+absorbed.length+
+                           ' fact'+(absorbed.length===1?'':'s')+' merged into this one"':'')+
+        '>forget</button></div>'+
       '</div>';
   });
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
-    '<span style="font-size:11.5px;color:var(--muted)">the agent’s recall — revisable, never undone</span></div></div>';
+    // Was "revisable, never undone", which stopped being true when forget
+    // landed. The sentence now says which half is which, once, here — rather
+    // than on every row.
+    '<span style="font-size:11.5px;color:var(--muted)">the agent’s recall — revisable; forget is permanent</span></div></div>';
   modal.innerHTML=h; modal.classList.add('on');
   modal.querySelector('#closeModal').addEventListener('click',closeModal);
   const mq=modal.querySelector('#memq');
@@ -2249,6 +2272,23 @@ async function openMemory(qstr){
     await openMemory(qstr||'');
     showToast((res.id||fid)+(want?' no longer ages — a year from now it ranks as it does today'
                                  :' ages again — recall halves it about every 30 days'));
+  }));
+  // The one control here with no inverse. Same shape as the two above — the
+  // answer is not a pane payload, so the pane refetches with the query it was
+  // showing — but the toast carries the TEXT rather than the id, because after
+  // this call that text exists nowhere else a reader can reach. Typing it back
+  // in is the whole of the recovery, and it cannot be typed back from an id.
+  modal.querySelectorAll('.forget').forEach(el=>el.addEventListener('click',async ()=>{
+    el.disabled=true;                       // one fact cannot be forgotten twice
+    const fid=el.dataset.forget;
+    let res;
+    try{ res=await API.memoryForget(fid); }
+    catch(e){ el.disabled=false; showToast('could not reach the server — nothing was forgotten'); return; }
+    if(res.error){ el.disabled=false; showToast(res.error); return; }
+    await openMemory(qstr||'');
+    const also=(res.also||[]).length;
+    showToast('forgotten: “'+(res.fact||fid)+'”'+
+              (also?' — and the '+also+' fact'+(also===1?'':'s')+' merged into it':''));
   }));
 }
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
