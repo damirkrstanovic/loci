@@ -28,6 +28,7 @@
    that says whether the other two can be believed: derived data that is
    half-built is worse than derived data that is missing, because it answers."
   (:require [datalevin.core :as d]
+            [loci.factlog :as fl]
             [loci.substrate :as sub]))
 
 (defn- touched-ids
@@ -58,6 +59,8 @@
     (d/open-dbi kv "counts")
     (d/open-list-dbi kv "touched")
     (d/open-dbi kv "meta")
+    (d/open-dbi kv "facts")
+    (d/open-dbi kv "chunks")
     kv))
 
 (defn- read-log
@@ -324,3 +327,139 @@
               (map-indexed (fn [k ev] [(inc k) ev]) (read-log kv)))
       (d/transact-kv kv [[:del "meta" dirty-key :keyword]])
       :ok)))
+
+;; ----------------------------------------------------------------------------
+;; facts — a parallel truth, not an event
+;; ----------------------------------------------------------------------------
+
+(def ^:private next-id-key :facts/next-id)
+
+(defrecord DbiLog [kv]
+  fl/FactLog
+  ;; `facts` is a parallel truth and is NEVER an event: nothing here writes to
+  ;; `events`, so `undo!` cannot revoke a fact and `as-of` cannot time-travel
+  ;; one. That is the whole record/recall separation, and it is enforced by
+  ;; which dbi a write names rather than by which file it opens.
+  ;;
+  ;; **Every read-then-write here is ONE LMDB transaction, and there is no lock
+  ;; anywhere in this record.** An earlier version wrapped these in
+  ;; `(locking lock)` over a plain `(Object.)` and read the counter in one
+  ;; transaction before writing it in the next.
+  ;;
+  ;; Not because two processes need to be safe — loci is single-writer, and the
+  ;; answer to "something else wants the store" is the HTTP API, the facade in
+  ;; the server's own REPL, or stopping the app. Simply because a read followed
+  ;; by a dependent write IS a transaction, and this database performs
+  ;; transactions. Hand-rolling one out of a monitor and two `transact-kv`
+  ;; calls was more code doing less.
+  ;;
+  ;; `with-transaction-kv` is Datalevin's own answer and its docstring example
+  ;; is literally get-counter / increment / put. Reaching for it instead of a
+  ;; monitor is the whole lesson: the database does transaction control, and a
+  ;; hand-rolled version is only a second thing to be wrong. Measured after the
+  ;; change: 200 concurrent mints, 200 distinct ids, no lock, 13 ms.
+  ;;
+  ;; The fact and the counter move together for a second reason. A bulk writer
+  ;; — the migration — appends without minting, so if the counter did not
+  ;; advance here it would still read 0 after 248 facts landed and the next
+  ;; mint would hand out mem-1 onto a live record.
+  (append! [_ rec]
+    (d/with-transaction-kv [tx kv]
+      (let [n (max (or (d/get-value tx "meta" next-id-key :keyword) 0)
+                   (or (fl/id-ordinal (:id rec)) 0))]
+        (d/transact-kv tx [[:put "facts" (:id rec) rec :string]
+                           [:put "meta" next-id-key n :keyword]])))
+    :ok)
+  (load-all [_]
+    (into {} (d/get-range kv "facts" [:all] :string)))
+  ;; O(1), durable, and atomic. Reading the counter is one key lookup, not a
+  ;; scan of every fact — `FileLog` was measured at 642 ms/call doing the scan
+  ;; version against an 8.5 MB log, and there is no reason to reintroduce it
+  ;; here where a counter is native. `append!` keeps the counter current, so
+  ;; this never consults `facts` at all.
+  ;;
+  ;; Durable is the half `FileLog` cannot match: its high-water atom dies with
+  ;; the process, while this survives a restart.
+  (mint-id! [_]
+    (d/with-transaction-kv [tx kv]
+      (let [n (inc (or (d/get-value tx "meta" next-id-key :keyword) 0))]
+        (d/transact-kv tx [[:put "meta" next-id-key n :keyword]])
+        (str "mem-" n)))))
+
+(defonce ^{:doc "The process's one connection to <data-dir>/substrate.
+
+   **Datalevin refuses a second connection to one directory from one process**
+   (`:lmdb/duplicate-open`), so this cannot be per-consumer — `loci.content`'s
+   seeded store and `loci.memory`'s facts are two views of ONE environment and
+   have to share the handle. It lives here, in the namespace that owns
+   `datalevin-store`, rather than in `loci.content`, so that the memory engine
+   does not have to require the demo-seed namespace to find its own storage.
+
+   A delay, so requiring this namespace still opens nothing — the rule the whole
+   codebase keeps. Tests rebind it (and `loci.content/store`, and
+   `loci.memory/memory`) with `with-redefs` and a delay of their own."}
+  store
+  (delay (datalevin-store)))
+
+(defn fact-log
+  "The `FactLog` over a `DatalevinStore`'s environment.
+
+   Takes the store rather than a directory so that facts land in the SAME
+   environment as the events — which is the point of the change — and so that
+   nothing can open a second env against the same directory by accident.
+
+   **Seeds the counter if facts exist without one.** That state is reachable:
+   a store written by an older path, or one hand-loaded, holds `mem-1…mem-n`
+   and no `:facts/next-id`. Minting from a zero counter would then reissue
+   `mem-1` onto a live fact and last-wins would destroy it — the failure the
+   deleted `next-id` docstring called 'no longer hypothetical'. One scan, once,
+   only when the key is absent."
+  [st]
+  (let [kv (:kv st)]
+    (when (nil? (d/get-value kv "meta" next-id-key :keyword))
+      (let [highest (reduce (fn [hi [id _]] (max hi (or (fl/id-ordinal id) 0)))
+                            0 (d/get-range kv "facts" [:all] :string))]
+        (when (pos? highest)
+          (d/transact-kv kv [[:put "meta" next-id-key highest :keyword]]))))
+    (->DbiLog kv)))
+
+;; ---------------------------------------------------------------------------
+;; chunks — derived vectors, in the same environment, in their own dbi
+;; ---------------------------------------------------------------------------
+
+(defn put-chunk!
+  "One chunk record into the `chunks` dbi, last-wins by `:id`.
+
+   **Deliberately not a `FactLog`.** That protocol's third method is `mint-id!`,
+   and a chunk has no id to mint: its id is derived from the object and its
+   position, and its `:hash` is derived from its text. Implementing a minting
+   method that must never be called, over a counter that must never advance, is
+   a trap in exchange for reuse of two one-line functions.
+
+   Same last-wins-by-`:id` discipline as the file sidecar it replaces, so
+   retiring a chunk is still an appended `{:id … :retired true}` and never a
+   deletion — `loci.chunks/retire!` relies on that."
+  [st rec]
+  (d/transact-kv (:kv st) [[:put "chunks" (:id rec) rec :string]])
+  :ok)
+
+(defn all-chunks
+  "id → record for every chunk in the store, retired ones included.
+
+   Retired records must come back: `loci.chunks/stored` filters them out itself,
+   and dropping them here would let a retired id read as absent and be re-embedded
+   on the next sweep."
+  [st]
+  (into {} (d/get-range (:kv st) "chunks" [:all] :string)))
+
+(defn put-fact-raw-for-test!
+  "Writes `rec` straight into the `facts` dbi WITHOUT touching the `:facts/next-id`
+   counter — simulating a store some other path wrote to, so `fact-log`'s
+   seeding behaviour has something to seed from.
+
+   Exists ONLY for loci.factlog-test. Production code must go through
+   `fact-log`'s `append!`, which keeps the counter and the fact in the same
+   transaction; calling this from anywhere else reopens the exact collision
+   `fact-log`'s docstring exists to close."
+  [st rec]
+  (d/transact-kv (:kv st) [[:put "facts" (:id rec) rec :string]]))

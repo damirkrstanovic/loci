@@ -41,19 +41,109 @@ This does not weaken the rule below. "Verify by measuring" governs **changes to 
 when you have written something, prove it works and prove the test bites. It is not a licence
 to go measure things nobody asked about.
 
-## Never write to `data/`
+## `data/` is test data — don't be precious about it
 
-`data/` is the user's real substrate — live notebooks, research, agent flows. It has already
-survived one silent-truncation bug that destroyed 31 events.
+`data/` holds notebooks, research and agent flows, but it is **test data in this
+repository**. Do not spend effort protecting it. No md5 checksums before and after, no
+rehearsing on copies, no refusing to run something because it might touch the store.
+If a run destroys it, that is an acceptable outcome and not an incident.
 
-- Scratch servers get a throwaway `LOCI_DATA`, never the repo's `data/`
-- **A live REPL counts as a scratch server.** `clojure -M:nrepl` (what ClojureMCP starts) is
-  one `(loci.dlv/datalevin-store)` or `@loci.memory/memory` away from opening the real store,
-  and an agent evaluating forms has no sandbox around it. Export a throwaway `LOCI_DATA`
-  before evaluating anything that opens a store, and never deref `loci.memory/memory`
-- Verify against a **copy** when a running server holds the store open
-- Check `md5sum data/substrate.edn` before and after any risky work
-- `data/substrate.edn` is the frozen rollback of the pre-Datalevin log; leave it alone
+What still applies, because it costs nothing:
+
+- Prefer a throwaway `LOCI_DATA` when a test or scratch server doesn't need the real data —
+  not to protect `data/`, but because tests that share a store interfere with each other
+- `data/` already carries several `.bak-*` files. Take another if you're about to do
+  something wholesale, then get on with it
+
+This replaces an earlier rule that treated `data/` as irreplaceable. That rule cost far more
+than it saved: on 2026-08-15 it produced checksum verification in every single subagent
+prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
+until a server was stopped — all to guard data the user regards as disposable.
+
+## Don't build for a requirement nobody stated
+
+Before treating something as a constraint and engineering around it: **check the docs and
+specs. If they don't say, and it isn't obvious, ask.** An assumption that generates work is
+a question, not a premise.
+
+Two from 2026-08-15, both mine, both expensive:
+
+- **Fact ids are `mem-<n>`, so I defended the sequence.** Nothing asked for it. Exactly one
+  place uses the ordinal semantically — `older`, breaking a `:ts` tie — and its docstring
+  already handles non-sequential ids. Defending it produced `mint-id!` on a protocol, a
+  high-water atom, a durable counter, a seeding path, a lock, and a transaction. Measured:
+  `(random-uuid)` passes the same tests and deletes all of it. (The counter stays; the
+  point is that nobody was asked whether it should.)
+- **I wrote "cross-process safety" into my own spec, then built a two-JVM harness to test
+  it.** loci is single-writer and always was. A closed loop with no outside input.
+
+The tells, in order of how loudly they should stop you:
+
+1. You are **measuring how often your own mechanism corrupts data**. It should not exist.
+2. You are **testing a requirement you wrote yourself**. Ask whose it is.
+3. You are **building infrastructure to preserve a property** — an id shape, an ordering, a
+   format — that nothing in the docs asks for.
+
+Ask. One question costs a message; a side-quest costs an afternoon and lands work nobody
+wanted. This is the same rule as "answer the question that was asked" above, one step
+earlier: before the work starts, not after it has run long.
+
+## One writer. Three ways to reach storage, and a fourth that is a mistake
+
+loci is **single-writer**. One process owns the store. Reach it by:
+
+1. **The running app's HTTP API** — `/api/*`. The normal path.
+2. **A `loci.*` facade, called in the server's own process.**
+   `loci.corpus/import-corpus!`, `loci.conversation/import-conversation!`,
+   `loci.factmigrate/migrate-facts!` are public, dry-run by default, and meant to be
+   called from a REPL attached to the live server.
+3. **Directly, with the app stopped.** Surgery takes the store offline first. Stopping the
+   app *is* the mechanism; there is no lock to acquire and none is wanted.
+
+The fourth way is a scratch script opening the store in its own JVM while a server holds
+it. That is not a scenario to make safe — it is a mistake, and the fix is (2) or (3). On
+2026-08-15 doing it anyway produced a two-JVM test harness, a spec promising a
+cross-process guarantee nobody asked for, and a contaminated measurement of a requirement
+that did not exist.
+
+## Use what the tool already provides, before inventing a mechanism
+
+Before writing coordination, locking, transactions, counters, retries or caching by hand,
+**look for the native facility first**. The dependency almost certainly has one, it is
+almost certainly correct, and a hand-rolled version is a second thing to be wrong.
+
+The 2026-08-15 case, kept because it is embarrassing and typical. Fact ids needed to be
+unique across writers. What got built:
+
+- a `(locking lock)` around a read-then-write, where `lock` is a plain `(Object.)`
+- a counter in the `meta` dbi, incremented by reading it and writing it back
+- a high-water-mark atom in `FileLog` to patch a gap the above left
+- a two-JVM harness to measure how often it lost data
+
+Datalevin ships `with-transaction-kv`: *"Evaluate body within the context of a single new
+read/write transaction, ensuring atomicity of key-value operations."* One transaction,
+correct by construction. The whole apparatus above was an unreliable reimplementation of a
+feature already on the classpath, and replacing it **deleted** a record field, a monitor
+and a class of bug.
+
+Two tells, both present here. **Measuring how often your own mechanism corrupts data** is
+not a research finding; it means the mechanism should not exist. And **testing a
+requirement you invented** — the harness existed to check a cross-process guarantee this
+spec had promised and nothing had asked for — is a loop with no outside input in it.
+
+So: grep the dependency, read its API, ask the REPL (`(clojure.repl/doc …)`,
+`(clojure.repl/apropos "transaction")`). loci is small, single-server software — it is not
+a place to invent concurrency primitives.
+
+## The REPL is the execution surface — see `.claude/skills/clojure-repl-dev`
+
+**Do not start a JVM to run Clojure.** `clojure -M -e "…"` costs ~25 seconds before the
+first form evaluates (0.78 s JVM, 14 s Datalevin, 12 s loci source, measured 2026-08-15).
+The same work warm is milliseconds. Use `mcp__clojure-mcp__clojure_eval` against the
+running nREPL, call the namespace's own public facade, and `:reload` after every edit.
+
+`clojure -M:test` is for one final full-suite run before a commit — not for iteration,
+and never for checking whether one sabotage bit.
 
 ## Two test suites
 

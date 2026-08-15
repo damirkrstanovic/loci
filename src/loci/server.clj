@@ -2520,13 +2520,13 @@
    durable would hand it a fresh 1.0 recency multiplier in the same breath as
    recording that it ages. The 2026-08-09 repair documented this trap and
    `loci.classify` walked past it a week ago; this is the third writer and the
-   same rule. `unmerge!` is the shape: take the atom and the file, swap, append
+   same rule. `unmerge!` is the shape: take the atom and the log, swap, append
    the record the swap landed on.
 
    The write lives here rather than in `loci.memory` beside `unmerge!` because
    there is no memory logic in it — one key and its provenance, where `unmerge!`
    carries strength arithmetic, `:no-merge` and a four-way refusal. `loci.classify`
-   reaches for `{:keys [!facts file]}` from outside the namespace for the same
+   reaches for `{:keys [!facts log]}` from outside the namespace for the same
    reason. The cost is real and is this: the set of things that write to the fact
    log stops being enumerable from `loci.memory` alone — and where `loci.classify`
    is a one-off that runs once and can be deleted, this one stays.
@@ -2551,7 +2551,7 @@
    memory changed while this was being applied\"."
   [m id durable]
   (let [fid (str id)
-        {:keys [!facts file]} m]
+        {:keys [!facts log]} m]
     (cond
       (str/blank? fid) {:error "a judgement needs the id of the fact it is about"}
 
@@ -2573,7 +2573,7 @@
             (if-let [why (durable-refusal after fid)]
               {:error why}
               (let [rec (get after fid)]
-                (mem/append-line! file rec)
+                (mem/append-line! log rec)
                 (dissoc rec :vec))))))))
 
 ;; ---- routing ----

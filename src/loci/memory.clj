@@ -32,12 +32,12 @@
    reversal, and it records `:no-merge` on both facts so that the next sweep —
    which re-embeds the restored fact and finds the same cosine — does not fold
    them straight back."
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
-            [clojure.set :as set]
+  (:require [clojure.set :as set]
             [clojure.string :as str]
+            [loci.dlv :as dlv]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.factlog :as fl]
             [loci.mold :as mold]
             [loci.substrate :as sub])
   (:import [java.util.concurrent ArrayBlockingQueue TimeUnit]))
@@ -152,52 +152,31 @@
 (defn- score [qt qs dfm now f] (* (relevance qt qs dfm f) (weight now f)))
 
 (defn append-line!
-  "One record, appended. The only way anything in this namespace writes a fact:
-   the log is append-only and last-wins by :id, so a change to a fact is the
-   fact written again, never a line edited in place — `next-id`'s tombstone
-   reasoning depends on nothing ever being removed.
+  "One record, appended to `log`. The only way anything writes a fact.
 
-   Public for `loci.repair`, which re-files fifteen facts whose notebooks were
-   overwritten. It appends the way `store-vector!` and `unmerge!` do rather than
-   going through `remember`, which would re-stamp `:ts` and bump `:strength`;
-   sharing this function is what keeps \"appended\" meaning one thing."
-  [file rec]
-  (io/make-parents (io/file file))
-  (spit file (str (pr-str rec) "\n") :append true))
+   **Takes a FactLog, not a path.** It used to take a file and `spit` to it;
+   the argument changed so that a fact can land in the substrate's database
+   instead, and every caller moves with it rather than each learning where
+   facts live.
 
-(defn- load-facts [file]
-  (let [f (io/file file)]
-    (if (.exists f)
-      (with-open [r (java.io.PushbackReader. (io/reader f))]
-        (loop [acc {}]
-          (let [rec (try (edn/read {:eof ::eof} r) (catch Exception _ ::eof))]
-            (if (= ::eof rec) acc (recur (assoc acc (:id rec) rec))))))
-      {})))
+   Still public for `loci.repair`, `loci.classify` and the server's durability
+   toggle, all three of which append from outside this namespace and must
+   append the way everything else does rather than go through `remember` and
+   re-stamp `:ts`.
 
-(def ^:private id-pattern #"mem-(\d+)")
+   **The assertion is not defensive programming.** Six call sites reach a
+   memory's storage by destructuring `{:keys [!facts file]}`, and Clojure binds
+   a missing key to nil without complaint. Once `:file` is gone, a site that
+   was not updated would pass nil here and — with a bare `fl/append!` — fail
+   somewhere further in with a message about a protocol. Asserting at the door
+   names the caller's mistake instead."
+  [log rec]
+  (assert (satisfies? fl/FactLog log)
+          (str "append-line! takes a FactLog, not " (pr-str log)
+               " — a caller is still reaching for the old :file field"))
+  (fl/append! log rec))
 
-(defn- id-ordinal
-  "The <n> of a mem-<n> id, or nil for an id in any other shape."
-  [id]
-  (when-let [[_ n] (re-matches id-pattern (str id))] (parse-long n)))
-
-(defn- next-id
-  "One past the largest id ever issued — not (inc (count …)).
-
-   Counting is collision-free only while nothing is ever deleted. Delete mem-2
-   of three facts and the count is 2, so the next remember mints mem-3 and
-   overwrites a *different, still-live* fact: same id, last line wins, the
-   original text gone with no error anywhere. The semantic merge below deletes
-   the absorbed fact, so this is no longer hypothetical — which is why the
-   absorbed fact leaves a tombstone in the map rather than vanishing from it.
-   `facts` here is the whole map, tombstones included, and must stay that way.
-
-   An id that is not mem-<n> contributes nothing to the maximum rather than
-   throwing; there are none today, and a hand-edited log should not brick
-   remembering."
-  [facts]
-  (str "mem-"
-       (inc (reduce (fn [hi id] (max hi (or (id-ordinal id) 0))) 0 (keys facts)))))
+(def ^:private id-ordinal fl/id-ordinal)
 
 ;; ----------------------------------------------------------------------------
 ;; tombstones — how an absorbed fact stops being a fact
@@ -208,7 +187,7 @@
 
    The log is append-only and last-wins by :id, so a merge cannot remove a line;
    it appends a final record for the absorbed id carrying `:merged-into`. That
-   record stays in the map — `next-id` counts it, so the id is never reissued —
+   record stays in the map — `mint-id!` counts it, so the id is never reissued —
    and every reader of the facts filters it out through `live`."
   [f]
   (some? (:merged-into f)))
@@ -283,7 +262,7 @@
    that is no longer stored, and pairing it with the new text is the silent
    mismatch this whole path exists to avoid. The fact simply stays pending and
    the next pass embeds what it now says."
-  [{:keys [!facts file]} fact vector model dim]
+  [{:keys [!facts log]} fact vector model dim]
   (let [id   (:id fact)
         text (:fact fact)
         [_ after] (swap-vals! !facts
@@ -293,7 +272,7 @@
                                   fs)))
         rec  (get after id)]
     (when (and rec (= text (:fact rec)))
-      (append-line! file rec)
+      (append-line! log rec)
       true)))
 
 (defn embed-pending!
@@ -524,7 +503,7 @@
    Two appends, not a rewrite: the survivor's updated record, and the absorbed
    id's tombstone. Reload is last-wins by :id, so this is the same mechanism
    reinforcement and embedding already use."
-  [{:keys [!facts file]} keep gone]
+  [{:keys [!facts log]} keep gone]
   (let [kid (:id keep)
         gid (:id gone)
         [before after]
@@ -554,8 +533,8 @@
                                           :merged-into kid}))
                           fs))))]
     (when-not (identical? before after)
-      (append-line! file (get after kid))
-      (append-line! file (get after gid))
+      (append-line! log (get after kid))
+      (append-line! log (get after gid))
       true)))
 
 (defn merge-similar!
@@ -675,7 +654,7 @@
       ;; Only reachable through a hand-edited log — a merge leaves a tombstone
       ;; under the absorbed id — but the write below is `assoc`, so if it ever is
       ;; reachable it overwrites a live fact with a different one under its id.
-      ;; That is the exact failure `next-id`'s tombstones exist to prevent.
+      ;; That is the exact failure `mint-id!`'s tombstones exist to prevent.
       (and t (not (merged-away? t)))
       (str absorbed-id " is already a live fact, so restoring it would overwrite one")
 
@@ -735,13 +714,13 @@
    the absorbed id's record without its `:merged-into`. Reload is last-wins by
    id, so the restored line replaces the tombstone. The id is not *reissued* —
    it is given back to the one fact it always named, which is why this does not
-   reopen what `next-id` warns about.
+   reopen what `mint-id!` warns about.
 
    Only `merge-similar!` honours `:no-merge`. `remember`'s duplicate check is a
    different rule over different evidence (jaccard over tokens, not cosine) and
    an unmerge does not change it: the same sentence remembered again still
    reinforces whichever live fact its words overlap."
-  [{:keys [!facts file]} survivor-id absorbed-id]
+  [{:keys [!facts log]} survivor-id absorbed-id]
   (if-let [refusal (unmerge-refusal @!facts survivor-id absorbed-id)]
     {:error refusal}
     (let [[before after]
@@ -790,8 +769,8 @@
                      " was refused: the memory changed while it was being applied")}
         (let [s (get after survivor-id)
               r (get after absorbed-id)]
-          (append-line! file s)
-          (append-line! file r)
+          (append-line! log s)
+          (append-line! log r)
           {:survivor s :restored r})))))
 
 (defn start-embed-worker!
@@ -1061,57 +1040,72 @@
 
 ;; ----------------------------------------------------------------------------
 
-(defrecord FileMemory [!facts file]
+(defrecord FileMemory [!facts log lock]
   mold/Recall
   ;; NOTHING in here touches the embedder. That is the design, not an omission:
   ;; a fact is recorded whether or not an embedder exists, at the speed of one
   ;; file append, and `embed-pending!` catches up afterwards.
+  ;;
+  ;; The WHOLE body runs under `lock`, not just the mint. `mint-id!` alone
+  ;; being atomic still leaves the duplicate scan racing the write: two
+  ;; threads can each see "no duplicate yet" for the same near-identical
+  ;; sentence and both insert, producing two facts where reinforcement was
+  ;; correct — a lost write with the same cause as an id collision, just a
+  ;; different symptom. 200 concurrent `remember`s of genuinely UNRELATED
+  ;; facts cannot lose a write on either backend, locked or not — mint-id!
+  ;; and append! are already atomic per call, so a corpus with no possible
+  ;; duplicate never reaches the race this lock exists for. What does: 20
+  ;; topics, each remembered 10 times concurrently with IDENTICAL text
+  ;; (correct answer: 20 facts). Measured unlocked, three runs: 98, 90, 99
+  ;; survived (independently reproduced: 122, 106, 103). Locked, three runs:
+  ;; 20, 20, 20. See memory-dlv-test.
   (remember [_ fact opts]
-    (let [ft  (tokens fact)
-          ;; `live`, not every record: a tombstone still carries the absorbed
-          ;; text, and reinforcing one would put a merged-away fact back into
-          ;; circulation under an id the merge already accounted for.
-          dup (some (fn [f] (when (>= (jaccard ft (tokens (:fact f))) 0.6) f))
-                    (live (vals @!facts)))
-          rec (if dup
-                (cond-> (-> dup
-                            (assoc :fact fact :ts (System/currentTimeMillis))
-                            (assoc :source (or (:source opts) (:source dup)))
-                            (update :strength (fnil inc 1))
-                            (update :entities #(vec (distinct (concat % (:entities opts))))))
-                  ;; Reinforcement rewrites :fact, and a vector describes the
-                  ;; exact text it was made from. Identical wording (the common
-                  ;; case — auto-distill re-derives the same sentence) keeps its
-                  ;; vector; different wording drops it, so the next pass
-                  ;; re-embeds rather than leaving a vector pointing at a
-                  ;; sentence that is no longer stored.
-                  (not= fact (:fact dup)) (dissoc :vec :model :dim)
-                  ;; A judgement about whether the claim ages, and WHOSE it was.
-                  ;; Reinforcement may overwrite the agent's own earlier answer —
-                  ;; same author, later context — and may never overwrite yours:
-                  ;; without that, the agent re-deriving this sentence next week
-                  ;; silently reverts a call you made by hand, which is exactly
-                  ;; the failure `:no-merge` exists to prevent on the merge path.
-                  ;;
-                  ;; `contains?` and not `(:durable? opts)`, so silence stays
-                  ;; silence. A distiller that answered nothing — an older model,
-                  ;; a refusal — must not be read as having answered `false`.
-                  (and (contains? opts :durable?)
-                       (not= "you" (:durable-by dup)))
-                  (assoc :durable? (:durable? opts) :durable-by "agent"))
-                (cond-> {:id (next-id @!facts)
-                         :fact fact :entities (vec (:entities opts))
-                         :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
-                  ;; Absent, not nil. A key that is always present and usually
-                  ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
-                  ;; disagree — the shape `memory-payload`'s `:degraded` is
-                  ;; absent-when-healthy to avoid — and `weight` reads the value,
-                  ;; so absent has to keep meaning "nothing has judged this yet".
-                  (contains? opts :durable?)
-                  (assoc :durable? (:durable? opts) :durable-by "agent")))]
-      (append-line! file rec)
-      (swap! !facts assoc (:id rec) rec)
-      :ok))
+    (locking lock
+      (let [ft  (tokens fact)
+            ;; `live`, not every record: a tombstone still carries the absorbed
+            ;; text, and reinforcing one would put a merged-away fact back into
+            ;; circulation under an id the merge already accounted for.
+            dup (some (fn [f] (when (>= (jaccard ft (tokens (:fact f))) 0.6) f))
+                      (live (vals @!facts)))
+            rec (if dup
+                  (cond-> (-> dup
+                              (assoc :fact fact :ts (System/currentTimeMillis))
+                              (assoc :source (or (:source opts) (:source dup)))
+                              (update :strength (fnil inc 1))
+                              (update :entities #(vec (distinct (concat % (:entities opts))))))
+                    ;; Reinforcement rewrites :fact, and a vector describes the
+                    ;; exact text it was made from. Identical wording (the common
+                    ;; case — auto-distill re-derives the same sentence) keeps its
+                    ;; vector; different wording drops it, so the next pass
+                    ;; re-embeds rather than leaving a vector pointing at a
+                    ;; sentence that is no longer stored.
+                    (not= fact (:fact dup)) (dissoc :vec :model :dim)
+                    ;; A judgement about whether the claim ages, and WHOSE it was.
+                    ;; Reinforcement may overwrite the agent's own earlier answer —
+                    ;; same author, later context — and may never overwrite yours:
+                    ;; without that, the agent re-deriving this sentence next week
+                    ;; silently reverts a call you made by hand, which is exactly
+                    ;; the failure `:no-merge` exists to prevent on the merge path.
+                    ;;
+                    ;; `contains?` and not `(:durable? opts)`, so silence stays
+                    ;; silence. A distiller that answered nothing — an older model,
+                    ;; a refusal — must not be read as having answered `false`.
+                    (and (contains? opts :durable?)
+                         (not= "you" (:durable-by dup)))
+                    (assoc :durable? (:durable? opts) :durable-by "agent"))
+                  (cond-> {:id (fl/mint-id! log)
+                           :fact fact :entities (vec (:entities opts))
+                           :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
+                    ;; Absent, not nil. A key that is always present and usually
+                    ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
+                    ;; disagree — the shape `memory-payload`'s `:degraded` is
+                    ;; absent-when-healthy to avoid — and `weight` reads the value,
+                    ;; so absent has to keep meaning "nothing has judged this yet".
+                    (contains? opts :durable?)
+                    (assoc :durable? (:durable? opts) :durable-by "agent")))]
+        (append-line! log rec)
+        (swap! !facts assoc (:id rec) rec)
+        :ok)))
   ;; opts: {:k 6 :semantic? false :rerank? false :subjects #{name …}
   ;;        :filter {:sources #{id …} :entities #{name …}}}
   ;;
@@ -1215,8 +1209,35 @@
   (all-facts [_] (->> (vals @!facts) live (sort-by :ts >) vec)))
 
 (defn file-memory
+  "A memory backed by an EDN-lines file. Still the production memory — `mem/memory`
+   below is built from the no-arg form — until `DbiLog` lands in Task 3 and the
+   singleton moves onto it. Every test and `loci.calibrate` also call this
+   directly, with an explicit path, so neither reads or writes the real
+   `data/memory.edn`."
   ([] (file-memory (str (sub/data-dir) "/memory.edn")))
-  ([path] (->FileMemory (atom (load-facts path)) path)))
+  ([path] (let [log (fl/file-log path)]
+            (->FileMemory (atom (fl/load-all log)) log (Object.)))))
 
-(defonce ^{:doc "the server's memory singleton (data-dir resolved at first use)"}
-  memory (delay (file-memory)))
+(defn datalevin-memory
+  "A memory whose facts live in the substrate's own environment.
+
+   Takes the store, so that `undo!`, `as-of` and `recall` are all reading one
+   LMDB environment and a backup of `data/substrate/` is a backup of the facts
+   too — which it was not while they lived in `data/memory.edn`."
+  [st]
+  (let [log (dlv/fact-log st)]
+    (->FileMemory (atom (fl/load-all log)) log (Object.))))
+
+(defonce ^{:doc "The server's memory singleton — facts in the substrate's own environment.
+
+   Was `(delay (file-memory))` over `data/memory.edn` until 2026-08-15. It now
+   opens the `facts` dbi of `@dlv/store`, the process's single connection, so a
+   backup of `data/substrate` is a backup of the facts and one id counter serves
+   both. `data/memory.edn` is no longer read at runtime; it is the rollback, and
+   `loci.factmigrate/migrate-facts!` is what moves it across.
+
+   Still a delay behind an ordinary var, because that is the seam the suite is
+   built on: fifteen tests do `(with-redefs [mem/memory (delay m)] …)` to hand
+   the server a throwaway memory, and a var holding a live object instead would
+   make every one of them observe nothing while passing."}
+  memory (delay (datalevin-memory @dlv/store)))
