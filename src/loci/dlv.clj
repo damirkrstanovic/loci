@@ -28,6 +28,7 @@
    that says whether the other two can be believed: derived data that is
    half-built is worse than derived data that is missing, because it answers."
   (:require [datalevin.core :as d]
+            [loci.factlog :as fl]
             [loci.substrate :as sub]))
 
 (defn- touched-ids
@@ -58,6 +59,7 @@
     (d/open-dbi kv "counts")
     (d/open-list-dbi kv "touched")
     (d/open-dbi kv "meta")
+    (d/open-dbi kv "facts")
     kv))
 
 (defn- read-log
@@ -324,3 +326,80 @@
               (map-indexed (fn [k ev] [(inc k) ev]) (read-log kv)))
       (d/transact-kv kv [[:del "meta" dirty-key :keyword]])
       :ok)))
+
+;; ----------------------------------------------------------------------------
+;; facts — a parallel truth, not an event
+;; ----------------------------------------------------------------------------
+
+(def ^:private next-id-key :facts/next-id)
+
+(defrecord DbiLog [kv lock]
+  fl/FactLog
+  ;; `facts` is a parallel truth and is NEVER an event: nothing here writes to
+  ;; `events`, so `undo!` cannot revoke a fact and `as-of` cannot time-travel
+  ;; one. That is the whole record/recall separation, and after this change it
+  ;; is enforced by which dbi a write names rather than by which file it opens.
+  ;;
+  ;; **The fact and the counter move in ONE transaction.** A bulk writer — the
+  ;; migration — appends records without minting, so if the counter did not
+  ;; advance here it would still read 0 after 248 facts landed, and the next
+  ;; mint would hand out mem-1 onto a live record. Splitting them into two
+  ;; transactions would let a crash land the fact and lose the bump, which is
+  ;; the same failure one restart later. `commit-tx` groups events, counts and
+  ;; touches for exactly this reason.
+  (append! [_ rec]
+    (locking lock
+      (let [n (max (or (d/get-value kv "meta" next-id-key :keyword) 0)
+                   (or (fl/id-ordinal (:id rec)) 0))]
+        (d/transact-kv kv [[:put "facts" (:id rec) rec :string]
+                           [:put "meta" next-id-key n :keyword]]))
+      :ok))
+  (load-all [_]
+    (into {} (d/get-range kv "facts" [:all] :string)))
+  ;; O(1), and durable. Reading the counter is one key lookup, not a scan of
+  ;; every fact — `FileLog` was measured at 642 ms/call doing the scan version
+  ;; against an 8.5 MB log, and there is no reason to reintroduce it here where
+  ;; a counter is native. `append!` keeps the counter current, so this never
+  ;; needs to consult `facts` at all.
+  ;;
+  ;; Durable is the half `FileLog` cannot match: its high-water atom dies with
+  ;; the process, while this survives a restart.
+  (mint-id! [_]
+    (locking lock
+      (let [n (inc (or (d/get-value kv "meta" next-id-key :keyword) 0))]
+        (d/transact-kv kv [[:put "meta" next-id-key n :keyword]])
+        (str "mem-" n)))))
+
+(defn fact-log
+  "The `FactLog` over a `DatalevinStore`'s environment.
+
+   Takes the store rather than a directory so that facts land in the SAME
+   environment as the events — which is the point of the change — and so that
+   nothing can open a second env against the same directory by accident.
+
+   **Seeds the counter if facts exist without one.** That state is reachable:
+   a store written by an older path, or one hand-loaded, holds `mem-1…mem-n`
+   and no `:facts/next-id`. Minting from a zero counter would then reissue
+   `mem-1` onto a live fact and last-wins would destroy it — the failure the
+   deleted `next-id` docstring called 'no longer hypothetical'. One scan, once,
+   only when the key is absent."
+  [st]
+  (let [kv (:kv st)]
+    (when (nil? (d/get-value kv "meta" next-id-key :keyword))
+      (let [highest (reduce (fn [hi [id _]] (max hi (or (fl/id-ordinal id) 0)))
+                            0 (d/get-range kv "facts" [:all] :string))]
+        (when (pos? highest)
+          (d/transact-kv kv [[:put "meta" next-id-key highest :keyword]]))))
+    (->DbiLog kv (Object.))))
+
+(defn put-fact-raw-for-test!
+  "Writes `rec` straight into the `facts` dbi WITHOUT touching the `:facts/next-id`
+   counter — simulating a store some other path wrote to, so `fact-log`'s
+   seeding behaviour has something to seed from.
+
+   Exists ONLY for loci.factlog-test. Production code must go through
+   `fact-log`'s `append!`, which keeps the counter and the fact in the same
+   transaction; calling this from anywhere else reopens the exact collision
+   `fact-log`'s docstring exists to close."
+  [st rec]
+  (d/transact-kv (:kv st) [[:put "facts" (:id rec) rec :string]]))
