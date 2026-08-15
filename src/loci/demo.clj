@@ -70,7 +70,18 @@
                    (:connected (nb/links store "space:retention"))))
 
     (banner "two logs: substrate records, memory recalls")
-    (let [m (mem/file-memory (str (sub/data-dir) "/memory.edn"))]
+    ;; A THROWAWAY memory, not the real one. This block remembers two facts to
+    ;; show reinforcement, and until 2026-08-15 it wrote them into
+    ;; `data/memory.edn` — so every `clojure -M:demo` quietly added two facts to
+    ;; the user's own recall, which has no undo to take them back with. The
+    ;; substrate half above gets away with `commit!`/`undo!` because that pair
+    ;; really does reverse; there is no such pair here.
+    ;;
+    ;; A file rather than the substrate's `facts` dbi, deliberately: opening the
+    ;; real store twice in one process is refused by Datalevin, and a demo has
+    ;; no business holding the environment the server wants.
+    (let [m (mem/file-memory (str (System/getProperty "java.io.tmpdir")
+                                  "/loci-demo-" (System/nanoTime) "/memory.edn"))]
       (mold/remember m "Churn concentrates in accounts under 12 months."
                      {:entities ["churn"] :source {:obj "tbl:revenue"}})
       (mold/remember m "Churn concentrates in accounts under twelve months."
