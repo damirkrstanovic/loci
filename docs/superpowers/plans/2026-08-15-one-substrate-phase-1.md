@@ -20,7 +20,18 @@ Read these before starting:
 
 **Two facts that shape everything:**
 
-1. `append-line!` is public and is called from at least five places — `remember` (`:1112`), `store-vector!` (`:296`), `merge!` (`:557-558`), `unmerge!` (`:793-794`), and `loci.repair`. Changing its *implementation* moves every write path at once. Do not rewrite the `Recall` record.
+1. `append-line!` is public and has **eight call sites across four namespaces** — verified by grep on 2026-08-15, not estimated:
+
+   | namespace | lines |
+   |---|---|
+   | `memory.clj` | 296 (`store-vector!`), 557–558 (`merge!`), 793–794 (`unmerge!`), 1112 (`remember`) |
+   | `classify.clj` | 255 |
+   | `repair.clj` | 438 |
+   | `server.clj` | 2576 |
+
+   Six sites destructure `{:keys [!facts file]}` off the record to get the path: `memory.clj` 286/527/744, `classify.clj` 300, `repair.clj` 464, `server.clj` 2554. `server.clj:2529` carries a comment acknowledging that it "reaches for `{:keys [!facts file]}` from outside the namespace".
+
+   **This is the task's real hazard.** Clojure destructuring binds a missing key to `nil` silently, so if `FileMemory` keeps a `file` field beside a new `log` field, all three out-of-namespace sites keep writing to an EDN file that nothing reads after Task 3 — and `server.clj:2576` is the user's own hand-made `durable-by "you"` judgement, the one value the codebase works hardest to protect. Changing `append-line!`'s *implementation* moves every path at once only if the old path is made impossible to reach.
 2. `FileMemory.remember` currently takes **no lock**. `next-id` reads the atom, then `append-line!` writes, then `swap!` updates. Two threads interleave and mint the same id. This is a live bug and Task 4 fixes it.
 
 **Never write to `data/`.** Every test and every manual run uses a throwaway directory. See `test/loci/memory_test.clj:6-7` for the `tmpfile` convention.
@@ -89,7 +100,7 @@ Read these before starting:
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `clojure -M:test -v loci.factlog-test`
+Run: `clojure -M:test -n loci.factlog-test`
 Expected: FAIL — `No such namespace: loci.factlog`
 
 - [ ] **Step 3: Write the implementation**
@@ -155,7 +166,7 @@ Expected: FAIL — `No such namespace: loci.factlog`
 
 - [ ] **Step 4: Run the tests**
 
-Run: `clojure -M:test -v loci.factlog-test`
+Run: `clojure -M:test -n loci.factlog-test`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
@@ -173,11 +184,14 @@ No behaviour change. Every existing test must still pass — that is how you kno
 
 **Files:**
 - Modify: `src/loci/memory.clj:154-201` (`append-line!`, `load-facts`, `next-id`, `id-ordinal`), `:1064` (`FileMemory`), `:1217-1222` (`file-memory`)
+- Modify: `src/loci/classify.clj:255,300`
+- Modify: `src/loci/repair.clj:438,464`
+- Modify: `src/loci/server.clj:2529,2554,2576`
 
 - [ ] **Step 1: Run the existing suite and record the baseline**
 
 Run: `clojure -M:test`
-Expected: PASS. **Write down the test and assertion counts** — Task 2 must end with the same numbers.
+Expected: PASS, 541 tests / 3582 assertions / 0 failures as of commit `92f2b6b`. **Write the numbers down** — Task 2 must end with the same ones.
 
 - [ ] **Step 2: Replace the three private helpers with delegation**
 
@@ -190,13 +204,24 @@ In `src/loci/memory.clj`, add `[loci.factlog :as fl]` to the `:require`, then re
 
    **Takes a FactLog, not a path.** It used to take a file and `spit` to it;
    the argument changed so that a fact can land in the substrate's database
-   instead, and every caller — `store-vector!`, `merge!`, `unmerge!`, `remember`
-   and `loci.repair` — moves with it rather than each learning where facts live.
+   instead, and every caller moves with it rather than each learning where
+   facts live.
 
-   Still public for `loci.repair`, which re-files fifteen facts whose notebooks
-   were overwritten, and which must append the way everything else does rather
-   than go through `remember` and re-stamp `:ts`."
+   Still public for `loci.repair`, `loci.classify` and the server's durability
+   toggle, all three of which append from outside this namespace and must
+   append the way everything else does rather than go through `remember` and
+   re-stamp `:ts`.
+
+   **The assertion is not defensive programming.** Six call sites reach a
+   memory's storage by destructuring `{:keys [!facts file]}`, and Clojure binds
+   a missing key to nil without complaint. Once `:file` is gone, a site that
+   was not updated would pass nil here and — with a bare `fl/append!` — fail
+   somewhere further in with a message about a protocol. Asserting at the door
+   names the caller's mistake instead."
   [log rec]
+  (assert (satisfies? fl/FactLog log)
+          (str "append-line! takes a FactLog, not " (pr-str log)
+               " — a caller is still reaching for the old :file field"))
   (fl/append! log rec))
 
 (def ^:private id-ordinal fl/id-ordinal)
@@ -206,15 +231,19 @@ In `src/loci/memory.clj`, add `[loci.factlog :as fl]` to the `:require`, then re
 
 Delete `load-facts` and `next-id` entirely. `load-facts` took a path and had exactly one caller (`file-memory`, rewritten in Step 5); `mint-id!` replaces `next-id` and is wired in at Step 4.
 
-- [ ] **Step 3: Change `FileMemory`'s field from a path to a log**
+- [ ] **Step 3: Rename the field, and make the old one impossible to reach**
 
-Replace `(defrecord FileMemory [!facts file]` at `:1064` with `(defrecord FileMemory [!facts log]`, and replace every `(append-line! file rec)` in the record body with `(append-line! log rec)`.
+Replace `(defrecord FileMemory [!facts file]` at `:1064` with `(defrecord FileMemory [!facts log]`.
 
-Run this to find them all — expect 5 call sites:
+**Remove `file` entirely — do not keep it alongside `log` "for compatibility".** Keeping it is the failure mode this step exists to prevent: the three out-of-namespace call sites would go on writing to an EDN file that nothing reads once Task 3 lands, and one of them (`server.clj:2576`) persists the user's own hand-made durability judgement.
+
+Then update the in-namespace destructuring sites and their appends:
 
 ```bash
-grep -n "append-line! file" src/loci/memory.clj
+grep -n "!facts file\|append-line! file" src/loci/memory.clj
 ```
+
+Expect six: destructuring at `:286` (`store-vector!`), `:527` (`merge!`), `:744` (`unmerge!`); appends at `:296`, `:557-558`, `:793-794`, `:1112`. Change each `{:keys [!facts file]}` to `{:keys [!facts log]}` and each `(append-line! file …)` to `(append-line! log …)`.
 
 - [ ] **Step 4: Keep `next-id`'s call site compiling**
 
@@ -235,9 +264,39 @@ Replace `file-memory` (`:1217-1219`) with:
 
 **One log, bound once.** `(->FileMemory (atom (fl/load-all (fl/file-log path))) (fl/file-log path))` would build two `FileLog` records holding two different `(Object.)` monitors, so `mint-id!` and `append!` would serialise against different locks and the Task 4 fix would silently not apply.
 
-- [ ] **Step 6: Fix `loci.repair`'s call site**
+- [ ] **Step 6: Fix all three out-of-namespace call sites**
 
-Run `grep -n "append-line!" src/loci/repair.clj`. It passes a path; it must now pass `(:log mm)` from the memory it was handed. Make that change.
+These are the ones a rename alone would leave silently broken. Do all three:
+
+```bash
+grep -n "!facts file\|append-line!" src/loci/classify.clj src/loci/repair.clj src/loci/server.clj
+```
+
+| file | destructure | append |
+|---|---|---|
+| `src/loci/classify.clj` | `:300` | `:255` |
+| `src/loci/repair.clj` | `:464` | `:438` |
+| `src/loci/server.clj` | `:2554` | `:2576` |
+
+In each, change `{:keys [!facts file]}` to `{:keys [!facts log]}` and `(mem/append-line! file …)` to `(mem/append-line! log …)`.
+
+`src/loci/server.clj:2529` has a comment describing this reach-through by its old field name; update the prose so it does not send the next reader looking for `:file`.
+
+- [ ] **Step 6b: Prove no site was missed**
+
+```bash
+grep -rn ":keys \[!facts file\]\|append-line! file" src/
+```
+
+Expected: **no output.** Any hit is a site that will write to a dead file after Task 3.
+
+Then confirm the assertion fires rather than corrupting anything:
+
+```bash
+clojure -M -e "(require '[loci.memory :as mem]) (try (mem/append-line! \"some/path.edn\" {:id \"mem-1\"}) (catch Throwable t (println \"REFUSED:\" (.getMessage t)))) (System/exit 0)"
+```
+
+Expected: `REFUSED: … takes a FactLog, not "some/path.edn" …`. If it silently succeeds, the assertion is not wired up.
 
 - [ ] **Step 7: Run the full suite**
 
@@ -301,7 +360,7 @@ Append to `test/loci/factlog_test.clj`, and add `[loci.dlv :as dlv]` to its `:re
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `clojure -M:test -v loci.factlog-test`
+Run: `clojure -M:test -n loci.factlog-test`
 Expected: FAIL — `No such var: dlv/fact-log`
 
 - [ ] **Step 3: Open the dbi**
@@ -367,7 +426,7 @@ Add `[loci.factlog :as fl]` to `dlv.clj`'s `:require`.
 
 - [ ] **Step 5: Run the tests**
 
-Run: `clojure -M:test -v loci.factlog-test`
+Run: `clojure -M:test -n loci.factlog-test`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
@@ -412,7 +471,7 @@ git commit -m "feat: facts get a dbi in the substrate's own environment"
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `clojure -M:test -v loci.memory-dlv-test`
+Run: `clojure -M:test -n loci.memory-dlv-test`
 Expected: FAIL — `No such var: mem/datalevin-memory`.
 
 Once Step 3 adds the constructor but before Step 4 adds the lock, it must fail *again*, with a count below 200. **Do not skip that intermediate run — it is the proof the test bites.**
@@ -439,7 +498,7 @@ Add `[loci.dlv :as dlv]` to `memory.clj`'s `:require`.
 
 - [ ] **Step 4: Run the test and confirm it FAILS on the count**
 
-Run: `clojure -M:test -v loci.memory-dlv-test`
+Run: `clojure -M:test -n loci.memory-dlv-test`
 Expected: FAIL, with fewer than 200 facts — `remember` still mints and appends as two unsynchronised steps. Record the number you saw.
 
 - [ ] **Step 5: Add the lock**
@@ -466,7 +525,7 @@ The duplicate scan must be inside the lock, not just the mint. Two threads that 
 
 - [ ] **Step 6: Run the test**
 
-Run: `clojure -M:test -v loci.memory-dlv-test`
+Run: `clojure -M:test -n loci.memory-dlv-test`
 Expected: PASS, 200 distinct ids.
 
 - [ ] **Step 7: Prove the test bites by reverting the fix**
@@ -577,7 +636,7 @@ Add `[loci.substrate :as sub]` to the test's `:require`.
 
 - [ ] **Step 2: Run them**
 
-Run: `clojure -M:test -v loci.memory-dlv-test`
+Run: `clojure -M:test -n loci.memory-dlv-test`
 Expected: PASS immediately — `DbiLog.append!` writes only to `facts`, and `undo-tx`/`as-of` name only `events`, `counts` and `touched`.
 
 These are regression tests, not drivers. They pass on arrival by construction; their job is to fail the day somebody adds a fact to `commit-tx`.
@@ -627,7 +686,7 @@ Facts, not ids: both backends mint `mem-1`…`mem-5` in the same order, so compa
 
 - [ ] **Step 2: Run it**
 
-Run: `clojure -M:test -v loci.memory-dlv-test`
+Run: `clojure -M:test -n loci.memory-dlv-test`
 Expected: PASS. A failure here means storage leaked into scoring, which this change is not permitted to do.
 
 - [ ] **Step 3: Commit**
@@ -718,7 +777,7 @@ git commit -m "test: storage changed, ranking did not"
 
 - [ ] **Step 2: Run and watch them fail**
 
-Run: `clojure -M:test -v loci.factmigrate-test`
+Run: `clojure -M:test -n loci.factmigrate-test`
 Expected: FAIL — `No such namespace: loci.factmigrate`
 
 - [ ] **Step 3: Implement**
@@ -793,7 +852,7 @@ Expected: FAIL — `No such namespace: loci.factmigrate`
 
 - [ ] **Step 4: Run the tests**
 
-Run: `clojure -M:test -v loci.factmigrate-test`
+Run: `clojure -M:test -n loci.factmigrate-test`
 Expected: PASS, 6 tests.
 
 > `counter-is-set-past-the-migrated-facts` expects `mem-6`, but Step 3 calls `mint-id!` during migration, which itself consumes a number. If the test reports `mem-7`, the extra mint is the cause — replace the `(fl/mint-id! log)` call with a direct counter write, or adjust the expectation and say which you chose and why. **Do not change the test to match the code without understanding which is right.**
