@@ -385,6 +385,21 @@
         (d/transact-kv tx [[:put "meta" next-id-key n :keyword]])
         (str "mem-" n)))))
 
+(defonce ^{:doc "The process's one connection to <data-dir>/substrate.
+
+   **Datalevin refuses a second connection to one directory from one process**
+   (`:lmdb/duplicate-open`), so this cannot be per-consumer — `loci.content`'s
+   seeded store and `loci.memory`'s facts are two views of ONE environment and
+   have to share the handle. It lives here, in the namespace that owns
+   `datalevin-store`, rather than in `loci.content`, so that the memory engine
+   does not have to require the demo-seed namespace to find its own storage.
+
+   A delay, so requiring this namespace still opens nothing — the rule the whole
+   codebase keeps. Tests rebind it (and `loci.content/store`, and
+   `loci.memory/memory`) with `with-redefs` and a delay of their own."}
+  store
+  (delay (datalevin-store)))
+
 (defn fact-log
   "The `FactLog` over a `DatalevinStore`'s environment.
 

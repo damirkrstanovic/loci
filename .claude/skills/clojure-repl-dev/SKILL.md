@@ -37,6 +37,33 @@ a load average of 11 on 6 cores, and one contaminated measurement.
 6. **`:reload` and re-run.** An edit you have not reloaded and re-run is unverified.
 7. **Run the relevant test namespace in the REPL**, not the whole suite in a new JVM.
 
+## Two reload traps that will bite you
+
+**`:reload` does not re-evaluate `defonce`.** `loci.dlv/store`, `loci.content/store` and
+`loci.memory/memory` are all `defonce` delays. Editing their definition and reloading
+leaves the *old* value in place, and you will debug a change that is not running. Clear
+them by hand:
+
+```clojure
+(alter-var-root #'loci.memory/memory
+                (constantly (delay (loci.memory/datalevin-memory @loci.dlv/store))))
+```
+
+**Reload in dependency order when protocols are involved.** `loci.factlog` defines
+`FactLog`; `loci.dlv` and `loci.memory` implement it. Reloading `factlog` *after* them
+mints a new protocol object and orphans every existing implementation — the symptom is
+`No implementation of method: :append! of protocol: #'loci.factlog/FactLog found for
+class: loci.dlv.DbiLog`, which looks like a code bug and is not. Always:
+
+```clojure
+(require 'loci.factlog :reload)   ; protocol first
+(require 'loci.dlv :reload)       ; then its implementors
+(require 'loci.memory :reload)
+```
+
+`(require 'loci.memory :reload-all)` also works and is safer when unsure, at the cost of
+reloading the world.
+
 ## Running tests without leaving the REPL
 
 ```clojure

@@ -566,7 +566,11 @@
   store)
 
 (defonce store
-  (delay (let [s (dlv/datalevin-store)]
+  ;; `@dlv/store`, not a fresh `datalevin-store`: one process gets ONE connection
+  ;; to the directory (Datalevin refuses a second with `:lmdb/duplicate-open`),
+  ;; and `loci.memory` now opens its facts dbi through the same handle. Seeding
+  ;; stays here because seeding is this namespace's business, not `dlv`'s.
+  (delay (let [s @dlv/store]
            ;; a non-empty log on disk wins; otherwise seed (which writes the log)
            (if (seq (sub/history s)) s (seed! s)))))
 

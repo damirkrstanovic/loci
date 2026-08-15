@@ -1228,5 +1228,16 @@
   (let [log (dlv/fact-log st)]
     (->FileMemory (atom (fl/load-all log)) log (Object.))))
 
-(defonce ^{:doc "the server's memory singleton (data-dir resolved at first use)"}
-  memory (delay (file-memory)))
+(defonce ^{:doc "The server's memory singleton — facts in the substrate's own environment.
+
+   Was `(delay (file-memory))` over `data/memory.edn` until 2026-08-15. It now
+   opens the `facts` dbi of `@dlv/store`, the process's single connection, so a
+   backup of `data/substrate` is a backup of the facts and one id counter serves
+   both. `data/memory.edn` is no longer read at runtime; it is the rollback, and
+   `loci.factmigrate/migrate-facts!` is what moves it across.
+
+   Still a delay behind an ordinary var, because that is the seam the suite is
+   built on: fifteen tests do `(with-redefs [mem/memory (delay m)] …)` to hand
+   the server a throwaway memory, and a var holding a live object instead would
+   make every one of them observe nothing while passing."}
+  memory (delay (datalevin-memory @dlv/store)))
