@@ -2498,6 +2498,31 @@
 
       :else nil)))
 
+(defn memory-forget!
+  "POST /api/memory-forget — remove a fact for good.
+
+   Request `{\"id\": \"mem-42\"}`. Answers 200 with
+   `{\"forgotten\": \"mem-42\", \"fact\": \"…\", \"also\": [\"mem-7\"]}` or
+   `{\"error\": \"…\"}`, the shape every other refusal in this file uses.
+
+   **`:fact` comes back deliberately.** It is the last time that text exists
+   anywhere the caller can reach, and a confirmation that names what went is
+   the difference between a gesture you can check and one you have to trust.
+   `:also` is the merge group that went with it — see `mem/forget!` for why
+   forgetting a survivor cannot leave its absorbed facts behind.
+
+   **There is no agent route to this and there must not be one.** It is absent
+   from `loci.tools/specs`, so no flow can reach it; the only caller is the
+   shell, on a person's gesture. Everything else an agent does to the substrate
+   is a reversible event behind a review gate, and this is not reversible."
+  [m id]
+  (if (str/blank? (str id))
+    {:error "which fact? this needs an id"}
+    (let [r (mem/forget! m id)]
+      (if (:ok? r)
+        (select-keys r [:forgotten :fact :also])
+        {:error (:error r)}))))
+
 (defn memory-durable!
   "POST /api/memory-durable — your judgement about whether a fact goes out of
    date.
@@ -2649,6 +2674,8 @@
       ;; name, which is the only way a caller ever learns it sent nonsense.
       (= uri "/api/memory-durable")(let [{:keys [id durable]} (body-json req)]
                                      (json-resp (memory-durable! @mem/memory id durable)))
+      (= uri "/api/memory-forget")(let [{:keys [id]} (body-json req)]
+                                    (json-resp (memory-forget! @mem/memory id)))
       (= uri "/api/suggest") (let [{:keys [space]} (body-json req)]
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]

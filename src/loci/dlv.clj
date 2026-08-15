@@ -384,7 +384,15 @@
     (d/with-transaction-kv [tx kv]
       (let [n (inc (or (d/get-value tx "meta" next-id-key :keyword) 0))]
         (d/transact-kv tx [[:put "meta" next-id-key n :keyword]])
-        (str "mem-" n)))))
+        (str "mem-" n))))
+  ;; The row goes. Nothing is appended, nothing is hidden, and the counter is
+  ;; deliberately left where it is: it only ever increases and never reads the
+  ;; facts, so a gap in the ids is a gap and not a hazard. Rolling it back is
+  ;; what would reissue the id, which is the failure this database made
+  ;; impossible and the reason forgetting can be offered at all.
+  (forget! [_ id]
+    (d/transact-kv kv [[:del "facts" id :string]])
+    :ok))
 
 (defonce ^{:doc "The process's one connection to <data-dir>/substrate.
 

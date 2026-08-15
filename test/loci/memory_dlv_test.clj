@@ -1,8 +1,10 @@
 (ns loci.memory-dlv-test
   (:require [clojure.test :refer [deftest is]]
             [loci.dlv :as dlv]
+            [loci.factlog :as fl]
             [loci.memory :as mem]
             [loci.mold :as mold]
+            [loci.tools :as tools]
             [loci.substrate :as sub]))
 
 (defn- tmpdir []
@@ -188,3 +190,72 @@
         ;; plausibly be this small.
         (is (every? #(< (Math/abs (double %)) 1e-6) (map - (mapv :score rfm) (mapv :score rdm)))
             (str "scores differ beyond floating-point/timing noise for query: " q))))))
+
+;; ---------------------------------------------------------------------------
+;; forget! — the one gesture with no inverse
+;; ---------------------------------------------------------------------------
+
+(defn- mem-over-tmp []
+  (mem/datalevin-memory (dlv/datalevin-store (tmpdir))))
+
+(deftest forget-removes-the-row-not-just-the-view
+  (let [m (mem-over-tmp)]
+    (mold/remember m "Basalt weathers into laterite beneath monsoon canopies." {:entities ["basalt"]})
+    (mold/remember m "Kestrels hover by fixing their gaze against headwind." {:entities ["kestrel"]})
+    (let [r (mem/forget! m "mem-1")]
+      (is (:ok? r))
+      (is (= "mem-1" (:forgotten r)))
+      (is (some? (:fact r)) "the report names what went — the last reachable copy of the text"))
+    (is (= ["mem-2"] (mapv :id (mem/all-facts m))))
+    ;; the point of hard delete: not filtered from a view, absent from storage
+    (is (not (contains? (fl/load-all (:log m)) "mem-1"))
+        "the row is gone from the log, not merely hidden by `live`")
+    (is (empty? (mold/recall m "basalt laterite monsoon" {:k 5})))))
+
+(deftest a-forgotten-id-is-never-reissued
+  (let [m (mem-over-tmp)]
+    (mold/remember m "Basalt weathers into laterite beneath monsoon canopies." {:entities ["b"]})
+    (mold/remember m "Kestrels hover by fixing their gaze against headwind." {:entities ["k"]})
+    (mem/forget! m "mem-1")
+    ;; the counter is monotonic and never reads the facts, which is the whole
+    ;; reason deletion is safe — rolling it back would hand mem-1 to a new fact
+    (is (= "mem-3" (fl/mint-id! (:log m))))))
+
+(deftest forgetting-a-survivor-takes-its-merge-group
+  (let [m   (mem-over-tmp)
+        log (:log m)]
+    (fl/append! log {:id "mem-1" :fact "absorbed text" :ts 1 :merged-into "mem-2"})
+    (fl/append! log {:id "mem-2" :fact "survivor text" :ts 2 :strength 2 :entities ["x"]
+                    :merged-from [{:id "mem-1" :fact "absorbed text" :strength 1}]})
+    (fl/append! log {:id "mem-3" :fact "unrelated bystander" :ts 3 :entities ["y"]})
+    (reset! (:!facts m) (fl/load-all log))
+    (let [r (mem/forget! m "mem-2")]
+      (is (:ok? r))
+      (is (= ["mem-1"] (:also r))
+          "the absorbed fact's text lived only in the survivor's :merged-from"))
+    (is (= ["mem-3"] (sort (keys (fl/load-all log))))
+        "no tombstone left pointing at a fact that no longer exists")))
+
+(deftest forget-refuses-an-absorbed-fact-and-names-where-to-go
+  (let [m   (mem-over-tmp)
+        log (:log m)]
+    (fl/append! log {:id "mem-1" :fact "absorbed" :ts 1 :merged-into "mem-2"})
+    (fl/append! log {:id "mem-2" :fact "survivor" :ts 2})
+    (reset! (:!facts m) (fl/load-all log))
+    (let [r (mem/forget! m "mem-1")]
+      (is (false? (:ok? r)))
+      (is (re-find #"absorbed into mem-2" (:error r))))
+    (is (= 2 (count (fl/load-all log))) "a refusal removes nothing")))
+
+(deftest forget-refuses-an-id-that-is-not-there
+  (let [m (mem-over-tmp)]
+    (mold/remember m "Basalt weathers into laterite beneath monsoon canopies." {:entities ["b"]})
+    (is (false? (:ok? (mem/forget! m "mem-99"))))
+    (is (= 1 (count (mem/all-facts m))))))
+
+(deftest no-agent-tool-can-forget
+  ;; loci's shape is that agents emit reversible events through a review gate.
+  ;; This asserts the absence deliberately: a tool added later must fail here
+  ;; and be an argued decision rather than a quiet one.
+  (is (empty? (filter #(re-find #"(?i)forget" (str %)) (map #(get-in % [:function :name]) tools/specs)))
+      "forgetting must not be reachable from a flow"))

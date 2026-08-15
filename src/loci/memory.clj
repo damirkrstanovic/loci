@@ -1227,6 +1227,58 @@
                    (#(with-meta % (merge {:semantic :ok} st))))))))))
   (all-facts [_] (->> (vals @!facts) live (sort-by :ts >) vec)))
 
+(defn forget!
+  "Remove a fact, and whatever was merged into it. Returns a report, never throws:
+
+     {:ok? true  :forgotten \"mem-42\" :fact \"…\" :also [\"mem-7\" …]}
+     {:ok? false :error \"…\"}
+
+   **This is the one gesture in loci that cannot be undone.** The substrate's
+   `undo!` walks the event log back; the memory has never had an inverse, and
+   this does not give it one — there is no `:forgotten` flag to clear and no
+   earlier revision to return to. The caller is expected to have asked.
+
+   **It cascades to the merge group, and that is not a convenience.** When
+   `merge-similar!` folds B into A, B's text survives ONLY inside A's
+   `:merged-from`, and B keeps a tombstone pointing at A. Deleting A alone
+   would destroy B's text while leaving a tombstone that says B lives on inside
+   a fact that no longer exists — a dangling reference that reads as corruption
+   rather than as an answer. So forgetting a survivor forgets what it absorbed,
+   which is also what the survivor *is*: those facts were judged to be this one.
+
+   **No agent may call this.** There is no entry in `loci.tools`, and the only
+   route is one the shell calls on a person's gesture. loci's whole shape is
+   that agents emit reversible events through a review gate; an irreversible
+   agent capability would contradict it, and an agent that can delete the facts
+   disagreeing with it is worse than one that merely writes wrong ones.
+
+   Entities are unaffected. `loci.entities` promotes a name at two live facts
+   but never demotes a materialized one — 'it is yours, not the evidence's' —
+   so forgetting the last fact about a subject leaves its page standing."
+  [{:keys [!facts log lock]} id]
+  (locking lock
+    (let [fs  @!facts
+          rec (get fs id)]
+      (cond
+        (nil? rec)
+        {:ok? false :error (str "no such fact: " id)}
+
+        (merged-away? rec)
+        {:ok? false
+         :error (str id " is not a fact any more — it was absorbed into "
+                     (:merged-into rec) ". Forget that one, which takes this with it.")}
+
+        :else
+        (let [absorbed (mapv :id (:merged-from rec))
+              ;; the tombstones pointing AT this fact: their text lives in this
+              ;; record's :merged-from and dies with it
+              pointing (->> fs vals (filter #(= id (:merged-into %))) (mapv :id))
+              gone     (vec (distinct (concat absorbed pointing)))]
+          (doseq [g gone] (fl/forget! log g))
+          (fl/forget! log id)
+          (swap! !facts #(apply dissoc % id gone))
+          {:ok? true :forgotten id :fact (:fact rec) :also gone})))))
+
 (defn file-memory
   "A memory backed by an EDN-lines file. Still the production memory — `mem/memory`
    below is built from the no-arg form — until `DbiLog` lands in Task 3 and the

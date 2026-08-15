@@ -27,7 +27,22 @@
 (defprotocol FactLog
   (append!  [this rec] "Persist one record. Last-wins by :id. Returns :ok.")
   (load-all [this]     "id → record, last-wins, tombstones included.")
-  (mint-id! [this]     "A fact id no live or tombstoned record holds."))
+  (mint-id! [this]     "A fact id no live or tombstoned record holds.")
+  (forget!  [this id]
+    "Remove `id` entirely. Returns :ok whether or not it was there.
+
+     **The id is never reissued afterwards, and that is why this can exist at
+     all.** Minting reads a monotonic counter in `meta` and never consults the
+     stored facts, so a gap in the ids is just a gap. Before that counter
+     (2026-08-15) `next-id` took one past the highest id *present*, and deleting
+     a fact handed its id to the next one written — which is exactly the
+     2026-07-23 data loss, and is why forgetting was not offered until now.
+
+     `DbiLog` deletes the row. `FileLog` cannot — an append-only file has no
+     way to unwrite a line — so it appends a `:forgotten` marker that
+     `load-all` drops, which makes the two agree on what the log CONTAINS while
+     differing on what is on disk. That difference is the honest reason
+     `file-memory` is for tests: it can hide a fact, not erase one."))
 
 (def ^:private id-pattern #"mem-(\d+)")
 
@@ -46,13 +61,24 @@
   [id]
   (or (id-ordinal id) 0))
 
+(def ^:private forget-marker
+  "What `FileLog/forget!` appends. Not a fact shape and never returned by
+   `load-all` — it exists only so a file that cannot unwrite a line can still
+   say a line no longer counts."
+  ::forgotten)
+
 (defn- read-file [file]
   (let [f (io/file file)]
     (if (.exists f)
       (with-open [r (java.io.PushbackReader. (io/reader f))]
         (loop [acc {}]
           (let [rec (try (edn/read {:eof ::eof} r) (catch Exception _ ::eof))]
-            (if (= ::eof rec) acc (recur (assoc acc (:id rec) rec))))))
+            (if (= ::eof rec)
+              ;; Dropped at the END, after last-wins has settled: a forgotten id
+              ;; that is written again later is a fact again, and filtering
+              ;; during the fold would have to decide that twice.
+              (into {} (remove (comp #{forget-marker} :loci/marker val)) acc)
+              (recur (assoc acc (:id rec) rec))))))
       {})))
 
 (defn- highest-ordinal
@@ -101,6 +127,15 @@
   ;; lock in one process, which is a guarantee `swap!` actually keeps.
   (mint-id! [_]
     (locking lock
-      (str "mem-" (swap! minted inc)))))
+      (str "mem-" (swap! minted inc))))
+  ;; An append-only file cannot unwrite a line, so this appends a marker that
+  ;; `read-file` drops. The id leaves `load-all`; the text stays on disk. That
+  ;; is the whole reason `file-memory` is documented as for tests — it can hide
+  ;; a fact, not erase one — and it is why `minted` is NOT rolled back here:
+  ;; the forgotten id must never be handed out again either way.
+  (forget! [this id]
+    (locking lock
+      (append! this {:id id :loci/marker forget-marker})
+      :ok)))
 
 (defn file-log [path] (->FileLog path (Object.) (atom (highest-ordinal (keys (read-file path))))))
