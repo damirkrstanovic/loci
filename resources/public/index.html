@@ -206,6 +206,19 @@
   .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .undoBtn{display:flex;align-items:center;gap:7px;border:1px solid var(--line);background:transparent;font-size:12.5px;color:var(--muted);padding:6px 11px;border-radius:999px;cursor:pointer;font-family:var(--mono)}
   .undoBtn.dim{opacity:.4;cursor:not-allowed}          /* time mode: the past cannot be edited */
+  /* the count of flows waiting on you. On the button rather than a toast,
+     because a toast is gone by the time you come back to the desk and the
+     thing it was telling you about is still waiting. */
+  .fbadge{margin-left:6px;background:var(--attn);color:var(--white);border-radius:999px;
+    font-family:var(--mono);font-size:9.5px;padding:1px 5px;line-height:1.4}
+  .flowrow{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-bottom:8px;
+    background:var(--white);cursor:pointer}
+  .flowrow:hover{border-color:var(--accent)}
+  .flowrow.needs{border-color:var(--attn)}
+  .flowrow .frgoal{font-size:13px;margin-bottom:3px}
+  .flowrow .frmeta{font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.04em}
+  .flowrow .frmeta .fp-attn{color:var(--attn)}
+  .flowrow .frq{font-size:12px;color:var(--attn);margin-top:5px}
   .undoBtn:hover{border-color:var(--attn);color:var(--attn)}
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);z-index:80;background:var(--ink);color:var(--paper);font-size:12.5px;padding:9px 15px;border-radius:999px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;display:flex;gap:10px;align-items:center}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -291,14 +304,41 @@
   .ghostchip{display:inline-block;padding:0 6px;border-radius:4px;background:var(--panel);border:1px solid var(--line);color:var(--muted);cursor:pointer;margin:0 2px}
   .ghostchip:hover{border-color:var(--accent-line);color:var(--accent)}
   .flowgoal{font-weight:600;font-size:13.5px;margin-bottom:8px}
-  .flowsteps{display:flex;flex-direction:column;gap:4px}
-  .flowstep{display:flex;gap:8px;align-items:baseline;font-size:12.5px}
-  .flowstep .fic{width:16px;flex:none;color:var(--accent)}
-  .flowstep.s-failed .fic,.flowstep.s-rejected .fic{color:var(--attn)}
-  .flowstep.s-needs-you .fic{color:var(--attn)}
-  .flowstep .fverb{font-family:var(--mono);font-size:11px;color:var(--muted);width:64px;flex:none}
+  /* A plan, not a list. Three things carry that: a spine threading the steps
+     into one sequence, numbers so position is stated rather than counted, and
+     weight that says where you are — done recedes, current is full strength,
+     future is light. Before this the verb was --muted, the quietest thing on
+     the row, so the eye read five paragraphs of prose with grey labels. */
+  .flowplan{font-family:var(--mono);font-size:10.5px;color:var(--muted);
+    letter-spacing:.04em;margin:2px 0 10px}
+  .flowplan .fp-attn{color:var(--attn)}
+  .flowsteps{position:relative;display:flex;flex-direction:column;gap:9px}
+  /* the spine: one rule behind the icons, stopping at the last one so the plan
+     reads as finite rather than trailing off */
+  .flowsteps::before{content:"";position:absolute;left:6px;top:7px;bottom:9px;
+    width:1px;background:var(--line)}
+  .flowstep{display:grid;grid-template-columns:13px 16px 68px 1fr;gap:8px;
+    align-items:baseline;font-size:12.5px;position:relative}
+  .flowstep .fic{color:var(--accent);background:var(--paper);line-height:1;z-index:1}
+  .flowstep .fnum{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:right}
+  /* the verb is the plan's vocabulary — it is the loud token now, not the note */
+  .flowstep .fverb{font-family:var(--mono);font-size:11px;color:var(--ink);font-weight:600}
   .flowstep .fnote{color:var(--ink-2)}
-  .flowstep .fwhy{color:var(--attn);font-size:11.5px}
+  .flowstep .fwhy{color:var(--attn);font-size:11.5px;grid-column:4}
+  /* done recedes — it is context now, not instruction */
+  .flowstep.s-done .fverb{color:var(--muted);font-weight:400}
+  .flowstep.s-done .fnote{color:var(--muted)}
+  .flowstep.s-done .fic{color:var(--muted)}
+  /* future is lighter still, and deliberately lighter than done: what has
+     happened is more real than what is merely planned */
+  .flowstep.s-pending .fverb{color:var(--muted);font-weight:400;opacity:.75}
+  .flowstep.s-pending .fnote{opacity:.6}
+  .flowstep.s-pending .fic{color:var(--line)}
+  /* the stop you will be asked to make, visible before you reach it */
+  .flowstep.v-gate .fverb{color:var(--attn);font-weight:600;opacity:1}
+  .flowstep.s-needs-you .fic,.flowstep.s-failed .fic,.flowstep.s-rejected .fic{color:var(--attn)}
+  .flowstep .fneeds{font-family:var(--mono);font-size:10px;color:var(--attn);
+    letter-spacing:.06em;white-space:nowrap;margin-left:8px}
   .fstat{margin-top:6px;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
   .nbrow{display:flex;gap:16px;align-items:flex-start}
   .rail{flex:none;width:210px}
@@ -384,6 +424,7 @@
   <div class="ambient" id="ambient"></div>
   <button class="undoBtn" id="memBtn" title="what the agent remembers — distilled facts with provenance">⌾ memory</button>
   <button class="undoBtn" id="fnBtn" title="peek at the functions in this substrate (for the curious — not the everyday flow)">ƒ functions</button>
+  <button class="undoBtn" id="flowBtn" title="every flow in the substrate — what ran, what is running, what is waiting on you">⑂ flows<span class="fbadge" id="flowBadge" hidden></span></button>
   <button class="undoBtn" id="timeBtn" title="scrub the substrate's history — view any past moment, read-only">⏱ time</button>
   <button class="undoBtn" id="undoBtn" title="revert the last substrate event">↺ undo</button>
 </div>
@@ -433,6 +474,7 @@ const API = {
   notebook: (id,at) => fetch('/api/notebook?id='+encodeURIComponent(id)+(at!=null?'&at='+at:'')).then(r=>r.json()),
   events: () => fetch('/api/events').then(r=>r.json()),
   notebookOp: body => POST('/api/notebook', body),
+  flows: () => fetch('/api/flows').then(r=>r.json()),
   memory: q => fetch('/api/memory'+(q?'?q='+encodeURIComponent(q):'')).then(r=>r.json()),
   // answers with the two records, NOT a pane payload — it carries no q and no
   // space, so the caller refetches /api/memory with whatever it was showing
@@ -507,6 +549,8 @@ function applyState(s){
   STATE.spaces=ordered;
   STATE.objects={}; s.objects.forEach(o=>STATE.objects[o.id]=o); STATE.events=s.events;
   STATE.tagColors = s['tag-colors'] || {};   // kebab-case over the wire, like sp['spawned-by']
+  STATE['flows-need-you'] = s['flows-need-you'] || 0;
+  renderFlowBadge();
   const ni=STATE.spaces.findIndex(sp=>sp.id===fid); if(ni>=0) focusIdx=ni;
   else focusIdx=Math.min(focusIdx,Math.max(0,STATE.spaces.length-1));   // focused space vanished — stay in range
   renderStrip();
@@ -1213,21 +1257,50 @@ function renderMold(m){
   }
 }
 const FLOWICON={pending:'○',running:'◐',done:'●','needs-you':'⚑',failed:'✕',rejected:'⊘'};
+// "1:07", "2m 14s", "—". Coarse on purpose: a flow is minutes of model calls,
+// and a ticking seconds counter would be the loudest thing on a page whose
+// point is the plan.
+function fmtElapsed(from,to){
+  if(!from) return '';
+  const s=Math.max(0,Math.round(((to||Date.now())-from)/1000));
+  return s<60 ? s+'s' : Math.floor(s/60)+'m '+(s%60)+'s';
+}
+// The line that used to be the bare word "running". Everything in it was
+// already in the flow object and simply never rendered: which step, how many,
+// how long.
+function flowPlanLine(f){
+  const steps=f.steps||[], n=steps.length;
+  const done=steps.filter(s=>s.status==='done').length;
+  const i=steps.findIndex(s=>s.status==='running'||s.status==='needs-you');
+  const el=fmtElapsed(f.started, f.ended);
+  const bits=['PLAN', n+' STEP'+(n===1?'':'S')];
+  if(f.status==='needs-you')   bits.push('<span class="fp-attn">NEEDS YOU · STEP '+(i+1)+'</span>');
+  else if(f.status==='running') bits.push('RUNNING STEP '+(i<0?done+1:i+1));
+  else if(f.status==='done')    bits.push('DONE');
+  else bits.push('<span class="fp-attn">'+esc(String(f.status).toUpperCase())+'</span>');
+  if(f.status!=='needs-you'&&f.status!=='running') bits.push(done+' OF '+n+' DONE');
+  if(el) bits.push(el);
+  return '<div class="flowplan">'+bits.join(' · ')+'</div>';
+}
 function renderFlow(f, fid){
-  let h='<div class="flowgoal">'+esc(f.goal)+'</div><div class="flowsteps">';
+  let h='<div class="flowgoal">'+esc(f.goal)+'</div>'+flowPlanLine(f)+'<div class="flowsteps">';
   (f.steps||[]).forEach((s,k)=>{
-    h+='<div class="flowstep s-'+esc(s.status)+'"><span class="fic">'+(FLOWICON[s.status]||'○')+'</span>'+
+    h+='<div class="flowstep s-'+esc(s.status)+(s.verb==='gate'?' v-gate':'')+'">'+
+      '<span class="fic">'+(FLOWICON[s.status]||'○')+'</span>'+
+      '<span class="fnum">'+(k+1)+'</span>'+
       '<span class="fverb">'+esc(s.verb)+'</span>'+
-      (s.verb==='gate'?'<span class="fnote">'+esc((s.args&&s.args.question)||'')+'</span>'
-                      :'<span class="fnote">'+esc(s.note||((s.args&&s.args.prompt)||''))+'</span>')+
-      (s.out?' <span class="ghostchip" data-open="'+esc(s.out)+'">'+esc(s.out)+'</span>':'')+
-      (s.why?' <span class="fwhy">'+esc(s.why)+'</span>':'')+'</div>';
+      '<span class="fnote">'+
+        (s.verb==='gate'?esc((s.args&&s.args.question)||'')
+                        :esc(s.note||((s.args&&s.args.prompt)||'')))+
+        (s.out?' <span class="ghostchip" data-open="'+esc(s.out)+'">'+esc(s.out)+'</span>':'')+
+        (s.status==='needs-you'?'<span class="fneeds">⟵ NEEDS YOU</span>':'')+
+      '</span>'+
+      (s.why?'<span class="fwhy">'+esc(s.why)+'</span>':'')+'</div>';
   });
   h+='</div>';
   if(f.status==='needs-you')
-    h+='<div class="actions" style="margin-top:8px"><button class="btn sm" data-gate="yes" data-flow="'+esc(fid)+'">Approve &amp; continue</button>'+
+    h+='<div class="actions" style="margin-top:10px"><button class="btn sm" data-gate="yes" data-flow="'+esc(fid)+'">Approve &amp; continue</button>'+
        '<button class="btn ghost sm" data-gate="no" data-flow="'+esc(fid)+'">Reject</button></div>';
-  else h+='<div class="fstat">'+esc(f.status)+'</div>';
   return h;
 }
 function fmtNum(n){ return (+n).toLocaleString(); }
@@ -2291,6 +2364,57 @@ async function openMemory(qstr){
               (also?' — and the '+also+' fact'+(also===1?'':'s')+' merged into it':''));
   }));
 }
+// ---------------- flows: where they are, and which one is waiting ----------------
+//
+// A flow used to exist only as a cell inside the notebook it was started in, so
+// one waiting at a gate in a notebook you are not standing in was invisible
+// until you wandered into it. This is the home for that, alongside memory,
+// functions and time — and the badge on the button is the notification, because
+// a toast is gone by the time you come back to the desk.
+async function openFlows(){
+  const res=await API.flows();
+  const flows=res.flows||[];
+  const waiting=flows.filter(f=>f.status==='needs-you').length;
+  let h='<div class="modalcard" style="max-width:720px"><div class="modal-h">'+
+    '<span class="modalbadge">FLOWS</span>'+
+    '<span class="q">'+flows.length+' flow'+(flows.length===1?'':'s')+
+      (waiting?' · <b>'+waiting+' waiting on you</b>':'')+'</span></div><div class="modal-b">';
+  if(!flows.length) h+='<div style="color:var(--muted);font-size:13px">No flows yet — ⑂ Flow on a notebook plans one and runs it step by step.</div>';
+  flows.forEach(f=>{
+    const el=fmtElapsed(f.started,f.ended);
+    const needs=f.status==='needs-you';
+    const meta=[String(f.status).toUpperCase(), f.done+' OF '+f.steps+' DONE']
+      .concat(f.step&&!needs?['AT '+String(f.step).toUpperCase()]:[])
+      .concat(el?[el]:[]);
+    h+='<div class="flowrow'+(needs?' needs':'')+'" data-flow-open="'+esc(f.id)+'" data-space="'+esc(f.space||'')+'">'+
+      '<div class="frgoal">'+esc(f.goal||f.title||f.id)+'</div>'+
+      '<div class="frmeta">'+(needs?'<span class="fp-attn">'+esc(meta[0])+'</span>':esc(meta[0]))+
+        (meta.length>1?' · '+meta.slice(1).map(esc).join(' · '):'')+'</div>'+
+      (needs&&f.question?'<div class="frq">⚑ '+esc(f.question)+'</div>':'')+'</div>';
+  });
+  h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
+    '<span style="font-size:11.5px;color:var(--muted)">the agent plans, runs, and stops to ask</span></div></div>';
+  modal.innerHTML=h; modal.classList.add('on');
+  modal.querySelector('#closeModal').addEventListener('click',closeModal);
+  // opening a row takes you to the notebook the flow lives in — the gate's
+  // buttons are on the flow cell there, which is also where its outputs landed
+  modal.querySelectorAll('[data-flow-open]').forEach(el=>el.addEventListener('click',()=>{
+    const sp=el.dataset.space;
+    closeModal();
+    const j=STATE.spaces.findIndex(s=>s.id===sp);
+    if(j>=0) enter(j); else openObject(el.dataset.flowOpen);
+  }));
+}
+// The badge rides on state, which every write refreshes, so a flow that reaches
+// a gate while you are elsewhere shows up without polling.
+function renderFlowBadge(){
+  const n=(STATE&&STATE['flows-need-you'])||0;
+  const b=document.getElementById('flowBadge');
+  if(!b) return;
+  b.hidden=!n; b.textContent=n;
+  document.getElementById('flowBtn').classList.toggle('needs', !!n);
+}
+document.getElementById('flowBtn').addEventListener('click',openFlows);
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
 modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
 

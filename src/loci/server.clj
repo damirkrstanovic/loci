@@ -149,7 +149,15 @@
      ;; out of the map already in hand, not via `tag-colors`: that would re-fold
      ;; the whole log for one object, and this payload is built on nearly every
      ;; write — 2.2 ms this way against 3.9 ms on a 3003-event log
-     :tag-colors (or (:value (get objm palette-id)) {})}))
+     :tag-colors (or (:value (get objm palette-id)) {})
+     ;; ONE integer, for the badge on the flows button. The per-flow arithmetic
+     ;; stays in `/api/flows`, which is fetched only when the pane opens; this
+     ;; is a filter over a sequence already in hand, and it is the difference
+     ;; between noticing a flow waiting in another notebook and wandering into
+     ;; it by accident.
+     :flows-need-you (count (filter #(and (= :flow (:kind %))
+                                          (= "needs-you" (get-in % [:value :status])))
+                                    objs))}))
 
 ;; ---- the entity page ----
 ;;
@@ -2290,7 +2298,12 @@
   [st space goal steps]
   (let [fid (next-id st "flow:")
         fobj {:id fid :kind :flow :title (str "Flow — " (if (> (count goal) 40) (str (subs goal 0 40) "…") goal))
-              :value {:goal goal :space space :status "running" :steps (vec steps)}}]
+              ;; `:started` so the card can say how long this has been going.
+              ;; On the flow rather than derived from the event's `:ts`: an event
+              ;; timestamp is the substrate's, and a flow that is undone and
+              ;; re-run would read as having started at the undo.
+              :value {:goal goal :space space :status "running" :started (System/currentTimeMillis)
+                      :steps (vec steps)}}]
     (sub/commit! st {:op :tx :events [{:op :put :id fid :value fobj}
                                       (nb/append-cell-event st space {:ref fid})]})
     fid))
@@ -2298,12 +2311,20 @@
 (defn- flow-assoc! [st fid value]
   (sub/commit! st {:op :assoc :id fid :path [:value] :value value}))
 
+(def ^:private flow-over?
+  "The statuses after which nothing more runs. `needs-you` is deliberately not
+   one: the flow is stopped but not finished, and stamping `:ended` there would
+   make the card report an elapsed time that stops while you are deciding and
+   then resumes, which is neither wall-clock nor working time."
+  #{"done" "failed" "rejected"})
+
 (defn- flow-step!
   "One transition: update step i (and optionally the flow status) — one event."
   [st fid i patch & [flow-status]]
   (let [fl (:value (sub/object st fid))
         fl (cond-> (update-in fl [:steps i] merge patch)
-             flow-status (assoc :status flow-status))]
+             flow-status (assoc :status flow-status)
+             (flow-over? flow-status) (assoc :ended (System/currentTimeMillis)))]
     (flow-assoc! st fid fl)
     fl))
 
@@ -2331,7 +2352,8 @@
           i  (first (keep-indexed (fn [k s] (when (= "pending" (:status s)) k)) (:steps fl)))]
       (cond
         (nil? i)
-        (do (when (not= "done" (:status fl)) (flow-assoc! st fid (assoc fl :status "done")))
+        (do (when (not= "done" (:status fl))
+              (flow-assoc! st fid (assoc fl :status "done" :ended (System/currentTimeMillis))))
             {:state (state-payload st) :flowId fid :status "done"})
 
         (= "gate" (get-in fl [:steps i :verb]))
@@ -2347,6 +2369,43 @@
                 {:state (state-payload st) :flowId fid :status "failed"})
             (do (flow-step! st fid i {:status "done" :out (:out r)})
                 (recur))))))))
+
+(defn flows-payload
+  "GET /api/flows — every flow in the substrate, the ones needing you first.
+
+   **Its own endpoint rather than a widening of `state-payload`.** That payload
+   ships every object as `{:id :title :kind}` and is fetched on every state
+   change; putting per-flow step arithmetic in it would make the common read pay
+   for a pane that is usually closed. This is the same argument `/api/memory`
+   already makes for facts.
+
+   `needs-you` first and then newest first, because the whole reason to open
+   this is 'is anything waiting on me', and a flow waiting in a notebook you are
+   not standing in is otherwise invisible until you wander into it.
+
+   `:question` rides along only for a flow that is actually at a gate — it is
+   what the reader has to answer, and fetching the flow again to find it would
+   make the list a menu rather than an answer."
+  [st]
+  (let [flows (->> (sub/objects st) vals (filter #(= :flow (:kind %))))
+        row   (fn [o]
+                (let [v     (:value o)
+                      steps (:steps v)
+                      done  (count (filter #(= "done" (:status %)) steps))
+                      cur   (first (filter #(#{"running" "needs-you"} (:status %)) steps))]
+                  (cond-> {:id (:id o) :title (:title o) :goal (:goal v)
+                           :space (:space v) :status (:status v)
+                           :steps (count steps) :done done
+                           :started (:started v) :ended (:ended v)}
+                    cur (assoc :step (:verb cur))
+                    (= "needs-you" (:status v))
+                    (assoc :question (get-in cur [:args :question])))))]
+    {:flows (->> flows
+                 (map row)
+                 (sort-by (juxt #(if (= "needs-you" (:status %)) 0 1)
+                                #(- (or (:started %) 0))))
+                 vec)
+     :needs-you (count (filter #(= "needs-you" (get-in % [:value :status])) flows))}))
 
 (defn flow-start!
   "Endpoint entry: validate the notebook NOW, then plan + create + run in a job."
@@ -2661,6 +2720,7 @@
       (= uri "/api/delegate")(let [{:keys [space]} (body-json req)] (json-resp (delegate! st space)))
       (= uri "/api/research")(let [{:keys [space prompt]} (body-json req)] (json-resp (research-start! st space prompt)))
       (= uri "/api/flow")     (let [{:keys [space goal]} (body-json req)] (json-resp (flow-start! st space goal)))
+      (= uri "/api/flows")    (json-resp (flows-payload (store-at st (params "at"))))
       (= uri "/api/flow-gate")(let [{:keys [id approve]} (body-json req)] (json-resp (flow-gate! st id approve)))
       (= uri "/api/job")     (json-resp (job-status (params "id")))
       (= uri "/api/do")      (let [{:keys [id prompt space]} (body-json req)] (json-resp (do! st id prompt space)))

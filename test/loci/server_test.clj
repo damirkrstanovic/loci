@@ -4036,3 +4036,31 @@
         "?at=1 is the world after one event — the route passes the store through `store-at`, and nothing else can produce this")
     (is (= "second" (:rendered (get! "id=doc:d&at=99")))
         "…clamped to the log's length rather than answering an empty world")))
+
+(deftest flows-payload-puts-what-needs-you-first-and-says-what-it-asks
+  ;; 2026-08-16: a flow lived only as a cell in the notebook it was started in,
+  ;; so one waiting at a gate somewhere else was invisible until you wandered
+  ;; into it. This payload is the flows pane's whole content.
+  (let [st (store-with-table)]                     ; gives us space:n
+    (let [older (srv/flow-create! st "space:n" "an older one"
+                                  [{:verb "draft" :args {} :status "done"}])
+          _     (sub/commit! st {:op :assoc :id older :path [:value :status] :value "done"})
+          newer (srv/flow-create! st "space:n" "the one waiting"
+                                  [{:verb "gate" :args {:question "Proceed?"} :status "pending"}
+                                   {:verb "draft" :args {} :status "pending"}])
+          _     (srv/run-flow! st newer)
+          p     (srv/flows-payload st)
+          [a b] (:flows p)]
+      (is (= 1 (:needs-you p)))
+      (is (= newer (:id a)) "the flow needing you comes first, wherever it lives")
+      (is (= "needs-you" (:status a)))
+      (is (= "Proceed?" (:question a)) "the pane says what it is asking without a second fetch")
+      (is (= "gate" (:step a)))
+      (is (= [0 2] [(:done a) (:steps a)]))
+      (is (= older (:id b)))
+      (is (nil? (:question b)) "a flow not at a gate carries no question")
+      ;; and the one-integer badge count on the ordinary state payload
+      (is (= 1 (:flows-need-you (srv/state-payload st))))
+      (srv/flow-gate! st newer false)
+      (is (= 0 (:flows-need-you (srv/state-payload st)))
+          "rejecting clears the badge — nothing is waiting any more"))))
