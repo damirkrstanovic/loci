@@ -186,3 +186,23 @@
       (is (= aeon-fact fact))
       (is (not (contains? opts :durable?))
           "a string, a number, a null — none of them is a judgement, and passing one through would be a judgement nobody made in the WRONG direction"))))
+
+(deftest llm-timeout-is-configurable-and-long-enough-for-a-research-step
+  ;; 60000 was the hardcoded value and it is what made agent flows unusable.
+  ;; Measured 2026-08-15: a bare research! on a narrow prompt finished in 31 s
+  ;; and passed; the same verb inside a flow — same model, plus the notebook
+  ;; context and a broader prompt — passed 60 s and died with
+  ;; "TimeoutException: idle timeout", at step 1 of 5.
+  ;;
+  ;; It is http-kit's IDLE timeout, and a non-streaming completion arrives all
+  ;; at once, so it is really a deadline for the whole response rather than a
+  ;; budget for a slow trickle.
+  (let [f #'agent/timeout-ms]
+    (is (= 180000 (f)) "the default must clear a research step with several tool rounds")
+    (with-redefs [loci.config/env {"LOCI_LLM_TIMEOUT_MS" "45000"}]
+      (is (= 45000 (f)) "the knob is read"))
+    ;; a misconfigured value must not become a zero-length timeout
+    (with-redefs [loci.config/env {"LOCI_LLM_TIMEOUT_MS" "abc"}]
+      (is (= 180000 (f)) "garbage falls back rather than breaking every call"))
+    (with-redefs [loci.config/env {"LOCI_LLM_TIMEOUT_MS" ""}]
+      (is (= 180000 (f)) "blank is unset, as everywhere else in loci.config"))))

@@ -59,6 +59,30 @@
   (or (non-blank (env "DEEPSEEK_MODEL")) (non-blank (from-file ".deepseek-model"))
       "deepseek-v4-flash"))
 
+(defn- timeout-ms
+  "How long to wait on one LLM call, in milliseconds. `LOCI_LLM_TIMEOUT_MS`,
+   else 180000.
+
+   **This is http-kit's IDLE timeout, and for a non-streaming completion that
+   makes it effectively time-to-first-byte** — the whole body arrives at once
+   when the model has finished thinking, so nothing arrives until then. It is
+   not a budget for a slow trickle; it is a deadline for the entire response.
+
+   It was 60000, and that number is what made agent flows unusable. Measured
+   2026-08-15 against the one flow this project has ever run: a bare
+   `research!` on a narrow prompt finished in 31 s and passed, while the same
+   verb inside a flow — same model, plus the notebook context and a broader
+   prompt — exceeded 60 s and died with `TimeoutException: idle timeout`, at
+   step 1 of 5. No gate had ever been reached in the history of the project.
+
+   180 s is chosen to clear a research step with several tool rounds rather
+   than to be generous: `chat-tools` allows five rounds, each its own request,
+   so this bounds ONE of them. A configurable knob because the right value
+   belongs to whichever model is behind `LOCI_LLM_ENDPOINT`, and a reasoning
+   model is slower than a chat one by more than a factor a default can guess."
+  []
+  (or (some-> (non-blank (env "LOCI_LLM_TIMEOUT_MS")) parse-long) 180000))
+
 (defn- api-key []
   ;; LOCI_LLM_API_KEY first: a token for your own server should not have to be
   ;; filed under a vendor you are not using. `.llm-key` is the same argument for
@@ -77,7 +101,7 @@
                                      ".llm-key / .deepseek-key)")
                                 {})))
         resp @(hc/post (endpoint)
-                {:timeout 60000
+                {:timeout (timeout-ms)
                  :headers {"Authorization" (str "Bearer " key) "Content-Type" "application/json"}
                  :body (json/write-str (cond-> {:model (model) :messages messages :temperature 0.2}
                                          json? (assoc :response_format {:type "json_object"})

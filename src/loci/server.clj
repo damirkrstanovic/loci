@@ -2233,19 +2233,56 @@
   (let [rows (:value (sub/object st id))]
     (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
 
+(defn- step-index->ref
+  "A bare step index — `0`, `\"0\"` — as the `$`-ref the planner meant.
+
+   Anything else is returned untouched, which is what keeps `tbl:orders` a
+   literal id rather than a reference to be resolved. Only a value that could
+   not possibly be an object id is rewritten: loci ids all carry a `<kind>:`
+   prefix, so a run of digits is unambiguous."
+  [v]
+  (cond
+    (integer? v) (str "$" v)
+    (and (string? v) (re-matches #"\d+" v)) (str "$" v)
+    :else v))
+
 (defn resolve-table-ref
-  "Like resolve-ref, but for compute steps: a $-ref prefers the nearest
-   earlier output that is actually a TABLE (research can land prose-only).
-   No tabular output anywhere → the plain walk result, so the failure
-   downstream stays honest. Literal ids are never second-guessed."
+  "The table a compute step should run on: its `:id` when that names a real
+   table, else the nearest earlier output that is one.
+
+   **The fallback is no longer gated on the value looking like a `$`-ref, and
+   that gate is what made agent flows fail.** Measured 2026-08-15 on the only
+   two flows this project has ever run — one from August, one reproduced today
+   — the planner emitted `:id 0` and `:id \"0\"` respectively, a bare step
+   INDEX, while putting the real reference in the prose (\"From $0, create a
+   new table…\"). Neither starts with `$`, so both were passed through as
+   literal object ids, `compute-clj!` looked up an object named `0`, found
+   none, and answered \"compute works on tables\" in under a millisecond. The
+   research step immediately before had produced a perfectly good table.
+
+   Asking the planner to emit `$0` instead would be asking a model to hold a
+   format it has now failed to hold twice. Resolving what it means is cheaper
+   and does not depend on it.
+
+   **A literal id is still never hijacked**, and the distinction is narrow on
+   purpose: a bare INTEGER is a step index, `tbl:orders` is an id. Only the
+   first is rewritten. An explicit id that names nothing still falls through to
+   the honest failure it always did, because substituting a different table for
+   one somebody named by hand is the worse error.
+
+   No tabular output anywhere → the unresolved value, so the failure
+   downstream stays honest rather than becoming a confident wrong table."
   [st flow v]
-  (if (and (string? v) (str/starts-with? v "$"))
-    (let [r (resolve-ref flow v)]
-      (if (and (string? r) (table-shaped? st r))
-        r
-        (or (->> (:steps flow) (keep :out) reverse (filter #(table-shaped? st %)) first)
-            r)))
-    v))
+  (let [ref (step-index->ref v)]
+    (if (and (string? ref) (str/starts-with? ref "$"))
+      (let [r (resolve-ref flow ref)]
+        (if (and (string? r) (table-shaped? st r))
+          r
+          (or (->> (:steps flow) (keep :out) reverse (filter #(table-shaped? st %)) first)
+              r)))
+      ;; the ORIGINAL value, not the normalized one: a literal id passes through
+      ;; untouched exactly as it always did, and only a reference is resolved
+      v)))
 
 (defn flow-create!
   "Commit the flow object + its notebook cell as ONE :tx. Steps must already

@@ -522,6 +522,31 @@
       ;; literal ids are never hijacked
       (is (= "tbl:x" (srv/resolve-table-ref st flow "tbl:x"))))))
 
+(deftest flow-compute-accepts-a-bare-step-index-not-only-a-dollar-ref
+  ;; live-fire finding, 2026-08-15: this is what stopped agent flows working.
+  ;; Both flows this project has ever run died here — the August one recorded
+  ;; `:id "0"`, today's reproduction `:id 0` — while putting the real reference
+  ;; in the PROSE ("From $0, create a new table…"). Neither starts with `$`, so
+  ;; both were passed through as literal object ids, compute looked up an object
+  ;; named 0, found none, and answered "compute works on tables" in under a
+  ;; millisecond with a perfectly good table sitting one step earlier.
+  ;;
+  ;; Asking the planner to emit `$0` would be asking a model to hold a format it
+  ;; has now failed to hold twice.
+  (let [st (store-with-table)]
+    (sub/commit! st {:op :put :id "doc:d" :value {:id "doc:d" :kind :doc :title "D" :value "prose"}})
+    (let [flow {:steps [{:out "tbl:t"} {:out "doc:d"} {}]}]
+      (is (= "tbl:t" (srv/resolve-table-ref st flow 0))    "a bare integer index")
+      (is (= "tbl:t" (srv/resolve-table-ref st flow "0"))  "a bare numeric string")
+      (is (= "tbl:t" (srv/resolve-table-ref st flow 1))    "index onto a doc still finds the table")
+      ;; and the narrowness of that rewrite is the point: an id is not an index.
+      ;; Substituting a different table for one somebody named by hand is worse
+      ;; than the honest failure, so a named-but-missing id still passes through.
+      (is (= "tbl:x" (srv/resolve-table-ref st flow "tbl:x"))
+          "an id-shaped literal is never rewritten, even when it names nothing")
+      (is (= "space:s" (srv/resolve-table-ref st flow "space:s"))
+          "nor is any other kind of id"))))
+
 (deftest flow-compute-step-receives-a-table-not-a-note
   (let [seen (atom nil)]
     (with-redefs [srv/research!    (fn [st space prompt]
