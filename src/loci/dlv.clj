@@ -60,6 +60,7 @@
     (d/open-list-dbi kv "touched")
     (d/open-dbi kv "meta")
     (d/open-dbi kv "facts")
+    (d/open-dbi kv "chunks")
     kv))
 
 (defn- read-log
@@ -421,6 +422,35 @@
         (when (pos? highest)
           (d/transact-kv kv [[:put "meta" next-id-key highest :keyword]]))))
     (->DbiLog kv)))
+
+;; ---------------------------------------------------------------------------
+;; chunks — derived vectors, in the same environment, in their own dbi
+;; ---------------------------------------------------------------------------
+
+(defn put-chunk!
+  "One chunk record into the `chunks` dbi, last-wins by `:id`.
+
+   **Deliberately not a `FactLog`.** That protocol's third method is `mint-id!`,
+   and a chunk has no id to mint: its id is derived from the object and its
+   position, and its `:hash` is derived from its text. Implementing a minting
+   method that must never be called, over a counter that must never advance, is
+   a trap in exchange for reuse of two one-line functions.
+
+   Same last-wins-by-`:id` discipline as the file sidecar it replaces, so
+   retiring a chunk is still an appended `{:id … :retired true}` and never a
+   deletion — `loci.chunks/retire!` relies on that."
+  [st rec]
+  (d/transact-kv (:kv st) [[:put "chunks" (:id rec) rec :string]])
+  :ok)
+
+(defn all-chunks
+  "id → record for every chunk in the store, retired ones included.
+
+   Retired records must come back: `loci.chunks/stored` filters them out itself,
+   and dropping them here would let a retired id read as absent and be re-embedded
+   on the next sweep."
+  [st]
+  (into {} (d/get-range (:kv st) "chunks" [:all] :string)))
 
 (defn put-fact-raw-for-test!
   "Writes `rec` straight into the `facts` dbi WITHOUT touching the `:facts/next-id`

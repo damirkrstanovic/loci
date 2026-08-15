@@ -1,7 +1,9 @@
 # One substrate: memory facts into the Datalevin environment
 
 Date: 2026-08-15
-Status: **design, awaiting approval.** No code written.
+Status: **shipped, both phases.** Facts and chunks live in the substrate's environment;
+`memory.edn` and `chunks.edn` remain on disk as rollbacks and are no longer read at runtime.
+Measured on the real store: 256 facts, 300 chunks, `data/substrate/data.mdb` 988K → 12M.
 
 ## The complaint
 
@@ -15,6 +17,10 @@ data/chunks.edn             16M   ditto
 
 The two files are twenty-five times the size of the database they sit next to, and they
 are the ones that are not in it. "Substrate" is supposed to mean one substrate.
+
+**Resolved 2026-08-15.** Both phases shipped: `data/substrate` now holds `events`,
+`counts`, `touched`, `meta`, `facts` and `chunks` in one environment. `memory.edn` and
+`chunks.edn` are left on disk untouched as rollbacks and are no longer read at runtime.
 
 The project's own spec already said so. `2026-08-05-datalevin-substrate-design.md` § 1:
 
@@ -65,17 +71,23 @@ Separate dbis in one environment give every one of them, because `undo!` and `as
 
 ## Target layout
 
-One environment, one more dbi:
+One environment, two more dbis:
 
 | dbi | kind | contents | undo? | as-of? |
 |---|---|---|---|---|
 | `events` | KV `:long` | the truth — substrate events | yes | yes |
 | `counts` | KV `:long` | derived, rebuildable | — | — |
 | `touched` | list `:string` | derived, rebuildable | — | — |
-| `meta` | KV | dirty mark, and now the fact counter | — | — |
+| `meta` | KV | dirty mark, and the fact counter | — | — |
 | **`facts`** | **KV `:string`** | **one record per fact id — parallel truth** | **never** | **never** |
+| **`chunks`** | **KV `:string`** | **one record per chunk id — derived, rebuildable** | **never** | **never** |
 
-`dlv/open-env!` (dlv.clj:56) already opens four dbis in four lines; this is a fifth.
+`dlv/open-env!` opened four dbis in four lines; it now opens six.
+
+Only `events` is truth. `counts`, `touched` and `chunks` are derived and can be rebuilt
+from it — deleting `chunks` and re-sweeping returns the same ids and hashes. `facts` is a
+*parallel* truth: written by the agent, revisable, decaying, and never reachable by `undo!`
+or `as-of`.
 
 ## Who may write: one process, three ways in
 
@@ -145,11 +157,27 @@ step 5 keeps the file rather than deleting it.
 
 **Phase 1 — memory.** The one with the correctness hazard. 248 facts today.
 
-**Phase 2 — chunks.** Bigger on disk (16 MB) but derived and rebuildable: `chunks.edn` can
-be deleted and re-swept byte-equivalently, so there is no data to lose and no id to
-collide. Lower risk, lower urgency, and a separate deliverable.
+**Phase 2 — chunks. DONE 2026-08-15**, on the same branch rather than after a merge —
+a deliberate deviation from the sentence that used to end this section.
 
-Phase 2 does not start until Phase 1 is merged.
+`chunks` is a fifth dbi. `loci.chunks` keeps `file-chunks` for the tests and gains
+`store-chunks`; its private `append-line!` takes the store rather than a path, and `:file`
+was removed rather than kept beside `:store` for the reason Phase 1 learned the hard way —
+Clojure binds a missing destructured key to nil in silence.
+
+Deliberately **not** a `FactLog`. That protocol's third method is `mint-id!`, and a chunk
+has no id to mint: its id is derived from the object and its position, its `:hash` from its
+text. Two one-line dbi accessors in `loci.dlv` beat implementing a minting method that must
+never be called.
+
+`migrate-from-file!` has no dry run and no refusals, and that is proportionate: a chunk is a
+pure function of an object plus an embedder call, so the worst case is deleting the dbi and
+sweeping again. It exists at all only because re-deriving 300 chunks is free while
+re-embedding them is 300 round trips to a model server that may not be running.
+
+Measured on the real store: 300 chunks migrated in 3.7 s, all 300 carrying 2560-dim
+vectors, 93 of them from the Gemini import; a second run migrated 0 and skipped 300; LEAP
+answers `"Lysenko"` with `doc:gem-13`, `doc:gem-12`, `subject:lysenkoism`.
 
 ## Tests that must bite
 

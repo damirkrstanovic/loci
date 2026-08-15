@@ -45,6 +45,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.dlv :as dlv]
             [loci.embed :as embed]
             [loci.notebook :as nb]
             [loci.substrate :as sub]))
@@ -305,9 +306,24 @@
 ;; the sidecar — append-only EDN lines, last-wins by :id
 ;; ---------------------------------------------------------------------------
 
-(defn- append-line! [file rec]
-  (io/make-parents (io/file file))
-  (spit file (str (pr-str rec) "\n") :append true))
+(defn- append-line!
+  "One record into the store's backing log, last-wins by `:id`.
+
+   Takes the STORE, not a path. It used to take a file and `spit` to it; the
+   argument changed when chunks moved into the substrate's own environment, so
+   that both write sites — `retire!` and `store-vector!` — move together rather
+   than each learning where chunks live.
+
+   The `:file` key is gone rather than kept beside `:store`, deliberately.
+   Clojure binds a missing destructured key to nil in silence, so a write site
+   that had not been updated would go on appending to an EDN file nothing reads
+   — which is exactly what `loci.memory` had to be rescued from on 2026-08-15,
+   where three out-of-namespace callers were still reaching for `:file`."
+  [{:keys [store file]} rec]
+  (if store
+    (dlv/put-chunk! store rec)
+    (do (io/make-parents (io/file file))
+        (spit file (str (pr-str rec) "\n") :append true))))
 
 (defn- load-chunks [file]
   (let [f (io/file file)]
@@ -319,13 +335,56 @@
       {})))
 
 (defn file-chunks
-  "A chunk store over `path`. The no-argument form resolves the user's real data
-   directory and is for the server; **every test passes a path.**"
+  "A chunk store over an EDN-lines `path`.
+
+   Kept for the tests, which pass a path and want a store they can delete and
+   reload without a Datalevin environment. The server uses `store-chunks`."
   ([] (file-chunks (str (sub/data-dir) "/chunks.edn")))
   ([path] {:!chunks (atom (load-chunks path)) :file path}))
 
-(defonce ^{:doc "the server's chunk store singleton (data-dir resolved at first use)"}
-  chunks (delay (file-chunks)))
+(defn store-chunks
+  "A chunk store over the substrate's own `chunks` dbi.
+
+   Chunks are derived — `chunks-of` is a pure function of one object, and the
+   corollary the docstring at the top of this namespace states is that the whole
+   store can be deleted and re-swept byte-equivalently. So this could have been a
+   rebuild rather than a migration. It is a migration because the *vectors* are
+   not free: re-deriving 94 chunks costs nothing, re-embedding them costs a round
+   trip each to a model server that may not be running."
+  [st]
+  {:!chunks (atom (dlv/all-chunks st)) :store st})
+
+(defn migrate-from-file!
+  "Copy `data/chunks.edn` into `st`'s `chunks` dbi. Returns `{:migrated n :skipped n}`.
+
+   **No dry run, no refusals, and that is proportionate.** `loci.factmigrate`
+   rehearses because a fact is written by an agent and cannot be recomputed;
+   a chunk is a pure function of an object plus an embedder call, so the worst
+   case here is deleting the dbi and sweeping again. Writes are last-wins by
+   `:id` and the ids are content-derived, so running this twice is a no-op.
+
+   Retired records migrate like any other. Dropping them would let a retired id
+   read as absent on the next sweep and be embedded all over again.
+
+   The source file is never written or deleted; it stays as the rollback until
+   somebody decides otherwise."
+  ([st] (migrate-from-file! st (str (sub/data-dir) "/chunks.edn")))
+  ([st path]
+   (let [src (load-chunks path)
+         dst (dlv/all-chunks st)
+         todo (remove (fn [[id rec]] (= rec (get dst id))) src)]
+     (doseq [[_ rec] todo] (dlv/put-chunk! st rec))
+     {:migrated (count todo)
+      :skipped  (- (count src) (count todo))
+      :total    (count (dlv/all-chunks st))})))
+
+(defonce ^{:doc "The server's chunk store — the `chunks` dbi of the process's one store.
+
+   Was `(delay (file-chunks))` over `data/chunks.edn` until 2026-08-15. A delay
+   behind an ordinary var because that is the seam the suite tests directly:
+   `chunks-test` asserts this var holds an unrealized delay, so that requiring
+   this namespace never touches the user's data directory."}
+  chunks (delay (store-chunks @dlv/store)))
 
 (defn- retired?
   "True for a record retired because the substrate no longer implies its chunk.
@@ -380,12 +439,12 @@
    and return how many. A deleted document's vectors must stop answering; they
    describe text that is no longer stored, and a hit on one would open an object
    that does not contain it."
-  [{:keys [!chunks file] :as cs} wanted-ids]
+  [{:keys [!chunks] :as cs} wanted-ids]
   (let [gone (remove wanted-ids (keys (stored cs)))]
     (doseq [id gone]
       (let [rec {:id id :retired true}]
         (swap! !chunks assoc id rec)
-        (append-line! file rec)))
+        (append-line! cs rec)))
     (count gone)))
 
 (def ^:private batch-size
@@ -405,11 +464,11 @@
    mismatch this whole path exists to avoid. The chunk simply stays pending and
    the next sweep embeds what it now says. Same guard as
    `loci.memory/store-vector!`, for the same reason."
-  [{:keys [!chunks file]} fresh chunk vector model dim]
+  [{:keys [!chunks] :as cs} fresh chunk vector model dim]
   (when (= (:hash chunk) (get fresh (:id chunk)))
     (let [rec (assoc chunk :vec vector :model model :dim dim)]
       (swap! !chunks assoc (:id rec) rec)
-      (append-line! file rec)
+      (append-line! cs rec)
       true)))
 
 (defonce ^{:private true

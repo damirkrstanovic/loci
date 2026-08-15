@@ -37,7 +37,25 @@ a load average of 11 on 6 cores, and one contaminated measurement.
 6. **`:reload` and re-run.** An edit you have not reloaded and re-run is unverified.
 7. **Run the relevant test namespace in the REPL**, not the whole suite in a new JVM.
 
-## Two reload traps that will bite you
+## Three REPL traps that will bite you
+
+**Realizing a singleton makes its own test fail.** `chunks-test` and `leap-deep-test` assert
+that `loci.chunks/chunks` is an *unrealized* delay — the guarantee that requiring a namespace
+never touches the user's data directory. Deref it once while poking around and those two
+tests fail in that session, looking exactly like a regression you just caused. Reset it:
+
+```clojure
+(alter-var-root #'ch/chunks (constantly (delay (ch/store-chunks @dlv/store))))
+```
+
+**Never `alter-var-root` a REALIZED store delay.** `@dlv/store` holds an open LMDB
+connection; replacing the var drops the handle without closing it, and the next deref
+fails with *"Please do not open multiple LMDB connections to the same DB in the same
+process"* — with no way left to close the orphan. Restarting the nREPL is then the only
+fix. Reset the store delay only while it is still unrealized; resetting `chunks`/`memory`
+is safe, because they take an already-open store rather than opening one.
+
+
 
 **`:reload` does not re-evaluate `defonce`.** `loci.dlv/store`, `loci.content/store` and
 `loci.memory/memory` are all `defonce` delays. Editing their definition and reloading

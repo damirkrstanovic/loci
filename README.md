@@ -339,11 +339,19 @@ that looks healthy and answers nothing, and `LOCI_DATA=/data` is the container's
 the image already sets and which a `clojure -M:serve` on your own machine would take
 literally and refuse to start over.
 
-`clojure -M:serve` persists its state under `data/` — the substrate is a
-Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
-`data/memory.edn`. Delete that directory to reset to a clean slate. A pre-2026-08
-EDN log at `data/substrate.edn` is migrated with `clojure -M:migrate`, which
-imports it verbatim and verifies the two logs materialize to the same state.
+`clojure -M:serve` persists its state under `data/` — everything lives in one
+Datalevin (LMDB) environment at `data/substrate`, in six dbis: `events` (the
+truth), `counts` and `touched` (derived indices), `meta`, `facts` (the agent's
+memory) and `chunks` (embedding vectors). Delete that directory to reset to a
+clean slate; one directory is the whole backup.
+
+Until 2026-08-15 the memory and the vectors were flat files beside it —
+`data/memory.edn` and `data/chunks.edn`, together twenty-five times the size of
+the database they sat next to. Both are still on disk, untouched, as rollbacks;
+neither is read at runtime. `loci.factmigrate/migrate-facts!` and
+`loci.chunks/migrate-from-file!` are what moved them. A pre-2026-08 EDN log at
+`data/substrate.edn` is migrated with `clojure -M:migrate`, which imports it
+verbatim and verifies the two logs materialize to the same state.
 
 **One writer.** loci is single-writer by design: one process owns the store, and
 there is no supported configuration in which two hold it open. Three ways in, and
