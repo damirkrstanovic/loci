@@ -194,6 +194,7 @@ those files, because `.dockerignore` deliberately keeps them out of the build co
 | `LOCI_RERANK_ENDPOINT` | `.rerank-endpoint` | *unset — rerank is skipped* |
 | `LOCI_RERANK_MODEL` | `.rerank-model` | `rerank-bge-m3` |
 | `LOCI_RERANK_API_KEY` | `LOCI_EMBED_API_KEY`, then `LOCI_LLM_API_KEY` | *unset — no header* |
+| `LOCI_LLM_TIMEOUT_MS` | — | `180000` — one model call's deadline; an idle timeout, so in practice the whole response |
 | `LOCI_DATA` | — | a **relative** `data/` |
 | `PORT` | — | `7777` |
 

@@ -1,9 +1,13 @@
 # Forkable flows: run it on a branch, then decide
 
-Date: 2026-08-08
-Status: **noted, not designed.** Recorded while reading ActiveGraph (2026-08-08). No
-brainstorming session has been held; the approaches below are sketches, not decisions, and
-nothing here is approved for planning.
+Date: 2026-08-08, updated 2026-08-16
+Status: **noted, not designed, and NOT ready to plan.** Recorded while reading ActiveGraph
+(2026-08-08). Its own "what to measure" gate was run on 2026-08-16 and came back negative:
+no gate had ever been reached, because agent flows had never completed a run at all. Two
+bugs behind that are now fixed and a flow runs end to end, but the question this spec exists
+to answer — *are gates ever declined?* — still has no data. **Read "The gate was run" before
+acting on any sketch here;** the sketches predate it, and approach B's cost basis has moved
+by 22×.
 
 ## What loci has, and what it doesn't
 
@@ -91,12 +95,59 @@ cache: every research step hits the model and Tavily afresh. A cache keyed by
 make the test suite cheaper — three payoffs, none of which requires branching to exist first.
 It is separable and could be done alone.
 
+## The gate was run, 2026-08-16 — read this first
+
+This spec ends with three things to measure before building. The first was measured, and it
+stopped the work.
+
+**Question 1 — "how often is a gate actually declined?" — assumed flows run.** They did not.
+Across the whole history of the substrate there was **exactly one flow object**, `flow:1`,
+and it had failed at step 1 of 5:
+
+```
+goal    "add positions, speeds and other data of known solar objects…"
+step 1  research  FAILED  — "research came back empty"
+step 2  gate      pending   ← never reached
+step 3  compute   pending
+step 4  draft     pending
+```
+
+**No gate had ever been reached, let alone declined.** The mechanism this spec proposes to
+improve had never completed a run. Two bugs were behind it, both since fixed:
+
+- `agent/request` hardcoded a 60 s idle timeout. A bare `research!` on a narrow prompt took
+  31 s; the same verb inside a flow, with the notebook context, ran past 60 s and died.
+  Now `LOCI_LLM_TIMEOUT_MS`, default 180 s.
+- `resolve-table-ref` only rewrote `$`-prefixed values, but the planner emits a bare step
+  INDEX (`:id "0"` in the August run, `:id 0` in the reproduction) while putting the real
+  reference in the prose. `compute` looked up an object named `0` and failed in under a
+  millisecond with a good table one step earlier.
+
+With both fixed, a flow ran end to end — research → gate → approve → compute → draft. So
+**question 1 is now answerable and still unanswered**: the instrument works, and nobody has
+used it enough to say whether gates get declined. Until flows are actually used, this remains
+machinery for a case that has not been observed once.
+
+**Approach B's arithmetic has also moved.** The sketch says "today's substrate is 652 KB, so
+copying is free at this scale". After the 2026-08-15 one-substrate work, `data/substrate` is
+**14.1 MB** — facts and 2560-dimension chunk vectors now live in the same environment — and it
+grows with every embedded chunk. A copy per fork is no longer free, and the thing that made it
+expensive was moving the memory *in*. Approach B needs re-costing, or needs to copy only the
+`events` dbi and rebuild the rest.
+
+Approaches A and C are untouched by that. A in particular gets *more* attractive: it never
+copies anything.
+
 ## What to measure before building
 
 1. **Is the payoff real?** How often is a gate actually declined, and how often does a
    declined flow leave work that had to be undone? If flows are approved nearly always, this
-   is machinery for a rare case.
+   is machinery for a rare case. **Run 2026-08-16: unanswerable, because flows had never
+   completed. Now they do; the question needs real use before it has an answer.**
 2. **Copy cost** (approach B) at today's 652 KB and at 10×, measured, not estimated.
+   **Superseded: the substrate is 14.1 MB as of 2026-08-15, not 652 KB. Measure at that, and
+   consider copying only `events` and rebuilding `counts`/`touched`/`chunks`, which are
+   derived.**
 3. **Cache hit rate** on a real re-run of an existing flow — the number that decides whether
    the cache is worth its own complexity.
 
