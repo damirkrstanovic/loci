@@ -953,3 +953,23 @@ Do NOT migrate the real `data/` in this task. That is a separate, deliberate act
 - `data/chunks.edn` (16 MB). Phase 2, and a separate plan. It is derived and rebuildable — delete it and re-sweep — so it carries no data-loss risk and no id to collide.
 - Any change to recall scoring, decay, merge thresholds or the embedding path.
 - Deleting `data/memory.edn`. It is the rollback until a later session retires it.
+
+---
+
+## Corrections — what this plan got wrong
+
+Recorded after execution, so that a reader following the tasks above does not repeat them. Four of the six defects found during Tasks 1-4 originated here, in the plan, rather than in any implementation — which is the pattern `CLAUDE.md` describes.
+
+**Task 1 — `FileLog.mint-id!` returned the same id twice.** As written it only scanned the file, so two mints with no `append!` between them repeated. The plan's own fourth test caught it. Fixed with a high-water atom, then made O(1) (see below).
+
+**Task 1/2 — the seam has nine callers, not five, and three are in other namespaces.** `classify.clj:255`, `repair.clj:438` and `server.clj:2576` reach into `FileMemory` by destructuring. Clojure binds a missing destructured key to `nil` in silence, so renaming the field while keeping the old one would have left all three writing to a file nothing reads. `server.clj:2576` persists the user's own `durable-by "you"` judgement.
+
+**Everywhere — `clojure -M:test -v <ns>` does not select a namespace.** `-v` selects vars. It is `-n`. Corrected in eleven places.
+
+**Task 2/3 — rescanning the log on every mint cost 642 ms/call.** Measured against the real 8.5 MB `memory.edn`: `remember` went 5.85 ms → 642 ms, essentially all of it parsing 404,480 embedding doubles to find the largest integer in the ids. `FileLog` now seeds a counter once and `append!` advances it (2.13 ms/call, better than the original). `DbiLog` keeps the counter in `meta` and advances it in the *same transaction* as the record.
+
+**Task 4 — the concurrency corpus was wrong in both directions.** The plan's sentences carried a comment claiming they were below the 0.6 reinforcement threshold; they measure **0.7143** between every pair, so correct locked behaviour collapses 200 facts to 1. And once made genuinely dissimilar, **200/200 survive with no lock at all**, because `DbiLog`'s `append!` and `mint-id!` are already individually atomic — a corpus with no possible duplicates cannot exercise the race the lock guards, which is the duplicate-scan racing the insert decision. The shipped test uses 20 topics × 10 concurrent identical texts: 122/106/103 unlocked, 20/20/20 locked.
+
+**Task 6 — the `undo!` test could not have failed.** Two compounding errors. The specified sabotage (writing to `events` from `append!`) is inert, because `undo!` and `object` read the store's in-RAM `!db` and never rescan. Worse, the assertion read `all-facts` from the *same* memory instance before and after, and that instance never re-reads `facts` after construction — so no storage-level corruption of any kind could have failed it. It was a certifying test. The shipped version asserts against a **freshly constructed** memory after the undo, which does fail when `undo-tx` is sabotaged to delete from `facts`.
+
+The general lesson, and the one worth carrying to Phase 2: **a plan's assertion about a threshold, a similarity, or a cost is a guess until someone measures it.** Every number in the corrections above came from running the code; none were visible by reading it.
