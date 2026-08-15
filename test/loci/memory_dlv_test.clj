@@ -49,3 +49,40 @@
         "10 concurrent remembers of the same text must reinforce one fact each, not insert extras")
     (is (= (count topics) (count (set (map :id (mem/all-facts m)))))
         "every surviving fact still has its own id")))
+
+(deftest undo-does-not-revoke-a-fact
+  (let [st (dlv/datalevin-store (tmpdir))
+        m  (mem/datalevin-memory st)]
+    (sub/commit! st {:op :put :id "doc:1" :value {:id "doc:1" :kind :doc :title "T" :value "x"}})
+    (mold/remember m "The document says something worth keeping."
+                   {:entities ["t"] :source {:obj "doc:1"}})
+    (is (= 1 (count (mem/all-facts m))))
+    (sub/undo! st)
+    (is (nil? (sub/object st "doc:1")) "the document is gone")
+    (is (= 1 (count (mem/all-facts m)))
+        "undoing a notebook edit must not un-learn a fact")
+    ;; The check above alone does NOT bite. `m`'s facts live in `!facts`, an
+    ;; in-RAM cache loaded once at `datalevin-memory` construction and
+    ;; mutated only by `remember`'s own writes — `undo!` cannot touch it no
+    ;; matter what `undo-tx` does to the `facts` dbi, so a regression that
+    ;; makes undo delete from `facts` would sail past `(count (all-facts m))`
+    ;; on the SAME `m`. Confirmed by sabotaging `DbiLog.append!` to also
+    ;; write `[[:put "events" 999 rec :long]]` per the original recipe: 0
+    ;; failures — an orphan, non-contiguous "events" key is never read back
+    ;; by anything either, so it is doubly inert.
+    ;;
+    ;; A fresh memory over the SAME store, built after the undo, reads
+    ;; `facts` back off disk and is what would actually notice a fact `undo!`
+    ;; had deleted.
+    (is (= 1 (count (mem/all-facts (mem/datalevin-memory st))))
+        "a fact reloaded from durable storage after undo must still be there")))
+
+(deftest as-of-does-not-time-travel-the-memory
+  (let [st (dlv/datalevin-store (tmpdir))
+        m  (mem/datalevin-memory st)]
+    (sub/commit! st {:op :put :id "doc:1" :value {:id "doc:1" :kind :doc :title "T" :value "x"}})
+    (mold/remember m "Cobalt blue reached Delft through the Dutch trade." {:entities ["cobalt"]})
+    (let [before (mold/recall m "cobalt" {:k 5})]
+      (sub/as-of st 0)
+      (is (= (mapv :id before) (mapv :id (mold/recall m "cobalt" {:k 5})))
+          "recall answers the same regardless of where the substrate is scrubbed to"))))
