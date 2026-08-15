@@ -29,13 +29,17 @@ put memory outside the environment anyway.
 
 Three things, all observed on 2026-08-15 while importing a Gemini conversation.
 
-**1. Id minting has no single authority.** `memory/next-id` (memory.clj:184) is "one past
-the largest id ever issued", computed from an in-RAM map. Two processes hold two maps and
-mint the same id; persistence is `spit :append true` with last-wins-by-`:id`, so the loser
-is destroyed with no error anywhere. This is the same failure class as the 2026-08-09
-forensics — concurrent `commit!`s destroying 208 of 900 events — which the substrate fixed
-with a lock and the memory never got. Today it forced a running server to be stopped
-before 106 facts could be written, and "stop the server first" is not a mechanism.
+**1. Minting reads RAM, not the store.** `memory/next-id` (memory.clj:184) is "one past the
+largest id ever issued", computed from an in-RAM map, and `remember` took no lock at all —
+so two *threads* in one process mint the same id, and `spit :append true` with
+last-wins-by-`:id` destroys the loser with no error anywhere. Measured: 20 topics × 10
+concurrent `remember`s left 98, 90 and 103 facts where 20 was correct. Same failure class
+as the 2026-08-09 forensics, where concurrent `commit!`s destroyed 208 of 900 events; the
+substrate got a lock for it and the memory never did.
+
+This is a single-process bug and is worth fixing on those grounds alone. It is *not* an
+argument for cross-process coordination — see "Who may write" below, which says plainly
+that loci has one writer and that taking the app down is the mechanism for anything else.
 
 **2. Backup is ambiguous.** The substrate is a directory, the memory is a file, the chunks
 are another file, and `migrate.clj` touches none of the latter two. "I backed it up" covers
@@ -73,175 +77,44 @@ One environment, one more dbi:
 
 `dlv/open-env!` (dlv.clj:56) already opens four dbis in four lines; this is a fifth.
 
-## The crux: where a fact id comes from
+## Who may write: one process, three ways in
 
-This is the decision the whole change turns on, and it is worth being exact about, because
-moving the bytes does not fix it by itself.
+**loci is single-writer by design.** One process owns the store. There is no supported
+configuration in which two processes hold it open, and nothing here tries to make that
+safe — `compose.yaml` runs one container, `:serve` runs one server, and no part of the
+codebase coordinates a second writer.
 
-`DatalevinStore.commit!` (dlv.clj:119) computes the next event index as `(inc (count log))`
-from the in-RAM log, under `locking lock`. That serialises writers **within one process**
-and is why the 208-event bug is fixed. It does **not** serialise two processes: LMDB's
-writer mutex orders the two `transact-kv` calls, but both computed `i` from their own stale
-snapshot, so the second overwrites the first. The substrate has the same theoretical
-exposure as the memory; it survives because exactly one process opens it.
+Storage is reached in exactly three ways:
 
-So the honest claim for this change is:
+1. **From the running app, over its HTTP API.** The normal path. `/api/*` is the surface;
+   the server owns the store behind it.
+2. **From a `loci.*` namespace, by loading the facade and calling it in the server's own
+   process.** `loci.corpus/import-corpus!`, `loci.conversation/import-conversation!`,
+   `loci.factmigrate/migrate-facts!` are public functions with dry-run defaults, meant to
+   be called from a REPL attached to the live server — not from a second JVM.
+3. **Directly on storage, with the app stopped.** Surgery — a migration, a repair, a
+   renumbering — takes the store offline first. Stopping the app is the mechanism; there
+   is no lock to acquire and none is wanted.
 
-- **In-process:** one lock, one authority — the memory gains what the substrate already has.
-- **Cross-process:** a monotonic counter kept in `meta`, read and incremented inside the
-  same write path rather than derived from RAM. This is new, and it is the part that makes
-  "don't run two writers" a guarantee instead of an operating convention.
+What this rules out is the fourth way, which is the one that caused trouble on
+2026-08-15: a throwaway script opening the store in its own JVM while a server holds it.
+That is not a scenario to be made safe. It is a mistake, and the answer is (2) or (3).
 
-If the counter proves awkward, the fallback is to make a second writer *fail loudly* rather
-than silently, which is still strictly better than today. **Either way, this must be
-demonstrated with two concurrent processes, not argued for** — per the working agreements,
-a reviewer runs it and reports numbers.
+### What this means for the id counter
 
-## ⚠ RETRACTED: the 2026-08-15 cross-process measurement is contaminated
+An earlier draft of this spec promised that a monotonic counter in `meta` would make
+"don't run two writers" a *guarantee* rather than a convention. That promise is withdrawn:
+it was inventing a requirement, and then engineering for it.
 
-**Do not cite the numbers in the section below.** They were produced by
-`dev/two_writers.clj` while a *concurrently running* review agent had sabotaged
-`DbiLog.append!` in the same working tree with `[:put "events" 999 rec :long]`,
-to prove an unrelated test could fail.
+`DbiLog` nevertheless mints ids inside `datalevin.core/with-transaction-kv`, and would do
+so even if only one thread ever ran. The reason is not concurrency across processes — it is
+that read-a-counter-then-write-it-back is a transaction, the database performs
+transactions, and the version it replaced was a hand-rolled `(locking lock)` over a plain
+`(Object.)` doing the read and the write in two separate LMDB transactions. The native
+form is both correct and smaller: it deleted a record field, a monitor, and a class of bug.
 
-That sabotage is the entire explanation for "failure mode 1". Nothing in
-`DbiLog` writes to `events`; the `999` in `expected 1, found 999` is the
-saboteur's constant, and the reviewer independently reported the twin error
-`expected 2, found 999` from the same edit. The store was corrupted by the
-sabotage, not by concurrent environment creation.
-
-"Failure mode 2" (181/200 facts surviving a two-writer run) ran inside the same
-window and is therefore also unverified. Its described mechanism — `mint-id!`
-doing `get-value` then `transact-kv` as two transactions, which is not atomic
-across processes — remains the predicted failure and is plausible. Plausible is
-not measured.
-
-**Cause:** the orchestrator dispatched an implementer and a review agent in
-parallel against one working tree, on the reasoning that a reviewer only reads.
-A reviewer that proves a test bites does not only read. Re-measurement must run
-in an isolated worktree with nothing else touching `src/`.
-
-**Status: the cross-process question is OPEN.** The section below is kept
-unedited as the record of a contaminated run, not as a finding.
-
-## Cross-process: measured, not achieved
-
-Measured 2026-08-15 with `dev/two_writers.clj`, two real `clojure -M` OS processes against
-one fresh `mktemp -d` directory, each calling `mold/remember` 100 times with sentences
-unique to its own tag (pairwise jaccard 0.3333, well under the 0.6 reinforcement threshold —
-measured with the same `tokens`/`jaccard` this harness writes with, not assumed). **The
-claim is false.** Two writers lose facts, and the way they lose them is worse than the
-single mechanism the design above worried about — there are two distinct failure modes, and
-the first one is more severe than the mint-id race that motivated this section.
-
-### Failure mode 1 — concurrent environment creation corrupts the store
-
-Exactly per Step 2/4 of the task: two processes each call `(dlv/datalevin-store dir)`
-against a directory that does not yet hold an LMDB environment, at (as close as `&`/`wait`
-gets) the same moment.
-
-| run | outcome |
-|---|---|
-| 1 | clean — 200/200 (100 tag a / 100 tag b), `:facts/next-id` = 200 |
-| 2 | **corrupted** — writer `b`'s own `(dlv/datalevin-store dir)` call throws before writing anything |
-| 3 | **corrupted** — same, writer `b` |
-| 4 | **corrupted** — same, writer `b` |
-| 5 | **corrupted** — same, writer `a` this time (confirms it is whichever process loses the race, not a tag-specific bug) |
-
-The exception is always the same, and it fires at `dlv.clj:79` (`read-log`) — i.e. inside
-`datalevin-store`'s own construction, before the harness prints "writing N facts", so no
-`remember` has run yet:
-
-```
-Execution error (ExceptionInfo) at loci.dlv/read-log$fn (dlv.clj:79).
-substrate event keys are not contiguous — expected 1, found 999. The events are intact;
-they must be renumbered 1..n before this log can be replayed.
-```
-
-`999` is garbage: nothing in this harness, or in `DbiLog`, ever writes to the `events` dbi —
-only `facts` and `meta`. **This is not a transient hiccup.** Re-opening the same directory
-from a clean third process, well after both writers had exited, reproduces the identical
-error on all four runs — the on-disk environment is durably corrupted, not just the losing
-process's read. Losing this race does not cost one fact; it costs the whole store.
-
-This matches a real LMDB caveat, not a Datalevin-specific bug: an LMDB environment that does
-not yet exist must be created by one opener before others may safely open it; concurrent
-*first* creation is unsafe in a way concurrent *use* of an existing environment is not. The
-follow-up measurement below confirms this directly — the exact same two writers, against a
-directory whose environment was pre-created by one process and closed first, corrupted
-nothing in three runs.
-
-### Failure mode 2 — the mint-id race, isolated
-
-Same two writers, same corpus, but the store's environment was created once by a single
-process (`open` then `close!`) *before* the two writers were launched — isolating the
-read-then-write race in `DbiLog/mint-id!` (dlv.clj) from failure mode 1 above.
-
-| run | total | tag a | tag b | `:facts/next-id` | writer exit codes |
-|---|---|---|---|---|---|
-| 1 | 200 | 100 | 100 | 200 | 0 / 0 |
-| 2 | 200 | 100 | 100 | 200 | 0 / 0 |
-| 3 | **181** | **92** | **89** | 181 | 0 / 0 |
-
-Run 3 lost 19 of 200 facts — **silently**. Both processes reported `remember` called 100
-times and exited 0; nothing anywhere logged an error. Writer `b`'s *own* in-RAM view (its
-local `!facts`, built only from its own writes) already showed 99 distinct ids among its own
-100 calls, meaning `b` reused one of its own minted ids without any help from `a` reading at
-the same instant it did. The mechanism is not merely "both processes read the same counter
-value" — it is that `mint-id!` computes its new value from a read and then writes that fixed
-value unconditionally, so **the counter can move backward**: if `a` reads `n=41` at T1 and
-`b` reads `n=41` at T2, and `b`'s write (`meta=42`) lands before `a`'s does, then `a`'s write
-still unconditionally sets `meta=42` — regressing what `b` had already advanced to 43 back
-down to 42, and handing `mem-42` out a second time. `DbiLog.mint-id!`'s `(locking lock)` is a
-JVM monitor and synchronises nothing across the two JVMs; LMDB's writer mutex serialises the
-two `transact-kv` calls but not the `get-value` that preceded each one, exactly as this
-section already suspected of `DatalevinStore.commit!`.
-
-### What this means
-
-"No loss observed in N runs" and "cannot lose" are different claims, and the evidence above
-supports neither in the strong direction — it supports the opposite. Two of eight total runs
-(1 of 5 fresh-directory, 1 of 3 pre-existing-store) lost data outright; four more corrupted
-the store before a single fact was written. **The cross-process guarantee this section
-proposed does not hold as designed.** A counter in `meta`, read via `get-value` and written
-via `transact-kv` as two separate calls, is not atomic across processes regardless of the
-in-process lock around it — same failure class as `DatalevinStore.commit!`'s `(inc (count
-log))`, and now demonstrated rather than argued.
-
-Per the design above, the fallback holds: **a second writer must fail loudly rather than
-silently corrupt.** Today it does neither reliably — it usually succeeds, sometimes loses
-facts with no error, and sometimes corrupts the environment outright. Loud failure (e.g. a
-pid/lock file a second opener refuses to proceed past) is strictly better than the current
-state and does not require solving distributed consensus.
-
-### A native primitive that might close it — not implemented, not measured
-
-Datalevin exposes `datalevin.core/with-transaction-kv` (public macro, `datalevin/lmdb.clj`,
-imported at `datalevin/core.clj:328`), which runs a body inside **one** LMDB read/write
-transaction rather than two. Its own docstring's example is this exact shape:
-
-```clojure
-(with-transaction-kv [kv lmdb]
-  (let [^long now (get-value kv "a" :counter)]
-    (transact-kv kv [[:put "a" :counter (inc now)]])
-    (get-value kv "a" :counter)))
-```
-
-The macro locks on `(write-txn orig-db#)` before opening the transaction, and `open-env!`
-(dlv.clj:52) opens with Datalevin's default env flags (`#{:nordahead :notls}` —
-`:nolock` is not among them), so the write-transaction acquisition goes through LMDB's
-ordinary cross-process writer lock rather than bypassing it. If `mint-id!` read and wrote
-the counter inside one `with-transaction-kv` instead of a bare `get-value` + `transact-kv`
-under a JVM `locking`, the read and the increment would be one LMDB transaction and the
-regression described above should not be possible.
-
-This is a **finding, not a fix**: `with-transaction-kv` has not been used anywhere in this
-codebase, and nothing above has implemented or measured it against two real processes. It
-does not touch failure mode 1 (environment creation) at all — that needs the store to
-already exist before a second process opens it, which is an operational rule, not a code
-change. Whether it fully closes failure mode 2, and at what cost (a `with-transaction-kv`
-still has to have somewhere to fail loudly if failure mode 1's precondition is violated), is
-future work.
+Single-writer is a statement about how loci is *operated*. Using the database's own
+transaction for a read-modify-write is just how you write that code.
 
 ## Migration
 
@@ -282,7 +155,9 @@ Phase 2 does not start until Phase 1 is merged.
 
 Per the working agreements, each of these must be shown to fail when its fix is reverted:
 
-1. Two processes writing facts concurrently do not lose one. Run it; report the numbers.
+1. Concurrent `remember`s **in one process** do not lose a fact. Run it; report the
+   numbers. Deliberately threads, not processes: loci is single-writer, so a second JVM is
+   not a scenario under test.
 2. `undo!` of a notebook leaves the facts citing it intact.
 3. `as-of` an earlier index does not change what `recall` returns.
 4. Recall over the migrated store returns the same ranked ids as over `memory.edn`.

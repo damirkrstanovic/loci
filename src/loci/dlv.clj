@@ -343,9 +343,14 @@
   ;; **Every read-then-write here is ONE LMDB transaction, and there is no lock
   ;; anywhere in this record.** An earlier version wrapped these in
   ;; `(locking lock)` over a plain `(Object.)` and read the counter in one
-  ;; transaction before writing it in the next. That is not atomic, and a JVM
-  ;; monitor means nothing to a second process: measured 2026-08-15 with two
-  ;; OS processes writing 100 facts each, runs lost 7 and 28 of 200, silently.
+  ;; transaction before writing it in the next.
+  ;;
+  ;; Not because two processes need to be safe — loci is single-writer, and the
+  ;; answer to "something else wants the store" is the HTTP API, the facade in
+  ;; the server's own REPL, or stopping the app. Simply because a read followed
+  ;; by a dependent write IS a transaction, and this database performs
+  ;; transactions. Hand-rolling one out of a monitor and two `transact-kv`
+  ;; calls was more code doing less.
   ;;
   ;; `with-transaction-kv` is Datalevin's own answer and its docstring example
   ;; is literally get-counter / increment / put. Reaching for it instead of a

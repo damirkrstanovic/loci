@@ -60,6 +60,24 @@ than it saved: on 2026-08-15 it produced checksum verification in every single s
 prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
 until a server was stopped — all to guard data the user regards as disposable.
 
+## One writer. Three ways to reach storage, and a fourth that is a mistake
+
+loci is **single-writer**. One process owns the store. Reach it by:
+
+1. **The running app's HTTP API** — `/api/*`. The normal path.
+2. **A `loci.*` facade, called in the server's own process.**
+   `loci.corpus/import-corpus!`, `loci.conversation/import-conversation!`,
+   `loci.factmigrate/migrate-facts!` are public, dry-run by default, and meant to be
+   called from a REPL attached to the live server.
+3. **Directly, with the app stopped.** Surgery takes the store offline first. Stopping the
+   app *is* the mechanism; there is no lock to acquire and none is wanted.
+
+The fourth way is a scratch script opening the store in its own JVM while a server holds
+it. That is not a scenario to make safe — it is a mistake, and the fix is (2) or (3). On
+2026-08-15 doing it anyway produced a two-JVM test harness, a spec promising a
+cross-process guarantee nobody asked for, and a contaminated measurement of a requirement
+that did not exist.
+
 ## Use what the tool already provides, before inventing a mechanism
 
 Before writing coordination, locking, transactions, counters, retries or caching by hand,
@@ -72,15 +90,18 @@ unique across writers. What got built:
 - a `(locking lock)` around a read-then-write, where `lock` is a plain `(Object.)`
 - a counter in the `meta` dbi, incremented by reading it and writing it back
 - a high-water-mark atom in `FileLog` to patch a gap the above left
-- a two-JVM harness to measure how often it lost data — it lost 7 of 200, then 28 of 200
+- a two-JVM harness to measure how often it lost data
 
 Datalevin ships `with-transaction-kv`: *"Evaluate body within the context of a single new
 read/write transaction, ensuring atomicity of key-value operations."* One transaction,
 correct by construction. The whole apparatus above was an unreliable reimplementation of a
-feature already on the classpath.
+feature already on the classpath, and replacing it **deleted** a record field, a monitor
+and a class of bug.
 
-The tell is when you find yourself **measuring how often your mechanism corrupts data**.
-That is not a research finding; it is a signal that the mechanism should not exist.
+Two tells, both present here. **Measuring how often your own mechanism corrupts data** is
+not a research finding; it means the mechanism should not exist. And **testing a
+requirement you invented** — the harness existed to check a cross-process guarantee this
+spec had promised and nothing had asked for — is a loop with no outside input in it.
 
 So: grep the dependency, read its API, ask the REPL (`(clojure.repl/doc …)`,
 `(clojure.repl/apropos "transaction")`). loci is small, single-server software — it is not

@@ -9,8 +9,13 @@
    **`mint-id!` is on the protocol and that is the point.** A file log can only
    answer 'what is the next id' by scanning what it has; a database can keep a
    counter and increment it inside the write transaction. Leaving minting in
-   `loci.memory`, over an in-RAM map, is what lets two writers mint the same id
-   and destroy one fact with no error anywhere.
+   `loci.memory`, over an in-RAM map with no lock, is what let two THREADS mint
+   the same id and destroy one fact with no error anywhere — measured at 98, 90
+   and 103 surviving facts where 20 was correct.
+
+   Threads, not processes. loci is single-writer: one process owns the store,
+   and anything else either goes through the running app or waits for it to
+   stop. Nothing here is trying to make two JVMs safe.
 
    A scan alone still isn't enough for the file case: a caller may mint an id
    before deciding whether to append one, so two mints with no append between

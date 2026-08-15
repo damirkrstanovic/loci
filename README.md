@@ -345,6 +345,22 @@ Datalevin (LMDB) store at `data/substrate`, the agent's memory an event log at
 EDN log at `data/substrate.edn` is migrated with `clojure -M:migrate`, which
 imports it verbatim and verifies the two logs materialize to the same state.
 
+**One writer.** loci is single-writer by design: one process owns the store, and
+there is no supported configuration in which two hold it open. Three ways in, and
+nothing else:
+
+1. **The running app's HTTP API** — `/api/*`. The normal path.
+2. **A `loci.*` facade called inside the server's own process.** `import-corpus!`,
+   `import-conversation!`, `migrate-facts!` are public and dry-run by default,
+   intended for a REPL attached to the live server.
+3. **Directly, with the app stopped.** Surgery — migrations, repairs, renumbering —
+   takes the store offline first. Stopping the app is the mechanism; there is no
+   lock to acquire and none is wanted.
+
+A scratch script that opens the store in its own JVM while the server is up is the
+one way that is simply wrong. Nothing guards against it, deliberately: the answer
+is (2) or (3), not a coordination scheme.
+
 **What rollback costs, stated plainly.** The migration never modifies
 `data/substrate.edn`, and `loci.substrate/PersistentStore` is kept — it is the
 parity reference the test suite holds `DatalevinStore` to, and it is the

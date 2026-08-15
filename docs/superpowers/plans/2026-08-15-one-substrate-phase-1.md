@@ -564,64 +564,30 @@ git commit -m "fix: minting and appending a fact are one critical section"
 
 ---
 
-### Task 5: Two processes, not two threads
+### Task 5: WITHDRAWN — loci is single-writer
 
-The spec claims cross-process safety. Task 4 proved in-process only. This task establishes what is actually true and records it.
+This task built a two-JVM harness to measure whether two OS processes could mint the same
+fact id. It should never have existed.
 
-**Files:**
-- Create: `dev/two_writers.clj`
-- Modify: `docs/superpowers/specs/2026-08-15-one-substrate-design.md` (record the measured result)
+Nothing in loci wants two writers. `compose.yaml` runs one container, `:serve` runs one
+server, and no part of the codebase coordinates a second. Storage is reached three ways —
+the running app's HTTP API, a `loci.*` facade called in the server's own process, or
+directly with the app stopped — and a scratch script opening the store beside a live server
+is a mistake rather than a scenario to be made safe. See "Who may write" in the spec.
 
-- [ ] **Step 1: Write the harness**
+The task existed because the spec *I wrote* promised a cross-process guarantee, and the
+harness then tested my own invented requirement. That is a closed loop with no outside
+input in it. `dev/two_writers.clj` is deleted.
 
-```clojure
-;; dev/two_writers.clj — run as:
-;;   clojure -M -e "(load-file \"dev/two_writers.clj\")" <dir> <tag> <n>
-;; Two JVMs, same dir, different tags, n facts each. Then count.
-(require '[loci.dlv :as dlv] '[loci.memory :as mem] '[loci.mold :as mold])
-(let [[dir tag n] *command-line-args*
-      n (parse-long n)
-      m (mem/datalevin-memory (dlv/datalevin-store dir))]
-  (dotimes [i n]
-    (mold/remember m (str "Writer " tag " fact " i " on subject " tag i ".") {:entities [tag]}))
-  (println tag "wrote" n))
-(shutdown-agents)
-(System/exit 0)
-```
+What survives is unrelated to process count: `DbiLog` mints inside
+`datalevin.core/with-transaction-kv`, because a read followed by a dependent write is a
+transaction and the database performs transactions. The version it replaced hand-rolled one
+from a JVM monitor and two separate `transact-kv` calls. The native form is correct and
+smaller — it deleted a record field, a monitor, and a class of bug — and would be the right
+code with one thread and one process.
 
-> `*command-line-args*` is **not** populated by `clojure -M -e "…" args`. Pass the arguments via a JVM property (`-J-Dtwo-writers.tag=a`) and read them with `System/getProperty`, or use `clojure -X`. This exact mistake produced a silent live write on 2026-08-15 — verify the harness reads its arguments before trusting a run.
-
-- [ ] **Step 2: Run two writers against one directory**
-
-```bash
-D=$(mktemp -d)/substrate
-clojure -M -e "(load-file \"dev/two_writers.clj\")" "$D" a 100 &
-clojure -M -e "(load-file \"dev/two_writers.clj\")" "$D" b 100 &
-wait
-```
-
-- [ ] **Step 3: Count what survived**
-
-```bash
-clojure -M -e "(require '[loci.dlv :as dlv] '[loci.memory :as mem])
-               (println (count (mem/all-facts (mem/datalevin-memory (dlv/datalevin-store \"$D\")))))
-               (System/exit 0)"
-```
-
-- [ ] **Step 4: Record the number honestly**
-
-Expected 200. **If it is 200, say so and say how many runs you did.** If it is fewer, LMDB's writer mutex does not serialise the read-then-write in `mint-id!` across processes, and the spec's cross-process claim is wrong.
-
-In that case do NOT invent a fix in this task. Add a section to the spec titled "Cross-process: measured, not achieved" recording the number, and state the fallback: a second writer must fail loudly. That is still strictly better than today's silent last-wins, and it is the honest outcome.
-
-- [ ] **Step 5: Commit the harness and the finding**
-
-```bash
-git add dev/two_writers.clj docs/superpowers/specs/2026-08-15-one-substrate-design.md
-git commit -m "test: two writers, one environment — what actually holds"
-```
-
----
+The concurrency property still under test is Task 4's, and it is deliberately threads:
+concurrent `remember`s in ONE process must not lose a fact.
 
 ### Task 6: `undo!` and `as-of` never touch a fact
 
