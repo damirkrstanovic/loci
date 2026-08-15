@@ -390,25 +390,34 @@ Append to `src/loci/dlv.clj`:
   ;; `events`, so `undo!` cannot revoke a fact and `as-of` cannot time-travel
   ;; one. That is the whole record/recall separation, and after this change it
   ;; is enforced by which dbi a write names rather than by which file it opens.
+  ;;
+  ;; **The fact and the counter move in ONE transaction.** A bulk writer — the
+  ;; migration — appends records without minting, so if the counter did not
+  ;; advance here it would still read 0 after 248 facts landed, and the next
+  ;; mint would hand out mem-1 onto a live record. Splitting them into two
+  ;; transactions would let a crash land the fact and lose the bump, which is
+  ;; the same failure one restart later. `commit-tx` groups events, counts and
+  ;; touches for exactly this reason.
   (append! [_ rec]
-    (d/transact-kv kv [[:put "facts" (:id rec) rec :string]])
-    :ok)
+    (locking lock
+      (let [n (max (or (d/get-value kv "meta" next-id-key :keyword) 0)
+                   (or (fl/id-ordinal (:id rec)) 0))]
+        (d/transact-kv kv [[:put "facts" (:id rec) rec :string]
+                           [:put "meta" next-id-key n :keyword]]))
+      :ok))
   (load-all [_]
     (into {} (d/get-range kv "facts" [:all] :string)))
-  ;; Read-then-write under a lock, and the value read is the DURABLE counter,
-  ;; not a max over an in-RAM map. That is the difference the whole change is
-  ;; for: two threads cannot both see the same value, and a process that
-  ;; restarts does not reset it.
+  ;; O(1), and durable. Reading the counter is one key lookup, not a scan of
+  ;; every fact — `FileLog` was measured at 642 ms/call doing the scan version
+  ;; against an 8.5 MB log, and there is no reason to reintroduce it here where
+  ;; a counter is native. `append!` keeps the counter current, so this never
+  ;; needs to consult `facts` at all.
+  ;;
+  ;; Durable is the half `FileLog` cannot match: its high-water atom dies with
+  ;; the process, while this survives a restart.
   (mint-id! [_]
     (locking lock
-      (let [stored (or (d/get-value kv "meta" next-id-key :keyword) 0)
-            ;; A bulk write (the migration) puts records in without minting, so
-            ;; the counter can legitimately lag the highest id present. Take
-            ;; whichever is larger, or the first mint after a migration would
-            ;; reissue mem-1 onto a live fact.
-            highest (reduce (fn [hi id] (max hi (or (fl/id-ordinal id) 0)))
-                            0 (keys (into {} (d/get-range kv "facts" [:all] :string))))
-            n (inc (max stored highest))]
+      (let [n (inc (or (d/get-value kv "meta" next-id-key :keyword) 0))]
         (d/transact-kv kv [[:put "meta" next-id-key n :keyword]])
         (str "mem-" n)))))
 
@@ -417,9 +426,22 @@ Append to `src/loci/dlv.clj`:
 
    Takes the store rather than a directory so that facts land in the SAME
    environment as the events — which is the point of the change — and so that
-   nothing can open a second env against the same directory by accident."
+   nothing can open a second env against the same directory by accident.
+
+   **Seeds the counter if facts exist without one.** That state is reachable:
+   a store written by an older path, or one hand-loaded, holds `mem-1…mem-n`
+   and no `:facts/next-id`. Minting from a zero counter would then reissue
+   `mem-1` onto a live fact and last-wins would destroy it — the failure the
+   deleted `next-id` docstring called 'no longer hypothetical'. One scan, once,
+   only when the key is absent."
   [st]
-  (->DbiLog (:kv st) (Object.)))
+  (let [kv (:kv st)]
+    (when (nil? (d/get-value kv "meta" next-id-key :keyword))
+      (let [highest (reduce (fn [hi [id _]] (max hi (or (fl/id-ordinal id) 0)))
+                            0 (d/get-range kv "facts" [:all] :string))]
+        (when (pos? highest)
+          (d/transact-kv kv [[:put "meta" next-id-key highest :keyword]]))))
+    (->DbiLog kv (Object.))))
 ```
 
 Add `[loci.factlog :as fl]` to `dlv.clj`'s `:require`.
@@ -843,10 +865,12 @@ Expected: FAIL — `No such namespace: loci.factmigrate`
          (if dry-run?
            {:ok? true :dry-run? true :plan plan}
            (do
+             ;; No counter bump here. `DbiLog.append!` advances `:facts/next-id`
+             ;; in the same transaction as each record, so by the time this
+             ;; doseq ends the counter is already past everything migrated.
+             ;; Calling `mint-id!` to "make sure" would burn a live id and
+             ;; leave a hole for no reason.
              (doseq [[_ rec] todo] (fl/append! log rec))
-             ;; Bump the counter past everything migrated, or the next mint
-             ;; reissues mem-1 onto a record this migration just wrote.
-             (fl/mint-id! log)
              {:ok? true :dry-run? false :plan plan :migrated (count todo)})))))))
 ```
 
@@ -855,7 +879,7 @@ Expected: FAIL — `No such namespace: loci.factmigrate`
 Run: `clojure -M:test -n loci.factmigrate-test`
 Expected: PASS, 6 tests.
 
-> `counter-is-set-past-the-migrated-facts` expects `mem-6`, but Step 3 calls `mint-id!` during migration, which itself consumes a number. If the test reports `mem-7`, the extra mint is the cause — replace the `(fl/mint-id! log)` call with a direct counter write, or adjust the expectation and say which you chose and why. **Do not change the test to match the code without understanding which is right.**
+> `counter-is-set-past-the-migrated-facts` expects exactly `mem-6` after five facts migrate — no gap. If you see `mem-7`, something bumped the counter an extra time; find it rather than adjusting the expectation. **Do not change a test to match the code without establishing which one is right.** Task 2's review found a repaired test that had silently stopped detecting the bug it was named after; that is the failure mode to avoid here.
 
 - [ ] **Step 5: Commit**
 
