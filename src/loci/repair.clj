@@ -426,16 +426,16 @@
    One append per fact rather than one swap for all fifteen: the log is
    append-only and last-wins by `:id`, so a run interrupted halfway leaves a
    prefix of correct facts and the rest exactly as they were. Nothing is ever
-   rewritten in place — `loci.memory/next-id`'s tombstone reasoning depends on
+   rewritten in place — `loci.factlog/mint-id!`'s tombstone reasoning depends on
    that."
-  [!facts file {:keys [id from to]}]
+  [!facts log {:keys [id from to]}]
   (let [[before after] (swap-vals! !facts
                                    (fn [fs] (if (= from (:source (get fs id)))
                                               (assoc-in fs [id :source] to)
                                               fs)))]
     (if (identical? before after)
       :declined
-      (do (mem/append-line! file (get after id)) :applied))))
+      (do (mem/append-line! log (get after id)) :applied))))
 
 (defn refile-astronomy-facts!
   "Re-file the fifteen facts onto the notebooks `restore-astronomy-dives!` put
@@ -461,8 +461,8 @@
    neither this nor anything committed after it."
   ([st m] (refile-astronomy-facts! st m {}))
   ([st m {:keys [dry-run?] :or {dry-run? true}}]
-   (let [{:keys [!facts file]} m]
-     (if-not (and !facts file)
+   (let [{:keys [!facts log]} m]
+     (if-not (and !facts log)
        {:ok? false :dry-run? dry-run?
         :error (str "this needs a loci.memory/FileMemory — it appends to the fact log the way "
                     "store-vector! and unmerge! do, and " (.getName (class m)) " has no log")}
@@ -476,7 +476,7 @@
            {:ok? true :dry-run? true :plan plan}
 
            :else
-           (let [done (mapv (fn [e] [(:id e) (refile-one! !facts file e)]) refile)]
+           (let [done (mapv (fn [e] [(:id e) (refile-one! !facts log e)]) refile)]
              {:ok? true :dry-run? false :plan plan
               :appended (count (filter #(= :applied (second %)) done))
               :declined (mapv first (filter #(= :declined (second %)) done))})))))))

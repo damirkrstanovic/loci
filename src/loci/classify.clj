@@ -237,9 +237,9 @@
    One append per fact rather than one swap for all of them: the log is
    append-only and last-wins by `:id`, so a run interrupted halfway leaves a
    prefix of judged facts and the rest exactly as they were. Nothing is ever
-   rewritten in place — `loci.memory/next-id`'s tombstone reasoning depends on
+   rewritten in place — `loci.factlog/mint-id!`'s tombstone reasoning depends on
    that."
-  [!facts file {:keys [id fact durable?]}]
+  [!facts log {:keys [id fact durable?]}]
   (let [[before after]
         (swap-vals! !facts
                     (fn [fs]
@@ -252,7 +252,7 @@
                           fs))))]
     (if (identical? before after)
       :declined
-      (do (mem/append-line! file (get after id)) :applied))))
+      (do (mem/append-line! log (get after id)) :applied))))
 
 (defn classify!
   "Judge every unjudged fact in `m` and record the answers. **Dry run by
@@ -297,8 +297,8 @@
    half-judged one."
   ([m] (classify! m {}))
   ([m {:keys [dry-run? batch-size] :or {dry-run? true batch-size default-batch}}]
-   (let [{:keys [!facts file]} m]
-     (if-not (and !facts file)
+   (let [{:keys [!facts log]} m]
+     (if-not (and !facts log)
        {:ok? false :dry-run? dry-run?
         ;; `(pr-str (type m))` and not `(.getName (class m))`, which NPEs on a
         ;; nil memory — a refusal that throws is not a refusal
@@ -327,7 +327,7 @@
                            :durable  (count (filter :durable? classify))}]
              (if dry-run?
                {:ok? true :dry-run? true :plan plan}
-               (let [done (mapv (fn [e] [(:id e) (classify-one! !facts file e)]) classify)]
+               (let [done (mapv (fn [e] [(:id e) (classify-one! !facts log e)]) classify)]
                  {:ok? true :dry-run? false :plan plan
                   :appended (count (filter #(= :applied (second %)) done))
                   :declined (mapv first (filter #(= :declined (second %)) done))})))))))))

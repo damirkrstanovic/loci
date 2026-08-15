@@ -50,6 +50,14 @@
       (spit file (str (pr-str rec) "\n") :append true)
       :ok))
   (load-all [_] (read-file file))
+  ;; One past the largest id ever issued — not (inc (count …)). Counting is
+  ;; collision-free only while nothing is ever deleted: delete mem-2 of three
+  ;; facts and the count is 2, so the next mint hands out mem-3 and a caller
+  ;; appending it overwrites a *different, still-live* fact — same id, last
+  ;; line wins, the original text gone with no error anywhere. `read-file`
+  ;; returns the whole map, tombstones included, precisely so a tombstoned id
+  ;; still counts toward the maximum and is never reissued.
+  ;;
   ;; Scans the file on every call, which is what a flat file can do — but a
   ;; scan alone is not enough. Two calls to `mint-id!` with no `append!` in
   ;; between (the caller mints, then decides, then writes) must not hand out
