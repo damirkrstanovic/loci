@@ -97,6 +97,33 @@ than silently, which is still strictly better than today. **Either way, this mus
 demonstrated with two concurrent processes, not argued for** — per the working agreements,
 a reviewer runs it and reports numbers.
 
+## ⚠ RETRACTED: the 2026-08-15 cross-process measurement is contaminated
+
+**Do not cite the numbers in the section below.** They were produced by
+`dev/two_writers.clj` while a *concurrently running* review agent had sabotaged
+`DbiLog.append!` in the same working tree with `[:put "events" 999 rec :long]`,
+to prove an unrelated test could fail.
+
+That sabotage is the entire explanation for "failure mode 1". Nothing in
+`DbiLog` writes to `events`; the `999` in `expected 1, found 999` is the
+saboteur's constant, and the reviewer independently reported the twin error
+`expected 2, found 999` from the same edit. The store was corrupted by the
+sabotage, not by concurrent environment creation.
+
+"Failure mode 2" (181/200 facts surviving a two-writer run) ran inside the same
+window and is therefore also unverified. Its described mechanism — `mint-id!`
+doing `get-value` then `transact-kv` as two transactions, which is not atomic
+across processes — remains the predicted failure and is plausible. Plausible is
+not measured.
+
+**Cause:** the orchestrator dispatched an implementer and a review agent in
+parallel against one working tree, on the reasoning that a reviewer only reads.
+A reviewer that proves a test bites does not only read. Re-measurement must run
+in an isolated worktree with nothing else touching `src/`.
+
+**Status: the cross-process question is OPEN.** The section below is kept
+unedited as the record of a contaminated run, not as a finding.
+
 ## Cross-process: measured, not achieved
 
 Measured 2026-08-15 with `dev/two_writers.clj`, two real `clojure -M` OS processes against
