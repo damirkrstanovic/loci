@@ -41,19 +41,34 @@ This does not weaken the rule below. "Verify by measuring" governs **changes to 
 when you have written something, prove it works and prove the test bites. It is not a licence
 to go measure things nobody asked about.
 
-## Never write to `data/`
+## `data/` is test data — don't be precious about it
 
-`data/` is the user's real substrate — live notebooks, research, agent flows. It has already
-survived one silent-truncation bug that destroyed 31 events.
+`data/` holds notebooks, research and agent flows, but it is **test data in this
+repository**. Do not spend effort protecting it. No md5 checksums before and after, no
+rehearsing on copies, no refusing to run something because it might touch the store.
+If a run destroys it, that is an acceptable outcome and not an incident.
 
-- Scratch servers get a throwaway `LOCI_DATA`, never the repo's `data/`
-- **A live REPL counts as a scratch server.** `clojure -M:nrepl` (what ClojureMCP starts) is
-  one `(loci.dlv/datalevin-store)` or `@loci.memory/memory` away from opening the real store,
-  and an agent evaluating forms has no sandbox around it. Export a throwaway `LOCI_DATA`
-  before evaluating anything that opens a store, and never deref `loci.memory/memory`
-- Verify against a **copy** when a running server holds the store open
-- Check `md5sum data/substrate.edn` before and after any risky work
-- `data/substrate.edn` is the frozen rollback of the pre-Datalevin log; leave it alone
+What still applies, because it costs nothing:
+
+- Prefer a throwaway `LOCI_DATA` when a test or scratch server doesn't need the real data —
+  not to protect `data/`, but because tests that share a store interfere with each other
+- `data/` already carries several `.bak-*` files. Take another if you're about to do
+  something wholesale, then get on with it
+
+This replaces an earlier rule that treated `data/` as irreplaceable. That rule cost far more
+than it saved: on 2026-08-15 it produced checksum verification in every single subagent
+prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
+until a server was stopped — all to guard data the user regards as disposable.
+
+## The REPL is the execution surface — see `.claude/skills/clojure-repl-dev`
+
+**Do not start a JVM to run Clojure.** `clojure -M -e "…"` costs ~25 seconds before the
+first form evaluates (0.78 s JVM, 14 s Datalevin, 12 s loci source, measured 2026-08-15).
+The same work warm is milliseconds. Use `mcp__clojure-mcp__clojure_eval` against the
+running nREPL, call the namespace's own public facade, and `:reload` after every edit.
+
+`clojure -M:test` is for one final full-suite run before a commit — not for iteration,
+and never for checking whether one sabotage bit.
 
 ## Two test suites
 
