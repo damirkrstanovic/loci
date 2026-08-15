@@ -1193,8 +1193,11 @@
   (all-facts [_] (->> (vals @!facts) live (sort-by :ts >) vec)))
 
 (defn file-memory
-  "A memory backed by an EDN-lines file. Kept for tests and `loci.calibrate`,
-   which requires an explicit path and reads only."
+  "A memory backed by an EDN-lines file. Still the production memory — `mem/memory`
+   below is built from the no-arg form — until `DbiLog` lands in Task 3 and the
+   singleton moves onto it. Every test and `loci.calibrate` also call this
+   directly, with an explicit path, so neither reads or writes the real
+   `data/memory.edn`."
   ([] (file-memory (str (sub/data-dir) "/memory.edn")))
   ([path] (let [log (fl/file-log path)]
             (->FileMemory (atom (fl/load-all log)) log))))

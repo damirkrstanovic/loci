@@ -319,14 +319,11 @@
         recs (into {} [(f "mem-1" "TSMC concentrates advanced nodes in Taiwan")
                        (f "mem-2" "Neptune takes 165 years to orbit the Sun")
                        (f "mem-3" "Serbia's inflation spiked to about 12% in 2022")])]
-    ;; `mint-id!` is on the FactLog now and scans `log`, not `!facts` — so the
-    ;; fixture has to land in both. Writing to the atom alone (as this test did
-    ;; before Task 2) left the log empty and `mint-id!` handed out "mem-1"
-    ;; again, silently overwriting the fixture's own mem-1 in the atom.
-    (doseq [rec (vals recs)] (mem/append-line! (:log m) rec))
-    (reset! (:!facts m) recs)
-    ;; the semantic merge in the design's §4 deletes the absorbed fact
-    (swap! (:!facts m) dissoc "mem-2")
+    ;; mem-2 was issued and then absorbed, so the log carries mem-1 and mem-3
+    ;; with a GAP where mem-2 was — which is the whole scenario. Counting the
+    ;; log's records gives 2 and mints mem-3 onto a live fact.
+    (doseq [id ["mem-1" "mem-3"]] (mem/append-line! (:log m) (get recs id)))
+    (reset! (:!facts m) (dissoc recs "mem-2"))
     (mold/remember m "Directed self-assembly patterns wafers below the lithographic limit" {})
     (is (= #{"mem-1" "mem-3" "mem-4"} (set (map :id (mem/all-facts m))))
         "one past the highest id ever issued — counting would mint mem-3 here")
