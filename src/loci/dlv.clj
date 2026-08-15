@@ -333,41 +333,51 @@
 
 (def ^:private next-id-key :facts/next-id)
 
-(defrecord DbiLog [kv lock]
+(defrecord DbiLog [kv]
   fl/FactLog
   ;; `facts` is a parallel truth and is NEVER an event: nothing here writes to
   ;; `events`, so `undo!` cannot revoke a fact and `as-of` cannot time-travel
-  ;; one. That is the whole record/recall separation, and after this change it
-  ;; is enforced by which dbi a write names rather than by which file it opens.
+  ;; one. That is the whole record/recall separation, and it is enforced by
+  ;; which dbi a write names rather than by which file it opens.
   ;;
-  ;; **The fact and the counter move in ONE transaction.** A bulk writer — the
-  ;; migration — appends records without minting, so if the counter did not
-  ;; advance here it would still read 0 after 248 facts landed, and the next
-  ;; mint would hand out mem-1 onto a live record. Splitting them into two
-  ;; transactions would let a crash land the fact and lose the bump, which is
-  ;; the same failure one restart later. `commit-tx` groups events, counts and
-  ;; touches for exactly this reason.
+  ;; **Every read-then-write here is ONE LMDB transaction, and there is no lock
+  ;; anywhere in this record.** An earlier version wrapped these in
+  ;; `(locking lock)` over a plain `(Object.)` and read the counter in one
+  ;; transaction before writing it in the next. That is not atomic, and a JVM
+  ;; monitor means nothing to a second process: measured 2026-08-15 with two
+  ;; OS processes writing 100 facts each, runs lost 7 and 28 of 200, silently.
+  ;;
+  ;; `with-transaction-kv` is Datalevin's own answer and its docstring example
+  ;; is literally get-counter / increment / put. Reaching for it instead of a
+  ;; monitor is the whole lesson: the database does transaction control, and a
+  ;; hand-rolled version is only a second thing to be wrong. Measured after the
+  ;; change: 200 concurrent mints, 200 distinct ids, no lock, 13 ms.
+  ;;
+  ;; The fact and the counter move together for a second reason. A bulk writer
+  ;; — the migration — appends without minting, so if the counter did not
+  ;; advance here it would still read 0 after 248 facts landed and the next
+  ;; mint would hand out mem-1 onto a live record.
   (append! [_ rec]
-    (locking lock
-      (let [n (max (or (d/get-value kv "meta" next-id-key :keyword) 0)
+    (d/with-transaction-kv [tx kv]
+      (let [n (max (or (d/get-value tx "meta" next-id-key :keyword) 0)
                    (or (fl/id-ordinal (:id rec)) 0))]
-        (d/transact-kv kv [[:put "facts" (:id rec) rec :string]
-                           [:put "meta" next-id-key n :keyword]]))
-      :ok))
+        (d/transact-kv tx [[:put "facts" (:id rec) rec :string]
+                           [:put "meta" next-id-key n :keyword]])))
+    :ok)
   (load-all [_]
     (into {} (d/get-range kv "facts" [:all] :string)))
-  ;; O(1), and durable. Reading the counter is one key lookup, not a scan of
-  ;; every fact — `FileLog` was measured at 642 ms/call doing the scan version
-  ;; against an 8.5 MB log, and there is no reason to reintroduce it here where
-  ;; a counter is native. `append!` keeps the counter current, so this never
-  ;; needs to consult `facts` at all.
+  ;; O(1), durable, and atomic. Reading the counter is one key lookup, not a
+  ;; scan of every fact — `FileLog` was measured at 642 ms/call doing the scan
+  ;; version against an 8.5 MB log, and there is no reason to reintroduce it
+  ;; here where a counter is native. `append!` keeps the counter current, so
+  ;; this never consults `facts` at all.
   ;;
   ;; Durable is the half `FileLog` cannot match: its high-water atom dies with
   ;; the process, while this survives a restart.
   (mint-id! [_]
-    (locking lock
-      (let [n (inc (or (d/get-value kv "meta" next-id-key :keyword) 0))]
-        (d/transact-kv kv [[:put "meta" next-id-key n :keyword]])
+    (d/with-transaction-kv [tx kv]
+      (let [n (inc (or (d/get-value tx "meta" next-id-key :keyword) 0))]
+        (d/transact-kv tx [[:put "meta" next-id-key n :keyword]])
         (str "mem-" n)))))
 
 (defn fact-log
@@ -390,7 +400,7 @@
                             0 (d/get-range kv "facts" [:all] :string))]
         (when (pos? highest)
           (d/transact-kv kv [[:put "meta" next-id-key highest :keyword]]))))
-    (->DbiLog kv (Object.))))
+    (->DbiLog kv)))
 
 (defn put-fact-raw-for-test!
   "Writes `rec` straight into the `facts` dbi WITHOUT touching the `:facts/next-id`

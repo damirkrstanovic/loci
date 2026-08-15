@@ -60,6 +60,32 @@ than it saved: on 2026-08-15 it produced checksum verification in every single s
 prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
 until a server was stopped — all to guard data the user regards as disposable.
 
+## Use what the tool already provides, before inventing a mechanism
+
+Before writing coordination, locking, transactions, counters, retries or caching by hand,
+**look for the native facility first**. The dependency almost certainly has one, it is
+almost certainly correct, and a hand-rolled version is a second thing to be wrong.
+
+The 2026-08-15 case, kept because it is embarrassing and typical. Fact ids needed to be
+unique across writers. What got built:
+
+- a `(locking lock)` around a read-then-write, where `lock` is a plain `(Object.)`
+- a counter in the `meta` dbi, incremented by reading it and writing it back
+- a high-water-mark atom in `FileLog` to patch a gap the above left
+- a two-JVM harness to measure how often it lost data — it lost 7 of 200, then 28 of 200
+
+Datalevin ships `with-transaction-kv`: *"Evaluate body within the context of a single new
+read/write transaction, ensuring atomicity of key-value operations."* One transaction,
+correct by construction. The whole apparatus above was an unreliable reimplementation of a
+feature already on the classpath.
+
+The tell is when you find yourself **measuring how often your mechanism corrupts data**.
+That is not a research finding; it is a signal that the mechanism should not exist.
+
+So: grep the dependency, read its API, ask the REPL (`(clojure.repl/doc …)`,
+`(clojure.repl/apropos "transaction")`). loci is small, single-server software — it is not
+a place to invent concurrency primitives.
+
 ## The REPL is the execution surface — see `.claude/skills/clojure-repl-dev`
 
 **Do not start a JVM to run Clojure.** `clojure -M -e "…"` costs ~25 seconds before the

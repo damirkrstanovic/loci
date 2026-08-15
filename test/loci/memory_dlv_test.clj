@@ -156,8 +156,28 @@
                "chips inflation cobalt petrol vacuum"]]
       (let [rfm (mold/recall fm q {:k 5})
             rdm (mold/recall dm q {:k 5})]
-        (is (= (mapv :fact rfm) (mapv :fact rdm))
-            (str "ranking differs for query: " q))
+        ;; Compared only where the scores actually DIFFER. `(= (mapv :fact rfm)
+        ;; (mapv :fact rdm))` looks like the obvious assertion and is a coin
+        ;; flip: on the multi-hit query two of these facts score within 2e-11
+        ;; of each other, so which one sorts first is decided by the decay
+        ;; clock ticking between `fm`'s remember and `dm`'s, not by anything
+        ;; either backend did. Measured 2026-08-15: the naive comparison failed
+        ;; 3 runs in 12, the version below 0 in 12, and both catch a wholesale
+        ;; reversal of one backend's ranking.
+        ;;
+        ;; Dropping the tied facts rather than sorting them by some tiebreak is
+        ;; deliberate: re-sorting the results here would also undo a reversed
+        ;; ranking, which is the one regression this assertion exists to find.
+        (let [tied (fn [rs] (set (for [a rs b rs
+                                       :when (and (not= (:fact a) (:fact b))
+                                                  (< (Math/abs (- (double (:score a))
+                                                                  (double (:score b))))
+                                                     1e-6))]
+                                   (:fact a))))
+              amb  (into (tied rfm) (tied rdm))
+              rank (fn [rs] (mapv :fact (remove #(amb (:fact %)) rs)))]
+          (is (= (rank rfm) (rank rdm))
+              (str "ranking differs for query: " q)))
         ;; :fact order alone lets a backend-dependent SCORE divergence that
         ;; happens to preserve order stay invisible. 1e-6 rather than exact
         ;; `=`: fm and dm are remembered a few instructions apart and
