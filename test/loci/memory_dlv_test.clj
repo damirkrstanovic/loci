@@ -86,3 +86,22 @@
       (sub/as-of st 0)
       (is (= (mapv :id before) (mapv :id (mold/recall m "cobalt" {:k 5})))
           "recall answers the same regardless of where the substrate is scrubbed to"))))
+
+(def ^:private corpus
+  [["TSMC produces most leading-edge logic chips."        ["tsmc" "taiwan"]]
+   ["Serbia's inflation spiked to about 12% in 2022."     ["serbia"]]
+   ["Cobalt blue reached Delft through the Dutch trade."  ["cobalt" "delft"]]
+   ["Japan banned leaded petrol in road vehicles in 1986." ["japan" "leaded petrol"]]
+   ["The Casimir effect demonstrates vacuum energy."      ["casimir effect"]]])
+
+(deftest recall-is-identical-across-both-backends
+  (let [fm (mem/file-memory (str (System/getProperty "java.io.tmpdir")
+                                 "/loci-par-" (System/nanoTime) "/memory.edn"))
+        dm (mem/datalevin-memory (dlv/datalevin-store (tmpdir)))]
+    (doseq [[f es] corpus]
+      (mold/remember fm f {:entities es})
+      (mold/remember dm f {:entities es}))
+    (doseq [q ["taiwan chips" "cobalt" "petrol ban" "vacuum" "inflation"]]
+      (is (= (mapv :fact (mold/recall fm q {:k 5}))
+             (mapv :fact (mold/recall dm q {:k 5})))
+          (str "ranking differs for query: " q)))))
