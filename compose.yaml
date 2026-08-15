@@ -4,6 +4,13 @@
 # Copy `loci.env.example` to `loci.env` and fill it in. Keeping it out of this
 # file means a key never lands in a committed file, in shell history, or in
 # `docker inspect` output shared with someone else.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE WRITER. The substrate below is the repo's own ./data, which is also what
+# `clojure -M:serve` opens. **Do not run both.** loci is single-writer by
+# design: one process owns the store, and two holding it open is not a
+# configuration this codebase makes safe. Stop one before starting the other.
+# ─────────────────────────────────────────────────────────────────────────────
 services:
   loci:
     build: .
@@ -18,11 +25,32 @@ services:
       # would move the listener without moving this mapping, and the result is a
       # container that looks healthy and answers nothing.
       - "7777:7777"
+    # The image pins its own unprivileged uid 10001, which is right for a named
+    # volume: Docker seeds a fresh volume's ownership from the image, so the
+    # files come out owned by the user that will write them.
+    #
+    # A BIND MOUNT gets no such favour — ./data already exists and belongs to
+    # you, and uid 10001 simply cannot write it. loci checks before it opens
+    # anything and refuses with a message naming the path and the uid, rather
+    # than handing you an LMDB permission error. So run as yourself instead:
+    #
+    #   printf 'LOCI_UID=%s\nLOCI_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+    #
+    # Compose reads `.env` automatically and it is gitignored, so the value
+    # stays yours and this file stays portable. The 10001 default preserves the
+    # old behaviour for anyone who switches back to a named volume.
+    user: "${LOCI_UID:-10001}:${LOCI_GID:-10001}"
     volumes:
-      # named, so the substrate outlives the container — an anonymous volume
-      # survives `docker restart` but dies with the container it belongs to
-      - loci-data:/data
+      # The repo's own data directory, so a container and a `clojure -M:serve`
+      # look at the same substrate and there is no second thing to manage. It is
+      # gitignored, so nothing here is committed.
+      #
+      # The trade against the named volume this replaced: a named volume
+      # outlives `docker compose down -v`-less teardowns and is awkward to
+      # inspect; a bind mount is a directory you can read, back up, copy and
+      # delete with ordinary tools. For a substrate you are actively developing
+      # against, that is the better default. Switch back with `loci-data:/data`
+      # and the `volumes:` block below if you ever want the container to own
+      # storage the host cannot casually touch.
+      - ./data:/data
     restart: unless-stopped
-
-volumes:
-  loci-data:

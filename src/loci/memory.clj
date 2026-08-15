@@ -796,13 +796,32 @@
    The thread is a daemon: a worker parked in a 30-second request must not be
    what keeps the JVM alive."
   ([m] (start-embed-worker! m {}))
-  ([m {:keys [interval-ms] :or {interval-ms 15000}}]
+  ([m {:keys [interval-ms report] :or {interval-ms 15000}}]
    (let [wake (ArrayBlockingQueue. 1)
          run? (atom true)
+         ;; `report` is called only when a pass CHANGED something, or when the
+         ;; backlog reaches zero for the first time. Without that guard a quiet
+         ;; server prints a line every 15 seconds forever; with it, the console
+         ;; says something exactly when there is something to say.
+         ;;
+         ;; The wording lives in the caller. This namespace already prints
+         ;; through `warn-once!`, but a count of embedded facts is progress
+         ;; rather than a warning, and the server is what knows how its startup
+         ;; lines read.
+         last-pending (atom nil)
+         announce (fn [r]
+                    (when report
+                      (let [p (:pending r)]
+                        (when (and (not (:off r))
+                                   (or (pos? (long (or (:embedded r) 0)))
+                                       (and (= 0 p) (pos? (long (or @last-pending 0))))))
+                          (report r))
+                        (reset! last-pending p))))
          t    (Thread. ^Runnable
                        (fn []
                          (while @run?
                            (try (let [r (embed-pending! m)]
+                                  (announce r)
                                   (when-not (or (:off r) (:error r))
                                     (merge-similar! m)))
                                 (catch Throwable e

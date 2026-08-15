@@ -2756,7 +2756,18 @@
     ;; fifteen seconds to discover it has no endpoint. The endpoint itself is not
     ;; printed: it is a URL a user set, and a URL can carry credentials.
     (if (embed/embedding-configured?)
-      (do (mem/start-embed-worker! @mem/memory)
+      (do (mem/start-embed-worker!
+           @mem/memory
+           ;; So the startup line's "N fact(s) awaiting embedding" is a
+           ;; beginning rather than the last thing you ever hear about it.
+           ;; Prints only when a pass embedded something, and once when the
+           ;; backlog drains — a quiet server stays quiet.
+           {:report (fn [{:keys [embedded pending error]}]
+                      (println (str "  embedded " embedded " fact(s), "
+                                    (if (zero? (long (or pending 0)))
+                                      "all facts now have vectors"
+                                      (str pending " still awaiting"))
+                                    (when error (str " — " error)))))})
           (start-chunk-sweep! (store) @ch/chunks)
           (println (str "  semantic recall: " (embed/embed-model) ", "
                         (count (mem/pending-facts @mem/memory)) " fact(s) awaiting embedding"))
