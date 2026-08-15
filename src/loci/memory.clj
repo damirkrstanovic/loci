@@ -34,6 +34,7 @@
    them straight back."
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [loci.dlv :as dlv]
             [loci.embed :as embed]
             [loci.entities :as ent]
             [loci.factlog :as fl]
@@ -1039,57 +1040,66 @@
 
 ;; ----------------------------------------------------------------------------
 
-(defrecord FileMemory [!facts log]
+(defrecord FileMemory [!facts log lock]
   mold/Recall
   ;; NOTHING in here touches the embedder. That is the design, not an omission:
   ;; a fact is recorded whether or not an embedder exists, at the speed of one
   ;; file append, and `embed-pending!` catches up afterwards.
+  ;;
+  ;; The WHOLE body runs under `lock`, not just the mint. `mint-id!` alone
+  ;; being atomic still leaves the duplicate scan racing the write: two
+  ;; threads can each see "no duplicate yet" for the same near-identical
+  ;; sentence and both insert, producing two facts where reinforcement was
+  ;; correct — a lost write with the same cause as an id collision, just a
+  ;; different symptom. Measured without this lock: 200 concurrent
+  ;; `remember`s of unrelated facts left 12 of 200 — see memory-dlv-test.
   (remember [_ fact opts]
-    (let [ft  (tokens fact)
-          ;; `live`, not every record: a tombstone still carries the absorbed
-          ;; text, and reinforcing one would put a merged-away fact back into
-          ;; circulation under an id the merge already accounted for.
-          dup (some (fn [f] (when (>= (jaccard ft (tokens (:fact f))) 0.6) f))
-                    (live (vals @!facts)))
-          rec (if dup
-                (cond-> (-> dup
-                            (assoc :fact fact :ts (System/currentTimeMillis))
-                            (assoc :source (or (:source opts) (:source dup)))
-                            (update :strength (fnil inc 1))
-                            (update :entities #(vec (distinct (concat % (:entities opts))))))
-                  ;; Reinforcement rewrites :fact, and a vector describes the
-                  ;; exact text it was made from. Identical wording (the common
-                  ;; case — auto-distill re-derives the same sentence) keeps its
-                  ;; vector; different wording drops it, so the next pass
-                  ;; re-embeds rather than leaving a vector pointing at a
-                  ;; sentence that is no longer stored.
-                  (not= fact (:fact dup)) (dissoc :vec :model :dim)
-                  ;; A judgement about whether the claim ages, and WHOSE it was.
-                  ;; Reinforcement may overwrite the agent's own earlier answer —
-                  ;; same author, later context — and may never overwrite yours:
-                  ;; without that, the agent re-deriving this sentence next week
-                  ;; silently reverts a call you made by hand, which is exactly
-                  ;; the failure `:no-merge` exists to prevent on the merge path.
-                  ;;
-                  ;; `contains?` and not `(:durable? opts)`, so silence stays
-                  ;; silence. A distiller that answered nothing — an older model,
-                  ;; a refusal — must not be read as having answered `false`.
-                  (and (contains? opts :durable?)
-                       (not= "you" (:durable-by dup)))
-                  (assoc :durable? (:durable? opts) :durable-by "agent"))
-                (cond-> {:id (fl/mint-id! log)
-                         :fact fact :entities (vec (:entities opts))
-                         :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
-                  ;; Absent, not nil. A key that is always present and usually
-                  ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
-                  ;; disagree — the shape `memory-payload`'s `:degraded` is
-                  ;; absent-when-healthy to avoid — and `weight` reads the value,
-                  ;; so absent has to keep meaning "nothing has judged this yet".
-                  (contains? opts :durable?)
-                  (assoc :durable? (:durable? opts) :durable-by "agent")))]
-      (append-line! log rec)
-      (swap! !facts assoc (:id rec) rec)
-      :ok))
+    (locking lock
+      (let [ft  (tokens fact)
+            ;; `live`, not every record: a tombstone still carries the absorbed
+            ;; text, and reinforcing one would put a merged-away fact back into
+            ;; circulation under an id the merge already accounted for.
+            dup (some (fn [f] (when (>= (jaccard ft (tokens (:fact f))) 0.6) f))
+                      (live (vals @!facts)))
+            rec (if dup
+                  (cond-> (-> dup
+                              (assoc :fact fact :ts (System/currentTimeMillis))
+                              (assoc :source (or (:source opts) (:source dup)))
+                              (update :strength (fnil inc 1))
+                              (update :entities #(vec (distinct (concat % (:entities opts))))))
+                    ;; Reinforcement rewrites :fact, and a vector describes the
+                    ;; exact text it was made from. Identical wording (the common
+                    ;; case — auto-distill re-derives the same sentence) keeps its
+                    ;; vector; different wording drops it, so the next pass
+                    ;; re-embeds rather than leaving a vector pointing at a
+                    ;; sentence that is no longer stored.
+                    (not= fact (:fact dup)) (dissoc :vec :model :dim)
+                    ;; A judgement about whether the claim ages, and WHOSE it was.
+                    ;; Reinforcement may overwrite the agent's own earlier answer —
+                    ;; same author, later context — and may never overwrite yours:
+                    ;; without that, the agent re-deriving this sentence next week
+                    ;; silently reverts a call you made by hand, which is exactly
+                    ;; the failure `:no-merge` exists to prevent on the merge path.
+                    ;;
+                    ;; `contains?` and not `(:durable? opts)`, so silence stays
+                    ;; silence. A distiller that answered nothing — an older model,
+                    ;; a refusal — must not be read as having answered `false`.
+                    (and (contains? opts :durable?)
+                         (not= "you" (:durable-by dup)))
+                    (assoc :durable? (:durable? opts) :durable-by "agent"))
+                  (cond-> {:id (fl/mint-id! log)
+                           :fact fact :entities (vec (:entities opts))
+                           :source (:source opts) :ts (System/currentTimeMillis) :strength 1}
+                    ;; Absent, not nil. A key that is always present and usually
+                    ;; nil makes `(:durable? f)` and `(contains? f :durable?)`
+                    ;; disagree — the shape `memory-payload`'s `:degraded` is
+                    ;; absent-when-healthy to avoid — and `weight` reads the value,
+                    ;; so absent has to keep meaning "nothing has judged this yet".
+                    (contains? opts :durable?)
+                    (assoc :durable? (:durable? opts) :durable-by "agent")))]
+        (append-line! log rec)
+        (swap! !facts assoc (:id rec) rec)
+        :ok)))
   ;; opts: {:k 6 :semantic? false :rerank? false :subjects #{name …}
   ;;        :filter {:sources #{id …} :entities #{name …}}}
   ;;
@@ -1200,7 +1210,17 @@
    `data/memory.edn`."
   ([] (file-memory (str (sub/data-dir) "/memory.edn")))
   ([path] (let [log (fl/file-log path)]
-            (->FileMemory (atom (fl/load-all log)) log))))
+            (->FileMemory (atom (fl/load-all log)) log (Object.)))))
+
+(defn datalevin-memory
+  "A memory whose facts live in the substrate's own environment.
+
+   Takes the store, so that `undo!`, `as-of` and `recall` are all reading one
+   LMDB environment and a backup of `data/substrate/` is a backup of the facts
+   too — which it was not while they lived in `data/memory.edn`."
+  [st]
+  (let [log (dlv/fact-log st)]
+    (->FileMemory (atom (fl/load-all log)) log (Object.))))
 
 (defonce ^{:doc "the server's memory singleton (data-dir resolved at first use)"}
   memory (delay (file-memory)))
