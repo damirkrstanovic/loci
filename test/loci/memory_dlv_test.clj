@@ -47,6 +47,12 @@
     (doall (pmap #(mold/remember m % {:entities ["x"]}) fs))
     (is (= (count topics) (count (mem/all-facts m)))
         "10 concurrent remembers of the same text must reinforce one fact each, not insert extras")
+    ;; Does not carry independent signal today: `mint-id!` is already atomic,
+    ;; so distinct-count == fact-count in every unlocked run too — this
+    ;; assertion has never once caught anything the one above didn't. Kept
+    ;; as a tripwire against id-level regressions (a future change that
+    ;; makes minting collision-prone again), not because it is doing work
+    ;; here.
     (is (= (count topics) (count (set (map :id (mem/all-facts m)))))
         "every surviving fact still has its own id")))
 
@@ -67,9 +73,16 @@
     ;; matter what `undo-tx` does to the `facts` dbi, so a regression that
     ;; makes undo delete from `facts` would sail past `(count (all-facts m))`
     ;; on the SAME `m`. Confirmed by sabotaging `DbiLog.append!` to also
-    ;; write `[[:put "events" 999 rec :long]]` per the original recipe: 0
-    ;; failures — an orphan, non-contiguous "events" key is never read back
-    ;; by anything either, so it is doubly inert.
+    ;; write `[[:put "events" 999 rec :long]]` per the plan's original
+    ;; recipe: 0 failures — but NOT because the write is inert. It IS read
+    ;; back — by `read-log`, on the next boot, which throws:
+    ;;   "substrate event keys are not contiguous — expected 2, found 999"
+    ;; It is invisible to a LIVE process only: `undo!`/`history` read the
+    ;; in-RAM `!db`, never a live rescan of `events`, so nothing here notices
+    ;; until the store is reopened — at which point it bricks the store
+    ;; rather than merely failing a test. See `undo-does-not-revoke-a-fact-
+    ;; via-a-contiguous-phantom-event` below for the sabotage that DOES land
+    ;; a durable event a reload will actually accept.
     ;;
     ;; A fresh memory over the SAME store, built after the undo, reads
     ;; `facts` back off disk and is what would actually notice a fact `undo!`
@@ -77,7 +90,38 @@
     (is (= 1 (count (mem/all-facts (mem/datalevin-memory st))))
         "a fact reloaded from durable storage after undo must still be there")))
 
+(deftest undo-does-not-revoke-a-fact-via-a-contiguous-phantom-event
+  ;; The orphan-key sabotage above bricks the store (a contiguity error on
+  ;; reload) rather than corrupting undo — it's not what "somebody routed
+  ;; remember through commit!" would actually produce. A real routing bug
+  ;; lands the fact at the NEXT CONTIGUOUS durable event key, which `read-log`
+  ;; accepts as a real event. That is durable-events-side corruption, and the
+  ;; live `st`'s `sub/history` cannot see it either — for the same reason
+  ;; `!facts` above could not see a durable `facts` deletion: `history` reads
+  ;; the in-RAM `!db`, not a rescan of `events`. `dlv/reload!` (standing in
+  ;; for the next server restart, or a background reindex) is what actually
+  ;; re-derives RAM from what's on disk.
+  (let [st (dlv/datalevin-store (tmpdir))
+        m  (mem/datalevin-memory st)]
+    (sub/commit! st {:op :put :id "doc:1" :value {:id "doc:1" :kind :doc :title "T" :value "x"}})
+    (mold/remember m "The document says something worth keeping."
+                   {:entities ["t"] :source {:obj "doc:1"}})
+    (dlv/reload! st)
+    (sub/undo! st)
+    (is (nil? (sub/object st "doc:1"))
+        "one undo, after a reload, must revert the user's edit — not a fact
+         that had no business being an event in the first place")))
+
 (deftest as-of-does-not-time-travel-the-memory
+  ;; This is a tripwire, not a live guard, and cannot be made into one: `sub/
+  ;; as-of` is a pure read (`(sub/materialize (take n (:log @!db)))`) that
+  ;; mutates nothing, in `st` or anywhere else, so nothing here — reusing the
+  ;; same live `m` and comparing `mold/recall` before and after — could fail
+  ;; today no matter what `n` is passed. Its job is to catch the day `as-of`
+  ;; stops being pure — a future version that resets `!db` to the scrubbed
+  ;; state, say, rather than just returning it — which is exactly the kind
+  ;; of change this test would need mutation-based sabotage to prove it
+  ;; bites, and there is no such mutation to make in `as-of` today.
   (let [st (dlv/datalevin-store (tmpdir))
         m  (mem/datalevin-memory st)]
     (sub/commit! st {:op :put :id "doc:1" :value {:id "doc:1" :kind :doc :title "T" :value "x"}})
@@ -101,7 +145,26 @@
     (doseq [[f es] corpus]
       (mold/remember fm f {:entities es})
       (mold/remember dm f {:entities es}))
-    (doseq [q ["taiwan chips" "cobalt" "petrol ban" "vacuum" "inflation"]]
-      (is (= (mapv :fact (mold/recall fm q {:k 5}))
-             (mapv :fact (mold/recall dm q {:k 5})))
-          (str "ranking differs for query: " q)))))
+    (doseq [q ["taiwan chips" "cobalt" "petrol ban" "vacuum" "inflation"
+               ;; the five single-keyword queries above each return exactly
+               ;; ONE hit — comparing two singleton lists cannot detect a
+               ;; reversed or otherwise reordered ranking. Reviewer proved
+               ;; this: reversing the DbiLog backend's ranking outright still
+               ;; passed 0 failures against the query list above. This query
+               ;; matches all five facts (one keyword per fact) so there is
+               ;; an actual order to compare.
+               "chips inflation cobalt petrol vacuum"]]
+      (let [rfm (mold/recall fm q {:k 5})
+            rdm (mold/recall dm q {:k 5})]
+        (is (= (mapv :fact rfm) (mapv :fact rdm))
+            (str "ranking differs for query: " q))
+        ;; :fact order alone lets a backend-dependent SCORE divergence that
+        ;; happens to preserve order stay invisible. 1e-6 rather than exact
+        ;; `=`: fm and dm are remembered a few instructions apart and
+        ;; recalled by two separate calls, so `now` (decay's clock) differs
+        ;; by a few milliseconds between them — measured diffs ~1e-10, so
+        ;; 1e-6 has six orders of magnitude of margin against timing noise
+        ;; while still catching a real scoring divergence, which would not
+        ;; plausibly be this small.
+        (is (every? #(< (Math/abs (double %)) 1e-6) (map - (mapv :score rfm) (mapv :score rdm)))
+            (str "scores differ beyond floating-point/timing noise for query: " q))))))

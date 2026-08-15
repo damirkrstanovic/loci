@@ -1051,8 +1051,14 @@
   ;; threads can each see "no duplicate yet" for the same near-identical
   ;; sentence and both insert, producing two facts where reinforcement was
   ;; correct — a lost write with the same cause as an id collision, just a
-  ;; different symptom. Measured without this lock: 200 concurrent
-  ;; `remember`s of unrelated facts left 12 of 200 — see memory-dlv-test.
+  ;; different symptom. 200 concurrent `remember`s of genuinely UNRELATED
+  ;; facts cannot lose a write on either backend, locked or not — mint-id!
+  ;; and append! are already atomic per call, so a corpus with no possible
+  ;; duplicate never reaches the race this lock exists for. What does: 20
+  ;; topics, each remembered 10 times concurrently with IDENTICAL text
+  ;; (correct answer: 20 facts). Measured unlocked, three runs: 98, 90, 99
+  ;; survived (independently reproduced: 122, 106, 103). Locked, three runs:
+  ;; 20, 20, 20. See memory-dlv-test.
   (remember [_ fact opts]
     (locking lock
       (let [ft  (tokens fact)
