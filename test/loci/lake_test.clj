@@ -301,3 +301,10 @@
         (when-let [h (:handle r)]
           (is (string? (json/write-str (tbl/rows lk h {})))
               "stored, the rows would be unserializable"))))))
+
+(deftest table-gc-is-off-and-says-so
+  (with-lake [lk]
+    (let [r (lake/sweep! lk #{})]
+      (is (= :disabled (:mode r)))
+      (is (string? (:why r)))
+      (is (re-find #"261|527|529" (:why r)) "the reason names the upstream issues"))))

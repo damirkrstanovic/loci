@@ -110,10 +110,18 @@ made while loci still ran as root keeps its root-owned files forever, and uid
 docker run --rm -v loci-data:/data alpine chown -R 10001:10001 /data
 ```
 
-Use `-R`: chowning `/data` alone leaves `/data/substrate` root-owned, which
-fails in the same place. loci checks both before it opens anything and refuses
+Use `-R`, and note that since 2026-08-16 there are **two** stores under `/data`:
+chowning `/data` alone leaves `/data/substrate` root-owned, and chowning
+`/data/substrate` by hand leaves `/data/lake` root-owned. A reader who fixes
+only the substrate gets a working log and broken tables — the server boots and
+the shell draws, and the first write to a table fails when DuckDB cannot write
+its catalog. `-R` covers both.
+
+loci checks `/data` and `/data/substrate` before it opens anything and refuses
 to start with a message naming the path, the uid and that command, rather than
-handing you an LMDB permission error. It will not chown for you — the same path
+handing you an LMDB permission error. **It does not yet probe `/data/lake`** —
+that one still surfaces as a DuckDB error on the first table write, which is
+why the `-R` matters. It will not chown for you either — the same path
 may be a bind-mounted host directory, and quietly taking ownership of your own
 files is the worse surprise.
 
@@ -340,11 +348,33 @@ that looks healthy and answers nothing, and `LOCI_DATA=/data` is the container's
 the image already sets and which a `clojure -M:serve` on your own machine would take
 literally and refuse to start over.
 
-`clojure -M:serve` persists its state under `data/` — everything lives in one
-Datalevin (LMDB) environment at `data/substrate`, in six dbis: `events` (the
+`clojure -M:serve` persists its state under `data/`, in **two stores**:
+
+```
+data/
+  substrate/   LMDB — the log. Truth: metadata, structure, and handles.
+  lake/        DuckLake catalog + Parquet — every table's rows.
+```
+
+`data/substrate` is one Datalevin (LMDB) environment in six dbis: `events` (the
 truth), `counts` and `touched` (derived indices), `meta`, `facts` (the agent's
-memory) and `chunks` (embedding vectors). Delete that directory to reset to a
-clean slate; one directory is the whole backup.
+memory) and `chunks` (embedding vectors). Since 2026-08-16 a `:kind :table`
+object's `:value` in that log is a **handle** — `{:store :lake :table … :snapshot
+… :rows … :cols …}` — and the rows themselves are Parquet under `data/lake`.
+Delete `data/` to reset to a clean slate.
+
+**Backing up means copying `data/`, with the app stopped.** It used to be one
+directory you could copy at any time; it is now two stores that are not written
+in one transaction — a `:put` lands in LMDB and the Parquet lands in the lake —
+so a copy taken between the two holds a handle pointing at a table the copy does
+not contain. Stopping the app first costs nothing and is route (3) below.
+
+**Table GC is off.** `data/lake` only grows: every write creates a new table and
+nothing is ever expired, because a handle reads `AT (VERSION => n)` and expiring
+a snapshot would invalidate every handle in the log that names it. See
+`loci.lake/sweep!`, which reports `:mode :disabled` and the reason rather than a
+zero that reads like a completed sweep. A growing `lake/` is the design, not a
+leak.
 
 Until 2026-08-15 the memory and the vectors were flat files beside it —
 `data/memory.edn` and `data/chunks.edn`, together twenty-five times the size of

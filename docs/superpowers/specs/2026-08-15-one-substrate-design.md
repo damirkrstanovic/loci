@@ -18,6 +18,61 @@ data/chunks.edn             16M   ditto
 The two files are twenty-five times the size of the database they sit next to, and they
 are the ones that are not in it. "Substrate" is supposed to mean one substrate.
 
+### Note, 2026-08-16: tables moved out again — to `data/lake`
+
+This spec's layout is no longer the whole of `data/`. Table **rows** left the log for a
+DuckLake catalog beside it (`2026-08-16-big-content-design.md`), and the layout is now:
+
+```
+data/
+  substrate/   LMDB — the log. Truth: metadata, structure, and handles.
+  lake/        DuckLake catalog + Parquet — every table's rows.
+```
+
+**This is not a reversal of what this spec bought.** The property was never "one
+database", it was **one directory** — and `lake/` sits inside `data/`, so `data/` is still
+the whole backup and deleting it is still the whole reset. What DuckLake is, and what
+`memory.edn` and `chunks.edn` were not, is a real store: indexed, transactional,
+versioned, and able to answer `count(*)` over 10M rows without loading them. Rows in the
+log were the same complaint this spec opened with — bulk sitting where only metadata
+belongs — one layer up.
+
+**One thing did get harder, and it is worth stating plainly.** `data/` is no longer a
+directory you can *copy while the server runs*. The two stores are not written in one
+transaction: a `:put` lands in LMDB and the Parquet lands in the lake, and a copy taken
+between them holds a handle pointing at a table the copy does not contain. The fix for a
+user is to stop the app first — route (3) in "Who may write" below, and it costs nothing.
+
+**Table GC is off**, deliberately, and `loci.lake/sweep!` says so rather than returning a
+zero. DuckLake cannot expire the latest snapshot (duckdb/ducklake#261) and snapshot expiry
+has open data-loss bugs (#527, #529) — but the load-bearing reason survives those being
+fixed: every handle reads `AT (VERSION => n)`, so expiring a snapshot invalidates every
+handle in the log that names it. Measured: after
+`ducklake_expire_snapshots(older_than => now())` and `ducklake_cleanup_old_files`, an
+existing handle's read throws *Invalid Input Error: No snapshot found at version 1*.
+Enabling GC to free space would be the day every historical object stopped rendering.
+Retention is: keep everything, and `lake/` grows.
+
+**Measured over the real store, 2026-08-16/17.** The migration
+(`loci.tablemigrate/migrate-tables!`) converted all 31 row-bearing objects to handles:
+
+| | |
+|---|---|
+| materialized state, 31 row-bearing objects | 544,287 → 7,645 chars (−98.6%) |
+| log event for `tbl:corpus-1` (352 rows) | 66,959 → 302 chars (222×) |
+| `content/seed!`'s 12 objects | 232,144 → 3,032 chars |
+| `data/lake` on disk after migration | 6,683,166 bytes — of which 117,278 is Parquet across 31 tables, the rest DuckDB's block-preallocated `catalog.duckdb` |
+| lake open at boot (10M rows in catalog) | 75 ms |
+| versioned read, 10M rows | 34 ms |
+| chunk sweep, warm | 14 ms |
+
+The cost the move introduced, and what it took back: DuckDB's JDBC driver is slow row-wise
+(42 ms to walk 1,000×8 cells and build nothing), so every metadata reader that hydrated a
+table to count it got expensive at once — `list_tables` 271 ms, `agent-ctx` 282 ms on
+every chat turn. `tbl/table-shape` reads `:cols`/`:rows` off the handle instead: 0.05 ms
+and 10 ms. `mold-payload` stays at 52 ms, because opening a table genuinely needs its
+rows.
+
 **Resolved 2026-08-15.** Both phases shipped: `data/substrate` now holds `events`,
 `counts`, `touched`, `meta`, `facts` and `chunks` in one environment. `memory.edn` and
 `chunks.edn` are left on disk untouched as rollbacks and are no longer read at runtime.

@@ -346,3 +346,43 @@
 
   (column-samples [lk h per-col max-cols]
     (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
+
+(defn sweep!
+  "Table GC. Disabled, deliberately, and it reports that rather than returning
+   a zero that reads like a completed sweep.
+
+   Two reasons, and the second is the load-bearing one.
+
+   **Today: DuckLake's expiry is not safe to run.** It cannot expire the latest
+   snapshot (duckdb/ducklake#261) — which is exactly the state an undo leaves —
+   and snapshot expiry has open data-loss bugs (#527, #529).
+
+   **After those are fixed: expiry is still incompatible with how loci reads a
+   table.** Every handle reads `AT (VERSION => n)`, so a handle is a *reference
+   to a snapshot*, and the log keeps handles forever — an undone `:put` still
+   names the table it wrote. Measured 2026-08-16 during Task 5's review:
+   `ducklake_expire_snapshots(older_than => now())` followed by
+   `ducklake_cleanup_old_files` makes an existing handle's read throw
+
+     Invalid Input Error: No snapshot found at version 1
+
+   So reclaiming disk invalidates stored handles *across the whole log*, and the
+   day someone enables GC to free space is the day every historical object stops
+   rendering. A working expiry is therefore not enough: loci would first have to
+   decide which snapshots are still referenced by live handles — walk the log,
+   collect every `{:store :lake}` value, keep those versions — and that
+   machinery does not exist. `live` is the argument it would take.
+
+   Blob GC has no such dependency and ships in its own plan, which means loci
+   will for a while reclaim blob space and not table space. Retention here is:
+   keep everything. Saying so is the whole point of this function existing
+   before it works — the same job `embedding-configured?` does for semantic
+   recall, and the failure it avoids is a sweep that *implies* it was complete."
+  [_lk _live]
+  {:mode :disabled
+   :freed 0
+   :why (str "table GC is off: DuckLake cannot expire the latest snapshot "
+             "(duckdb/ducklake#261) and snapshot expiry has open data-loss bugs "
+             "(#527, #529) — and even fixed, expiring a snapshot invalidates "
+             "every handle that reads AT (VERSION => it), which loci does not "
+             "yet track. Retention is: keep everything.")})

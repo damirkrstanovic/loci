@@ -521,7 +521,11 @@ Ingest accepts csv/json/parquet, since DuckDB reads all three; what lands is Par
 catalog.
 
 One directory is still the whole backup, which was the point of the 2026-08-15 consolidation
-and must not be given back.
+and must not be given back. **What it no longer is, once `lake/` lands, is one directory you
+can copy while the server runs**: `substrate/` and `lake/` are not written in one
+transaction, so a copy taken between a `:put` and its Parquet holds a handle naming a table
+the copy does not contain. Stopping the app first is the fix, and it is route (3) of "who may
+write" — it costs nothing and was already the rule for anything touching storage directly.
 
 ## What this costs
 
