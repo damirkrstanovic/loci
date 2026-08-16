@@ -2693,6 +2693,12 @@ way (2) of the three legitimate routes to storage in `CLAUDE.md`.
 
 **Four things changed under this task while Tasks 6b–6f ran.**
 
+**(a-1) `report:qbr` holds a duplicate copy of `metric:mrr`'s rows** inside a chart spec, and no
+writer converts it because a report is not row-bearing. Found in Task 7d. **Leave it alone** — a
+report's `:value` is a document, and its embedded rows are part of that document rather than a
+table's storage. Named here only so that a scan for stale row copies finds it and stops rather
+than treating it as a missed migration.
+
 **(a0) Do not use `tbl/table-object` to migrate.** It hardcodes `:kind :table`, so the two
 `:metric` objects would silently become tables. Use `tbl/table-value` and `assoc` over `:value`,
 which also preserves the extra keys the live objects carry (`:from` ×2, `:via` ×2). Found in
