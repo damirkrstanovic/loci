@@ -2971,6 +2971,31 @@ data/
 
 And both should state that table GC is off, so nobody reads a growing `lake/` as a bug.
 
+**Two more places say something that is now false. Grep before you write.**
+
+- **`data/` is no longer one directory you can copy while the server runs.** Anything in
+  `README.md` or the spec that describes backup as "copy `data/`" now spans two stores that are
+  not written in one transaction: a `:put` lands in LMDB and the Parquet lands in the lake, and a
+  copy taken between them has a handle pointing at a table that is not in the copy. This is a
+  real change to a stated property and it needs saying plainly — the fix for a user is to stop
+  the app first, which is route (3) in `CLAUDE.md` and costs nothing.
+- **Anything that says the log holds a table's rows.** Task 7 made that false in eight places.
+  `grep -rn "rows" README.md docs/superpowers/specs/2026-08-15-one-substrate-design.md` and check
+  each hit.
+
+**Record the numbers this branch measured**, in the spec note rather than the README — they are
+the evidence for the design, and a later reader deciding whether to keep DuckLake will want them:
+
+| | |
+|---|---|
+| log size, `tbl:corpus-1` (352 rows) | 66,959 → 302 chars (**222×**) |
+| the `content/seed!` ten tables | 230,300 → 2,572 chars |
+| lake open at boot (10M rows in the catalog) | 75 ms |
+| versioned read, 10M rows | 34 ms |
+| `restore-to!`, 10M rows | 182 ms |
+| chunk sweep, warm | 15 ms (was 297 ms hydrating) |
+| chunk sweep, cold, per process | ~1,060 ms |
+
 - [ ] **Step 5: Sabotage**
 
 Make `sweep!` return `{:freed 0}` with no `:mode`. The test must FAIL. Restore.
@@ -3000,8 +3025,16 @@ not a number to update.
 - [ ] **Measure what shipped, and write the numbers down.** The spec's measurements were taken
   against a bare DuckLake, not against loci. Report:
   - server boot time before and after the lake is wired in (expected: +~75 ms)
-  - `mold-payload` latency for `tbl:orders` (1,000 rows) before and after
+  - `mold-payload` latency for `tbl:orders` (1,000 rows) before and after — this is the one a
+    user feels, and the only one where the lake could plausibly have made things *worse*
   - the migration's actual output map
+  - `data/substrate` and `data/lake` on disk, before and after
+
+- [ ] **Boot the app and look at it.** Every assertion in this plan is about storage. Start the
+  server against the migrated store, open a migrated table and one seeded table, and confirm each
+  renders with its viewers. Use the `run` skill if there is one. A green suite and a broken shell
+  is the outcome this plan is most exposed to, because the browser suite runs against
+  `content.clj`'s seed rather than against the lake.
 
 - [ ] **Then:** `superpowers:finishing-a-development-branch`.
 
