@@ -9,6 +9,11 @@
   (:require [clojure.java.io :as io]
             [loci.lake :as lake]))
 
+(defn rm-rf [x]
+  (let [x (io/file x)]
+    (when (.isDirectory x) (run! rm-rf (.listFiles x)))
+    (.delete x)))
+
 (defn with-temp-lake
   "A clojure.test fixture. Use with `use-fixtures :once`."
   [f]
@@ -18,7 +23,16 @@
       (with-redefs [lake/lake (delay lk)] (f))
       (finally
         (lake/close! lk)
-        (letfn [(rm [x] (let [x (io/file x)]
-                          (when (.isDirectory x) (run! rm (.listFiles x)))
-                          (.delete x)))]
-          (rm dir))))))
+        (rm-rf dir)))))
+
+(defmacro with-lake
+  "A fresh DuckLake in a temp directory, always removed.
+
+   Here rather than in `loci.lake-test`, where it started, because
+   `loci.tablemigrate-test` needs it too and a macro cannot be borrowed from a
+   namespace whose helpers are private — the expansion names `rm-rf` at the
+   call site."
+  [[sym] & body]
+  `(let [dir# (str (System/getProperty "java.io.tmpdir") "/loci-lake-" (System/nanoTime))
+         ~sym (lake/open-lake! dir#)]
+     (try ~@body (finally (lake/close! ~sym) (rm-rf dir#)))))
