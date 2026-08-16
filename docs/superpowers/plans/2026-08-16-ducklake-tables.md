@@ -2524,6 +2524,116 @@ git commit -m "fix: the eighth writer, two uncaught throws, and a value the shel
 
 ---
 
+## Task 7d: two more values the shell cannot render, and two metrics the seed missed
+
+**Files:** `src/loci/tablestore.clj`, `src/loci/lake.clj`, `src/loci/content.clj`,
+`src/loci/server.clj`; tests in `lake_test.clj`, `tablestore_test.clj`, `server_test.clj`.
+
+**Added 2026-08-17, from Task 7c's review.**
+
+**1. `unwrap` closed one hole of three.** `read_json_auto` widens a *mixed*-type column to
+DuckDB `JSON`, which `unwrap` now handles. But a column where every row has the **same** nested
+shape is inferred as `STRUCT` or `LIST` instead, never touches `unwrap`, and produces the
+identical failure:
+
+```
+Don't know how to write JSON of class org.duckdb.DuckDBArray
+Don't know how to write JSON of class org.duckdb.DuckDBStruct
+```
+
+Reachable from the agent's own path: `save_table` with `[{:name "a" :tags ["x" "y"]}]` succeeds,
+and the next `query_table` on it throws into the tool loop. It is a **regression from moving rows
+to the lake** — the same rows through `InlineTable` serialize fine.
+
+**The remedy is to refuse, not to support.** A table column holding a vector or a map is not
+something loci renders: `content.clj`'s viewer predicates want scalars, `fnlib`'s `numeric-cols`
+and `cat-cols` want scalars, and `save_table`'s own tool description says "each row is an object
+of column→value". Supporting nested columns properly means `to_json` in the SELECT plus a type
+probe per read, which is real machinery for a shape nothing asks for. **0 of the 31 live tables
+have a nested value.** Refusing at write time, with a message the agent can act on, is strictly
+better than a 500 at read time.
+
+Refuse in **both** stores, in `normalize-rows` beside the collision check, so `InlineTable` and
+`Lake` cannot disagree — a divergence between them is the failure this plan has spent four tasks
+closing.
+
+**2. `seed!` converted 10 of 12.** It filters `(= :table (:kind o))`, and `content/objects` holds
+`{:table 10, :metric 2, …}`. So `metric:mrr` and `metric:headcount` still seed **48 rows,
+1,882 characters** of inline rows with `777000` sitting in the log. The new test cannot see it —
+`the-seed-lands-handles-not-rows` filters on `:table` and asserts `(= 10 …)`, so it is
+structurally blind to the two it misses.
+
+This also falsifies a premise in Task 9: *"nothing writes a `:metric`"*. `seed!` does. Migrating
+the live pair without fixing this means a fresh install re-creates them inline — the exact
+scenario Task 7c set out to end.
+
+- [ ] **Step 1: Write the failing tests**
+
+```clojure
+;; lake_test.clj — the hole unwrap does not cover
+(deftest a-uniformly-nested-column-is-refused-not-returned-unserializable
+  (with-lake [lk]
+    (doseq [rs [[{:tags ["x" "y"]} {:tags ["z"]}]
+                [{:meta {"a" 1}} {:meta {"a" 2}}]]]
+      (let [r (try (tbl/put-rows! lk "tbl:x" rs) (catch Exception e (.getMessage e)))]
+        (is (string? r) "a nested column must be refused at write time")
+        (is (re-find #"nested" r))))))
+
+;; tablestore_test.clj — both stores agree
+(deftest both-stores-refuse-a-nested-column
+  (doseq [ts [(tbl/inline-table)]]
+    (is (thrown-with-msg? Exception #"nested"
+          (tbl/put-rows! ts "tbl:x" [{:tags ["x"]}])))))
+
+;; server_test.clj — replace the kind-blind seed assertion
+(deftest the-seed-lands-handles-for-every-row-bearing-kind
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (content/seed! st @lake/lake)
+        (let [rb (->> (sub/objects st) vals (filter #(#{:table :metric} (:kind %))))]
+          (is (= 12 (count rb)) "10 tables and 2 metrics")
+          (is (every? #(tbl/handle? (:value %)) rb))
+          (is (not (re-find #"777000" (pr-str (sub/history st))))
+              "a metric's rows must not be in the log either"))))))
+```
+
+Confirm the third test fails at **10 of 12** before the fix, and report the metric objects'
+character count.
+
+- [ ] **Step 2: Implement**
+
+Refuse nested values in `normalize-rows` (`tablestore.clj`), beside the collision check. Name the
+column and the offending value's type in the `ex-info`, and say in the docstring why refusing
+beats supporting — the `content.clj`/`fnlib` scalar assumption, the 0-of-31 measurement, and the
+`DuckDBArray`/`DuckDBStruct` errors this prevents.
+
+Then widen `seed!`'s filter from `(= :table (:kind o))` to `#{:table :metric}`.
+
+- [ ] **Step 3: Two documentation corrections**
+
+- `q`'s comment (`lake.clj:79-82`) says `column-samples` "depends on seeing the JSON rendering".
+  Measured false: with `unwrap` installed inside `q`, samples are byte-identical, because
+  `column-samples` depends on the `CAST(… AS VARCHAR)`, not on `q` declining to unwrap. Fix it —
+  this is the same class of inaccurate docstring Task 7c was asked to correct elsewhere.
+- `rerun!`'s body was not re-indented after gaining its `try` (`server.clj:1316-1362`, off by one
+  throughout).
+
+- [ ] **Step 4: Sabotage**
+
+Remove the nested-value refusal → both new tests fail, and the lake one must reach the
+`DuckDBArray` error through `json/write-str`; paste it. Revert `seed!`'s filter → the 12-count
+test fails at 10.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/loci/tablestore.clj src/loci/lake.clj src/loci/content.clj src/loci/server.clj test/
+git commit -m "fix: refuse a nested column, and seed a metric like a table"
+```
+
+---
+
 ## Task 8: as-of reads a table's past
 
 **Files:**
@@ -2582,6 +2692,18 @@ a report rather than thrown, and callable from a REPL attached to the live serve
 way (2) of the three legitimate routes to storage in `CLAUDE.md`.
 
 **Four things changed under this task while Tasks 6b–6f ran.**
+
+**(a0) Do not use `tbl/table-object` to migrate.** It hardcodes `:kind :table`, so the two
+`:metric` objects would silently become tables. Use `tbl/table-value` and `assoc` over `:value`,
+which also preserves the extra keys the live objects carry (`:from` ×2, `:via` ×2). Found in
+Task 7c's review.
+
+**(a1) Numeric widening is accepted, not refused.** `tbl:csv-19-7071`'s `:urban_pct` holds `100`
+beside `43.2`, and `read_json_auto` widens the column to DOUBLE, so `100` comes back `100.0`.
+That is the one row divergence in 31. **Accept it and report it as `:widened`** — refusing a
+table permanently because one integer became a float in a column that is already floats would
+leave real data inline forever for a cosmetic difference. Report it distinctly from `:refused`
+so the run says what it did rather than implying byte-identity it did not achieve.
 
 **(a) It is 31 objects, not 29.** 29 carry `:kind :table` and 2 carry `:kind :metric`, and both
 are row-bearing: `chunks.clj`'s `texts-of` handles `(:table :metric)` in one branch, and
