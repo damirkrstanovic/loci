@@ -378,3 +378,53 @@ test('a cited id in a real notebook cell is a chip you can click through', async
     assert.match(await page.textContent('.molder'), /Sources — fixture/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// the paths that are NOT markdown
+// ---------------------------------------------------------------------------
+//
+// A notebook's intent and a prose cell are plain sentences rendered with esc(),
+// so the objref pass missed them entirely — and an id cited in an intent is
+// exactly as dead as one cited in a draft. They get URLs and ids made
+// followable and nothing else: full markdown there would start rendering a
+// stray asterisk as emphasis in a line somebody typed by hand.
+
+test('a cited id in a notebook intent is followable', async () => {
+  await withPage(browser, 'objref-intent', async (page) => {
+    await bootedShell(page, server.url);
+    const chip = await page.evaluate(() => {
+      const host = document.createElement('div');
+      host.innerHTML = richInline(
+        'Start here: read doc:sources, then mold tbl:nosuch-9999.');
+      const c = [...host.querySelectorAll('.objref')];
+      return { ids: c.map(x => x.dataset.open), text: host.textContent };
+    });
+    assert.deepEqual(chip.ids, ['doc:sources'],
+      'the id that names something resolves; the one that does not is left alone');
+    assert.match(chip.text, /tbl:nosuch-9999/, 'an id naming nothing stays as written');
+  });
+});
+
+test('a plain sentence is not turned into markdown', async () => {
+  await withPage(browser, 'richinline-not-markdown', async (page) => {
+    await bootedShell(page, server.url);
+    const out = await page.evaluate(() =>
+      richInline('Rates rose 5*3 and #2 was **not** a heading'));
+    assert.ok(!/<strong>|<em>|<h[1-6]>/.test(out),
+      `an intent is one line somebody typed, not markdown: ${out}`);
+    assert.match(out, /\*\*not\*\*/, 'the asterisks survive as characters');
+  });
+});
+
+test('a URL in a prose cell is clickable too', async () => {
+  await withPage(browser, 'richinline-url', async (page) => {
+    await bootedShell(page, server.url);
+    const hrefs = await page.evaluate(() => {
+      const host = document.createElement('div');
+      host.innerHTML = richInline('See https://example.org/fixture/one for the source.');
+      return [...host.querySelectorAll('a')].map(a => a.getAttribute('href'));
+    });
+    assert.deepEqual(hrefs, ['https://example.org/fixture/one'],
+      'the same URL is a link in a doc; it must not be dead in a prose cell');
+  });
+});

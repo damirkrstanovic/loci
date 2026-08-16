@@ -634,10 +634,18 @@ function buildPanel(sp,i){
   p.innerHTML='<div class="p-status"><span class="adot"></span>'+(merged?'connected':hub?'spawned':'notebook')+'</div>'+
     '<div class="p-head"><div class="p-eyebrow">'+
       (merged?'connected · '+esc(mtitles):hub?'deep-dive':'notebook · intention')+'</div>'+
-    '<h2 class="p-title">'+esc(sp.title)+'</h2><p class="p-intent">'+esc(sp.intent)+'</p>'+
+    '<h2 class="p-title">'+esc(sp.title)+'</h2><p class="p-intent">'+richInline(sp.intent)+'</p>'+
     structureLine(i)+'</div>'+
     '<div class="p-body" id="body'+i+'"></div>';
   p.addEventListener('click',e=>{
+    // a cited id in the intent — checked FIRST, because the fallthrough below
+    // enters the notebook on any click in overview mode and would swallow it
+    const ref=e.target.closest('.objref');
+    if(ref){ e.stopPropagation();
+      if(ref.dataset.open){ openObject(ref.dataset.open); return; }
+      const k=STATE.spaces.findIndex(x=>x.id===ref.dataset.space);
+      if(k>=0) enter(k);
+      return; }
     const link=e.target.closest('.slink[data-space]');
     if(link){ e.stopPropagation();
       const j=STATE.spaces.findIndex(x=>x.id===link.dataset.space);
@@ -702,7 +710,7 @@ async function renderNotebook(i){
       (c.type==='text'?'<button data-act="edit" data-i="'+c.i+'">✎</button>':'')+
       '<button data-act="rm" data-i="'+c.i+'">✕</button></div>';
     if(c.type==='text'){
-      cellsH+='<div class="cellwrap" data-cell="'+c.i+'">'+bar+'<p class="prose">'+esc(c.text)+'</p></div>';
+      cellsH+='<div class="cellwrap" data-cell="'+c.i+'">'+bar+'<p class="prose">'+richInline(c.text)+'</p></div>';
     } else if(c.type==='missing'){
       cellsH+='<div class="cellwrap" data-cell="'+c.i+'">'+bar+'<div style="color:var(--attn);font-size:12px">missing object '+esc(c.ref)+'</div></div>';
     } else {
@@ -1978,74 +1986,84 @@ let lastAnswer=null;
 // agent outputs are markdown — render them properly. esc() FIRST (everything
 // below operates on escaped text), then a small line-walker: fences, tables,
 // headings, lists, quotes, then inline marks. No library, no surprises.
+// URL and object-id linkifying, hoisted out of mdToHtml so the paths that are
+// NOT markdown can share them. A notebook's intent and a prose cell are plain
+// sentences rendered with esc() — full markdown there would start turning a
+// stray asterisk into emphasis — but an id cited in one is exactly as dead as
+// an id cited in a draft, which was the complaint these exist to answer.
+// Trailing punctuation is not part of a URL — but /wiki/Mercury_(planet) is.
+// The text is already esc()'d, so a closing quote arrives as &quot;, which is
+// punctuation too; a query's &amp; in the MIDDLE stays, and the parser turns it
+// back into & on read. Trim entities, then . , ; : ! ?, then an UNBALANCED ) or
+// ], and repeat — "(https://x/a)." needs three passes.
+const trimUrl=u=>{ let prev; const n=ch=>u.split(ch).length-1;
+  do{ prev=u;
+    u=u.replace(/(?:&(?:amp|quot|lt|gt|#\d+);|[.,;:!?])$/,'');
+    if(/\)$/.test(u)&&n('(')<n(')')) u=u.slice(0,-1);
+    if(/\]$/.test(u)&&n('[')<n(']')) u=u.slice(0,-1);
+  } while(u!==prev);
+  return u; };
+// A bare URL is a link too. This pass runs LAST and walks TAGS, not text, and
+// must stay that way: by now `[t](u)` has emitted anchors and backticks have
+// emitted <code>, and linkifying inside either gives a nested <a>, a mangled
+// href, or a URL the author meant as code. Fold it into the chain below and
+// all three come back. The two depths are separate on purpose — a </code>
+// inside anchor text must not re-arm linkifying for the rest of the anchor.
+const autolink=s=>{ let a=0,c=0;
+  return s.split(/(<[^>]*>)/).map(p=>{
+    if(p.charAt(0)==='<'){ const t=p.match(/^<(\/?)(a|code)\b/i);
+      if(t){ const d=t[1]?-1:1;
+        if(t[2].toLowerCase()==='a') a=Math.max(0,a+d); else c=Math.max(0,c+d); }
+      return p; }
+    if(a||c) return p;
+    return p.replace(/\bhttps?:\/\/[^\s<]+/g,m=>{ const u=trimUrl(m);
+      return '<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>'+m.slice(u.length); });
+  }).join(''); };
+// An object id the agent cited is a reference, and it was arriving as dead
+// text: "Mass figures from tbl:derived-2" told the reader nothing and could
+// not be followed. The agent is *instructed* to cite ids (see the ask and
+// draft prompts in server.clj), so this is the other half of that contract.
+//
+// Resolved against STATE.objects rather than a list of known prefixes: only
+// an id that names something the workspace actually holds becomes a chip, so
+// a deleted object, an id from a store this shell never loaded, or an
+// ordinary sentence like "note: see below" all stay as plain text. A chip
+// that opens nothing would be worse than no chip.
+//
+// Runs AFTER autolink and walks tags for the same reasons: by now URLs are
+// inside <a> — and "https:" would otherwise match the id shape — while
+// backticked text is inside <code>, where an id is being shown, not cited.
+const objlink=s=>{ let a=0,c=0;
+  return s.split(/(<[^>]*>)/).map(p=>{
+    if(p.charAt(0)==='<'){ const t=p.match(/^<(\/?)(a|code)\b/i);
+      if(t){ const d=t[1]?-1:1;
+        if(t[2].toLowerCase()==='a') a=Math.max(0,a+d); else c=Math.max(0,c+d); }
+      return p; }
+    if(a||c) return p;
+    return p.replace(/\b[a-z]+:[a-z0-9][a-z0-9-]*/g, id=>{
+      if(typeof STATE==='undefined') return id;
+      // Two registries, because `state-payload` REMOVES :space from :objects —
+      // a cited notebook would otherwise stay dead text, which is the same
+      // complaint one level up. A space opens by entering it, not by opening
+      // it as an object, so it carries data-space like every other space chip.
+      const o=(STATE.objects||{})[id];
+      const sp=o?null:(STATE.spaces||[]).find(s=>s.id===id);
+      if(!o&&!sp) return id;
+      // the TITLE is what the reader needed; the id rides on the hover, so
+      // provenance stays checkable without spending a line of prose on it
+      const t=(o||sp).title||id, short=t.length>44?t.slice(0,44)+'…':t;
+      const attr=o?'data-open':'data-space';
+      return '<span class="objref" '+attr+'="'+esc(id)+'" title="'+esc(id)+'">'+esc(short)+'</span>';
+    });
+  }).join(''); };
+// A plain sentence, escaped, with URLs and cited ids made followable — and
+// nothing else. Deliberately not mdToHtml: an intent is one line the user
+// typed, and markdown there would render a stray * or # as formatting.
+function richInline(s){ return objlink(autolink(esc(s||''))); }
+
 function mdToHtml(md){
   const lines=esc(md||'').split('\n');
   const out=[]; let i=0, para=[];
-  // Trailing punctuation is not part of a URL — but /wiki/Mercury_(planet) is.
-  // The text is already esc()'d, so a closing quote arrives as &quot;, which is
-  // punctuation too; a query's &amp; in the MIDDLE stays, and the parser turns it
-  // back into & on read. Trim entities, then . , ; : ! ?, then an UNBALANCED ) or
-  // ], and repeat — "(https://x/a)." needs three passes.
-  const trimUrl=u=>{ let prev; const n=ch=>u.split(ch).length-1;
-    do{ prev=u;
-      u=u.replace(/(?:&(?:amp|quot|lt|gt|#\d+);|[.,;:!?])$/,'');
-      if(/\)$/.test(u)&&n('(')<n(')')) u=u.slice(0,-1);
-      if(/\]$/.test(u)&&n('[')<n(']')) u=u.slice(0,-1);
-    } while(u!==prev);
-    return u; };
-  // A bare URL is a link too. This pass runs LAST and walks TAGS, not text, and
-  // must stay that way: by now `[t](u)` has emitted anchors and backticks have
-  // emitted <code>, and linkifying inside either gives a nested <a>, a mangled
-  // href, or a URL the author meant as code. Fold it into the chain below and
-  // all three come back. The two depths are separate on purpose — a </code>
-  // inside anchor text must not re-arm linkifying for the rest of the anchor.
-  const autolink=s=>{ let a=0,c=0;
-    return s.split(/(<[^>]*>)/).map(p=>{
-      if(p.charAt(0)==='<'){ const t=p.match(/^<(\/?)(a|code)\b/i);
-        if(t){ const d=t[1]?-1:1;
-          if(t[2].toLowerCase()==='a') a=Math.max(0,a+d); else c=Math.max(0,c+d); }
-        return p; }
-      if(a||c) return p;
-      return p.replace(/\bhttps?:\/\/[^\s<]+/g,m=>{ const u=trimUrl(m);
-        return '<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>'+m.slice(u.length); });
-    }).join(''); };
-  // An object id the agent cited is a reference, and it was arriving as dead
-  // text: "Mass figures from tbl:derived-2" told the reader nothing and could
-  // not be followed. The agent is *instructed* to cite ids (see the ask and
-  // draft prompts in server.clj), so this is the other half of that contract.
-  //
-  // Resolved against STATE.objects rather than a list of known prefixes: only
-  // an id that names something the workspace actually holds becomes a chip, so
-  // a deleted object, an id from a store this shell never loaded, or an
-  // ordinary sentence like "note: see below" all stay as plain text. A chip
-  // that opens nothing would be worse than no chip.
-  //
-  // Runs AFTER autolink and walks tags for the same reasons: by now URLs are
-  // inside <a> — and "https:" would otherwise match the id shape — while
-  // backticked text is inside <code>, where an id is being shown, not cited.
-  const objlink=s=>{ let a=0,c=0;
-    return s.split(/(<[^>]*>)/).map(p=>{
-      if(p.charAt(0)==='<'){ const t=p.match(/^<(\/?)(a|code)\b/i);
-        if(t){ const d=t[1]?-1:1;
-          if(t[2].toLowerCase()==='a') a=Math.max(0,a+d); else c=Math.max(0,c+d); }
-        return p; }
-      if(a||c) return p;
-      return p.replace(/\b[a-z]+:[a-z0-9][a-z0-9-]*/g, id=>{
-        if(typeof STATE==='undefined') return id;
-        // Two registries, because `state-payload` REMOVES :space from :objects —
-        // a cited notebook would otherwise stay dead text, which is the same
-        // complaint one level up. A space opens by entering it, not by opening
-        // it as an object, so it carries data-space like every other space chip.
-        const o=(STATE.objects||{})[id];
-        const sp=o?null:(STATE.spaces||[]).find(s=>s.id===id);
-        if(!o&&!sp) return id;
-        // the TITLE is what the reader needed; the id rides on the hover, so
-        // provenance stays checkable without spending a line of prose on it
-        const t=(o||sp).title||id, short=t.length>44?t.slice(0,44)+'…':t;
-        const attr=o?'data-open':'data-space';
-        return '<span class="objref" '+attr+'="'+esc(id)+'" title="'+esc(id)+'">'+esc(short)+'</span>';
-      });
-    }).join(''); };
   // order matters: [**bold**](u) works only because bold runs before the link rule
   const inline=s=>objlink(autolink(s
     .replace(/`([^`]+)`/g,'<code>$1</code>')
