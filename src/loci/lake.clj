@@ -275,7 +275,7 @@
 (extend-type Lake
   tbl/TableStore
   (put-rows! [lk id rs]
-    (let [rs    (vec rs)
+    (let [rs    (tbl/normalize-rows (vec rs))
           cols  (tbl/cols-of rs)
           table (table-name id (System/nanoTime))]
       (when (empty? rs)

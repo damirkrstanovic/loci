@@ -5,7 +5,8 @@
    `InlineTable` keeps rows in the handle itself — which is what every loci
    table was before 2026-08-16 — and stays as the parity reference and as the
    store a test uses when it has nothing to say about DuckLake, the same role
-   `substrate/PersistentStore` plays next to `dlv/DatalevinStore`.")
+   `substrate/PersistentStore` plays next to `dlv/DatalevinStore`."
+  (:require [loci.substrate :as sub]))
 
 (defprotocol TableStore
   (put-rows! [this id rows]
@@ -73,15 +74,47 @@
   (and (map? v) (contains? #{:inline :lake} (:store v))))
 
 (defn cols-of
-  "The column order to preserve. Taken from the first row, which is what
-   `save-table!` and `import-csv!` already treat as authoritative."
+  "The column order to preserve: every key any row has, in the order first seen.
+
+   First-seen order, not sorted, because the first row is what `save-table!` and
+   `import-csv!` treat as authoritative and a table that renders with its
+   columns rearranged reads as a different table. Every row rather than the
+   first, because a key that appears only in row 2 is still a column, and the
+   lake would otherwise drop it silently while `InlineTable` kept it.
+
+   Each key goes through `sub/col-kw`, which leaves a keyword that already reads
+   back cleanly alone — `:tenure-band` stays `:tenure-band` — and normalizes one
+   that does not. That matters here and nowhere else in the codebase, because
+   `:cols` is the only place a column keyword travels through the log as a
+   *value*: `normalize-keys` fixes map keys, and `safe-event`'s guard compares
+   printed strings, so `[:foo bar]` passes it while reading back as two
+   elements.
+
+   Both `put-rows!` implementations hand this already-normalized rows, so that
+   `col-kw` cannot fire on either of their paths — which is the point, because
+   it is what makes the rows and the column list unable to disagree. Keep it
+   anyway: this is public, `loci.lake` calls it, and a caller holding raw rows
+   must not get back a column list the log cannot hold. See
+   `cols-of-normalises-on-its-own`, which is the only thing that reaches it."
   [rows]
-  (vec (keys (first rows))))
+  (into [] (distinct) (map sub/col-kw (mapcat keys rows))))
+
+(defn normalize-rows
+  "Every row keyed by `cols-of`'s keywords, so the rows and the column list
+   cannot disagree.
+
+   Public because `Lake` implements `put-rows!` from its own namespace and has
+   to normalize before `load-rows!` writes the JSON. Measured with this dropped:
+   the JSON keeps the key `foo bar`, the CREATE names the column `\"foo_bar\"`,
+   and DuckDB refuses the write outright — *Binder Error: Referenced column
+   \"foo_bar\" not found in FROM clause! Candidate bindings: \"foo bar\"*."
+  [rows]
+  (mapv (fn [r] (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)) rows))
 
 (defrecord InlineTable []
   TableStore
   (put-rows! [_ _ rs]
-    (let [rs (vec rs)]
+    (let [rs (normalize-rows (vec rs))]
       {:store :inline :rows (count rs) :cols (cols-of rs) :data rs}))
   (rows [_ h {:keys [offset limit]}]
     (cond->> (:data h)

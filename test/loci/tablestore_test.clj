@@ -1,5 +1,6 @@
 (ns loci.tablestore-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.edn]
+            [clojure.test :refer [deftest is]]
             [loci.tablestore :as tbl]))
 
 (def rows [{:id 1 :name "a"} {:id 2 :name "b"} {:id 3 :name "c"}])
@@ -65,7 +66,44 @@
 (deftest column-samples-skips-nulls
   (let [ts (tbl/inline-table)
         h  (tbl/put-rows! ts "tbl:x" [{:a nil} {:a "z"}])]
-    (is (= {:a ["z"]} (tbl/column-samples ts h 3 5)))))
+    (is (= {:a ["z"]} (tbl/column-samples ts h 3 5))))
+  ;; A ragged table puts a column in `:cols` that a given row simply lacks.
+  ;; That must contribute no sample, not a "" or a "null" — the same `keep`
+  ;; that drops an explicit nil drops an absent key, and this pins it now that
+  ;; `cols-of` can name more columns than any single row carries.
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a 1} {:a 2 :b 9}])]
+    (is (= {:a ["1" "2"] :b ["9"]} (tbl/column-samples ts h 3 5))
+        "a column absent from a row contributes no sample")))
+
+(deftest a-ragged-table-keeps-every-column
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a 1} {:a 2 :b 9}])]
+    (is (= [:a :b] (:cols h))
+        "a column that first appears in row 2 is still a column")))
+
+(deftest a-column-keyword-the-log-cannot-hold-is-normalised
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{(keyword "foo bar") 1 :ok 2}])]
+    (is (= [:foo_bar :ok] (:cols h)))
+    (is (= [{:foo_bar 1 :ok 2}] (tbl/rows ts h {}))
+        "the rows must agree with the columns")
+    (is (= (:cols h) (:cols (clojure.edn/read-string (pr-str h))))
+        "a handle must survive the log it is about to be written to")))
+
+(deftest cols-of-normalises-on-its-own
+  ;; `put-rows!` hands `cols-of` rows that `normalize-rows` has already fixed,
+  ;; so the two can never disagree — and so the `col-kw` inside `cols-of` is
+  ;; unreachable from either store. It is not decoration: `cols-of` is public,
+  ;; `lake.clj` calls it, and a caller with raw rows must not get back a column
+  ;; list the log cannot hold. This is the assertion that reaches it.
+  (is (= [:foo_bar :ok] (tbl/cols-of [{(keyword "foo bar") 1 :ok 2}]))))
+
+(deftest a-readable-column-keyword-is-left-alone
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:tenure-band "0-6m" :Category "A"}])]
+    (is (= [:tenure-band :Category] (:cols h))
+        "col-kw passes a readable keyword through — Task 6d's whole point")))
 
 (deftest hydrate-caps-a-large-table
   (let [ts   (tbl/inline-table)

@@ -208,6 +208,19 @@
           (is (= after-first @n)
               "a handle cannot change, so it must not be sampled twice"))))))
 
+(deftest a-ragged-table-keeps-every-column-in-the-lake
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{:a 1} {:a 2 :b 9}])]
+      (is (= [:a :b] (:cols h)))
+      (is (= [{:a 1 :b nil} {:a 2 :b 9}] (tbl/rows lk h {}))
+          "a row that lacked the column reads back with nil, not without the key"))))
+
+(deftest a-column-keyword-the-log-cannot-hold-is-normalised-in-the-lake
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{(keyword "foo bar") 1}])]
+      (is (= [:foo_bar] (:cols h)))
+      (is (= [{:foo_bar 1}] (tbl/rows lk h {}))))))
+
 (deftest requiring-this-namespace-opens-no-lake
   (is (delay? lake/lake)
       "the process lake is a delay — requiring loci.lake must not touch the data dir")
