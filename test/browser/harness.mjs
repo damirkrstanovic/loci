@@ -49,7 +49,11 @@ const SOURCES_FIXTURE = `
                "\\n"
                "- https://example.org/fixture/one\\n"
                "- https://example.org/fixture/search?q=one&two=2\\n"
-               "- https://example.org/fixture/three.\\n")]
+               "- https://example.org/fixture/three.\\n\\n"
+               ;; an object id and a notebook id cited in prose, the way the ask
+               ;; and draft prompts tell the agent to — the objref end-to-end
+               ;; test needs a real one in a real cell
+               "Mass figures from doc:sources, gathered in space:cosmos.\\n")]
   (sub/commit! st {:op :tx :events
                    [{:op :put :id "doc:sources"
                      :value {:id "doc:sources" :kind :doc :title "Sources — fixture" :value doc}}

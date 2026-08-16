@@ -250,3 +250,131 @@ test('a Sources list in a real notebook cell is clickable end to end', async () 
     ], `the Sources list in a live notebook cell is not clickable: ${cell.text}`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// object ids the agent cited, resolved to what they name
+// ---------------------------------------------------------------------------
+//
+// The ask and draft prompts instruct the agent to "cite object ids", and they
+// arrived as dead text: "Mass figures from tbl:derived-2" told the reader
+// nothing and could not be followed. Resolution is against STATE.objects, so
+// only an id the workspace actually holds becomes a chip.
+
+const refs = (page, md) => page.evaluate(m => {
+  const host = document.createElement('div');
+  host.innerHTML = mdToHtml(m);
+  return {
+    text: host.textContent,
+    chips: [...host.querySelectorAll('.objref')].map(c => ({
+      id: c.dataset.open, label: c.textContent, title: c.getAttribute('title'),
+      inCode: !!c.closest('code'), inAnchor: !!c.closest('a'),
+    })),
+  };
+}, md);
+
+test('a cited id becomes the thing it names, and carries the id on hover', async () => {
+  await withPage(browser, 'objref-resolves', async (page) => {
+    await bootedShell(page, server.url);
+    // a real object from the seed, whichever it is — read its title from STATE
+    const { id, title } = await page.evaluate(() => {
+      const o = Object.values(STATE.objects).find(o => o.kind === 'table');
+      return { id: o.id, title: o.title };
+    });
+    const r = await refs(page, `Mass figures from ${id}; see also the notes.`);
+    assert.equal(r.chips.length, 1, `expected one chip: ${JSON.stringify(r.chips)}`);
+    assert.equal(r.chips[0].id, id);
+    assert.equal(r.chips[0].title, id, 'the raw id stays reachable on hover');
+    assert.ok(title.startsWith(r.chips[0].label.replace(/…$/, '')),
+      `the chip must read as the object's title, not its id: ${r.chips[0].label}`);
+    assert.ok(!r.text.includes(id),
+      'the bare id should no longer be sitting in the prose');
+  });
+});
+
+test('an id that names nothing stays plain text', async () => {
+  await withPage(browser, 'objref-unresolved', async (page) => {
+    await bootedShell(page, server.url);
+    // a chip that opens nothing is worse than no chip
+    const r = await refs(page, 'Figures from tbl:does-not-exist-9999 are missing.');
+    assert.equal(r.chips.length, 0);
+    assert.match(r.text, /tbl:does-not-exist-9999/, 'the text must survive unchanged');
+  });
+});
+
+test('an ordinary colon phrase is not mistaken for an id', async () => {
+  await withPage(browser, 'objref-not-a-id', async (page) => {
+    await bootedShell(page, server.url);
+    const r = await refs(page, 'note: see below. Also http://example.com/a:b for context.');
+    assert.equal(r.chips.length, 0, `nothing here names an object: ${JSON.stringify(r.chips)}`);
+    assert.match(r.text, /note: see below/);
+  });
+});
+
+test('an id inside backticks is being shown, not cited', async () => {
+  await withPage(browser, 'objref-in-code', async (page) => {
+    await bootedShell(page, server.url);
+    const { id } = await page.evaluate(() => {
+      const o = Object.values(STATE.objects).find(o => o.kind === 'table');
+      return { id: o.id };
+    });
+    const r = await refs(page, `The id is \`${id}\` exactly.`);
+    assert.equal(r.chips.length, 0, 'code shows an id; it does not reference one');
+    assert.match(r.text, new RegExp(id.replace(/[:.]/g, '\\$&')));
+  });
+});
+
+test('a URL containing a real object id stays one link, not a chip inside a link', async () => {
+  await withPage(browser, 'objref-url-intact', async (page) => {
+    await bootedShell(page, server.url);
+    // This is what makes the pass ORDER load-bearing. A plain https:// URL is
+    // safe either way — the id pattern needs [a-z0-9] after the colon and a URL
+    // has "//" — so an ordinary URL cannot tell the two orders apart. A URL with
+    // a real id in its path can: run objlink first and the id becomes a chip
+    // buried inside the href, which then linkifies into nonsense.
+    const r = await page.evaluate(() => {
+      const id = Object.values(STATE.objects).find(o => o.kind === 'table').id;
+      const host = document.createElement('div');
+      host.innerHTML = mdToHtml('See https://example.com/wiki/' + id + ' for more.');
+      return { id,
+               anchors: [...host.querySelectorAll('a')].map(a => a.getAttribute('href')),
+               chips: host.querySelectorAll('.objref').length,
+               chipsInAnchors: host.querySelectorAll('a .objref').length };
+    });
+    assert.deepEqual(r.anchors, ['https://example.com/wiki/' + r.id],
+      'the href must survive whole');
+    assert.equal(r.chipsInAnchors, 0, 'never a chip inside a link');
+    assert.equal(r.chips, 0);
+  });
+});
+
+test('a cited id in a real notebook cell is a chip you can click through', async () => {
+  await withPage(browser, 'objref-cell-end-to-end', async (page) => {
+    await bootedShell(page, server.url);
+    const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+    await page.evaluate(n => enter(n), i);
+    await page.waitForSelector(`#body${i} .cellmold`);
+    await page.waitForFunction(n => [...document.querySelectorAll(`#body${n} .chip`)]
+      .some(c => c.textContent === 'doc:sources'), i, { timeout: 20_000 });
+
+    // the fixture prose cites an object AND a notebook; both must resolve, and
+    // to DIFFERENT attributes — a space is entered, not opened as an object
+    const chips = await page.evaluate(n => {
+      const chip = [...document.querySelectorAll(`#body${n} .chip`)]
+        .find(c => c.textContent === 'doc:sources');
+      return [...chip.closest('.cellmold').querySelectorAll('.md .objref')]
+        .map(c => ({ open: c.dataset.open || null, space: c.dataset.space || null,
+                     label: c.textContent, title: c.getAttribute('title') }));
+    }, i);
+    assert.equal(chips.length, 2, `expected both citations to resolve: ${JSON.stringify(chips)}`);
+    assert.deepEqual(chips.map(c => c.title), ['doc:sources', 'space:cosmos']);
+    assert.equal(chips[0].open, 'doc:sources', 'an object opens');
+    assert.equal(chips[1].space, 'space:cosmos', 'a notebook is entered, not opened');
+    assert.ok(chips.every(c => !/^[a-z]+:/.test(c.label)),
+      `a chip must read as a title, not an id: ${JSON.stringify(chips.map(c => c.label))}`);
+
+    // and clicking the object one actually opens it
+    await page.evaluate(n => document.querySelector(`#body${n} .md .objref[data-open]`).click(), i);
+    await page.waitForSelector('.molder', { timeout: 10_000 });
+    assert.match(await page.textContent('.molder'), /Sources — fixture/);
+  });
+});
