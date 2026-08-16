@@ -13,7 +13,7 @@ scrubber, one directory to back up.
 Today it holds none of them. A table's rows live inside the event that created them; there is
 no image or video kind at all (`grep` finds one `<img>` in the shell and it is the favicon).
 
-## What is actually there today
+## What is in the test substrate today — and why it does not size this design
 
 | | |
 |---|---|
@@ -24,8 +24,15 @@ no image or video kind at all (`grep` finds one `<img>` in the shell and it is t
 | all 29 together | 603 KB of JSON |
 | images, video, blobs | none, no kind, no route, no renderer |
 
-So nothing is currently big. This design is for what loci cannot do, not for a load it is
-failing under, and it should be judged on capability rather than on relief.
+**This is a test substrate and must not be read as the target workload.** It is seeded demo
+data plus a few months of light real use; it says what loci has been *able* to hold, which is
+a statement about the current implementation and not about the intent. The design targets
+tables of millions of rows and video files, because that is what was asked for, and the table
+above is included only so nobody later mistakes today's numbers for evidence that the design
+was over-built.
+
+The one thing it does establish: there is no migration burden. Whatever ships can convert 29
+small tables in a single pass.
 
 ## The rule
 
@@ -183,9 +190,14 @@ becomes a translation layer. This is a real open question, not a formality.
 — ~1 GB/s per core against 300–400 MB/s, and it parallelises near-linearly while SHA-256 stays
 single-threaded. For multi-gigabyte video that is the difference between seconds and minutes.
 
-And yet: **start with SHA-256.** It is in the JDK, it hashes a 100 MB image in about a third
-of a second, and there is no media in the substrate at all — so the faster hash would be
-optimising a workload that does not exist.
+For the workload this design targets, that gap is real rather than theoretical: a 4 GB video
+is roughly 11 seconds of single-threaded SHA-256, against about a second of BLAKE3 across six
+cores. Ingesting video is exactly where it would be felt.
+
+**So: prefer BLAKE3 if a sound JVM implementation exists, and fall back to SHA-256 — which is
+in the JDK — if not.** Either way the decision is reversible, because a self-describing
+handle lets BLAKE3 blobs sit beside SHA-256 ones in the same store with every old handle
+still resolving.
 
 The reason this is a deferral and not a mistake is the self-describing handle. A CID carries
 its own multihash code, so BLAKE3 blobs can be added later beside SHA-256 ones, in the same
@@ -295,7 +307,8 @@ and must not be given back.
 1. **DuckLake for all tables, or above a threshold?** I would argue all: one code path, and a
    threshold makes a table's *semantics* depend on its row count — "undo worked on my 900-row
    table but not my 1,100-row one" is the worst kind of surprise. `InlineTable` stays for
-   tests.
+   tests. The current corpus is small enough that converting all of it is one pass, so
+   "everything" costs nothing to adopt.
 2. **Media scope.** Images are cheap — a kind, a route, an `<img>`. Video raises playback,
    ranges, thumbnails and transcoding, none of which this design addresses.
 3. **Does a blob participate in LEAP and recall?** An image has no text. A caption or an
@@ -311,6 +324,6 @@ and must not be given back.
 2. **Boot cost** of attaching the lake, against loci's existing ~14 s Datalevin load — the
    startup budget is already the thing that made every test run expensive.
 3. **`undo!` latency** when it moves a snapshot pointer versus popping an inline table.
-4. **Hash throughput on this machine**, SHA-256 against a realistic image and a realistic
-   video, before assuming the JDK's default is fast enough — the claim above is from a
-   benchmark, not from here.
+4. **Hash throughput on this machine**, SHA-256 and BLAKE3 against a realistic video, before
+   choosing — the figures above are from published benchmarks, not from here. And whether a
+   sound JVM BLAKE3 implementation exists at all.
