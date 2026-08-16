@@ -2619,6 +2619,22 @@ objects have vector-of-maps values that would pass a naive `(every? map? …)` s
 rows live inside `:rows` keys on `:block` maps, and DuckDB would build LIST/STRUCT columns out of
 them. **Filter by `#{:table :metric}` on `:kind`, never by shape.**
 
+**(c2) There are two parity measurements and they are not the same number.** Verified in the
+REPL 2026-08-17 against the live store: `{:table 29 :metric 2}`, **31 row-bearing, 0 already
+handles**. Both parities are over that 31.
+
+- **Row round-trip** — `tbl/rows` inline vs lake. **30 of 31** after Task 7c's `unwrap`, up from
+  28. The one that still differs is `tbl:csv-19-7071`'s `:urban_pct`, `100` against `100.0` —
+  a `Long`/`Double` widening by `read_json_auto`, not a JSON one.
+- **Synopsis/chunk** — `column-samples`. **27 of 31**, and Task 7c could not move it: samples go
+  through `q` with `CAST(… AS VARCHAR)`, so the quoting that reorders them comes from the CAST,
+  not from JDBC. The four are `tbl:csv-19-7071`, `tbl:csv-18-1542`, `tbl:corpus-2`,
+  `tbl:extract-20-8413`.
+
+`tbl:corpus-2` is the one to keep straight: its **rows are equal** — `1.24E7` is a Double on both
+sides — and only its *samples* diverge. It is a chunk divergence and never was a row one. Verify
+against the right measurement or you will chase it.
+
 **(d) Migration moves 4 tables' chunk text, on top of 31 already pending.** Task 6f rewrote
 `synopsis`, so all 31 stored chunk records are already stale and will re-embed on the next
 sweep regardless of this task. Of those, 4 — `tbl:csv-19-7071`, `tbl:csv-18-1542`,
