@@ -76,10 +76,17 @@
               rs (.executeQuery st sql)]
     (let [md (.getMetaData rs)
           n  (.getColumnCount md)]
-      ;; `identity`, not `unwrap`: this is the general helper over this
-      ;; namespace's OWN SQL — snapshot ids, table names, the CAST-to-VARCHAR
-      ;; `column-samples` runs — none of which produces a JSON column, and one
-      ;; of which (`column-samples`) depends on seeing the JSON rendering.
+      ;; `identity`, not `unwrap`, on scope rather than on need: this is the
+      ;; general helper over this namespace's OWN SQL — snapshot ids, table
+      ;; names, the CAST-to-VARCHAR `column-samples` runs — and none of those
+      ;; result sets has a JSON column in it, so there is nothing to unwrap.
+      ;;
+      ;; It is NOT that `column-samples` depends on seeing the JSON rendering.
+      ;; That was written here and is false: measured 2026-08-17 by installing
+      ;; `unwrap` in `q` and re-running the synopsis parity over the live
+      ;; tables, the samples came back byte-identical. The quotes that reorder
+      ;; them come from `CAST(… AS VARCHAR)`, which happens in SQL before any
+      ;; value reaches JDBC.
       (rs->maps rs (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n)) identity))))
 
 (defn- q-as

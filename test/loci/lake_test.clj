@@ -283,15 +283,33 @@
       (is (every? #(or (number? %) (string? %)) (map :pct back)))
       (is (string? (json/write-str back))))))
 
-(deftest a-nested-json-value-comes-back-with-string-keys
-  ;; The `:key-fn` choice, pinned. These keys are values DuckDB parsed out of
-  ;; user data, not loci column names, and `:key-fn keyword` on "odd key" mints
-  ;; a keyword that does not read back — the trap `sub/col-kw` exists for, one
-  ;; layer in. A SQL NULL is Java null and never reaches `unwrap` at all.
+(deftest a-null-in-a-mixed-column-is-nil-not-a-json-node
+  ;; The other half of `unwrap`'s contract: a SQL NULL is Java null whatever the
+  ;; column type, so it never reaches `unwrap` at all and comes back as the same
+  ;; `nil` every other column type gives.
   (with-lake [lk]
-    (let [rs   [{:v {"a" 1 "odd key" [1 2]}} {:v "plain"} {:v nil}]
+    (let [rs   [{:pct 50} {:pct "~13%"} {:pct nil}]
           back (tbl/rows lk (tbl/put-rows! lk "tbl:n" rs) {})]
-      (is (= {"a" 1 "odd key" [1 2]} (:v (first back))))
-      (is (= "plain" (:v (second back))))
-      (is (nil? (:v (nth back 2))))
+      (is (= rs back))
+      (is (nil? (:pct (nth back 2))))
       (is (string? (json/write-str back))))))
+
+(deftest a-nested-column-is-refused-rather-than-stored
+  ;; `unwrap` closed one hole of three. A column whose rows all share one shape
+  ;; is inferred as STRUCT or LIST, never JSON, so it bypasses `unwrap` and the
+  ;; object cannot be serialized at all. Refused at write time instead —
+  ;; naming the column, which is something the agent can act on.
+  (with-lake [lk]
+    (doseq [[what rs] [["a vector" [{:name "a" :tags ["x" "y"]} {:name "b" :tags ["z"]}]]
+                       ["a map"    [{:name "a" :meta {"k" 1}} {:name "b" :meta {"k" 2}}]]]]
+      (let [r (try {:handle (tbl/put-rows! lk (str "tbl:" what) rs)}
+                   (catch clojure.lang.ExceptionInfo e {:ex e}))]
+        (is (some? (:ex r)) (str what " must be refused at write time"))
+        (is (re-find #"holds a .* — a loci table column holds scalars"
+                     (str (some-> ^Exception (:ex r) .getMessage))))
+        (is (#{:tags :meta} (:column (ex-data (:ex r)))) "the refusal names the column")
+        ;; What the refusal prevents, made reachable: stored instead, these rows
+        ;; come back as org.duckdb.DuckDBArray / DuckDBStruct and write-str dies.
+        (when-let [h (:handle r)]
+          (is (string? (json/write-str (tbl/rows lk h {})))
+              "stored, the rows would be unserializable"))))))

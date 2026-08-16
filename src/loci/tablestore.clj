@@ -114,9 +114,19 @@
         (keep (fn [[k ks]] (when (next ks) [k (vec (sort-by pr-str ks))])))
         (group-by sub/col-kw (into #{} (mapcat keys) rows))))
 
+(defn- nested-value
+  "The first `[column value]` whose value is a vector, map or set — or nil.
+
+   Over the whole table for `collisions`' reason: a ragged table whose column is
+   a string in row 1 and a vector in row 2 is still a table with a nested
+   column, and one row cannot see it."
+  [rows]
+  (first (for [r rows, [k v] r :when (coll? v)] [k v])))
+
 (defn normalize-rows
   "Every row keyed by `cols-of`'s keywords, so the rows and the column list
-   cannot disagree — **or a throw**, when two column names normalize to one.
+   cannot disagree — **or a throw**, when two column names normalize to one, or
+   when a column holds a vector or a map.
 
    Public because `Lake` implements `put-rows!` from its own namespace and has
    to normalize before `load-rows!` writes the JSON. Measured with the
@@ -135,7 +145,34 @@
 
    Refusing rather than merging is the register this codebase already keeps:
    `put-rows!` throws on a table with no rows, and `safe-event` throws rather
-   than write a line it could not read back."
+   than write a line it could not read back.
+
+   **A nested column is refused for the same reason, and refused rather than
+   supported.** `read_json_auto` infers a column whose rows all share one shape
+   as DuckDB `STRUCT` or `LIST` — never `JSON` — so JDBC returns
+   `org.duckdb.DuckDBStruct` / `DuckDBArray`, `lake/unwrap` never sees them, and
+   the object cannot be serialized at all:
+
+     Don't know how to write JSON of class org.duckdb.DuckDBArray
+     Don't know how to write JSON of class org.duckdb.DuckDBStruct
+
+   Reachable from the agent's own path — `save_table` with
+   `[{:name \"a\" :tags [\"x\" \"y\"]}]` lands fine and the next `query_table`
+   throws into the tool loop — and a regression from moving rows to the lake,
+   since the same rows through `InlineTable` serialize.
+
+   Supporting them properly means `to_json` in the SELECT plus a type probe per
+   read, which is real machinery for a shape nothing asks for: a loci table
+   column is a scalar everywhere it is consumed — `content.clj`'s viewer
+   predicates, `fnlib`'s `numeric-cols`/`cat-cols` — and `save_table`'s own tool
+   description says \"each row is an object of column->value\". **0 of the 31
+   live tables have a nested column** (measured 2026-08-16). A refusal at write
+   time, naming the column, is something the agent can act on; a 500 at read
+   time is not.
+
+   Here rather than in `Lake` so **both stores refuse**. An inline/lake
+   divergence is the failure this move has spent four tasks closing, and a check
+   that lived in one store would be one more."
   [rows]
   (let [cs (collisions rows)]
     (when (seq cs)
@@ -144,6 +181,11 @@
                              (str/join " and " (map pr-str ks))
                              " both normalize to " k " — refusing to merge them")
                         {:column k :from ks :collisions cs})))))
+  (when-let [[k v] (nested-value rows)]
+    (throw (ex-info (str "column " k " holds a " (.getSimpleName (class v))
+                         " — a loci table column holds scalars, not a vector or a map."
+                         " Join it into a string, or split it into columns.")
+                    {:column k :type (.getName (class v)) :value v})))
   (mapv (fn [r] (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)) rows))
 
 (defrecord InlineTable []

@@ -564,7 +564,8 @@
 ;; ============================================================================
 
 (defn seed!
-  "Write the demo world into `store`, landing every table's rows in `ts`.
+  "Write the demo world into `store`, landing every row-bearing object's rows
+   in `ts`.
 
    **This is a writer, and it was the eighth one found.** `objects` above builds
    its table objects through `obj`, which takes `kind` as a *parameter* — so it
@@ -579,13 +580,25 @@
    top-level `def` and this namespace's property is that requiring it starts
    nothing — no store opened, no lake attached. The rows stay plain data in
    `objects`; landing them is something a caller asks for. `store` below is the
-   only caller, and it forces the lake only on the branch that actually seeds."
+   only caller, and it forces the lake only on the branch that actually seeds.
+
+   **`:metric` as well as `:table`**, because a metric's `:value` is rows too:
+   `metric:mrr` and `metric:headcount` are 48 rows and 1,882 characters between
+   them, `777000` among them. The first pass filtered on `:kind :table` and
+   converted 10 of 12 — and its test could not see the other two, because it
+   filtered the same way. Filtering by the property being fixed is the blind
+   spot this move keeps rediscovering; it is what hid `rerun!` one level up. It
+   also falsifies \"nothing writes a `:metric`\": something does, on every fresh
+   boot.
+
+   `table-value` rather than `table-object`, because these objects already exist
+   and only their `:value` moves — and because `table-object` would stamp
+   `:kind :table` on a `:metric`."
   [store ts]
   (doseq [o objects]
     (sub/commit! store {:op :put :id (:id o)
-                        :value (if (= :table (:kind o))
-                                 (tbl/table-object ts (:id o) (:title o) (:value o)
-                                                   (dissoc o :id :kind :title :value))
+                        :value (if (#{:table :metric} (:kind o))
+                                 (assoc o :value (tbl/table-value ts (:id o) (:value o)))
                                  o)}))
   store)
 

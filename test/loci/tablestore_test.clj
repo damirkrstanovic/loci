@@ -149,3 +149,24 @@
     (is (= "tbl:src" (:from o)) "extra keys survive")
     (is (tbl/handle? (:value o)))
     (is (= rows (tbl/rows ts (:value o) {})))))
+
+(deftest a-nested-column-is-refused-by-the-inline-store-too
+  ;; The refusal lives in `normalize-rows` rather than in `Lake` so that BOTH
+  ;; stores refuse. Only the lake can actually fail on one — inline would
+  ;; serialize a vector happily — and that is exactly why the check belongs
+  ;; here: an inline/lake divergence is the failure this move exists to close.
+  (let [ts (tbl/inline-table)
+        e  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                 #"holds a PersistentVector — a loci table column holds scalars"
+                                 (tbl/put-rows! ts "tbl:x" [{:name "a" :tags ["x" "y"]}])))]
+    (is (= :tags (:column (ex-data e))) "the refusal names the column")
+    (is (= "clojure.lang.PersistentVector" (:type (ex-data e))) "and the offending type"))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"holds a .*Map"
+                        (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:m {"k" 1}}]))
+      "a map is refused the same way")
+  ;; Across the table, not per row — `collisions`' rule, for its reason
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"holds a"
+                        (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:v "flat"} {:v [1 2]}]))
+      "a ragged table still has a nested column")
+  (is (some? (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:a 1 :b "s" :c nil :d true}]))
+      "scalars, nil and booleans are untouched"))

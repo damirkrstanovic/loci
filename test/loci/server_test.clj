@@ -4265,18 +4265,39 @@
     (is (re-find #"two column names would become one column" (str (:error r))))
     (is (= before (count (sub/history st))) "and nothing was committed")))
 
-(deftest the-seed-lands-handles-not-rows
+(deftest the-seed-lands-handles-for-every-row-bearing-kind
   ;; The EIGHTH writer, missed for the same reason as the seventh: `content/obj`
   ;; takes `kind` as a parameter, so it spells no `:kind :table` literal for a
   ;; grep to find. This is production code — `content/store` seeds whenever the
-  ;; log is empty, so a fresh boot after a migration re-created ten inline
-  ;; tables. Measured before the conversion: 10 objects, 1,810 rows, 230,300
-  ;; characters of :put events, `tbl:orders` alone 134,630 in one event.
-  (let [st      (sub/fresh-store)
-        _       (c/seed! st @lake/lake)
-        tbl-evs (filterv #(= :table (:kind (:value %))) (sub/history st))]
-    (is (= 10 (count tbl-evs)) "ten seeded tables")
-    (is (every? #(tbl/handle? (:value (:value %))) tbl-evs))
-    (is (< (reduce + (map (comp count pr-str) tbl-evs)) 5000)
-        "the ten :put events together, against 230,300 before")
-    (is (= 1000 (count (rows-of st "tbl:orders"))) "and the rows are still all there")))
+  ;; log is empty, so a fresh boot after a migration re-created them inline.
+  ;;
+  ;; **Kind-agnostic on purpose.** The first version of this test filtered the
+  ;; seeded objects by `:kind :table` and asserted `(= 10 …)` — the same filter
+  ;; the fix used — so it was structurally blind to the two `:metric` objects
+  ;; the fix missed. Filtering by the property being fixed is the blind spot
+  ;; this whole move keeps rediscovering.
+  ;;
+  ;; Measured before: 10 tables at 230,300 characters (`tbl:orders` alone
+  ;; 134,630 in one event) and 2 metrics at 1,882, with `777000` in the log.
+  (let [st (sub/fresh-store)
+        _  (c/seed! st @lake/lake)
+        rb (->> (sub/objects st) vals (filter #(#{:table :metric} (:kind %))))]
+    (is (= 12 (count rb)) "10 tables and 2 metrics")
+    (is (every? #(tbl/handle? (:value %)) rb))
+    ;; Scoped to the row-bearing events, and NOT to the whole log, because
+    ;; `report:qbr` carries its own inline copy of the mrr rows inside a chart
+    ;; spec. A report's `:value` is a document, not a table — a different kind
+    ;; of duplication, and not one this constructor reaches.
+    (is (not (re-find #"777000"
+                      (pr-str (filter #(#{:table :metric} (:kind (:value %))) (sub/history st)))))
+        "a metric's rows must not be in its own event either")
+    ;; 3,032 with all twelve converted; 4,454 with the two metrics left inline,
+    ;; 232,144 with none of them. The bound has to sit below the middle number
+    ;; or it does not notice the case this test was rewritten for.
+    (is (< (reduce + (map (comp count pr-str)
+                          (filter #(#{:table :metric} (:kind (:value %))) (sub/history st))))
+           3500)
+        "the twelve :put events together")
+    (is (= 1000 (count (rows-of st "tbl:orders"))) "and the rows are still all there")
+    (is (= 24 (count (rows-of st "metric:mrr"))))
+    (is (= :metric (:kind (sub/object st "metric:mrr"))) "landing rows must not restamp the kind")))

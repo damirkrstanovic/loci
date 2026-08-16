@@ -338,8 +338,16 @@
    that a lake exists.
 
    Byte-identical to the inline path only where the two agree on how a value
-   *prints*. Measured over the 31 live row-bearing tables, 2026-08-16: **27 of
-   31**. Never because the ordering differs — DuckDB's VARCHAR collation and
+   *prints*. Measured over the 31 live row-bearing objects, 2026-08-16: **27 of
+   31**, and re-measured unchanged on 2026-08-17 after `lake/unwrap` landed —
+   the JSON columns it fixed are read through `q-as`, and these samples come
+   from `q` over a `CAST(… AS VARCHAR)` that happens before any value reaches
+   JDBC.
+
+   *Objects*, not tables: 29 tables and the two `:metric`s, which carry rows the
+   same way and which a `:kind :table` filter silently drops. That word cost a
+   round — it made the count look wrong, and the two it hid are exactly the two
+   `content/seed!` was failing to convert. Never because the ordering differs — DuckDB's VARCHAR collation and
    Clojure's `sort` were checked against each other over 27 strings spanning
    punctuation, digits, case, accents and CJK and agreed exactly. Always
    because `CAST(… AS VARCHAR)` and Clojure's `str` render the same value

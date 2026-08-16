@@ -1325,41 +1325,41 @@
    not even the levels that had already succeeded."
   [st id]
   (try
-   (let [o (sub/object st id)]
-    (if-not (and o (= :table (:kind o)))
-      {:error (str "not a table: " id)}
-      (let [objs     (vals (sub/objects st))
-            children (fn [pid] (->> objs (filter #(= pid (:from %))) (sort-by :id) (map :id)))
-            ;; breadth-first over the :from DAG, parents before children
-            order    (loop [q (vec (if (:from o) [id] (children id))) seen #{} out []]
-                       (if (empty? q)
-                         out
-                         (let [[x & xs] q]
-                           (if (seen x)
-                             (recur (vec xs) seen out)
-                             (recur (vec (concat xs (children x))) (conj seen x) (conj out x))))))
-            {:keys [working refreshed skipped]}
-            (reduce (fn [{:keys [working refreshed skipped]} cid]
-                      (let [r (recompute st working (sub/object st cid))]
-                        (if (:rows r)
-                          {:working (assoc working cid (:rows r))
-                           :refreshed (conj refreshed cid) :skipped skipped}
-                          {:working working :refreshed refreshed
-                           :skipped (conj skipped {:id cid :why (:why r)})})))
-                    {:working {} :refreshed [] :skipped []}
-                    order)]
-        ;; `working` holds ROWS, because that is what `recompute` threads from an
-        ;; ancestor to its descendants. What lands in the LOG is the handle those
-        ;; rows were written to — the seventh writer, and the one that builds no
-        ;; `:kind :table` literal for a grep to find.
-        (when (seq refreshed)
-          (sub/commit! st {:op :tx :events (mapv (fn [cid]
-                                                   {:op :assoc :id cid :path [:value]
-                                                    :value (tbl/table-value @lake/lake cid
-                                                                            (get working cid))})
-                                                 refreshed)}))
-        {:state (state-payload st) :refreshed refreshed :skipped skipped})))
-   (catch Exception e {:error (.getMessage e)})))
+    (let [o (sub/object st id)]
+      (if-not (and o (= :table (:kind o)))
+        {:error (str "not a table: " id)}
+        (let [objs     (vals (sub/objects st))
+              children (fn [pid] (->> objs (filter #(= pid (:from %))) (sort-by :id) (map :id)))
+              ;; breadth-first over the :from DAG, parents before children
+              order    (loop [q (vec (if (:from o) [id] (children id))) seen #{} out []]
+                         (if (empty? q)
+                           out
+                           (let [[x & xs] q]
+                             (if (seen x)
+                               (recur (vec xs) seen out)
+                               (recur (vec (concat xs (children x))) (conj seen x) (conj out x))))))
+              {:keys [working refreshed skipped]}
+              (reduce (fn [{:keys [working refreshed skipped]} cid]
+                        (let [r (recompute st working (sub/object st cid))]
+                          (if (:rows r)
+                            {:working (assoc working cid (:rows r))
+                             :refreshed (conj refreshed cid) :skipped skipped}
+                            {:working working :refreshed refreshed
+                             :skipped (conj skipped {:id cid :why (:why r)})})))
+                      {:working {} :refreshed [] :skipped []}
+                      order)]
+          ;; `working` holds ROWS, because that is what `recompute` threads from
+          ;; an ancestor to its descendants. What lands in the LOG is the handle
+          ;; those rows were written to — the seventh writer, and the one that
+          ;; builds no `:kind :table` literal for a grep to find.
+          (when (seq refreshed)
+            (sub/commit! st {:op :tx :events (mapv (fn [cid]
+                                                     {:op :assoc :id cid :path [:value]
+                                                      :value (tbl/table-value @lake/lake cid
+                                                                              (get working cid))})
+                                                   refreshed)}))
+          {:state (state-payload st) :refreshed refreshed :skipped skipped})))
+    (catch Exception e {:error (.getMessage e)})))
 
 ;; ONE verb over a table: the user says what they want, the agent picks the
 ;; simplest mechanism (declarative view-spec / browser applet / server-side
