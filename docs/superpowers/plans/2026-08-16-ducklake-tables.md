@@ -1616,6 +1616,14 @@ git commit -m "fix: a table comes back with the columns it went in with"
 **Added 2026-08-16, from Task 6d's implementer.** Two defects in Task 2/3's code, both latent
 today and both written into the log the moment Task 7 lands. The last task before the writers.
 
+**Task 6f made the first of these worse, so this task now repairs two paths rather than one.**
+`synopsis` takes its columns from `(:cols h)`, where it previously took the union of keys over
+the first 50 rows. Measured on `[{:a 1} {:a 2 :b 9} {:a 3 :c 7}]`, the synopsis went from
+`"columns: a, b, c\na: 1, 2, 3\nb: 9\nc: 7"` to `"columns: a\na: 1, 2, 3"` — columns `b` and `c`
+vanish from what semantic search can find. No live table is ragged, so the exposure between 6f
+and this task is empty, and the fix below is a union over **all** rows rather than the old
+50-row window, so it improves on both.
+
 **1. `cols-of` reads the first row only** (`tablestore.clj:27-31`), so a key that first appears
 in a later row is dropped — by the lake, silently, while `InlineTable` keeps it:
 
@@ -1743,10 +1751,19 @@ from the normalized rows so the two cannot drift.
 
 - [ ] **Step 5: Confirm the live corpus is unmoved**
 
-Task 6d got 30 of 31 tables round-tripping with byte-identical synopses. Re-run that measurement
-and confirm it is **still 30 of 31** — `col-kw` on the existing tables' keywords must be a
-no-op, and if this task changes any of the 30 it has broken something Task 6d fixed. Report the
-number.
+The baseline is **27 of 31**, measured twice independently after Task 6f. (Task 6d's 30 of 31
+described the hydrate-and-scan synopsis that 6f replaced; do not use it.) The four that diverge
+are `tbl:csv-19-7071`, `tbl:csv-18-1542`, `tbl:corpus-2` and `tbl:extract-20-8413`, all for
+value-rendering reasons that have nothing to do with column names.
+
+Re-run that measurement and confirm it is **still 27 of 31** — `col-kw` on the existing tables'
+keywords must be a no-op, since all 31 already carry readable keywords. If this task moves any
+of the 27, it has broken something Task 6d fixed. Report the number and any table that changed
+side.
+
+Note also that after this task the *inline* synopsis names normalized columns, because `cols-of`
+routes them through `col-kw`. Nothing live is affected — the 27 hold precisely because every
+existing column keyword already reads back cleanly — but your sabotage step should expect it.
 
 - [ ] **Step 6: Sabotage**
 
