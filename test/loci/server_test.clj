@@ -14,7 +14,8 @@
             [loci.notebook :as nb]
             [loci.server :as srv]
             [loci.substrate :as sub]
-            [loci.tablestore :as tbl])
+            [loci.tablestore :as tbl]
+            [loci.tools :as tools])
   (:import [java.util Locale]))
 
 (use-fixtures :once loci.lake-fixture/with-temp-lake)
@@ -4301,3 +4302,24 @@
     (is (= 1000 (count (rows-of st "tbl:orders"))) "and the rows are still all there")
     (is (= 24 (count (rows-of st "metric:mrr"))))
     (is (= :metric (:kind (sub/object st "metric:mrr"))) "landing rows must not restamp the kind")))
+
+(deftest as-of-reads-the-table-that-existed-then
+  ;; Design decision 1 — every read names its version — is supposed to make
+  ;; time travel work over lake-backed tables without anything else being built.
+  ;; No implementation backs this test; it exists because the claim needs one.
+  ;;
+  ;; **What it does not prove.** Measured by sabotage 2026-08-17: dropping
+  ;; ` AT (VERSION => …)` from `lake/rows` leaves this test green, because each
+  ;; table here has exactly one snapshot and the current version IS the recorded
+  ;; one. `a-read-names-its-version` in `loci.lake-test` is the test that fails
+  ;; there. This one proves the substrate's `frozen-at` window and the lake agree
+  ;; on which tables existed — not that a handle reads its own version.
+  (let [st (sub/fresh-store)
+        a  (:saved_as (tools/save-table! st "A" [{:v 1}]))
+        n1 (count (sub/history st))
+        b  (:saved_as (tools/save-table! st "B" [{:v 2}]))
+        frozen (sub/frozen-at st n1)]
+    (is (some? (sub/object frozen a)) "the first table existed at n1")
+    (is (nil? (sub/object frozen b))  "the second did not")
+    (is (= [{:v 1}] (:value (tbl/hydrate lake/lake (sub/object frozen a))))
+        "and its rows still resolve, from a store that cannot commit")))
