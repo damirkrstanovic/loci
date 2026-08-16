@@ -504,6 +504,24 @@
               (is (str/includes? (str msg) (str store))
                   "the message names the directory that actually failed")))))))
 
+(deftest a-writable-data-dir-with-an-unwritable-lake-inside-is-refused
+  ;; the same half-fixed volume, one directory over: table rows live in
+  ;; <data-dir>/lake now, so `chown` without -R leaves DuckDB dying on the first
+  ;; table write instead of Datalevin dying on open. Same refusal, same message.
+  (with-tmpdir [d]
+    (let [dir  (io/file d "substrate-home")
+          lake (io/file dir "lake")]
+      (.mkdirs lake)
+      (chmod! lake "---------")
+      (if-not (permissions-enforced?)
+        (skipped! "a-writable-data-dir-with-an-unwritable-lake-inside-is-refused")
+        (do (is (nil? (write-probe-ok dir)) "the data dir itself is writable")
+            (let [msg (sub/data-dir-problem (str dir))]
+              (is (string? msg) "and it is still refused")
+              (is (str/includes? (str msg) (str lake))
+                  "the message names the directory that actually failed")
+              (is (str/includes? (str msg) "chown") "the message carries the fix")))))))
+
 (deftest a-missing-data-dir-is-not-judged-by-a-sibling-substrate-dir
   ;; the store probe applies to <data-dir>/substrate, not <ancestor>/substrate.
   ;; With the data dir absent the check walks up to the parent — and an
@@ -511,6 +529,17 @@
   ;; mistaken for ours.
   (with-tmpdir [d]
     (let [decoy (io/file d "substrate")]
+      (.mkdirs decoy)
+      (chmod! decoy "---------")
+      (is (nil? (sub/data-dir-problem (str d "/loci-data")))
+          "a first run under a writable parent still passes"))))
+
+(deftest a-missing-data-dir-is-not-judged-by-a-sibling-lake-dir
+  ;; and the lake probe likewise applies to <data-dir>/lake, not
+  ;; <ancestor>/lake — otherwise someone else's `lake` in the parent refuses our
+  ;; first run.
+  (with-tmpdir [d]
+    (let [decoy (io/file d "lake")]
       (.mkdirs decoy)
       (chmod! decoy "---------")
       (is (nil? (sub/data-dir-problem (str d "/loci-data")))

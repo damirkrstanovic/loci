@@ -240,18 +240,24 @@
        (str (header (str nearest " is a file, not a directory")) refusal)
 
        :else
-       ;; the data dir AND, when it is already there, the store dir inside it —
-       ;; `chown` on /data alone leaves /data/substrate root-owned, and a check
-       ;; that passed there would hand the user back the Datalevin trace it
-       ;; exists to replace. Only when `nearest` IS the data directory: if we
-       ;; walked up to an ancestor then nothing below it exists yet, and
-       ;; <ancestor>/substrate would be some other directory entirely.
-       (let [store (io/file nearest "substrate")]
+       ;; the data dir AND, when they are already there, the two databases
+       ;; inside it — `chown` on /data alone leaves /data/substrate and
+       ;; /data/lake root-owned, and a check that passed there would hand the
+       ;; user back the Datalevin trace, or the DuckDB one, that it exists to
+       ;; replace. Only when `nearest` IS the data directory: if we walked up to
+       ;; an ancestor then nothing below it exists yet, and <ancestor>/substrate
+       ;; would be some other directory entirely.
+       (let [store (io/file nearest "substrate")
+             lake  (io/file nearest "lake")
+             here? (= nearest (.getAbsoluteFile asked))]
          (or (when-let [why (write-probe nearest)]
                (str (header (str "cannot write " nearest " — " why)) advice))
-             (when (and (= nearest (.getAbsoluteFile asked)) (.isDirectory store))
+             (when (and here? (.isDirectory store))
                (when-let [why (write-probe store)]
-                 (str (header (str "cannot write " store " — " why)) advice)))))))))
+                 (str (header (str "cannot write " store " — " why)) advice)))
+             (when (and here? (.isDirectory lake))
+               (when-let [why (write-probe lake)]
+                 (str (header (str "cannot write " lake " — " why)) advice)))))))))
 
 (defn- load-events
   "Replay the log line by line. A crash mid-append can truncate the LAST line —
