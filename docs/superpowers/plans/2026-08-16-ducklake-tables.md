@@ -1767,6 +1767,324 @@ git commit -m "fix: every column is a column, and a handle survives the log"
 
 ---
 
+## Task 6f: ask the database for the synopsis, instead of shipping it rows
+
+**Files:**
+- Modify: `src/loci/tablestore.clj` (`TableStore` gains `column-samples`; `InlineTable` implements it)
+- Modify: `src/loci/lake.clj` (`Lake` implements it, in SQL, memoized)
+- Modify: `src/loci/chunks.clj` (`synopsis` splits into a formatter and a sampler; `all-chunks` attaches samples instead of hydrating)
+- Test: `test/loci/tablestore_test.clj`, `test/loci/lake_test.clj`, `test/loci/chunks_test.clj`
+
+**Added 2026-08-16.** Task 6c made `all-chunks` hydrate so a lake-backed table would still get a
+synopsis. That was the smallest change that restored the behaviour, and it is the wrong shape:
+it ships 2,000 rows every 15 seconds to build a 600-character string, and it still samples only
+the first 2,000 rows of a table that may have 10,000,000.
+
+Three facts make a better version obvious, and all three are already established:
+
+1. **A synopsis is bounded output.** `synopsis-max-chars` is 600 and the clip is unconditional
+   (`chunks.clj:69`), so a 10M-row table and a 3-row table produce the same size vector. We were
+   never embedding rows and this task does not change that.
+2. **A handle is immutable.** Writes never overwrite — every write creates a new lake table — so
+   a given `[table, snapshot]` pair can be sampled once, ever. Re-deriving it every 15 seconds
+   is work that provably cannot produce a different answer.
+3. **DuckDB can answer the question directly.** The synopsis needs each column's first few
+   distinct values. That is `SELECT DISTINCT` with a `LIMIT`, which ships nine values rather
+   than 2,000 rows, and is correct over 10M rows rather than over the first 2,000.
+
+**The ordering change, and why it is worth a one-time re-embed.** Today `synopsis` takes the
+first three distinct values *in row order*. SQL has no row order to appeal to without an
+`ORDER BY`, and a synopsis whose values vary between runs would move the hash on every sweep and
+re-embed forever. So both implementations change to: **the distinct values of the column,
+ordered by their string form, first three.** Deterministic in both, identical in both — which is
+what keeps the lake and inline paths from drifting — and it fixes the >`mold-cap` divergence
+recorded in Task 6d rather than moving it.
+
+Ordering by string form rather than natural order is deliberate: a column holding both `50` and
+`"~13%"` has no natural order, and the string form is what gets printed into the synopsis anyway.
+
+The cost is that every table's synopsis text changes once, so **all 31 re-embed when this
+lands** — one model round trip each, once. That is cheaper than doing it at migration and
+cheaper than keeping the bug.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test/loci/tablestore_test.clj`:
+
+```clojure
+(deftest column-samples-are-distinct-ordered-and-bounded
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:r "EMEA" :n 1} {:r "APAC" :n 2}
+                                      {:r "EMEA" :n 3} {:r "AMER" :n 4}])]
+    (is (= {:r ["AMER" "APAC" "EMEA"] :n ["1" "2"]}
+           (tbl/column-samples ts h 3 2))
+        "distinct, ordered by string form, capped per column")))
+
+(deftest column-samples-skips-nulls
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a nil} {:a "z"}])]
+    (is (= {:a ["z"]} (tbl/column-samples ts h 3 5)))))
+```
+
+`test/loci/lake_test.clj` — the same contract against the real store, plus the property the
+whole task exists for:
+
+```clojure
+(deftest the-lake-samples-the-same-values-the-rows-would
+  (with-lake [lk]
+    (let [rs (into [] (for [i (range 100)] {:r (str "r" (mod i 7)) :n i}))
+          hl (tbl/put-rows! lk "tbl:x" rs)
+          hi (tbl/put-rows! (tbl/inline-table) "tbl:x" rs)]
+      (is (= (tbl/column-samples (tbl/inline-table) hi 3 3)
+             (tbl/column-samples lk hl 3 3))
+          "inline and lake must agree, or migration re-embeds every table"))))
+
+(deftest sampling-sees-past-the-mold-cap
+  ;; The bug this task exists to fix. Sorted so a column's variety begins well
+  ;; past `mold-cap`: hydrating 2,000 rows sees one region, the database sees
+  ;; all three.
+  (with-lake [lk]
+    (let [rs (into [] (for [i (range 3000)]
+                        {:region (cond (< i 2500) "AAA" (< i 2800) "BBB" :else "CCC") :i i}))
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= ["AAA" "BBB" "CCC"] (:region (tbl/column-samples lk h 3 3)))
+          "a column's variety past row 2,000 is still the column's variety"))))
+
+(deftest sampling-an-immutable-handle-happens-once
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{:a 1}])
+          n (atom 0)]
+      (with-redefs [lake/q (let [q lake/q] (fn [& args] (swap! n inc) (apply q args)))]
+        (tbl/column-samples lk h 3 3)
+        (let [after-first @n]
+          (tbl/column-samples lk h 3 3)
+          (is (= after-first @n)
+              "a handle cannot change, so it must not be sampled twice"))))))
+```
+
+`test/loci/chunks_test.clj` — the parity test from Task 6c must still hold, and one new test
+that the sweep no longer reads rows:
+
+```clojure
+(deftest chunking-a-lake-table-reads-no-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [rs (into [] (for [i (range 500)] {:a i}))
+            h  (tbl/put-rows! @lake/lake "tbl:x" rs)
+            st (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "S" :value h}})
+        (with-redefs [tbl/rows (fn [& _] (throw (ex-info "the sweep fetched rows" {})))]
+          (is (seq (ch/all-chunks st))
+              "a synopsis must come from samples, not from a page of rows"))))))
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `No such var: tbl/column-samples` throughout. Paste it.
+
+- [ ] **Step 3: Add `column-samples` to the protocol**
+
+`src/loci/tablestore.clj`:
+
+```clojure
+(defprotocol TableStore
+  (put-rows! [ts id rows])
+  (rows [ts h opts])
+  (row-count [ts h])
+  (column-samples [ts h per-col max-cols]
+    "Up to `per-col` sample values for each of the first `max-cols` columns, as
+     `{column [\"…\" …]}` with the values already stringified.
+
+     Distinct, ordered by string form, nulls dropped. Ordered rather than
+     first-seen because the lake has no row order to appeal to without an
+     `ORDER BY`, and a synopsis whose values vary between runs would move its
+     hash on every sweep and re-embed forever. Ordered *by string form* because
+     a column holding both `50` and `\"~13%\"` has no natural order, and the
+     string is what reaches the synopsis anyway.
+
+     This is what a table's chunk is built from. It exists so that describing a
+     10M-row table costs nine values rather than a page of rows, and so that the
+     description covers the whole column rather than its first `mold-cap` rows."))
+```
+
+`InlineTable`'s implementation, which is also the reference definition of the contract:
+
+```clojure
+  (column-samples [_ h per-col max-cols]
+    (let [rs (:data h)]
+      (into {} (for [c (take max-cols (:cols h))]
+                 [c (->> rs (keep #(get % c)) (map str) distinct sort (take per-col) vec)]))))
+```
+
+- [ ] **Step 4: Implement it in SQL**
+
+`src/loci/lake.clj`. One query per column — `SELECT DISTINCT` with `ORDER BY` and `LIMIT` on a
+single column is what a columnar store is for, and the memoize below means a given handle pays
+it once:
+
+```clojure
+(def ^:private sample-cache
+  "Samples for a `[table snapshot]`, computed once.
+
+   `memoize` rather than a hand-rolled atom, and sound rather than merely
+   convenient: a handle is immutable, because `put-rows!` always creates a new
+   lake table and nothing overwrites one. So a hit is not a stale answer, it is
+   the only answer.
+
+   Unbounded, and that is affordable: an entry is at most 24 columns × 3 clipped
+   strings, well under 1 KB, so a thousand table versions is about a megabyte.
+   Measure before replacing this with an eviction policy."
+  (memoize
+   (fn [lk table snapshot cols per-col]
+     (into {} (for [c cols]
+                [c (mapv #(str (first (vals %)))
+                         (q lk (str "SELECT DISTINCT CAST(" (ident c) " AS VARCHAR) AS v"
+                                    " FROM " table " AT (VERSION => " (long snapshot) ")"
+                                    " WHERE " (ident c) " IS NOT NULL"
+                                    " ORDER BY v LIMIT " (long per-col))))]))))) 
+```
+
+and in the `extend-type Lake` block:
+
+```clojure
+  (column-samples [lk h per-col max-cols]
+    (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col))
+```
+
+**Confirm by measurement, not by reading, that `ORDER BY` on the CAST alias matches
+`InlineTable`'s `sort` over stringified values** — including for a column mixing numbers and
+strings, where SQL's VARCHAR collation and Clojure's `compare` on strings could differ. If they
+disagree, say so and report both orderings rather than picking one; that is a finding about the
+contract, and the contract is what keeps migration from re-embedding.
+
+- [ ] **Step 5: Split `synopsis`**
+
+`src/loci/chunks.clj`. The formatting stays in one place so the two stores cannot drift:
+
+```clojure
+(defn- synopsis
+  "One bounded description of a table: its title, its column names, and a few
+   sample values per column.
+
+   Not its rows. The whole point is that 2,584 rows produce one vector, and the
+   clip at the end makes that a guarantee rather than an expectation — a caller
+   can assert on the length and the assertion holds for any table.
+
+   Takes samples rather than rows so that a lake-backed table can be described
+   without fetching any: the store answers `column-samples` from SQL, and this
+   function never learns which store it was. The row *count* is deliberately
+   absent: it would move the hash on every appended row and buy nothing anyone
+   searches for."
+  [title cols samples]
+  (let [line (fn [c] (str (col-name c) ": "
+                          (str/join ", " (map #(clip % 40) (get samples c)))))]
+    (clip (str/join "\n" (concat (when-not (str/blank? (str title)) [(str title)])
+                                 [(str "columns: " (str/join ", " (map col-name cols)))]
+                                 (map line cols)))
+          synopsis-max-chars)))
+```
+
+`texts-of`'s `(:table :metric)` branch takes its samples from the object when they are there and
+computes them from rows when they are not:
+
+```clojure
+    (:table :metric)
+    (cond
+      (:table/samples obj)
+      [(synopsis title (:table/cols obj) (:table/samples obj))]
+
+      (rows? value)
+      (let [h (tbl/put-rows! (tbl/inline-table) (:id obj) value)]
+        [(synopsis title (vec (take synopsis-cols (:cols h)))
+                   (tbl/column-samples (tbl/inline-table) h synopsis-samples synopsis-cols))])
+
+      (not (str/blank? (str title))) [(str title)]
+      :else [])
+```
+
+`chunks-of` stays **pure** — it reads only the map it was handed. `InlineTable` is a record with
+no state, so constructing one is not a store access; if that reads badly to you, lift it to a
+`def` rather than threading a store into a pure function.
+
+- [ ] **Step 6: Stop hydrating in `all-chunks`**
+
+```clojure
+(defn- with-samples
+  "A handle-backed table, described. Attaches what `texts-of` needs and nothing
+   else — the rows are never fetched."
+  [o]
+  (if (tbl/handle? (:value o))
+    (let [h (:value o)]
+      (assoc o :table/cols    (vec (take synopsis-cols (:cols h)))
+               :table/samples (tbl/column-samples (force lake/lake) h
+                                                  synopsis-samples synopsis-cols)))
+    o))
+
+(defn all-chunks
+  "Every chunk the substrate currently implies. Reads the store; writes nothing
+   to it, ever.
+
+   A table's synopsis comes from `column-samples`, which the lake answers in SQL
+   and memoizes per handle, so this costs no row reads in steady state and stays
+   bounded whatever a table's size. `chunks-of` stays pure — it never learns
+   that a lake exists."
+  [st]
+  (chunks-in (map with-samples (vals (sub/objects st)))))
+```
+
+Note `(force lake/lake)` inside the handle branch only, preserving Task 6c's property that a
+store holding no handle never opens a lake. `all-chunks-opens-no-lake-for-a-store-with-no-handle`
+from Task 6d must still pass — if it does not, this branch is in the wrong place.
+
+- [ ] **Step 7: Measure what this was for**
+
+Three numbers, on the live corpus (154 objects, 306 chunks, 31 row-bearing tables), median of 7:
+
+| | Task 6d measured | now |
+|---|---|---|
+| `all-chunks`, tables inline | 16 ms | ? |
+| `all-chunks`, tables handle-backed, cold cache | 297 ms | ? |
+| `all-chunks`, tables handle-backed, warm cache | — | ? |
+
+The warm number is the one that matters: it is what the 15-second sweep actually pays. Then
+measure the cold cost of a **10M-row** table's samples — the case the whole task is about — and
+report it. Building 10M rows takes ~2.9 s via `put-rows!`; that is a fair price for the one
+measurement that says whether this design holds at the size it was designed for.
+
+- [ ] **Step 8: Re-measure the live corpus for parity**
+
+Run all 31 tables through a temp lake and compare synopsis text inline vs handle-backed, as
+Tasks 6c and 6d did. Expected: **30 of 31 identical**, the exception still
+`tbl:extract-20-8413`'s mixed `Long`/`String` column. Report the number.
+
+Separately and importantly: the synopsis text now differs from what is **already stored** in
+`chunks.edn`, because the sample ordering changed. Report how many of the 31 tables' chunk
+hashes move. That number is the one-time re-embedding cost of this task, and it should be
+roughly all of them.
+
+- [ ] **Step 9: Sabotage**
+
+Drop the `sort` from `InlineTable`'s `column-samples`. `the-lake-samples-the-same-values-the-rows-would`
+must FAIL — paste both orderings, because that difference is what would re-embed every table on
+migration.
+
+Drop the memoize (call the inner function directly). `sampling-an-immutable-handle-happens-once`
+must FAIL with a second query count. Restore.
+
+Replace `column-samples` on `Lake` with one that hydrates and samples the rows.
+`sampling-sees-past-the-mold-cap` must FAIL with `["AAA"]` — paste it, because that single value
+is what a 10M-row table's whole description would have been.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/loci/tablestore.clj src/loci/lake.clj src/loci/chunks.clj test/
+git commit -m "feat: a table describes itself in SQL, once, however big it is"
+```
+
+---
+
 ## Task 7: The six writers land handles
 
 **Files:**
@@ -2234,7 +2552,11 @@ not a number to update.
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
   Worth a measurement if a table ever comes back with a column the viewers stop treating as
   numeric.
-- **The chunk sweep now reads the lake every 15 seconds.** `all-chunks` hydrates, and
+- ~~**The chunk sweep now reads the lake every 15 seconds.**~~ *Fixed in Task 6f — the synopsis
+  comes from `column-samples` in SQL, memoized per handle, so the sweep reads no rows in steady
+  state. The measurement below is kept because it is what motivated that task.*
+
+  **The chunk sweep now reads the lake every 15 seconds.** `all-chunks` hydrates, and
   `start-chunk-sweep!` (`server.clj:2828`) calls `sweep!` on a 15 s daemon — before the
   `embedding-configured?` check, so it runs whether or not an embedder exists. Measured
   2026-08-16, 29 tables × 1,000 rows, median of 7: **790 ms** per pass handle-backed against
