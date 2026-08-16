@@ -2297,6 +2297,233 @@ git commit -m "feat: every table writer lands a handle, not rows"
 
 ---
 
+## Task 7c: the eighth writer, three uncaught throws, and a value the shell cannot render
+
+**Files:**
+- Modify: `src/loci/lake.clj` (`q-as`)
+- Modify: `src/loci/content.clj` (`seed!`)
+- Modify: `src/loci/tools.clj` (`save-table!`), `src/loci/server.clj` (`rerun!`)
+- Modify: `src/loci/tablestore.clj` (`table-object` docstring)
+- Test: `test/loci/lake_test.clj`, `test/loci/tools_test.clj`, `test/loci/server_test.clj`, `test/loci/content_test.clj`
+
+**Added 2026-08-16, from Task 7's review.** Four defects, in the order they matter.
+
+**1. `q-as` leaks `org.duckdb.JsonNode` into the payload, and it is a 500.** This is the Task 9
+blocker. When `read_json_auto` meets a column holding more than one type it widens it to DuckDB
+`JSON`, and JDBC hands back a `JsonNode`. Measured on `tbl:csv-18-1542` round-tripped through a
+real lake:
+
+```clojure
+(json/write-str (mold-payload …))
+;; => "Don't know how to write JSON of class org.duckdb.JsonNode"
+```
+
+`json-resp` is `clojure.data.json/write-str` (`server.clj:44-47`), so migrating one of these
+tables makes `/api/mold` throw — **the object cannot be opened in the shell at all** — and
+`query_table` on it throws into the agent loop. Task 9 as written would refuse three tables and
+call it a rendering disagreement. It is not: a storage layer must not return values its callers
+cannot serialize.
+
+The fix is at the boundary that created the problem. A `JsonNode`'s `toString` is the JSON text
+of the value, so parsing it back restores the original Clojure value exactly — `50` returns as
+`50`, `"~13% (1 of 8 countries)"` as that string. The mixed column then round-trips **losslessly**
+rather than being refused.
+
+**2. `loci.content/seed!` is an eighth writer**, and the grep missed it for exactly the reason
+it missed `rerun!`: `obj` (`content.clj:494`) takes `kind` as a *parameter*, so
+`(obj "tbl:orders" :table … orders-rows)` matches no `:kind :table` search. Measured: **10 table
+objects, 1,810 rows, 230,300 characters** of `:put` events, `tbl:orders` alone 134,630 chars in
+one event. This is production code — `content/store` seeds whenever the log is empty, i.e. every
+fresh install — so after Task 9 migrates the store, deleting `data/substrate` and rebooting
+re-creates ten inline tables. `table-object`'s "The one way to build a `:kind :table` object" is
+false while this stands.
+
+**3. Two writers throw where nothing catches.** Task 6e made `normalize-rows` throw on a column
+collision; Task 7 made that throw reachable from two boundaries with no net.
+
+- **`tools/save-table!`** has no `try`, `agent/chat-tools` does not catch `tool-fn`
+  (`agent.clj:139`), and `draft-brief!` catches at `server.clj:2079` — so a model emitting both
+  `"Total Sales"` and `"total_sales"` blanks the entire brief with
+  `_(agent unavailable: two column names would become one column…)_`. That is the same failure
+  the empty-rows guard was added to prevent, from the same tool.
+- **`server/rerun!`** is the only writer with no `try` — `fn-apply!`, `compute-clj!`,
+  `import-csv!`, `describe!`, `make-view!` and `do!` all catch. `handler` has no top-level catch
+  either, so `/api/rerun` returns a 500 with a stack trace. Worse, the commit is a single one
+  *after* the whole reduce, so a throw means **nothing** refreshes, not even the levels that
+  succeeded. Reachable because `lib:pivot` takes column names from data *values*
+  (`fnlib.clj:63`).
+
+**4. One missing assertion.** `do-query :save_as` is the only converted writer with no test that
+it lands a handle when it has rows; `a-save_as-that-filtered-everything-out-is-an-empty-table`
+covers only the empty branch.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test/loci/lake_test.clj`:
+
+```clojure
+(deftest a-mixed-type-column-round-trips-as-its-own-values
+  ;; read_json_auto widens a column holding more than one type to DuckDB JSON,
+  ;; and JDBC returns org.duckdb.JsonNode. Left alone it reaches the payload
+  ;; and `clojure.data.json/write-str` throws — measured on tbl:csv-18-1542,
+  ;; which would make /api/mold a 500 for that object. A JsonNode's toString is
+  ;; the JSON text of the value, so parsing it back gives the value that went in.
+  (with-lake [lk]
+    (let [rs [{:pct 50} {:pct "~13% (1 of 8 countries)"} {:pct 10}]
+          h  (tbl/put-rows! lk "tbl:x" rs)
+          back (tbl/rows lk h {})]
+      (is (= rs back) "the values that went in must be the values that come out")
+      (is (every? #(or (number? %) (string? %)) (map :pct back))
+          "and nothing may be a driver type")
+      (is (string? (json/write-str back))
+          "the whole point: the shell must be able to render it"))))
+```
+
+`test/loci/tools_test.clj`:
+
+```clojure
+(deftest a-column-collision-is-an-error-not-a-thrown-exception
+  ;; save_table runs inside the agent's tool loop, which does not catch. A
+  ;; throw here blanks the whole answer with "(agent unavailable: …)" — the
+  ;; same failure the empty-rows guard exists to prevent, from the same tool.
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{(keyword "Total Sales") 1 :total_sales 2}])]
+    (is (:error r) "a refusal must come back as a value")
+    (is (re-find #"one column" (:error r)))
+    (is (empty? (sub/objects st)) "and nothing may be committed")))
+
+(deftest a-save_as-with-rows-lands-a-handle
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:src"
+                     :value {:id "tbl:src" :kind :table :title "S" :value [{:a 1} {:a 2}]}})
+    (let [r (tools/dispatch st "query_table" {:table_id "tbl:src" :save_as "Kept"})]
+      (is (tbl/handle? (:value (sub/object st (:saved_as r))))))))
+```
+
+`test/loci/server_test.clj`:
+
+```clojure
+(deftest a-rerun-that-cannot-write-returns-an-error-not-a-500
+  ;; /api/rerun has no net under it: rerun! is the only writer without a try,
+  ;; and `handler` does not catch either. The commit is one :tx after the whole
+  ;; reduce, so a throw loses every level, including the ones that worked.
+  (let [st (sub/fresh-store)]
+    (with-redefs [tbl/table-value (fn [& _] (throw (ex-info "boom" {})))]
+      (let [r (srv/rerun! st "tbl:nope")]
+        (is (:error r) "a refusal must come back as a value")
+        (is (not (re-find #"Exception" (str (:error r)))))))))
+```
+
+`test/loci/content_test.clj` — read the file first; if there is no such namespace, put this in
+whichever suite already exercises the seed:
+
+```clojure
+(deftest the-seed-lands-handles-not-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (content/seed! st)
+        (let [tables (->> (sub/objects st) vals (filter #(= :table (:kind %))))]
+          (is (seq tables))
+          (is (every? #(tbl/handle? (:value %)) tables)
+              "a fresh install must not put 1,810 rows in the log")
+          (is (not (re-find #":sku " (pr-str (sub/history st))))
+              "and no row may appear anywhere in the log"))))))
+```
+
+Read `seed!`'s actual arity and the shape of `content/store` before writing this — `:sku` is a
+guess at a column name, so use one you have confirmed is in the seed data.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Paste all five failures.
+
+- [ ] **Step 3: Fix `q-as`**
+
+`src/loci/lake.clj`. A `JsonNode` must not escape the storage layer:
+
+```clojure
+(defn- unwrap
+  "A JDBC value as a Clojure value.
+
+   `read_json_auto` widens a column holding more than one type to DuckDB JSON,
+   and the driver returns `org.duckdb.JsonNode` — which `clojure.data.json`
+   cannot write, so it reaches `/api/mold` and 500s the object rather than
+   merely rendering oddly. Its `toString` is the JSON text of the value, so
+   parsing it back gives what was written: `50` returns as `50` and
+   `\"~13%\"` as that string. Measured 2026-08-16 over `tbl:csv-18-1542`,
+   `tbl:csv-19-7071` and `tbl:extract-20-8413` — the three tables in the
+   substrate with such a column, and the three Task 9 would otherwise refuse."
+  [v]
+  (if (instance? org.duckdb.JsonNode v)
+    (json/read-str (str v))
+    v))
+```
+
+applied in `q-as`'s row construction. **Leave `q` alone** — it is the general helper and its
+callers are SQL of this namespace's own making.
+
+Check whether `json/read-str` needs `:key-fn` for a genuinely nested JSON object, and say what
+you chose. Also confirm what happens for a JSON `null`.
+
+- [ ] **Step 4: Convert `seed!`**
+
+`content.clj`'s `obj` helper builds every object. Route the table case through
+`tbl/table-object`. **`seed!` must take the table store as an argument** rather than forcing
+`@lake/lake` itself — `loci.content` is required by tests that have no business opening a lake,
+and the namespace's existing property is that requiring it starts nothing. Give it a default of
+`@lake/lake` for the boot path if that reads cleanly, or thread it from `content/store`.
+
+**If threading it turns out to reach further than `content/store` — into the browser fixture's
+seeding script, or into a test helper you would have to change in several places — stop and
+report what it would take.** Exempting `seed!` and documenting it is an acceptable outcome; a
+half-threaded store is not.
+
+- [ ] **Step 5: Catch the two throws**
+
+`tools/save-table!` — wrap the `table-object` call so a collision returns
+`{:error <message>}`, matching its own `{:error "no rows to save"}` sibling. Nothing may be
+committed on that path.
+
+`server/rerun!` — give it the `try`/`catch` its six sibling writers already have, returning
+`{:error …}`. Follow whichever of them reads closest.
+
+- [ ] **Step 6: Correct `table-object`'s docstring**
+
+"The one way to build a `:kind :table` object" and "One function rather than six map literals"
+are both now false — there were seven writers, then eight. Say the true thing: it is the
+constructor every writer should use, name `table-value` as the sibling for the `:assoc` path,
+and record that two writers were found only after the `:kind :table` grep came back clean, so
+the grep is not the invariant.
+
+- [ ] **Step 7: Re-measure the corpus**
+
+With `q-as` fixed, re-run the 31-object parity measurement. The three JSON-column tables should
+now round-trip, so **expect the count to rise from 27 of 31**. Report the actual number and
+which tables still diverge — `tbl:corpus-2`'s `1.24E7`/`12400000.0` rendering difference is the
+one that should remain, since that is a Double formatting difference and not a JSON one.
+
+Then confirm the thing that motivated all of this:
+`(json/write-str (mold-payload …))` on a migrated `tbl:csv-18-1542` must return a string.
+
+- [ ] **Step 8: Sabotage**
+
+Remove `unwrap` from `q-as` → `a-mixed-type-column-round-trips-as-its-own-values` must fail, and
+paste the `write-str` error.
+Revert `save-table!`'s catch → the collision test must fail by throwing rather than returning.
+Revert `rerun!`'s catch → the 500 test must fail.
+Revert `seed!` → `the-seed-lands-handles-not-rows` must fail; report the log's character count
+with the rows back in it.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/loci/lake.clj src/loci/content.clj src/loci/tools.clj src/loci/server.clj src/loci/tablestore.clj test/
+git commit -m "fix: the eighth writer, two uncaught throws, and a value the shell cannot render"
+```
+
+---
+
 ## Task 8: as-of reads a table's past
 
 **Files:**
@@ -2369,13 +2596,28 @@ thrown exception" is the whole shape of this namespace, and a migration that die
 tells you less than one that finishes and names what it skipped. Wrap each table's conversion so
 a throw becomes a refusal with its reason.
 
-**(c) Two shapes will fail verification, and should be refused with a reason rather than
+**(c) One shape will fail verification, and should be refused with a reason rather than
 mismatch.** A **ragged** table reads back from the lake with explicit nils where a key was
-absent, so `(= (vec (:value o)) (vec back))` is false for it even though nothing was lost. A
-table with a column of **mixed types** comes back widened by `read_json_auto`. Measured: 0 of 31
-are ragged, and 1 of 31 (`tbl:extract-20-8413`) has a mixed `Long`/`String` column. Detect these
-and report them as named refusals, so the live run does not stop on a table that was never going
-to round-trip byte-identically.
+absent, so `(= (vec (:value o)) (vec back))` is false for it even though nothing was lost.
+Measured: **0 of 31 are ragged**, so this is a guard against a shape that does not exist yet
+rather than a case you will hit.
+
+*Corrected 2026-08-16 by Task 7's review.* This bullet originally also named mixed-type columns,
+said there was one such table, and told you to refuse it. All three were wrong. There are
+**three** — `tbl:csv-18-1542` (three columns), `tbl:csv-19-7071` (one) and `tbl:extract-20-8413`
+(one) — and refusing them was the wrong remedy, because the underlying problem was that
+`read_json_auto` widens such a column to DuckDB `JSON` and the driver returns an
+`org.duckdb.JsonNode` that `clojure.data.json/write-str` cannot serialize. Migrating one would
+have made `/api/mold` **throw a 500** for that object rather than merely render it oddly. Task 7c
+fixes it in `q-as`, so all three now round-trip losslessly and none needs refusing. **Verify that
+before you start**: if a mixed-type table still fails to round-trip, stop — Task 7c did not
+land.
+
+Two other things that survey established about `data/`, worth having: **0 collisions**, 0 nested
+values, 0 non-keyword keys, 0 nil-bearing columns, max cell 591 chars. And five `:report`
+objects have vector-of-maps values that would pass a naive `(every? map? …)` shape filter — their
+rows live inside `:rows` keys on `:block` maps, and DuckDB would build LIST/STRUCT columns out of
+them. **Filter by `#{:table :metric}` on `:kind`, never by shape.**
 
 **(d) Migration moves 4 tables' chunk text, on top of 31 already pending.** Task 6f rewrote
 `synopsis`, so all 31 stored chunk records are already stale and will re-embed on the next
