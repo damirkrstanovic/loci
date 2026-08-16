@@ -1337,9 +1337,15 @@
                            :skipped (conj skipped {:id cid :why (:why r)})})))
                     {:working {} :refreshed [] :skipped []}
                     order)]
+        ;; `working` holds ROWS, because that is what `recompute` threads from an
+        ;; ancestor to its descendants. What lands in the LOG is the handle those
+        ;; rows were written to — the seventh writer, and the one that builds no
+        ;; `:kind :table` literal for a grep to find.
         (when (seq refreshed)
-          (sub/commit! st {:op :tx :events (mapv (fn [cid] {:op :assoc :id cid :path [:value]
-                                                            :value (get working cid)})
+          (sub/commit! st {:op :tx :events (mapv (fn [cid]
+                                                   {:op :assoc :id cid :path [:value]
+                                                    :value (tbl/table-value @lake/lake cid
+                                                                            (get working cid))})
                                                  refreshed)}))
         {:state (state-payload st) :refreshed refreshed :skipped skipped}))))
 

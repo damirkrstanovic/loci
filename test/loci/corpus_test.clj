@@ -889,3 +889,25 @@
         "every quoted fact quotes an extract the manifest describes")
     (is (= tbl (set (map :table corpus/derived))) "and every table is read")
     (is (= prs (set (map :doc corpus/quoted))) "and every extract is quoted")))
+
+(deftest a-dry-run-writes-nothing-to-the-lake-either
+  ;; "Returns the plan it would have applied without applying any of it" has to
+  ;; cover the lake as well as the log. Minting IS how the plan is computed, so a
+  ;; dry run runs `mint-hub` in full — and once tables moved to DuckLake that
+  ;; meant every preview left orphan Parquet behind for a plan nobody applied.
+  ;; Measured before the fix: 5 tables and 6 snapshots per dry run.
+  (let [count-of (fn [sql] (:n (first (lake/q @lake/lake sql))))
+        tables   #(count-of "SELECT count(*) AS n FROM duckdb_tables()")
+        snaps    #(count-of "SELECT count(*) AS n FROM ducklake_snapshots('lake')")
+        [t0 s0]  [(tables) (snaps)]
+        st       (sub/fresh-store)
+        r        (corpus/import-corpus! st {:dir dir})]      ; DRY RUN
+    (is (:ok? r))
+    (is (= 5 (:commits (:plan r))) "it planned all five notebooks")
+    (is (zero? (count (sub/history st))) "and committed none of them")
+    (is (= t0 (tables)) "no table may be left in the lake")
+    (is (= s0 (snaps)) "and no snapshot")
+    ;; the same run live does write — otherwise the assertions above would pass
+    ;; on a lake nothing can reach
+    (ran! st)
+    (is (= (+ t0 5) (tables)) "a live run lands one table per notebook")))

@@ -172,37 +172,47 @@
    today is 1,000 rows, so this changes nothing about what currently renders."
   2000)
 
+(defn table-value
+  "Rows, landed in `ts`, as a table object's `:value` — a handle, or `[]` for no
+   rows.
+
+   **The empty case is not a handle** because `Lake/put-rows!` refuses an empty
+   table and two writers can honestly produce one: `query_table :save_as` over a
+   filter that matched nothing, and `import-csv!` on a header-only file. Both
+   committed `:value []` before tables moved and the shell drew an empty table;
+   letting the throw through would turn \"nothing matched\" into an error string,
+   and on the `save_as` path into an uncaught exception inside the agent's tool
+   loop. `[]` is not a handle, so `hydrate` passes it through and everything
+   downstream sees what it saw before — and `[]` in the log is not rows in the
+   log, so the guard costs the move nothing.
+
+   The other five writers cannot reach the empty case, measured 2026-08-16, and
+   this is worth knowing before anyone \"simplifies\" one of them: `save-table!`
+   returns `{:error \"no rows to save\"}` first; `compute-clj!`, the ƒ apply and
+   `rerun!` are all fed by `run-clj-rows`/`fnlib/run-fn`, which already answer
+   *the function did not return rows* / *no rows came out — nothing to keep* for
+   an empty result; and `corpus/mint-hub` runs after `material-complaint` has
+   refused any file with no rows in it.
+
+   Separate from `table-object` because `rerun!` replaces an existing object's
+   `:value` in place with `{:op :assoc :path [:value]}` and has no object to
+   construct — and rows written through that path are still rows in the log.
+   That is exactly how it went unnoticed: it builds no `:kind :table` literal,
+   so the grep that found the six writers did not find the seventh, and a test
+   reading through `hydrate` cannot see the difference because `hydrate` passes
+   a literal vector through untouched."
+  [ts id rows]
+  (if (seq rows) (put-rows! ts id rows) []))
+
 (defn table-object
   "The one way to build a `:kind :table` object. Lands the rows in `ts` and
    returns the object carrying a handle.
 
    One function rather than six map literals, so that a site added later gets
    lake storage by using the obvious constructor rather than by remembering to.
-
-   **A table with no rows keeps them in the object**, because `Lake/put-rows!`
-   refuses one and two of the writers can honestly produce one: `query_table
-   :save_as` over a filter that matched nothing, and `import-csv!` on a
-   header-only file. Both committed `:value []` before tables moved and the
-   shell drew an empty table; letting the throw through would turn \"nothing
-   matched\" into an error string, and on the `save_as` path into an uncaught
-   exception inside the agent's tool loop. `[]` is not a handle, so `hydrate`
-   passes it through and everything downstream sees what it saw before — and
-   `[]` in the log is not rows in the log, so the guard costs the plan nothing.
-
-   The other four cannot reach it, measured 2026-08-16, and this is worth
-   knowing before anyone \"simplifies\" one of them: `save-table!` returns
-   `{:error \"no rows to save\"}` first; `compute-clj!` and the ƒ apply are both
-   fed by `run-clj-rows`/`fnlib/run-fn`, which already answer *the function did
-   not return rows* / *no rows came out — nothing to keep* for an empty result;
-   and `corpus/mint-hub` runs after `material-complaint` has refused any file
-   with no rows in it.
-
-   One guard here rather than two at the call sites, for the same reason there
-   is one constructor rather than six literals — a seventh writer gets it for
-   free, and the two that need it are not the two you would guess."
+   `table-value` is the half of it a site that only replaces a `:value` can use."
   [ts id title rows & [extra]]
-  (merge {:id id :kind :table :title title
-          :value (if (seq rows) (put-rows! ts id rows) [])}
+  (merge {:id id :kind :table :title title :value (table-value ts id rows)}
          extra))
 
 (defn hydrate

@@ -45,7 +45,15 @@
    rows and asserting on it asserts on the handle's own keys. `hydrate` is what
    the fifteen production call sites use, and it passes a literal vector through
    untouched — so a test that writes rows into `:value` by hand still reads back
-   what it wrote."
+   what it wrote.
+
+   **Which is exactly why a test that reads through here cannot tell a converted
+   writer from an unconverted one.** That blind spot is not hypothetical: it is
+   how `rerun!` — the seventh writer, which assocs over `:value` and so builds no
+   `:kind :table` literal for a grep to find — went on putting rows in the log
+   with every rerun test passing. Assertions that a writer *landed a handle* must
+   read `(:value (sub/object …))` raw; see `every-server-writer-lands-a-handle`
+   and `rerun-writes-a-handle-and-not-the-refreshed-rows`."
   [st id]
   (:value (tbl/hydrate lake/lake (sub/object st id))))
 
@@ -475,8 +483,8 @@
         r  (srv/rerun! st "tbl:t")]
     (is (= (inc before) (count (sub/history st))))                 ; ONE :tx for the whole chain
     (is (= #{b c} (set (:refreshed r))))
-    (is (= [{:region "EMEA" :revenue 900}] (:value (sub/object st b))))       ; top-1 follows the new data
-    (is (= [1800 500] (map :revenue (:value (sub/object st c)))))             ; doubled fresh rows
+    (is (= [{:region "EMEA" :revenue 900}] (rows-of st b)))                   ; top-1 follows the new data
+    (is (= [1800 500] (map :revenue (rows-of st c))))                         ; doubled fresh rows
     (sub/undo! st)                                                 ; one undo restores BOTH
     ;; undo puts back the handle `fn-apply!` landed — `rerun!` assoc'd rows over
     ;; it, so this is the one assertion in the chain that reads through hydrate
@@ -493,7 +501,10 @@
                             :value [{:region "X" :revenue 7} {:region "Y" :revenue 3}]})
         r  (srv/rerun! st b)]                                      ; hit ↻ on the DERIVED table
     (is (= [b c] (:refreshed r)))                                  ; parent before child
-    (is (= [14 6] (map :revenue (:value (sub/object st c)))))))    ; child used b's NEW rows
+    ;; `recompute` threads ROWS between an ancestor and its descendants through
+    ;; `working`; only what lands in the log is a handle. This is the assertion
+    ;; that breaks first if those two ever get confused.
+    (is (= [14 6] (map :revenue (rows-of st c))))))                ; child used b's NEW rows
 
 (deftest rerun-skips-paramless-legacy-and-reports-why
   (let [st (store-with-table)]
@@ -4212,3 +4223,24 @@
     (let [st (store-with-table)
           r  (srv/compute-clj! st "tbl:t" "keep nothing" nil)]
       (is (= "compute failed: the function did not return rows" (:error r))))))
+
+(deftest rerun-writes-a-handle-and-not-the-refreshed-rows
+  ;; The seventh writer, and the one no grep for `:kind :table` finds: `rerun!`
+  ;; replaces an existing object's `:value` in place. It went unnoticed for the
+  ;; same reason `every-server-writer-lands-a-handle` exists — `rows-of` reads a
+  ;; literal vector exactly as happily as a handle, so nothing that hydrates can
+  ;; tell. Measured before the fix: one refresh of a 50-row derived table wrote a
+  ;; 1,599-character event with `:region "r99"` in it.
+  (let [trows (mapv (fn [i] {:region (str "r" i) :revenue (* 10 i)}) (range 100))
+        st    (sub/fresh-store)
+        _     (sub/commit! st {:op :put :id "tbl:t"
+                               :value (tbl/table-object @lake/lake "tbl:t" "T" trows)})
+        b     (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                      {:by "revenue" :n "50" :order "desc"} nil))
+        _     (srv/rerun! st "tbl:t")
+        ev    (last (sub/history st))]
+    (is (tbl/handle? (:value (sub/object st b)))
+        "a refresh must leave a handle where fn-apply! left one")
+    (is (not (re-find #":region \"r99\"" (pr-str ev)))
+        "and no row may appear anywhere in the :assoc event")
+    (is (= 50 (count (rows-of st b))) "the refreshed rows are still readable")))
