@@ -1319,6 +1319,21 @@ The spec decided table GC ships disabled, inheriting DuckLake's open snapshot-ex
 failure mode to avoid is a sweep that *implies* it was complete. This task makes the condition
 stated, the way `embedding-configured?` makes "semantic recall: off" a stated condition.
 
+**Added 2026-08-16, measured during Task 5's review, and it is a stronger reason than the
+upstream bugs.** Expiry is not merely buggy — it is *incompatible with how loci reads tables*.
+Every handle reads `AT (VERSION => n)`, so a handle is a reference to a snapshot. Running
+`ducklake_expire_snapshots(older_than => now())` followed by `ducklake_cleanup_old_files`
+makes an existing handle's read throw:
+
+> `Invalid Input Error: No snapshot found at version 1`
+
+Reclaiming disk therefore invalidates stored handles across the log, and the day someone
+enables GC to free space is the day every historical object stops rendering. This holds even
+if #261/#527/#529 were all fixed tomorrow. `sweep!`'s docstring must say it: a working expiry
+still needs loci to first decide which snapshots are still referenced by live handles, and
+that machinery does not exist. Keep the upstream issue numbers — they are the reason it is off
+*today* — and add this as the reason it cannot simply be switched on later.
+
 - [ ] **Step 1: Write the test**
 
 ```clojure
