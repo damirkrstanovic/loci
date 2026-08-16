@@ -2097,6 +2097,18 @@ const autolink=s=>{ let a=0,c=0;
 // Runs AFTER autolink and walks tags for the same reasons: by now URLs are
 // inside <a> — and "https:" would otherwise match the id shape — while
 // backticked text is inside <code>, where an id is being shown, not cited.
+// One id, resolved — or null when it names nothing this workspace holds.
+const objChip=id=>{
+  if(typeof STATE==='undefined') return null;
+  // Two registries: `state-payload` REMOVES :space from :objects, and a space
+  // is ENTERED rather than opened, so it carries data-space.
+  const o=(STATE.objects||{})[id];
+  const sp=o?null:(STATE.spaces||[]).find(x=>x.id===id);
+  if(!o&&!sp) return null;
+  const t=(o||sp).title||id, short=t.length>44?t.slice(0,44)+'…':t;
+  return '<span class="objref" '+(o?'data-open':'data-space')+'="'+esc(id)+
+         '" title="'+esc(id)+'">'+esc(short)+'</span>';
+};
 const objlink=s=>{ let a=0,c=0;
   return s.split(/(<[^>]*>)/).map(p=>{
     if(p.charAt(0)==='<'){ const t=p.match(/^<(\/?)(a|code)\b/i);
@@ -2104,22 +2116,19 @@ const objlink=s=>{ let a=0,c=0;
         if(t[2].toLowerCase()==='a') a=Math.max(0,a+d); else c=Math.max(0,c+d); }
       return p; }
     if(a||c) return p;
-    return p.replace(/\b[a-z]+:[a-z0-9][a-z0-9-]*/g, id=>{
-      if(typeof STATE==='undefined') return id;
-      // Two registries, because `state-payload` REMOVES :space from :objects —
-      // a cited notebook would otherwise stay dead text, which is the same
-      // complaint one level up. A space opens by entering it, not by opening
-      // it as an object, so it carries data-space like every other space chip.
-      const o=(STATE.objects||{})[id];
-      const sp=o?null:(STATE.spaces||[]).find(s=>s.id===id);
-      if(!o&&!sp) return id;
-      // the TITLE is what the reader needed; the id rides on the hover, so
-      // provenance stays checkable without spending a line of prose on it
-      const t=(o||sp).title||id, short=t.length>44?t.slice(0,44)+'…':t;
-      const attr=o?'data-open':'data-space';
-      return '<span class="objref" '+attr+'="'+esc(id)+'" title="'+esc(id)+'">'+esc(short)+'</span>';
-    });
-  }).join(''); };
+    return p.replace(/\b[a-z]+:[a-z0-9][a-z0-9-]*/g, id=>objChip(id)||id);
+  }).join('')
+  // …and then the backticked ones. The agent writes ids in backticks as a
+  // FORMATTING habit — measured on the live substrate, every id in
+  // draft:cosmos-1 was backticked and not one was bare — so treating <code> as
+  // "being shown, not cited" made the guard above skip every citation there
+  // was. A <code> whose whole content resolves is a citation and is replaced
+  // outright, rather than putting a long title in monospace.
+  //
+  // Fenced blocks are untouched and need no guard: mdToHtml pushes them
+  // straight into <pre class="mdcode"> without passing them through `inline`,
+  // so they never reach this function. A test pins that.
+  .replace(/<code>([a-z]+:[a-z0-9][a-z0-9-]*)<\/code>/g,(m,id)=>objChip(id)||m); };
 // A plain sentence, escaped, with URLs and cited ids made followable — and
 // nothing else. Deliberately not mdToHtml: an intent is one line the user
 // typed, and markdown there would render a stray * or # as formatting.

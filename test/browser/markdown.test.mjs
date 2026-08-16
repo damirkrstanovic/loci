@@ -310,16 +310,46 @@ test('an ordinary colon phrase is not mistaken for an id', async () => {
   });
 });
 
-test('an id inside backticks is being shown, not cited', async () => {
+test('an id in backticks is still a citation — the agent writes them that way', async () => {
   await withPage(browser, 'objref-in-code', async (page) => {
     await bootedShell(page, server.url);
+    // This assertion used to say the opposite, on the reasoning that <code>
+    // means "being shown, not cited". Measured against the live substrate on
+    // 2026-08-16: every id in draft:cosmos-1 was backticked and not one was
+    // bare, so that guard skipped every citation the document had. Backticks
+    // are the agent's formatting habit, not a change of meaning.
     const { id } = await page.evaluate(() => {
       const o = Object.values(STATE.objects).find(o => o.kind === 'table');
       return { id: o.id };
     });
-    const r = await refs(page, `The id is \`${id}\` exactly.`);
-    assert.equal(r.chips.length, 0, 'code shows an id; it does not reference one');
-    assert.match(r.text, new RegExp(id.replace(/[:.]/g, '\\$&')));
+    const r = await refs(page, `Mass figures from \`${id}\`; see also.`);
+    assert.equal(r.chips.length, 1, 'a backticked id must resolve like any other');
+    assert.equal(r.chips[0].id, id);
+    assert.ok(!r.chips[0].inCode,
+      'the whole <code> is replaced — a long title in monospace reads badly');
+  });
+});
+
+test('a fenced code block is code, and its ids are left alone', async () => {
+  await withPage(browser, 'objref-fenced', async (page) => {
+    await bootedShell(page, server.url);
+    // The guard that matters. It needs no special case: mdToHtml pushes a fence
+    // straight into <pre class="mdcode"> without passing it through `inline`,
+    // so it never reaches objlink at all — this pins that it stays that way.
+    const { id } = await page.evaluate(() => {
+      const o = Object.values(STATE.objects).find(o => o.kind === 'table');
+      return { id: o.id };
+    });
+    const r = await page.evaluate(({ i }) => {
+      const host = document.createElement('div');
+      host.innerHTML = mdToHtml('```\n(sub/object st "' + i + '")\n```');
+      return { chips: host.querySelectorAll('.objref').length,
+               pre: !!host.querySelector('pre.mdcode'),
+               text: host.textContent };
+    }, { i: id });
+    assert.ok(r.pre, 'the fence must still render as a code block');
+    assert.equal(r.chips, 0, 'an id inside a fence is code, not a citation');
+    assert.ok(r.text.includes(id), 'and survives verbatim');
   });
 });
 
