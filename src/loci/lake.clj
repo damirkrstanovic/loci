@@ -229,6 +229,26 @@
                   "', format='newline_delimited')"))
       (finally (.delete f)))))
 
+(def ^:private sample-cache
+  "Samples for a `[table snapshot]`, computed once.
+
+   `memoize` rather than a hand-rolled atom, and sound rather than merely
+   convenient: a handle is immutable, because `put-rows!` always creates a new
+   lake table and nothing overwrites one. So a hit is not a stale answer, it is
+   the only answer.
+
+   Unbounded, and that is affordable: an entry is at most 24 columns × 3 clipped
+   strings, well under 1 KB, so a thousand table versions is about a megabyte.
+   Measure before replacing this with an eviction policy."
+  (memoize
+   (fn [lk table snapshot cols per-col]
+     (into {} (for [c cols]
+                [c (mapv #(str (first (vals %)))
+                         (q lk (str "SELECT DISTINCT CAST(" (ident c) " AS VARCHAR) AS v"
+                                    " FROM " table " AT (VERSION => " (long snapshot) ")"
+                                    " WHERE " (ident c) " IS NOT NULL"
+                                    " ORDER BY v LIMIT " (long per-col))))])))))
+
 (extend-type Lake
   tbl/TableStore
   (put-rows! [lk id rs]
@@ -248,4 +268,7 @@
                   (when offset (str " OFFSET " (long offset))))
           (:cols h)))
 
-  (row-count [_ h] (:rows h)))
+  (row-count [_ h] (:rows h))
+
+  (column-samples [lk h per-col max-cols]
+    (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))

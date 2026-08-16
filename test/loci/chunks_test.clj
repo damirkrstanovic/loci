@@ -277,6 +277,18 @@
                  (map :hash (ch/all-chunks st)))
               "and therefore the same hashes"))))))
 
+(deftest chunking-a-lake-table-reads-no-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [rs (into [] (for [i (range 500)] {:a i}))
+            h  (tbl/put-rows! @lake/lake "tbl:x" rs)
+            st (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "S" :value h}})
+        (with-redefs [tbl/rows (fn [& _] (throw (ex-info "the sweep fetched rows" {})))]
+          (is (seq (ch/all-chunks st))
+              "a synopsis must come from samples, not from a page of rows"))))))
+
 (deftest all-chunks-opens-no-lake-for-a-store-with-no-handle
   (let [boom (delay (throw (ex-info "the sweep opened the lake for tables that never left the log" {})))
         st   (sub/fresh-store)]

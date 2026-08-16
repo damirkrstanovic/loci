@@ -130,6 +130,37 @@
       (is (= 1000 (count (tbl/rows lk h {})))
           "restore replaces the table; the handle must still resolve its own version"))))
 
+(deftest the-lake-samples-the-same-values-the-rows-would
+  (with-lake [lk]
+    (let [rs (into [] (for [i (range 100)] {:r (str "r" (mod i 7)) :n i}))
+          hl (tbl/put-rows! lk "tbl:x" rs)
+          hi (tbl/put-rows! (tbl/inline-table) "tbl:x" rs)]
+      (is (= (tbl/column-samples (tbl/inline-table) hi 3 3)
+             (tbl/column-samples lk hl 3 3))
+          "inline and lake must agree, or migration re-embeds every table"))))
+
+(deftest sampling-sees-past-the-mold-cap
+  ;; The bug this task exists to fix. Sorted so a column's variety begins well
+  ;; past `mold-cap`: hydrating 2,000 rows sees one region, the database sees
+  ;; all three.
+  (with-lake [lk]
+    (let [rs (into [] (for [i (range 3000)]
+                        {:region (cond (< i 2500) "AAA" (< i 2800) "BBB" :else "CCC") :i i}))
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= ["AAA" "BBB" "CCC"] (:region (tbl/column-samples lk h 3 3)))
+          "a column's variety past row 2,000 is still the column's variety"))))
+
+(deftest sampling-an-immutable-handle-happens-once
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{:a 1}])
+          n (atom 0)]
+      (with-redefs [lake/q (let [q lake/q] (fn [& args] (swap! n inc) (apply q args)))]
+        (tbl/column-samples lk h 3 3)
+        (let [after-first @n]
+          (tbl/column-samples lk h 3 3)
+          (is (= after-first @n)
+              "a handle cannot change, so it must not be sampled twice"))))))
+
 (deftest requiring-this-namespace-opens-no-lake
   (is (delay? lake/lake)
       "the process lake is a delay — requiring loci.lake must not touch the data dir")

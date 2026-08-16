@@ -14,7 +14,21 @@
      for one table.")
   (rows [this handle opts]
     "A page of rows for `handle`. `opts` may carry :offset and :limit.")
-  (row-count [this handle] "How many rows `handle` names, without fetching them."))
+  (row-count [this handle] "How many rows `handle` names, without fetching them.")
+  (column-samples [this handle per-col max-cols]
+    "Up to `per-col` sample values for each of the first `max-cols` columns, as
+     `{column [\"…\" …]}` with the values already stringified.
+
+     Distinct, ordered by string form, nulls dropped. Ordered rather than
+     first-seen because the lake has no row order to appeal to without an
+     `ORDER BY`, and a synopsis whose values vary between runs would move its
+     hash on every sweep and re-embed forever. Ordered *by string form* because
+     a column holding both `50` and `\"~13%\"` has no natural order, and the
+     string is what reaches the synopsis anyway.
+
+     This is what a table's chunk is built from. It exists so that describing a
+     10M-row table costs nine values rather than a page of rows, and so that the
+     description covers the whole column rather than its first `mold-cap` rows."))
 
 (defn handle?
   "True for a handle this namespace produced. The `:store` key is explicit
@@ -40,7 +54,11 @@
       offset (drop offset)
       limit  (take limit)
       true   vec))
-  (row-count [_ h] (:rows h)))
+  (row-count [_ h] (:rows h))
+  (column-samples [_ h per-col max-cols]
+    (let [rs (:data h)]
+      (into {} (for [c (take max-cols (:cols h))]
+                 [c (->> rs (keep #(get % c)) (map str) distinct sort (take per-col) vec)])))))
 
 (defn inline-table [] (->InlineTable))
 

@@ -182,6 +182,12 @@
 
 (defn- rows? [v] (and (sequential? v) (seq v) (every? map? v)))
 
+(def ^:private inline-store
+  "The reference `TableStore`. Lifted to a def rather than constructed per call
+   so that `chunks-of` staying **pure** is obvious: `InlineTable` is a record
+   with no fields, so this is a value, not a store to be reached."
+  (tbl/inline-table))
+
 (defn- col-name [c] (if (keyword? c) (name c) (str c)))
 
 (defn- clip [s n] (if (> (count s) n) (str (subs s 0 n) "…") s))
@@ -194,16 +200,14 @@
    clip at the end makes that a guarantee rather than an expectation — a caller
    can assert on the length and the assertion holds for any table.
 
-   Columns come from the first rows in order of first appearance, so the answer
-   does not depend on how a map happens to iterate. The row *count* is
-   deliberately absent: it would move the hash on every appended row and buy
-   nothing anyone searches for."
-  [title rows]
-  (let [cols (->> (take 50 rows) (mapcat keys) distinct (take synopsis-cols) vec)
-        line (fn [c]
-               (let [vs (->> rows (keep #(get % c)) (map #(clip (str %) 40))
-                             distinct (take synopsis-samples))]
-                 (str (col-name c) ": " (str/join ", " vs))))]
+   Takes samples rather than rows so that a lake-backed table can be described
+   without fetching any: the store answers `column-samples` from SQL, and this
+   function never learns which store it was. The row *count* is deliberately
+   absent: it would move the hash on every appended row and buy nothing anyone
+   searches for."
+  [title cols samples]
+  (let [line (fn [c] (str (col-name c) ": "
+                          (str/join ", " (map #(clip % 40) (get samples c)))))]
     (clip (str/join "\n" (concat (when-not (str/blank? (str title)) [(str title)])
                                  [(str "columns: " (str/join ", " (map col-name cols)))]
                                  (map line cols)))
@@ -253,7 +257,7 @@
    no chunks until it is named here, which is the safe direction to fail: an
    unembedded object is found lexically, an embedded viewspec is noise in every
    result."
-  [{:keys [kind title value]}]
+  [{:keys [id kind title value] :table/keys [cols samples]}]
   (case kind
     :space  (let [head (str/trim (str title "\n" (str (:intent value))))]
               (into (if (str/blank? head) [] [head])
@@ -264,10 +268,17 @@
     ;; leaving the object to be found the way it is found today, by title.
     :doc    (if (string? value) (prose-chunks value) [])
     :report (prose-chunks (report-body value))
-    (:table :metric) (cond
-                       (rows? value)                 [(synopsis title value)]
-                       (not (str/blank? (str title))) [(str title)]
-                       :else [])
+    (:table :metric)
+    (cond
+      samples [(synopsis title cols samples)]
+
+      (rows? value)
+      (let [h (tbl/put-rows! inline-store id value)]
+        [(synopsis title (vec (take synopsis-cols (:cols h)))
+                   (tbl/column-samples inline-store h synopsis-samples synopsis-cols))])
+
+      (not (str/blank? (str title))) [(str title)]
+      :else [])
     []))
 
 (defn chunks-of
@@ -298,24 +309,55 @@
   [objs]
   (vec (mapcat chunks-of (sort-by #(str (:id %)) objs))))
 
+(defn- with-samples
+  "A handle-backed table, described. Attaches what `texts-of` needs and nothing
+   else — the rows are never fetched."
+  [o]
+  (if (tbl/handle? (:value o))
+    (let [h (:value o)]
+      (assoc o :table/cols    (vec (take synopsis-cols (:cols h)))
+               :table/samples (tbl/column-samples (force lake/lake) h
+                                                  synopsis-samples synopsis-cols)))
+    o))
+
 (defn all-chunks
   "Every chunk the substrate currently implies. Reads the store; writes nothing
    to it, ever.
 
-   Hydrates on the way in, so a table's synopsis is built from its rows whether
-   they sit in the log or in the lake. `chunks-of` stays pure — it never learns
+   A table's synopsis comes from `column-samples`, which the lake answers in SQL
+   and memoizes per handle, so this costs no row reads in steady state and stays
+   bounded whatever a table's size. `chunks-of` stays pure — it never learns
    that a lake exists.
 
-   Byte-identical for a table whose columns hold one type each and whose rows
-   number `mold-cap` or fewer — which is all 31 in the substrate today, bar one
-   with a mixed `Long`/`String` column that `read_json_auto` widens to a JSON
-   column, so its values come back JSON-quoted. Past `mold-cap` the synopsis
-   samples only the first 2,000 rows, so a table sorted such that a column's
-   variety begins later will chunk differently than it did inline. Both are
-   re-embeddings, not losses; the point of getting this close is that Task 9's
-   migration re-embeds almost nothing."
+   Byte-identical to the inline path only where the two agree on how a value
+   *prints*. Measured over the 31 live row-bearing tables, 2026-08-16: **27 of
+   31**. The four that differ do so because `CAST(… AS VARCHAR)` and Clojure's
+   `str` render the same value differently, never because the ordering differs
+   — DuckDB's VARCHAR collation and Clojure's `sort` were checked against each
+   other over 27 strings spanning punctuation, digits, case, accents and CJK
+   and agreed exactly.
+
+   Three of the four are the lake's own type inference and predate this
+   function — reading the rows back disagreed with inline in exactly the same
+   way, and sampling in row order simply never reached the offending value:
+
+   · `100` against `100.0` — a column mixing `Long` and `Double` is one
+     `DOUBLE` to `read_json_auto` (`tbl:csv-19-7071`).
+   · `\"\"` against `\"\\\"\\\"\"` — a column mixing a string with numbers is
+     widened to JSON, and a JSON value keeps its quotes (`tbl:csv-18-1542`,
+     `tbl:extract-20-8413`).
+
+   The fourth is this function's own, and is the price of asking SQL rather
+   than Clojure to render:
+
+   · `1.24E7` against `12400000.0` — Clojure switches a `Double` to scientific
+     notation at 1e7 and below 1e-3, DuckDB never does (`tbl:corpus-2`).
+
+   Not repaired by stringifying in Clojure instead: the values are *ordered* by
+   the rendering, so printing one rendering and sorting by another is a worse
+   contract than either. All four are re-embeddings, not losses."
   [st]
-  (chunks-in (map #(tbl/hydrate lake/lake %) (vals (sub/objects st)))))
+  (chunks-in (map with-samples (vals (sub/objects st)))))
 
 ;; ---------------------------------------------------------------------------
 ;; the sidecar — append-only EDN lines, last-wins by :id

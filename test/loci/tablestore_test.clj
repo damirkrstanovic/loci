@@ -50,6 +50,23 @@
     (is (= rows (:value (tbl/hydrate ts {:kind :table :value h})))
         "passing the store itself, not a delay, must keep working")))
 
+(deftest column-samples-are-distinct-ordered-and-bounded
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:r "EMEA" :n 1} {:r "APAC" :n 2}
+                                      {:r "EMEA" :n 3} {:r "AMER" :n 4}])]
+    ;; per-col is 3, and the two columns show the two halves of the contract:
+    ;; `:r` has exactly three distinct values, so all survive and the order is
+    ;; the evidence (first-seen would put EMEA first); `:n` has four, so one is
+    ;; dropped, which is the cap.
+    (is (= {:r ["AMER" "APAC" "EMEA"] :n ["1" "2" "3"]}
+           (tbl/column-samples ts h 3 2))
+        "distinct, ordered by string form, capped per column")))
+
+(deftest column-samples-skips-nulls
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a nil} {:a "z"}])]
+    (is (= {:a ["z"]} (tbl/column-samples ts h 3 5)))))
+
 (deftest hydrate-caps-a-large-table
   (let [ts   (tbl/inline-table)
         many (mapv (fn [i] {:id i}) (range 5000))
