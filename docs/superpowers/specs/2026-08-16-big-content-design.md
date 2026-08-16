@@ -37,7 +37,7 @@ That is the whole design. Everything below is consequences of it.
 | content | store | handle | immutable because |
 |---|---|---|---|
 | large table | DuckLake | snapshot id | Parquet files are never modified in place |
-| blob / image / video | content-addressed store | `sha256:…` | the name IS the hash |
+| blob / image / video | content-addressed store | a CID | the name IS the hash |
 | small table, doc, note | the event itself | — | the log is append-only |
 
 ## Undo is not a feature to add. It is a consequence of never overwriting
@@ -60,12 +60,12 @@ different rules — see below.
 ### The mapping, concretely
 
 ```
-event 41  {:op :put :id "img:hero" :value {:kind :image :blob "sha256:9f2c…" :w 3000 …}}
-event 42  {:op :assoc :id "img:hero" :path [:value :blob] :value "sha256:41ab…"}   ; cropped
+event 41  {:op :put :id "img:hero" :value {:kind :image :content "bafkrei9f2c…" :w 3000 …}}
+event 42  {:op :assoc :id "img:hero" :path [:value :content] :value "bafkrei41ab…"}   ; cropped
 
-undo!            → event 42 gone; img:hero's :blob is 9f2c… again; both blobs on disk
-as-of 41         → 9f2c…
-gc (later)       → 41ab… is referenced by no live event → collectable
+undo!            → event 42 gone; img:hero's :content is …9f2c… again; both blobs on disk
+as-of 41         → …9f2c…
+gc (later)       → …41ab… is referenced by no live event → collectable
 ```
 
 and for a table:
@@ -97,6 +97,101 @@ three under different names:
 
 So the work is not to adopt a new architecture. It is to notice that the substrate is already
 a claim log over permanodes, and to give it a payload store that matches.
+
+## Portable references: identity is not location
+
+A reference must survive the blob moving — to S3, to a NAS, to IPFS, to another machine —
+without rewriting a single event. Every system that has solved this solved it the same way,
+and the rule is one sentence:
+
+> **The handle is an identity. Where the bytes currently live is separate, mutable, and not
+> authoritative.**
+
+RFC 6920 states it as a rule about equality: *"all `ni` names with different authorities refer
+to the same object if and only if the digest algorithm, length, and value are the same"* — the
+authority is explicitly outside the identity. Git separates an oid from its remotes; OCI
+separates a digest from the registry serving it; IPFS separates a CID from the peers providing
+it. loci's log stores the identity and nothing else.
+
+**The consequence worth naming: moving every blob to S3 changes zero events.** The log does not
+know or care where bytes are, so a substrate copied to another machine, or pointed at a
+different backend, still resolves — and `as-of` still resolves, because the identity in a
+five-year-old event is still the identity.
+
+### What an event carries
+
+Modelled on an [OCI content descriptor](https://github.com/opencontainers/image-spec/blob/main/descriptor.md)
+— `{mediaType, digest, size}` — which is the most widely deployed content-addressing in
+practice, plus whatever the kind needs:
+
+```clojure
+{:kind       :image
+ :content    "bafkrei…"      ; identity. Never changes. This is the whole reference.
+ :media-type "image/png"     ; what it is, without fetching it
+ :size       481203          ; how big, without fetching it — a UI can plan
+ :w 3000 :h 2000}            ; kind-specific
+```
+
+`:size` and `:media-type` are on the event deliberately: the shell must be able to lay out,
+label and decide about a blob it has not fetched and may not be able to reach.
+
+### Where the bytes are is configuration
+
+```
+LOCI_BLOB_STORES=file:data/blobs,s3://bucket/loci,ipfs://
+```
+
+An ordered list the resolver tries. A blob may exist in several at once; nothing records
+which. Adding a backend is a config change, never a migration.
+
+### Untrusted backends are safe, and that is the point
+
+Because the handle *is* the hash, every fetch is verifiable: hash what came back, compare to
+the handle you asked for. RFC 6920 gives this as the reason the scheme exists — it "allows for
+many forms of in-network storage without requiring as much trust in the infrastructure". So an
+S3 bucket, a public IPFS gateway or a shared NAS need no trust: a corrupted or substituted
+blob fails verification rather than entering the substrate. **Verification on read is not
+optional in this design**; it is what makes remote backends acceptable at all.
+
+### The handle format: a CID, not a bespoke string
+
+Three candidates, all portable, differing in what they are self-describing about:
+
+| | form | self-describes | notes |
+|---|---|---|---|
+| OCI digest | `sha256:<hex>` | algorithm, by convention | simplest, universally understood |
+| RFC 6920 | `ni:///sha-256;<b64url>` | algorithm | IETF standard, defines an HTTP mapping |
+| **CIDv1** | `bafkrei…` | algorithm **and content type** | native IPFS address; multicodec |
+
+**Recommend CIDv1.** Two reasons that are about loci and not about fashion:
+
+- **IPFS was named as a target, and a CID *is* an IPFS address.** With any other format an
+  IPFS backend needs a translation layer that can only be lossy in one direction.
+- **It makes the chunking upgrade a non-event.** The earlier section commits to not building
+  content-defined chunking now while not precluding it. A CID's multicodec is exactly the
+  field that distinguishes "this hash is of raw bytes" from "this hash is of a chunk list" —
+  so a chunked blob is a different codec under the same identifier scheme, and nothing above
+  `ContentStore` changes. With `sha256:<hex>` that distinction has nowhere to live.
+
+**Check before committing:** whether a usable multiformats/CID library exists for the JVM. If
+it does not, the fallback is `ni:` — an IETF standard, trivial to encode — and IPFS interop
+becomes a translation layer. This is a real open question, not a formality.
+
+### Which hash, and why it can be deferred
+
+[BLAKE3 is 3–10× faster than SHA-256](https://ssojet.com/compare-hashing-algorithms/sha-256-vs-blake3)
+— ~1 GB/s per core against 300–400 MB/s, and it parallelises near-linearly while SHA-256 stays
+single-threaded. For multi-gigabyte video that is the difference between seconds and minutes.
+
+And yet: **start with SHA-256.** It is in the JDK with zero dependency, loci's jar is already
+doubling from DuckDB, and there is no media in the substrate at all — SHA-256 hashes a 100 MB
+image in about a third of a second.
+
+The reason this is a deferral and not a mistake is the self-describing handle. A CID carries
+its own multihash code, so BLAKE3 blobs can be added later beside SHA-256 ones, in the same
+store, with every old handle still resolving and no migration. **That is the concrete payoff
+for paying multiformats' complexity, and it is why the format decision matters more than the
+algorithm one.**
 
 ## Garbage collection, and why it is not undo
 
@@ -147,9 +242,14 @@ Two protocols, in the house style already set by `sub/Store`, `mold/Recall` and
 ```clojure
 (defprotocol ContentStore
   (put!   [this in]      "bytes/stream → handle. Idempotent: same bytes, same handle.")
-  (fetch  [this handle]  "→ stream, or nil")
+  (fetch  [this handle]  "→ stream, or nil. VERIFIES the bytes against the handle.")
   (size   [this handle]  "→ bytes, or nil")
   (sweep! [this live]    "delete handles not in `live`. Dry run by default."))
+
+;; …and a resolver over an ordered list of stores, so `file:`, `s3:` and `ipfs:`
+;; are the same protocol behind one lookup. Nothing records WHICH store holds a
+;; blob: that is the point of identity-not-location, and it is what makes adding
+;; a backend a config change rather than a migration.
 
 (defprotocol TableStore
   (rows      [this id opts]  "a page, for the Rows viewer")
@@ -203,6 +303,9 @@ and must not be given back.
    ranges, thumbnails and transcoding, none of which this design addresses.
 4. **Does a blob participate in LEAP and recall?** An image has no text. A caption or an
    agent-written description would be the chunkable surface, and that is a separate design.
+5. **CIDv1 or `ni:`** — decided in favour of CIDv1 above, but contingent on a usable JVM
+   multiformats library existing. If none does, is a translation layer for IPFS acceptable, or
+   should the format follow whatever ships cleanly?
 
 ## What to measure before building
 
@@ -211,3 +314,6 @@ and must not be given back.
 2. **Boot cost** of attaching the lake, against loci's existing ~14 s Datalevin load — the
    startup budget is already the thing that made every test run expensive.
 3. **`undo!` latency** when it moves a snapshot pointer versus popping an inline table.
+4. **Hash throughput on this machine**, SHA-256 against a realistic image and a realistic
+   video, before assuming the JDK's default is fast enough — the claim above is from a
+   benchmark, not from here.
