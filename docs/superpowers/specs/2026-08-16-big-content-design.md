@@ -1,7 +1,7 @@
 # Big content: tables, blobs and media, without giving up undo
 
 Date: 2026-08-16
-Status: **research and design, awaiting approval.** No code written. Numbers below are
+Status: **design settled, nothing built.** Every open question is answered; what remains is measurement, then a plan. No code written. Numbers below are
 measured against the live substrate on 2026-08-16 unless marked otherwise.
 
 ## The want
@@ -43,13 +43,13 @@ That is the whole design. Everything below is consequences of it.
 
 | content | store | handle | immutable because |
 |---|---|---|---|
-| table (any size) | content store, as csv/json/parquet | a CID | the name IS the hash |
+| table (any size) | DuckLake | snapshot id | Parquet is never modified in place |
 | image, video, blob | content store | a CID | the name IS the hash |
 | doc, note, small value | the event itself | — | the log is append-only |
-| **mutable** table, later | DuckLake | snapshot id | Parquet is never modified in place |
 
-Every loci table is create-only today, so the last row is a future need rather than a current
-one — see "Decided: one table interface" for the evidence and the recommendation.
+Two handle types, one rule. Tables could have used a CID too — every loci table is create-only
+today — and "Decided: one table interface" records why DuckLake was chosen anyway and what
+that costs.
 
 ## Undo is not a feature to add. It is a consequence of never overwriting
 
@@ -79,21 +79,14 @@ as-of 41         → …9f2c…
 gc (later)       → …41ab… is referenced by no live event → collectable
 ```
 
-and for a table — the same shape, because a table is a file:
+and for a table, the same shape with the other handle type:
 
 ```
-event 57  {:op :put :id "tbl:orders" :value {:kind :table :content "bafkrei…" 
-                                             :format :parquet :rows 4200000 :cols 8}}
+event 57  {:op :put   :id "tbl:orders" :value {:kind :table :snapshot 12 :rows 4200000 :cols 8}}
+event 58  {:op :assoc :id "tbl:orders" :path [:value :snapshot] :value 13}
 
-as-of 57         → SELECT … FROM read_parquet('<blob path for that CID>')
-undo!            → the previous event's CID is current again
-```
-
-and only when a table becomes mutable does it need the other mechanism:
-
-```
-event 91  {:op :assoc :id "tbl:live" :path [:value :snapshot] :value 13}
-as-of 90         → SELECT … FROM tbl_live AT (VERSION => 12)
+as-of 57         → SELECT … FROM tbl_orders AT (VERSION => 12)
+undo!            → snapshot 12 is current again; 13 is orphaned until GC
 ```
 
 `as-of` gets **faster**, not slower: today it re-folds a prefix of the log to rebuild a
@@ -293,24 +286,33 @@ daily. That is a real future want and DuckLake is the right answer to it; it is 
 today's, and building the catalog now means carrying its snapshot semantics and its open bugs
 before anything needs them.
 
-**Recommendation: DuckDB now, DuckLake when the first mutable table appears.** The
-`TableStore` interface is the same either way — which is the point of having one — so
-`DuckLakeTable` slots in beside `FileTable` without touching a caller. If you would rather
-have DuckLake from the start for uniformity, that is a defensible call and the interface
-absorbs it; this section exists so the choice is made knowingly rather than by momentum.
+**Decided 2026-08-16: DuckLake from the start.** Uniformity wins — every table gets snapshots
+whether or not it currently needs them, and the mutable case arrives without a second
+mechanism appearing at the moment it is least convenient.
+
+The section above stays because it names what that choice costs, and those costs are now
+shipping constraints rather than hypotheticals:
+
+- **Two undo mechanisms, not one.** CIDs for blobs, snapshot ids for tables. Both are
+  handles in an event and both are swept by mark-and-sweep, so the *rule* is still single —
+  but there are two implementations of it to keep honest.
+- **DuckLake's snapshot-expiry bugs are inherited on day one**, so table GC ships disabled
+  with retention "keep everything". See the GC section.
+- **A small table is Parquet in a catalog, not the CSV it arrived as.** The `less`-readable
+  property is given up. If that turns out to matter, `FileTable` is the escape hatch and the
+  interface already allows it.
 
 ### What the interface hides
 
 ```
-tbl:planets      8 rows        planets.csv        ← readable with `less`, diffable
-tbl:orders       1,000 rows    orders.csv
-tbl:events       40M rows      events.parquet     ← columnar, predicate pushdown
-tbl:live-feed    growing       DuckLake snapshot  ← only when mutation arrives
+tbl:planets      8 rows        DuckLake snapshot 3
+tbl:orders       1,000 rows    DuckLake snapshot 7
+tbl:events       40M rows      DuckLake snapshot 12
 ```
 
-Keeping a small table as the CSV it arrived as is not nostalgia: it means `data/blobs/` stays
-inspectable with ordinary tools, which is the same reason the compose file bind-mounts `./data`
-rather than hiding it in a named volume.
+One store, one handle type, one query surface. Ingest still accepts csv/json/parquet — DuckDB
+reads all three natively — but what lands is Parquet under the catalog, and the caller cannot
+tell which it started as.
 
 ## Images: metadata is not optional
 
@@ -348,14 +350,33 @@ promising cross-process safety before measuring it.
 
 ### Open questions this raises
 
-- **Which VLM, and where?** loci's LLM is DeepSeek and its embedder is a local llama server;
-  a vision model is a third endpoint. `LOCI_VLM_ENDPOINT`, or does the existing
-  `LOCI_LLM_ENDPOINT` serve a vision-capable model?
-- **Is a description a field or an object?** On the image's `:value` is simpler and matches
-  `:title`/`:intent`. A separate doc would make it independently versionable and citable. The
-  first is probably right and the second is what a caption-heavy archive would want.
-- **Does an EXIF extractor exist for the JVM that we would want?** The same check that closed
-  the CID question — verify in a REPL before the spec commits to it.
+### Decided: the VLM, and where the description lives
+
+**`LOCI_VLM_MODEL=gemma-4-26b-a4b`**, with the endpoint falling back to `LOCI_LLM_ENDPOINT`
+when `LOCI_VLM_ENDPOINT` is unset — a vision model here is a chat-completions call with an
+image in the message, so it is the same surface with a different model. That fallback chain is
+the one `LOCI_RERANK_API_KEY` already uses (embed's key, then the LLM's), so it is a pattern
+the config file has rather than a new idea. Absent a model, ingest states "no VLM configured"
+the way `embedding-configured?` states "semantic recall: off".
+
+**The description is a field on the image's `:value`**, not a separate object. It matches
+`:title` and `:intent`, it makes `chunks-of` an ordinary read of the object rather than a
+join, and an `:assoc` on that one path is how a correction becomes a reversible event.
+
+### Verified: EXIF on the JVM
+
+`com.drewnoakes/metadata-extractor` 2.20.0 (Apache 2.0), exercised in a REPL 2026-08-16. It
+reads EXIF, IPTC, XMP and ICC — and **for video too**, which is the room this design left.
+
+It answers what the descriptor needs even for an image carrying no EXIF whatsoever: a
+generated JPEG still yielded `Detected MIME Type = image/jpeg`, `Image Width = 640`,
+`Image Height = 480`. So `:media-type`, `:w` and `:h` come from one call rather than from
+guessing at a file extension.
+
+**One thing to filter.** The library reports a `File` directory containing `File Name` and
+`File Modified Date`. In a content-addressed store those are a temp filename and the moment of
+ingest — accidents of transport, not facts about the image. Recording them would put a lie in
+the substrate that reads exactly like provenance. Drop that directory; keep JPEG/Exif/GPS/XMP.
 
 ## Garbage collection, and why it is not undo
 
@@ -375,15 +396,15 @@ Two rules make this safe, and both are the reason it is a separate act:
   it cannot account for. A GC that silently deletes the wrong blob is unrecoverable in a way
   a stale index never is.
 
-**DuckLake caveat, and a reason the deferral in "Decided: one table interface" is not only
-about simplicity —** measured from its issue tracker: it
+**DuckLake caveat, inherited on day one by the decision to adopt it now —** measured from its
+issue tracker: it
 [cannot expire the latest snapshot](https://github.com/duckdb/ducklake/issues/261) — which is
 exactly the state an undo leaves — and snapshot expiry has open data-loss bugs
 ([#527](https://github.com/duckdb/ducklake/issues/527),
-[#529](https://github.com/duckdb/ducklake/issues/529)). So if DuckLake is adopted, table GC
-ships **disabled** with retention "keep everything". Deferring DuckLake defers that problem
-entirely: a table held as a content-addressed file is swept by the same blob GC as an image,
-with no snapshot semantics involved.
+[#529](https://github.com/duckdb/ducklake/issues/529)). So table GC ships **disabled**, with
+retention "keep everything", and is enabled only once those are closed. Blob GC has no such
+dependency and can ship first — which means for a while loci reclaims image space and not
+table space, and should say so rather than implying a sweep was complete.
 
 ## Storage cost, and the upgrade path we should not preclude
 
@@ -424,10 +445,10 @@ Two protocols, in the house style already set by `sub/Store`, `mold/Recall` and
   (at        [this handle]   "a read-only view at a past handle"))
 ```
 
-Implementations: `FileContentStore` (`data/blobs/ab/cd/abcd…`), `FileTable` (a csv/json/parquet
-blob queried by DuckDB — the only one needed today, since every loci table is create-only), and
-`DuckLakeTable` when the first mutable table arrives. `InlineTable` — rows in the event, what
-exists now — survives for tests.
+Implementations: `FileContentStore` (`data/blobs/ab/cd/abcd…`) and `DuckLakeTable`.
+`InlineTable` — rows in the event, what exists now — survives for tests. `FileTable` (a
+csv/json/parquet blob queried by DuckDB over its path) is the documented escape hatch if
+catalog-managed Parquet turns out to cost more than it buys.
 
 **Queries are [HoneySQL](https://github.com/seancorfield/honeysql) data, not SQL strings**, and
 that is a thesis point rather than a taste one: `compute-clj!` currently has the agent write
@@ -441,11 +462,11 @@ decide" applied to computation instead of to prose.
 data/
   substrate/      LMDB — the log. Truth: metadata, structure, and handles.
   blobs/          content-addressed, immutable, swept — tables, images, video alike
-  lake/           DuckLake catalog + Parquet. Only once a table becomes mutable.
+  lake/           DuckLake catalog + Parquet — every table
 ```
 
-A small table stays the CSV it arrived as, so `blobs/` is readable with ordinary tools — the
-same reason compose bind-mounts `./data` instead of hiding it in a named volume.
+Ingest accepts csv/json/parquet, since DuckDB reads all three; what lands is Parquet under the
+catalog.
 
 One directory is still the whole backup, which was the point of the 2026-08-15 consolidation
 and must not be given back.
@@ -462,24 +483,20 @@ and must not be given back.
 
 ## Open questions for the user
 
-1. **DuckDB now and DuckLake when the first mutable table appears, or DuckLake from the
-   start?** The evidence for the first is in "Decided: one table interface" — every loci table
-   is create-only, so nothing needs a catalog yet, and one undo mechanism serves everything.
-   Uniformity is a fair argument for the second.
-2. **Which VLM endpoint**, and is a description a field on the image or an object of its own?
-3. **Does an EXIF extractor exist for the JVM worth depending on?** Verify in a REPL, the way
-   the CID question was closed, before the spec commits to one.
+None outstanding. Everything the design needed decided is decided; what remains is
+measurement.
 
 **Closed:** CIDv1 vs `ni:` (CIDv1, library verified in a REPL). Which hash (SHA-256, by
 measurement that reversed the first answer). One interface for all tables, format free to vary
 (yes). Media scope (images now, room for video). Whether images participate in recall (yes —
-and the description is what makes it possible).
+and the description is what makes it possible). DuckLake from the start rather than deferred.
+The VLM (`gemma-4-26b-a4b`, endpoint falling back to `LOCI_LLM_ENDPOINT`). Description as a
+field. EXIF library (`metadata-extractor` 2.20.0, verified in a REPL).
 
 ## What to measure before building
 
-1. **DuckDB over a content-addressed file**, at 10k / 1M / 10M rows: write the parquet, query
-   it by path, and the size on disk. This is the path that ships first. DuckLake's own
-   round-trip (`write, snapshot, AT (VERSION =>)`) matters only if it is adopted now.
+1. **DuckLake round-trip**, at 10k / 1M / 10M rows: write, snapshot, query, `AT (VERSION =>)`,
+   and the size on disk. All of it is a guess today and it is the path that ships.
 2. **Boot cost** of attaching the lake, against loci's existing ~14 s Datalevin load — the
    startup budget is already the thing that made every test run expensive.
 3. **`undo!` latency** when it moves a snapshot pointer versus popping an inline table.
