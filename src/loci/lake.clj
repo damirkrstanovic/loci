@@ -118,8 +118,24 @@
 
 (defn- select-cols [cols] (str/join ", " (map ident cols)))
 
-(defn current-snapshot
-  "The snapshot id the lake's write head is at."
+(defn- current-snapshot
+  "The snapshot id the lake's write head is at.
+
+   Catalog-wide, not per-table: a DuckLake snapshot is one transaction against
+   the whole lake, so this is the max over every table, and two `put-rows!`
+   running concurrently can hand the first one a snapshot the second minted.
+
+   Measured 2026-08-16, and benign **only because writes never overwrite**: a
+   table read at a snapshot later than the one that created it returns exactly
+   the same rows, because nothing between the two touched it. Interleaved
+   `tbl:a`/`tbl:b` writes, then reading `a` at `b`'s snapshot, gave `[{:v 1}]`
+   either way.
+
+   That stops being true the day a table is mutated in place — a handle stamped
+   with a later snapshot would then read another transaction's edits as its own.
+   Whoever adds in-place mutation has to stamp the snapshot the write itself
+   produced rather than the catalog's high-water mark. See `restore-to!`, which
+   is the other half of that same day's work."
   [lk]
   (:snapshot_id (first (q lk "SELECT max(snapshot_id) AS snapshot_id FROM ducklake_snapshots('lake')"))))
 
