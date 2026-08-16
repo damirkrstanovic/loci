@@ -76,3 +76,8 @@
       (lake/x! lk (str "UPDATE " (:table h) " SET name = 'CHANGED'"))
       (is (= rows3 (tbl/rows lk h {}))
           "a handle reads its own snapshot, not whatever the table became"))))
+
+(deftest lake-singleton-is-lazy
+  (is (instance? clojure.lang.Delay lake/lake))
+  (is (not (realized? lake/lake))
+      "requiring loci.lake must open nothing — the rule the whole codebase keeps"))

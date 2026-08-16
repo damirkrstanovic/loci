@@ -90,6 +90,19 @@
 
 (defn close! [lk] (when-let [c (conn-of lk)] (.close c)))
 
+(defonce ^{:doc "The process's one lake at <data-dir>/lake.
+
+   A delay, so requiring this namespace still opens nothing — the rule the
+   whole codebase keeps, and the reason `loci.dlv/store` is shaped the same
+   way. Tests rebind it with `with-redefs` and a delay of their own.
+
+   One connection, because loci is single-writer: one process owns the store,
+   and the three legitimate ways to reach it are the running app's HTTP API, a
+   `loci.*` facade called in the server's own process, and direct access with
+   the app stopped."}
+  lake
+  (delay (open-lake!)))
+
 (defn- table-name
   "A loci object id → a lake table name that is a legal SQL identifier and
    unique per call.

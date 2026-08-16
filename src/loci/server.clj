@@ -17,6 +17,7 @@
             [loci.embed :as embed]
             [loci.entities :as ent]
             [loci.fnlib :as fnlib]
+            [loci.lake :as lake]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -2857,6 +2858,22 @@
   (when-let [problem (sub/data-dir-problem)]
     (binding [*out* *err*] (println problem))
     (System/exit 1))
+  ;; Force the lake at boot rather than on first use. 75 ms, measured against
+  ;; a lake holding 10M rows — 0.5% of the dependency load already paid — and
+  ;; it turns "tables are broken" into a startup error naming the directory.
+  ;; After `data-dir-problem`, for the same reason `(store)` is: the lake lives
+  ;; under the data directory, and a permissions failure should be reported by
+  ;; the check that names the uid rather than by DuckDB.
+  @lake/lake
+  ;; The substrate's LMDB env is left to the process exit — an unclosed LMDB
+  ;; environment loses nothing. DuckDB is not that: the catalog is a database
+  ;; file of its own, so the one connection this process owns is closed
+  ;; explicitly. `realized?` and not a bare deref, so a JVM that died before
+  ;; boot finished does not open a lake on its way out.
+  (.addShutdownHook (Runtime/getRuntime)
+                    (Thread. ^Runnable
+                             #(when (realized? lake/lake) (lake/close! @lake/lake))
+                             "loci-lake-close"))
   ;; PORT because that is what every container runtime sets. Through
   ;; `loci.config` like everything else, so that a PORT in loci.env is honoured
   ;; rather than silently ignored by a local run while compose obeys it — the
