@@ -1607,6 +1607,166 @@ git commit -m "fix: a table comes back with the columns it went in with"
 
 ---
 
+## Task 6e: a handle that survives the log, and a table that keeps every column
+
+**Files:**
+- Modify: `src/loci/tablestore.clj` (`cols-of`, `put-rows!` on both implementations)
+- Test: `test/loci/tablestore_test.clj`, `test/loci/lake_test.clj`
+
+**Added 2026-08-16, from Task 6d's implementer.** Two defects in Task 2/3's code, both latent
+today and both written into the log the moment Task 7 lands. The last task before the writers.
+
+**1. `cols-of` reads the first row only** (`tablestore.clj:27-31`), so a key that first appears
+in a later row is dropped — by the lake, silently, while `InlineTable` keeps it:
+
+```
+{:cols [:a], :lake [{:a 1} {:a 2}], :inline [{:a 1} {:a 2, :b 9}]}
+```
+
+None of the 31 live tables is ragged, but `compute-clj!` and the ƒ palette run arbitrary
+Clojure that returns rows, so nothing prevents one. Task 9 would migrate it and lose the column.
+
+**2. `:cols` is the first column keyword to travel through the log as a *value*, and
+`safe-event`'s guard does not cover it.** `readable?` (`substrate.clj:44`) compares *printed
+strings*. A column keyword containing a space makes `:cols` print as `[:foo bar]`, which reads
+back as a **two-element** vector and re-prints identically — so the guard passes while the value
+changes:
+
+```clojure
+{:printed "{:value {:cols [:foo bar]}}"
+ :string-round-trips? true
+ :value-round-trips?  false}
+```
+
+`normalize-keys` only `col-kw`s map *keys*. Until now every column keyword was a key, so this
+never mattered.
+
+The fix for both is in `put-rows!`, and it is the one `save-table!` (`tools.clj:148-152`)
+already applies to its own rows: run every column keyword through `sub/col-kw`. That leaves
+`:tenure-band` alone — `col-kw` passes a readable keyword through untouched, which is what Task
+6d just spent a commit preserving — and normalizes only what the log cannot hold.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test/loci/tablestore_test.clj`:
+
+```clojure
+(deftest a-ragged-table-keeps-every-column
+  (doseq [ts [(tbl/inline-table)]]
+    (let [h (tbl/put-rows! ts "tbl:x" [{:a 1} {:a 2 :b 9}])]
+      (is (= [:a :b] (:cols h))
+          "a column that first appears in row 2 is still a column"))))
+
+(deftest a-column-keyword-the-log-cannot-hold-is-normalised
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{(keyword "foo bar") 1 :ok 2}])]
+    (is (= [:foo_bar :ok] (:cols h)))
+    (is (= [{:foo_bar 1 :ok 2}] (tbl/rows ts h {}))
+        "the rows must agree with the columns")
+    (is (= (:cols h) (:cols (clojure.edn/read-string (pr-str h))))
+        "a handle must survive the log it is about to be written to")))
+
+(deftest a-readable-column-keyword-is-left-alone
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:tenure-band "0-6m" :Category "A"}])]
+    (is (= [:tenure-band :Category] (:cols h))
+        "col-kw passes a readable keyword through — Task 6d's whole point")))
+```
+
+`test/loci/lake_test.clj` — the same two properties against the real store, because the lake is
+where the column list becomes SQL:
+
+```clojure
+(deftest a-ragged-table-keeps-every-column-in-the-lake
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{:a 1} {:a 2 :b 9}])]
+      (is (= [:a :b] (:cols h)))
+      (is (= [{:a 1 :b nil} {:a 2 :b 9}] (tbl/rows lk h {}))
+          "a row that lacked the column reads back with nil, not without the key"))))
+
+(deftest a-column-keyword-the-log-cannot-hold-is-normalised-in-the-lake
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{(keyword "foo bar") 1}])]
+      (is (= [:foo_bar] (:cols h)))
+      (is (= [{:foo_bar 1}] (tbl/rows lk h {}))))))
+```
+
+Note the asymmetry the first lake test pins: a missing key comes back as `nil` rather than
+absent, because a columnar store has no way to say "this row had no such column". That is a
+shape change, not a loss, and it is the honest trade against dropping the column entirely.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `[:a]` where `[:a :b]` belongs, and `[:foo bar]`-shaped breakage on the handle. Paste
+both.
+
+- [ ] **Step 3: Implement**
+
+`src/loci/tablestore.clj`. Add `[loci.substrate :as sub]` to the requires — `loci.substrate`
+does not require `loci.tablestore`, so there is no cycle; confirm before editing.
+
+```clojure
+(defn cols-of
+  "The column order to preserve: every key any row has, in the order first seen.
+
+   First-seen order, not sorted, because the first row is what `save-table!` and
+   `import-csv!` treat as authoritative and a table that renders with its
+   columns rearranged reads as a different table. Every row rather than the
+   first, because a key that appears only in row 2 is still a column, and the
+   lake would otherwise drop it silently while `InlineTable` kept it.
+
+   Each key goes through `sub/col-kw`, which leaves a keyword that already reads
+   back cleanly alone — `:tenure-band` stays `:tenure-band` — and normalizes one
+   that does not. That matters here and nowhere else in the codebase, because
+   `:cols` is the only place a column keyword travels through the log as a
+   *value*: `normalize-keys` fixes map keys, and `safe-event`'s guard compares
+   printed strings, so `[:foo bar]` passes it while reading back as two
+   elements."
+  [rows]
+  (into [] (distinct) (map sub/col-kw (mapcat keys rows))))
+
+(defn- normalize-rows
+  "Every row keyed by `cols-of`'s keywords, so the rows and the column list
+   cannot disagree."
+  [rows]
+  (mapv (fn [r] (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)) rows))
+```
+
+Both `put-rows!` implementations then work from `(normalize-rows (vec rs))`. In `Lake`'s
+`put-rows!` that is one binding change; in `InlineTable`'s the same. Keep `cols-of` computed
+from the normalized rows so the two cannot drift.
+
+`load-rows!` needs no change: `read_json_auto` gives NULL for a key a JSON object omits, and
+`select-cols` names every column, so a ragged table loads with nulls where keys were absent.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Confirm the live corpus is unmoved**
+
+Task 6d got 30 of 31 tables round-tripping with byte-identical synopses. Re-run that measurement
+and confirm it is **still 30 of 31** — `col-kw` on the existing tables' keywords must be a
+no-op, and if this task changes any of the 30 it has broken something Task 6d fixed. Report the
+number.
+
+- [ ] **Step 6: Sabotage**
+
+Revert `cols-of` to `(vec (keys (first rows)))`. `a-ragged-table-keeps-every-column` and its
+lake twin must FAIL with `[:a]`. Restore.
+
+Then drop the `sub/col-kw` from `cols-of` alone, leaving `normalize-rows` in place.
+`a-column-keyword-the-log-cannot-hold-is-normalised` must FAIL — and note *which* assertion
+fails, because if only the `pr-str` one does, the rows and columns have drifted apart, which is
+the failure mode `normalize-rows` exists to prevent. Restore.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/loci/tablestore.clj test/loci/tablestore_test.clj test/loci/lake_test.clj
+git commit -m "fix: every column is a column, and a handle survives the log"
+```
+
+---
+
 ## Task 7: The six writers land handles
 
 **Files:**
