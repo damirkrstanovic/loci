@@ -221,6 +221,47 @@
       (is (= [:foo_bar] (:cols h)))
       (is (= [{:foo_bar 1}] (tbl/rows lk h {}))))))
 
+(deftest two-column-names-must-not-become-one-column-in-the-lake
+  ;; Refused before any SQL runs, so the lake never gets a table whose column
+  ;; silently holds one of the two values it was given.
+  (with-lake [lk]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"refusing to merge them"
+                          (tbl/put-rows! lk "tbl:x" [{(keyword "a b") 1 :a_b 2}])))
+    (is (empty? (lake/q lk "SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake'"))
+        "and nothing was written on the way to refusing")))
+
+(deftest the-two-stores-disagree-on-a-ragged-row
+  ;; Recorded, not asserted away — the house pattern of
+  ;; `the-two-stores-disagree-on-a-mixed-type-column` above.
+  ;;
+  ;; New the moment `cols-of` began taking the union over every row. The two
+  ;; stores agree on `:cols`, and they agree on `column-samples` — `keep` and
+  ;; `IS NOT NULL` both drop the absent key, which is why synopsis parity over
+  ;; the live corpus did not move. They disagree on the ROWS, and that is what
+  ;; `hydrate` hands every viewer: a columnar store has no way to say "this row
+  ;; had no such column", so the key comes back present and nil.
+  ;;
+  ;; That is the honest trade against dropping the column entirely, and it is a
+  ;; shape change rather than a loss. Pin it so a future change to either store
+  ;; has to come past this test and say whether it closed the gap or widened it.
+  (with-lake [lk]
+    (let [rs [{:region "north" :sales 10} {:region "south" :sales 20 :returns 3}]
+          hl (tbl/put-rows! lk "tbl:r" rs)
+          hi (tbl/put-rows! (tbl/inline-table) "tbl:r" rs)]
+      (is (= [:region :sales :returns] (:cols hl) (:cols hi))
+          "both stores name the same three columns")
+      (is (= [{:region "north" :sales 10}
+              {:region "south" :sales 20 :returns 3}]
+             (tbl/rows (tbl/inline-table) hi {}))
+          "inline leaves the key absent")
+      (is (= [{:region "north" :sales 10 :returns nil}
+              {:region "south" :sales 20 :returns 3}]
+             (tbl/rows lk hl {}))
+          "the lake returns it present and nil")
+      (is (= (tbl/column-samples (tbl/inline-table) hi 3 3)
+             (tbl/column-samples lk hl 3 3))
+          "and the samples agree regardless, which is why the synopsis did not move"))))
+
 (deftest requiring-this-namespace-opens-no-lake
   (is (delay? lake/lake)
       "the process lake is a delay — requiring loci.lake must not touch the data dir")

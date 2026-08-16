@@ -1,6 +1,7 @@
 (ns loci.tablestore-test
   (:require [clojure.edn]
             [clojure.test :refer [deftest is]]
+            [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
 (def rows [{:id 1 :name "a"} {:id 2 :name "b"} {:id 3 :name "c"}])
@@ -84,12 +85,39 @@
 
 (deftest a-column-keyword-the-log-cannot-hold-is-normalised
   (let [ts (tbl/inline-table)
-        h  (tbl/put-rows! ts "tbl:x" [{(keyword "foo bar") 1 :ok 2}])]
+        h  (tbl/put-rows! ts "tbl:x" [{(keyword "foo bar") 1 :ok 2}])
+        ;; the guard Task 7's writer will actually pass this handle through,
+        ;; not a stand-in for it. It is deliberately not the thing that saves
+        ;; us: measured on a handle carrying an unnormalised `:cols`,
+        ;; `safe-event` does NOT throw — `normalize-keys` fixes `:data`'s map
+        ;; keys and leaves the `:cols` *values* alone, and `readable?` compares
+        ;; printed strings, which `[:foo bar]` matches while reading back as
+        ;; three elements instead of two. The log write is the assertion.
+        ev (sub/safe-event {:op :put :id "tbl:x" :value h})]
     (is (= [:foo_bar :ok] (:cols h)))
     (is (= [{:foo_bar 1 :ok 2}] (tbl/rows ts h {}))
         "the rows must agree with the columns")
-    (is (= (:cols h) (:cols (clojure.edn/read-string (pr-str h))))
+    (is (= (:cols h) (:cols (:value (clojure.edn/read-string (pr-str ev)))))
         "a handle must survive the log it is about to be written to")))
+
+(deftest two-column-names-must-not-become-one-column
+  ;; The same failure `col-kw` prevents at the `:cols` level, one layer down and
+  ;; costing more. There, an unnormalised column keyword corrupts its own value
+  ;; on the way out of the log. Here, both keys normalise to `:a_b`, one value
+  ;; wins, `:cols` and the rows agree with each other perfectly — and a column's
+  ;; data is simply gone with nothing downstream able to notice. Reachable today
+  ;; through `save_table`, where a model names its own columns.
+  (let [ts (tbl/inline-table)
+        e  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"refusing to merge them"
+                                 (tbl/put-rows! ts "tbl:x" [{(keyword "a b") 1 :a_b 2}])))]
+    (is (= :a_b (:column (ex-data e))) "the exception names the column they collided on")
+    (is (= [(keyword "a b") :a_b] (:from (ex-data e))) "and both originals"))
+  ;; Across the table, not per row: no single row loses a value here, and the
+  ;; table still ends up with one column fed by two names.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"refusing to merge them"
+                        (tbl/put-rows! (tbl/inline-table) "tbl:x"
+                                       [{(keyword "a b") 1} {:a_b 2}]))
+      "a ragged table spells the collision one row apart"))
 
 (deftest cols-of-normalises-on-its-own
   ;; `put-rows!` hands `cols-of` rows that `normalize-rows` has already fixed,
