@@ -2585,6 +2585,25 @@ not a number to update.
   handle, which is sound because writes never overwrite so a given handle's rows are immutable.
   Measured and written down rather than fixed, because nothing is migrated yet and so nobody has
   felt it.
+- **Six places assume the first row carries every key.** Measured in Task 6e's review, and
+  latent only because **0 of the 31 live tables are ragged**: `content.clj:169` (`numeric-cols`),
+  `:177` (`string-cols`), `:229` (`timeseries?`), `:256`, `:320`, plus `viewspec.clj:42` and
+  `server.clj:1430` (`table-digest`). The last two do not merely mis-report — they throw. A nil
+  in a numeric column makes `viewspec`'s sort keyfn return a String for one row and a Long for
+  the rest (`ClassCastException`), and `table-digest` does `(reduce + xs)` over a column
+  containing nil (`NullPointerException`), which takes down `obj-digest` and with it the agent's
+  whole context. Both throw identically for inline and lake, so they are pre-existing — but
+  before Task 6e a ragged column was silently dropped from `:cols` and therefore unreachable,
+  and now it is advertised to the UI and the agent. Reachable the moment an agent writes a
+  ragged table through `save_table`.
+
+  Curiously `content.clj`'s `summary` viewer is the one that gets *better*: it already computes
+  `:missing` and its comment says holes are expected, so the lake's explicit nil repairs a
+  first-row bug rather than causing one.
+- **A namespaced column keyword collides on `name`.** `lake/ident` uses `(name k)`, so `{:a/b 1}`
+  round-trips fine but `{:a/b 1 :c/b 2}` gives DuckDB `Invalid Input Error: … Object
+  {"b":1,"b":2} has duplicate key "b"`, where `InlineTable` keeps both. It fails **loudly**, so
+  a writer sees it rather than storing corruption. Recorded rather than fixed.
 - **The cap now sits in front of three paths that *commit*.** `compute-clj!` (`server.clj:1124`
   → `:1162`), `fn-apply!` via `table-rows` (`:1188` → `:1244`) and `recompute` (`:1259` →
   `rerun!` at `:1306`) all build a derived table from hydrated rows and write it back. Over
