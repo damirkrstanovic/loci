@@ -314,6 +314,28 @@
      weight that says where you are — done recedes, current is full strength,
      future is light. Before this the verb was --muted, the quietest thing on
      the row, so the eye read five paragraphs of prose with grey labels. */
+  /* The notebook outline. A notebook is a vertical stack of cells and the only
+     way to reach the sixth one was to scroll past five; this is the map. It is
+     `position:sticky` inside .p-body, which is the scrolling ancestor, so it
+     stays put without leaving the flow — a fixed rail would have to know the
+     panel's transformed position, and panels are scaled and translated. */
+  .nbrail{flex:0 0 138px;position:sticky;top:0;max-height:calc(100vh - 190px);
+    overflow:auto;padding-right:4px}
+  .nbrail .nr-h{font-family:var(--mono);font-size:9.5px;color:var(--faint);
+    letter-spacing:.08em;margin:0 0 7px 7px}
+  .nbrail button{display:flex;gap:6px;align-items:baseline;width:100%;text-align:left;
+    border:0;background:none;font:inherit;font-size:11.5px;color:var(--muted);
+    padding:3px 7px;border-radius:6px;cursor:pointer;line-height:1.35;
+    border-left:2px solid transparent}
+  .nbrail button:hover{background:var(--panel);color:var(--ink-2)}
+  /* the cell you are looking at — a rule on the left rather than a fill, so the
+     rail stays quiet while you read and still answers "where am I" */
+  .nbrail button.on{color:var(--accent);border-left-color:var(--accent)}
+  .nbrail .nr-ic{flex:none;width:11px;font-size:10px;opacity:.8}
+  .nbrail .nr-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* where a rail click lands, for one beat, so the jump is legible */
+  .cellwrap.flash{background:var(--accent-wash,rgba(0,0,0,.03));border-radius:8px;
+    transition:background .8s}
   .flowplan{font-family:var(--mono);font-size:10.5px;color:var(--muted);
     letter-spacing:.04em;margin:2px 0 10px}
   .flowplan .fp-attn{color:var(--attn)}
@@ -748,7 +770,45 @@ async function renderNotebook(i){
     '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button>'+
     '<button class="btn ghost sm" id="tagBtn">⌗ tags</button></div>'+
     (nb['spawned-by']?'<div style="font-size:11px;font-family:var(--mono);color:var(--faint);margin-bottom:8px">spawned from <span class="ghostchip" data-space="'+esc(nb['spawned-by'].space)+'">'+esc(nb['spawned-by'].space)+'</span> · “'+esc(nb['spawned-by'].prompt||'')+'”</div>':'');
-  b.innerHTML=actions+'<div class="nbrow"><div style="flex:1;min-width:0">'+cellsH+add+'</div>'+rail+'</div>';
+  // The outline. Only from two cells up: a one-cell notebook has nothing to
+  // navigate, and a rail that says "you are here" about the only thing there is
+  // is furniture.
+  const outline = nb.cells.length>1
+    ? '<div class="nbrail"><div class="nr-h">OUTLINE</div>'+
+      nb.cells.map(c=>{
+        const kind = c.type==='text' ? 'text' : (c.type==='missing' ? 'missing' : (c.kind||'doc'));
+        const label = c.type==='text'    ? (c.text||'').trim().replace(/\s+/g,' ').slice(0,44)
+                    : c.type==='missing' ? c.ref
+                    : (c.title||c.id||'');
+        return '<button type="button" data-jump="'+c.i+'" title="'+esc(label)+'">'+
+          '<span class="nr-ic">'+(CELLICON[kind]||'·')+'</span>'+
+          '<span class="nr-t">'+esc(label||'—')+'</span></button>';
+      }).join('')+'</div>'
+    : '';
+  b.innerHTML=actions+'<div class="nbrow">'+outline+'<div style="flex:1;min-width:0">'+cellsH+add+'</div>'+rail+'</div>';
+  b.querySelectorAll('[data-jump]').forEach(el=>el.addEventListener('click',()=>{
+    const w=b.querySelector('.cellwrap[data-cell="'+el.dataset.jump+'"]');
+    if(!w) return;
+    w.scrollIntoView({behavior:'smooth',block:'start'});
+    // one beat of highlight, so a jump is legible as an arrival rather than
+    // leaving the reader to work out whether anything moved
+    w.classList.add('flash'); setTimeout(()=>w.classList.remove('flash'),900);
+  }));
+  // which cell you are reading. `b` IS the scroll container (.p-body), so the
+  // listener goes on it — and is REPLACED rather than added, because
+  // renderNotebook re-runs every 2.5s while a flow is watched and the element
+  // survives innerHTML, so adding would stack a listener per re-render.
+  const spy=()=>{
+    const cells=[...b.querySelectorAll('.cellwrap')];
+    if(!cells.length) return;
+    const top=b.getBoundingClientRect().top;
+    let cur=cells[0];
+    for(const c of cells){ if(c.getBoundingClientRect().top-top<=12) cur=c; else break; }
+    b.querySelectorAll('[data-jump]').forEach(x=>
+      x.classList.toggle('on', x.dataset.jump===cur.dataset.cell));
+  };
+  if(b._spy) b.removeEventListener('scroll',b._spy);
+  b._spy=spy; b.addEventListener('scroll',spy,{passive:true}); spy();
   b.querySelector('#askBtn').addEventListener('click',()=>startAsk(i));
   b.querySelector('#researchBtn').addEventListener('click',()=>startResearch(i));
   b.querySelector('#draftBtn').addEventListener('click',async()=>{
@@ -1270,6 +1330,10 @@ function renderMold(m){
   }
 }
 const FLOWICON={pending:'○',running:'◐',done:'●','needs-you':'⚑',failed:'✕',rejected:'⊘'};
+// What a cell is, at a glance, in the outline. Prose is ¶ because that is what
+// it is; everything else takes the shape of the thing it molds.
+const CELLICON={text:'¶',table:'▤',doc:'▤',report:'▤',metric:'◪',applet:'◈',
+                entity:'⌾',flow:'⑂',viewspec:'◈',missing:'✕'};
 // "1:07", "2m 14s", "—". Coarse on purpose: a flow is minutes of model calls,
 // and a ticking seconds counter would be the loudest thing on a page whose
 // point is the plan.
