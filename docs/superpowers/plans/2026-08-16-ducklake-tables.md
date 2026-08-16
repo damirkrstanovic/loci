@@ -11,8 +11,14 @@ exactly as they do today.
 never rows. Reads always go `AT (VERSION => <recorded snapshot>)`, which is what makes `as-of`
 a pointer dereference instead of a re-fold. Writes always create a new lake table, which is
 what loci already does semantically (every path that produces a table creates a new one).
-Readers are unchanged: one `hydrate` call at the top of `mold-payload` swaps the handle back
-for rows, so viewers, `alternatives` and `viewspec` never learn that anything moved.
+Readers are unchanged: a `hydrate` call swaps the handle back for rows at each point an object
+leaves the substrate, so viewers, `alternatives` and `viewspec` never learn that anything moved.
+
+*Corrected 2026-08-16 after Task 6's review.* This sentence originally read "one `hydrate` call
+at the top of `mold-payload`". There are **twelve** such points, not one — `mold-payload`,
+`table-rows`, `describe!`, `make-view!`, `compute-clj!`, `do!`, `recompute`, `obj-digest`'s four
+callers, `list_tables` and `query_table`. Task 6 did `mold-payload`; Task 6b does the rest, and
+it exists because writing "one call" was an assumption rather than a grep.
 
 **Tech Stack:** DuckDB 1.5.5 + the `ducklake` extension via `org.duckdb/duckdb_jdbc 1.5.5.1`;
 `clojure.data.json` (already a dep) for bulk load; the existing `sub/Store` and `loci.dlv`
@@ -984,6 +990,235 @@ git commit -m "feat: hydrate — one call, and every reader keeps reading rows"
 
 ---
 
+## Task 6b: the other eleven readers
+
+**Files:**
+- Modify: `src/loci/tools.clj:105` (`do-list`), `:111` (`do-query`)
+- Modify: `src/loci/server.clj:1062`, `:1085`, `:1124`, `:1188`, `:1259`, `:1315`, `:1758`, `:2015`, `:2045`, `:2118`, `:1743`
+- Test: `test/loci/server_test.clj`, `test/loci/tools_test.clj`
+
+**Added 2026-08-16, after Task 6's review, and this task exists because this plan was wrong.**
+Line 14 of this plan says "Readers are unchanged: one `hydrate` call at the top of
+`mold-payload`". The first half is right and the second is false. `mold-payload` is one of
+twelve places where an object leaves the substrate and its `:value` is then read as rows.
+Task 6 fixed one. Task 7 lands the handles. Between those two commits the other eleven break,
+and this task goes in between.
+
+Measured against a lake-shaped handle committed into a fresh store, before any of this was
+written:
+
+- `tools.clj:105` `do-list` (`list_tables`) — `(keys (first (:value o)))` on a handle map gives
+  `ClassCastException: class clojure.lang.Keyword cannot be cast to class java.util.Map$Entry`.
+  The agent's table catalog dies.
+- `tools.clj:111` `do-query` (`query_table`) — **no error, wrong data.** `vs/interpret` walks the
+  handle map and returns `[[:store :lake] [:table "t_…"] [:snapshot 1] [:rows 3] [:cols […]]]`
+  as the table's rows. The model is told these are the contents, and with `:save_as` it commits
+  them as a new table. This is the worst site in the list, because it is silent.
+- `server.clj:1188` `table-rows` — the `(sequential? rows)` guard rejects a handle, so
+  `fns-payload` (`:1193`), the ƒ preview (`:1222`) and `fn-apply!` (`:1233`) all return
+  `{:error "functions work on tables"}`. The ƒ palette goes dark for every table.
+- `server.clj:1062` `describe!`, `:1085` `make-view!`, `:1124` `compute-clj!`, `:1315` `do!` —
+  the same guard, inline, four times: `{:error "… works on tables"}`.
+- `server.clj:1259` `recompute` — a handle is non-nil and non-sequential, so `rerun!` silently
+  skips: measured `{:refreshed [] :skipped []}`.
+- `server.clj:1758` (ask/chat), `:2015` (`delegate!`), `:2045`, `:2118`, `:1743` — the workspace
+  digest and the "cols: …; N rows" catalog fragments. `ClassCastException` at the catalog, and
+  `obj-digest` returns `""` for a table, so it vanishes from the agent's context silently.
+
+**The fix is one edit, twelve times: hydrate at the boundary and change nothing downstream.**
+Do not add a handle branch anywhere. Do not change a predicate. Once the object is hydrated its
+`:value` is a vector of maps again and every guard, predicate and viewer behaves exactly as it
+did before tables moved — which is what "readers are unchanged" was supposed to mean.
+
+In particular **leave `server.clj:1763`'s structural predicate alone**:
+
+```clojure
+          texty   (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
+                                (not (every? :block (:value %)))) objs)
+```
+
+It is tempting to "fix" it to `(remove #(= :table (:kind %)) objs)` to match `:2018` and `:2049`.
+Don't. It deliberately keeps `:block` reports, and `:kind`-based filtering would change which
+legacy objects survive. Hydrate `objs` first and this predicate is correct again unchanged.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `test/loci/tools_test.clj`:
+
+```clojure
+(deftest list-tables-reads-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (let [r (first (tools/dispatch st "list_tables" {}))]
+      (is (= ["a" "b"] (:columns r)) "columns come from the rows, not the handle's keys")
+      (is (= 2 (:rows r))))))
+
+(deftest query-table-reads-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (is (= [{:a 1 :b "p"} {:a 2 :b "q"}]
+           (:rows (tools/dispatch st "query_table" {:table_id "tbl:x"})))
+        "the handle's own keys must never be returned as rows")))
+```
+
+Add to `test/loci/server_test.clj`:
+
+```clojure
+(deftest the-fn-palette-sees-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (let [r (srv/fns-payload st "tbl:x")]
+      (is (nil? (:error r)) "a handle-backed table must not read as 'not a table'")
+      (is (seq (:fns r))))))
+
+(deftest the-workspace-digest-still-describes-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "Sales" :value h}})
+    (let [c (:context (srv/agent-context st nil))]
+      (is (re-find #"tbl:x" c) "the table must appear in the agent's context at all")
+      (is (re-find #"2 rows" c) "and with its true row count"))))
+```
+
+`srv/agent-context` is the function at `server.clj:2045` — read it and use its real name and
+arity; if it is private, reach it with `#'`. Both suites already have the temp-lake fixture from
+Task 6, so `@lake/lake` in a test is the fixture's lake, not `data/lake`.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `ClassCastException` from `list_tables`, the handle's own keys back from
+`query_table`, `{:error "functions work on tables"}` from `fns-payload`, and no `tbl:x` in the
+digest. Paste all four.
+
+- [ ] **Step 3: Convert the single-object sites**
+
+Each is the same edit. `server.clj:1188`:
+
+```clojure
+(defn- table-rows [st id]
+  (let [rows (:value (tbl/hydrate @lake/lake (sub/object st id)))]
+    (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
+```
+
+`server.clj:1062` (`describe!`), `:1085` (`make-view!`), `:1124` (`compute-clj!`), `:1315`
+(`do!`) — all four currently read:
+
+```clojure
+    (let [o (sub/object st id) rows (:value o)]
+```
+
+and all four become:
+
+```clojure
+    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
+```
+
+`server.clj:1259` (`recompute`):
+
+```clojure
+        rows   (or (get working src-id)
+                   (:value (tbl/hydrate @lake/lake (sub/object st src-id))))
+```
+
+`tools.clj:111` (`do-query`):
+
+```clojure
+  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate @lake/lake))]
+```
+
+- [ ] **Step 4: Convert the collection sites**
+
+Hydrate once, where the object list is assembled, so everything downstream — `texty`, `tbls`,
+`catalog`, `obj-digest` — sees rows.
+
+`server.clj:1758` (ask/chat) and `:2045`: the `objs` binding gains a hydrate:
+
+```clojure
+          objs    (mapv #(tbl/hydrate @lake/lake %)
+                        (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
+```
+
+`server.clj:2015` (`delegate!`): the same on `members`.
+
+`server.clj:1743` and `:2118`: `(map obj-digest …)` becomes
+`(map #(obj-digest (tbl/hydrate @lake/lake %)) …)`.
+
+`tools.clj:105` (`do-list`):
+
+```clojure
+(defn- do-list [st _]
+  (mapv (fn [o] (let [o (tbl/hydrate @lake/lake o)]
+                  {:id (:id o) :title (:title o)
+                   :columns (mapv name (keys (first (:value o))))
+                   :rows (or (:table/total o) (count (:value o)))}))
+        (table-objs st)))
+```
+
+Leave `table-objs` itself alone — `:116` and `:154` call it only to count ids, and hydrating
+there would fetch every table's rows to produce a number.
+
+- [ ] **Step 5: Say the true count, not the capped one**
+
+`hydrate` caps at `mold-cap`, so `(count (:value o))` after hydration is a lie for a table over
+2,000 rows. `:table/total` carries the truth. The three catalog fragments — `server.clj:1769`,
+`:2023`, `:2054` — each end `"; " (count (:value o)) " rows)"`. All three become:
+
+```clojure
+                                                   "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))
+```
+
+`do-list` already got this in step 4. Nothing else counts rows off a hydrated object.
+
+Add `[loci.tablestore :as tbl]` and `[loci.lake :as lake]` to `tools.clj`'s requires;
+`server.clj` has both already.
+
+- [ ] **Step 6: Prove no site was missed**
+
+```bash
+grep -n "(:value o)\|(:value %)\|(:value (sub/object" src/loci/server.clj src/loci/tools.clj
+```
+
+Every hit must be either (a) inside a `let` whose object came from `tbl/hydrate`, (b) reading a
+`:viewspec`/`:applet`/`:fn`/`:flow`/`:space` object, whose `:value` is a map and never a table,
+or (c) `mold-payload`, already done in Task 6. Walk the list and say which bucket each hit is
+in — this is the step that catches the twelfth site, and the reason this task exists is that
+the same walk was not done when the plan was written.
+
+- [ ] **Step 7: Run the suites**
+
+```clojure
+(doseq [n '[loci.tablestore loci.lake loci.tools loci.server]] (require n :reload))
+(clojure.test/run-tests 'loci.tools-test 'loci.server-test 'loci.tablestore-test 'loci.lake-test)
+```
+
+All green. `loci.server-test` baseline is 205 tests / 761 assertions.
+
+- [ ] **Step 8: Sabotage**
+
+Revert `table-rows` alone to `(:value (sub/object st id))`.
+`the-fn-palette-sees-a-handle-backed-table` must FAIL with
+`{:error "functions work on tables"}`. Restore.
+
+Then revert `do-query` alone. `query-table-reads-a-handle-backed-table` must FAIL showing the
+handle's own keys as rows — paste the actual returned vector, because that value is what a
+model would have been told was the user's data.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/loci/tools.clj src/loci/server.clj test/loci/tools_test.clj test/loci/server_test.clj
+git commit -m "fix: every reader hydrates, not just mold-payload"
+```
+
+---
+
 ## Task 7: The six writers land handles
 
 **Files:**
@@ -1440,10 +1675,12 @@ not a number to update.
 
 ## What this plan does not answer
 
-- **`query_table` still reads hydrated rows**, so a query against a 10M-row table would fetch
-  `mold-cap` rows and compute over those — wrong, and it will stay wrong until the HoneySQL
-  work lands. If any table in the substrate exceeds `mold-cap` before then, this becomes a
-  live bug rather than a deferred one. Nothing does today; the largest is 1,000 rows.
+- **`query_table` reads hydrated rows** — after Task 6b; before it, it read the raw handle and
+  returned the handle's own keys as data. So a query against a 10M-row table fetches `mold-cap`
+  rows and computes over those — wrong, and it will stay wrong until the HoneySQL work lands.
+  If any table in the substrate exceeds `mold-cap` before then, this becomes a live bug rather
+  than a deferred one. Nothing does today; the largest is 1,000 rows. (This bullet originally
+  asserted `query_table` already hydrated. It did not, and nothing had checked.)
 - **Column type fidelity through JSON.** `read_json_auto` infers, and a column of mixed
   types will land as VARCHAR. The 29 existing tables come from `parse-csv`, which already
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
