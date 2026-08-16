@@ -1,8 +1,12 @@
 # Big content: tables, blobs and media, without giving up undo
 
 Date: 2026-08-16
-Status: **design settled, nothing built.** Every open question is answered; what remains is measurement, then a plan. No code written. Numbers below are
-measured against the live substrate on 2026-08-16 unless marked otherwise.
+Status: **design settled and measured, nothing built.** Every open question is answered and
+the measurement gate has been run — see "What to measure before building", all five items
+done. It found one design error (undo must restore, not re-point — the spec said the wrong
+thing and is corrected inline) and killed one optimisation before it was written. What remains
+is the implementation plan. No code written. Numbers below are measured on 2026-08-16 unless
+marked otherwise.
 
 ## The want
 
@@ -67,6 +71,54 @@ question does not arise:
 So: **two copies is not a cost to be avoided, it is the mechanism.** The design does not try
 to be clever about it. What bounds it is garbage collection, which is a separate act with
 different rules — see below.
+
+### Correction, measured 2026-08-16: the second bullet was wrong
+
+"`undo!` pops the event and the previous event's snapshot is current" does not hold. It
+assumed DuckLake's time travel rewinds the table. It does not — **`AT (VERSION => n)` is a
+read, and reads do not move the write head.** Measured on a 1000-row table:
+
+| step | snapshot | `sum(v)` |
+|---|---|---|
+| create, all `v=1` | A=7 | 1000 |
+| update 100 rows to `v=999` | B=8 | 100800 |
+| loci pops the event — substrate now points at A | — | reads at A give 1000 ✓ |
+| **user writes again** (100 rows to `v=5`) | C=9 | **101200** ✗ |
+
+Had undo held, C would be 1400. It is 101200 — the change written at B, which the substrate
+believes was undone, is **still in the table and came back the moment anything else was
+written**. The substrate and the lake had silently diverged: the substrate's snapshot pointer
+said A, DuckLake's write head said B, and the next write built on B.
+
+This is the same class of bug as the migration that verified against a stale in-RAM snapshot:
+a pointer that says one thing while the durable state says another, reporting success.
+
+**The fix, and it is the boring one.** `undo!` must not merely re-point; it must restore:
+
+```sql
+CREATE OR REPLACE TABLE t AS SELECT * FROM t AT (VERSION => <recorded>)
+```
+
+That is a normal DuckLake transaction producing a new snapshot whose contents equal the old
+one. The write head and the substrate agree again, because the write head *moved*. There is
+no `ducklake_rollback` — I checked all 26 `ducklake_*` functions — so this is the native way
+to say it, not a mechanism invented around a missing one.
+
+**It is also, surprisingly, the fast way.** I expected to need the native change feed
+(`ducklake_table_changes`, which emits `update_preimage`/`update_postimage`) to invert only
+the rows that changed, at O(changed) instead of O(table). Measured on 10M rows with a 100-row
+edit, both correct:
+
+| repair | time |
+|---|---|
+| `CREATE OR REPLACE ... AT (VERSION => n)` | **182 ms** |
+| invert the change feed | 520 ms |
+
+The full restore is **2.8× faster than the clever delta**, and its cost does not scale with
+the size of the edit: restoring after a *50%* edit took 211/245/260 ms across three runs — the
+same as after a 100-row edit. The delta path is more code, more edge cases (four change types,
+and getting the filter wrong silently produced a no-op that *looked* like it worked), and
+slower. It is dropped.
 
 ### The mapping, concretely
 
@@ -493,12 +545,62 @@ and the description is what makes it possible). DuckLake from the start rather t
 The VLM (`gemma-4-26b-a4b`, endpoint falling back to `LOCI_LLM_ENDPOINT`). Description as a
 field. EXIF library (`metadata-extractor` 2.20.0, verified in a REPL).
 
-## What to measure before building
+## What to measure before building — all run 2026-08-16
 
-1. **DuckLake round-trip**, at 10k / 1M / 10M rows: write, snapshot, query, `AT (VERSION =>)`,
-   and the size on disk. All of it is a guess today and it is the path that ships.
-2. **Boot cost** of attaching the lake, against loci's existing ~14 s Datalevin load — the
-   startup budget is already the thing that made every test run expensive.
-3. **`undo!` latency** when it moves a snapshot pointer versus popping an inline table.
-4. ~~Hash throughput on this machine~~ — **done.** SHA-256 417 MB/s, pure-Java BLAKE3
-   97 MB/s, no `sha_ni` on this CPU. Recorded above.
+DuckDB 1.5.5 with the `ducklake` extension, via `org.duckdb/duckdb_jdbc 1.5.5.1`, on a
+throwaway lake under `/tmp` (deleted after). Same i5-8400 as the hash measurements.
+
+**1. Round-trip.** Schema `(id BIGINT, name VARCHAR, category VARCHAR, amount DOUBLE,
+ts TIMESTAMP)`, generated in-engine from `range()`; the update touches 10% of rows.
+
+| rows | create | `GROUP BY` | update 10% | **`AT (VERSION => n)`** | current-version read | disk |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 k | 35 ms | 27 ms | 15 ms | **7 ms** | 4 ms | <1 MB |
+| 1 M | 308 ms | 24 ms | 236 ms | **8 ms** | 8 ms | 10 MB |
+| 10 M | 2 900 ms | 53 ms | 1 432 ms | **34 ms** | 52 ms | 107 MB |
+
+Time travel is free — at 10M rows, reading an old version (34 ms) is *faster* than reading the
+current one (52 ms), because the old snapshot has no deletion vectors to apply. And it is
+correct: the pre-update sums came back exactly (499 995 000 against 549 990 000 current at 1M;
+4 999 950 000 against 5 499 900 000 at 10M). Nothing here is a bottleneck.
+
+**2. Boot cost.** Attaching a lake that already holds 10M rows:
+
+| open connection | `LOAD ducklake` | `ATTACH` | `USE` | **total** | first query |
+|---:|---:|---:|---:|---:|---:|
+| 9 ms | 43 ms | 4 ms | 19 ms | **75 ms** | 9 ms |
+
+Against loci's existing ~14 s dependency load, this is **0.5%**. The startup budget was the
+worry; it is not one. Note the extension was already installed to `~/.duckdb` — a first-ever
+`INSTALL ducklake` fetches over the network, so the packaged build must ship it or install at
+image-build time, never on first user boot.
+
+**3. `undo!` latency.** 182–260 ms on 10M rows, flat in the size of the edit, and it is a
+*restore* rather than a pointer move — see "Correction, measured 2026-08-16" above, which is
+the finding that matters most from this round.
+
+**4. Does undo history cost unbounded disk?** No, and reclaiming is cheap. Each restore writes
+a fresh Parquet copy (~38 MB per 10M rows), so a lake at 551 MB across three restores and a
+50% edit came back to **265 MB — 286 MB reclaimed in 69 ms**:
+
+```sql
+CALL ducklake_expire_snapshots('lake', older_than => now());  -- 42 ms
+CALL ducklake_cleanup_old_files('lake', cleanup_all => true); -- 27 ms
+```
+
+Current data survived intact (10M rows still readable). This is the native form of the
+garbage collection this spec already argues is a separate act from undo: expiring snapshots is
+exactly "drop undo history older than the horizon", and it costs milliseconds.
+
+**5.** ~~Hash throughput on this machine~~ — **done earlier.** SHA-256 417 MB/s, pure-Java
+BLAKE3 97 MB/s, no `sha_ni` on this CPU. Recorded above.
+
+### What the measurements changed
+
+- **One design error found and fixed**: undo must restore, not re-point. It would have shipped
+  as silent data resurrection — the worst possible failure for a substrate whose whole promise
+  is that undo means undo.
+- **One optimisation killed before it was built**: the change-feed delta inversion is slower
+  and more fragile than the naive restore.
+- **Two worries retired**: boot cost (75 ms) and time-travel cost (34 ms at 10M) are both
+  negligible, and neither needs mitigation in the plan.
