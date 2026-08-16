@@ -2,18 +2,21 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is use-fixtures]]
             [loci.agent :as agent]
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
             [loci.lake :as lake]
+            [loci.lake-fixture]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
             [loci.substrate :as sub])
   (:import [java.util Locale]))
+
+(use-fixtures :once loci.lake-fixture/with-temp-lake)
 
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))

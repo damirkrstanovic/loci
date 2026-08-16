@@ -43,3 +43,26 @@
   (row-count [_ h] (:rows h)))
 
 (defn inline-table [] (->InlineTable))
+
+(def mold-cap
+  "How many rows a molded table carries. The point of DuckLake is tables of
+   millions of rows, and a payload that materialized all of them would move the
+   problem from the substrate to the browser. The largest table in the substrate
+   today is 1,000 rows, so this changes nothing about what currently renders."
+  2000)
+
+(defn hydrate
+  "An object whose `:value` is a table handle → the same object with rows in
+   its place, capped, plus `:table/total`.
+
+   Everything downstream — `mold/mold`, `alternatives`, `viewspec/interpret`,
+   `content.clj`'s predicates — receives rows exactly as it did before tables
+   moved, which is the point: one call here instead of a handle branch in each
+   of them. Anything that is not a handle passes through untouched, so a legacy
+   inline table and a doc both survive."
+  [ts o]
+  (if (and o (handle? (:value o)))
+    (let [h (:value o)]
+      (assoc o :value       (rows ts h {:limit mold-cap})
+               :table/total (row-count ts h)))
+    o))

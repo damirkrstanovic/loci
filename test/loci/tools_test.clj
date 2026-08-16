@@ -1,8 +1,11 @@
 (ns loci.tools-test
   (:require [clojure.edn :as edn]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is use-fixtures]]
+            [loci.lake-fixture]
             [loci.substrate :as sub]
             [loci.tools :as tools]))
+
+(use-fixtures :once loci.lake-fixture/with-temp-lake)
 
 (deftest md-table-salvage-parses-prose-tables
   ;; live-fire finding #3: the model wrote the table INTO the note instead of

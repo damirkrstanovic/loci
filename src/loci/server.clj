@@ -22,6 +22,7 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools]
             [loci.viewspec :as vs])
   (:import [java.util Locale])
@@ -391,7 +392,7 @@
    read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
    pass it."
   [st m id view]
-  (let [o (sub/object st id)]
+  (let [o (tbl/hydrate @lake/lake (sub/object st id))]
     (cond
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
       ;; materialization, out of the same payload. A `mold/mold` viewer could not
