@@ -50,8 +50,9 @@
    install.** Pointed at an empty `extension_directory` — a machine that has
    never seen the extension — ATTACH fails outright with
    `IO Error: Extension \"…/ducklake.duckdb_extension\" not found`, and the
-   catalog never opens. Running the sequence below by hand in that same state
-   gives: LOAD fails, INSTALL succeeds, LOAD succeeds, ATTACH succeeds.
+   catalog never opens. Running this function's own sequence by hand in that
+   same state gives: LOAD fails, INSTALL succeeds, LOAD succeeds — and the
+   ATTACH that follows then succeeds.
 
    So this is a guard after all, and the thing it guards is first run. The
    INSTALL is the one line here that can reach the network; a packaged build
