@@ -1686,6 +1686,18 @@ not a number to update.
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
   Worth a measurement if a table ever comes back with a column the viewers stop treating as
   numeric.
+- **What an agent digest of a huge table should say.** `obj-digest` (`server.clj:1416`) reports
+  `(count v)` rows, which after hydration is the capped 2,000. Task 6b deliberately left it:
+  `table-digest`'s sums and the three sample rows just below come from the same capped `v`, so
+  substituting the true `:table/total` would print an accurate total above aggregates covering
+  only 2,000 rows — a worse lie than a consistently capped digest. Deciding this properly means
+  deciding what an agent should be told about a 10M-row table, and that belongs with whoever
+  revisits `mold-cap`, not with a mechanical hydrate pass.
+- **`table-shaped?` fetches rows to answer a boolean.** `server.clj:2247` hydrates — up to
+  `mold-cap` rows — only to ask whether an object is a table, and `resolve-table-ref` can call
+  it once per flow step. `tbl/handle?` would answer for free, but that is a handle branch, and
+  Task 6b's rule was to add none. Left mechanical on purpose: the largest table is 1,000 rows,
+  so nobody has felt this. It becomes worth fixing when someone does.
 - **The cap is silent.** `hydrate` puts `:table/total` on the object, but `mold-payload` builds
   its return map key by key — `:id :title :kind :view :label :rendered :alternatives` — and
   drops it, so a capped table renders as though it were whole. Found in Task 6, left as Task 6
