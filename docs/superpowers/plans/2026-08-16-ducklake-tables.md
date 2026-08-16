@@ -2344,7 +2344,7 @@ git commit -m "test: as-of reads the table that existed then"
 
 ---
 
-## Task 9: Migrate the 29 inline tables
+## Task 9: Migrate the 31 inline tables
 
 **Files:**
 - Create: `src/loci/tablemigrate.clj`
@@ -2353,6 +2353,37 @@ git commit -m "test: as-of reads the table that existed then"
 Shaped like `loci.factmigrate` and `loci.corpus`: **dry run by default**, refusals returned as
 a report rather than thrown, and callable from a REPL attached to the live server — which is
 way (2) of the three legitimate routes to storage in `CLAUDE.md`.
+
+**Four things changed under this task while Tasks 6b–6f ran.**
+
+**(a) It is 31 objects, not 29.** 29 carry `:kind :table` and 2 carry `:kind :metric`, and both
+are row-bearing: `chunks.clj`'s `texts-of` handles `(:table :metric)` in one branch, and
+`hydrate` keys off the handle rather than the kind. Filtering on `:table` alone would leave two
+objects with rows in the log forever, and no writer would ever convert them because nothing
+writes a `:metric`. Migrate both kinds; report the split.
+
+**(b) `put-rows!` can now refuse, and a refusal must not kill the run.** Since Task 6e it throws
+when two column names normalize to one keyword. Measured across all 31 live objects: **zero
+collide**, so this will not fire today — but "refusals come back in the report rather than as a
+thrown exception" is the whole shape of this namespace, and a migration that dies on table 17
+tells you less than one that finishes and names what it skipped. Wrap each table's conversion so
+a throw becomes a refusal with its reason.
+
+**(c) Two shapes will fail verification, and should be refused with a reason rather than
+mismatch.** A **ragged** table reads back from the lake with explicit nils where a key was
+absent, so `(= (vec (:value o)) (vec back))` is false for it even though nothing was lost. A
+table with a column of **mixed types** comes back widened by `read_json_auto`. Measured: 0 of 31
+are ragged, and 1 of 31 (`tbl:extract-20-8413`) has a mixed `Long`/`String` column. Detect these
+and report them as named refusals, so the live run does not stop on a table that was never going
+to round-trip byte-identically.
+
+**(d) Migration moves 4 tables' chunk text, on top of 31 already pending.** Task 6f rewrote
+`synopsis`, so all 31 stored chunk records are already stale and will re-embed on the next
+sweep regardless of this task. Of those, 4 — `tbl:csv-19-7071`, `tbl:csv-18-1542`,
+`tbl:corpus-2`, `tbl:extract-20-8413` — produce *different* text again once their rows are in
+the lake, for value-rendering reasons. So the total bill is still one re-embedding per table,
+not two; those 4 simply land on the lake-flavoured text. State the number after the run rather
+than being surprised by it.
 
 `data/` is test data. Do not checksum it, do not rehearse on a copy. Take a `.bak-*` of
 `data/substrate` before the live run because it costs nothing, then get on with it.
@@ -2407,7 +2438,52 @@ way (2) of the three legitimate routes to storage in `CLAUDE.md`.
         _  (tm/migrate-tables! st ts {:live? true})
         r  (tm/migrate-tables! st ts {:live? true})]
     (is (= 0 (:tables r)) "a handle is not converted twice")))
+
+(deftest a-metric-is-migrated-too
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "met:m" :value {:id "met:m" :kind :metric :title "M"
+                                                  :value [{:v 1}]}})
+    (let [ts (tbl/inline-table)
+          r  (tm/migrate-tables! st ts {:live? true})]
+      (is (= 1 (:tables r)) "nothing writes a :metric, so this is its only path out")
+      (is (tbl/handle? (:value (sub/object st "met:m")))))))
+
+(deftest a-refusal-does-not-stop-the-run
+  ;; The shape the whole namespace exists for. `put-rows!` throws when two
+  ;; column names normalize to one keyword (Task 6e); a run that died there
+  ;; would leave every later table unmigrated and say nothing about which.
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:bad"
+                     :value {:id "tbl:bad" :kind :table :title "B"
+                             :value [{(keyword "a b") 1 :a_b 2}]}})
+    (sub/commit! st {:op :put :id "tbl:good"
+                     :value {:id "tbl:good" :kind :table :title "G" :value [{:v 1}]}})
+    (let [ts (tbl/inline-table)
+          r  (tm/migrate-tables! st ts {:live? true})]
+      (is (= 1 (:tables r)) "the good table still migrated")
+      (is (= ["tbl:bad"] (mapv :id (:refused r))))
+      (is (re-find #"one column" (:why (first (:refused r)))))
+      (is (vector? (:value (sub/object st "tbl:bad"))) "the refused table is untouched"))))
+
+(deftest a-dry-run-writes-nothing-to-the-lake-either
+  ;; Not the same assertion as `dry-run-writes-nothing`, which only checks the
+  ;; log. `import-corpus!` passed that one while leaving 5 tables and 6
+  ;; snapshots of orphan Parquet behind on every preview — and table GC is off
+  ;; (Task 10), so orphans are never reclaimed. `InlineTable` has nowhere to
+  ;; leak to, so this one has to run against a real lake.
+  (lake-test/with-lake [lk]
+    (let [st    (seeded)
+          n     #(count (lake/q lk "SELECT table_name FROM ducklake_tables('lake')"))
+          before (n)]
+      (tm/migrate-tables! st lk)
+      (is (= before (n)) "a dry run must not mint a lake table")
+      (tm/migrate-tables! st lk {:live? true})
+      (is (= (inc before) (n)) "and the live run must mint exactly one"))))
 ```
+
+`with-lake` lives in `test/loci/lake_test.clj`; require that namespace for the macro, or lift it
+into a shared test helper if requiring a test namespace from another reads badly to you — say
+which you did.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -2429,35 +2505,64 @@ way (2) of the three legitimate routes to storage in `CLAUDE.md`.
   (:require [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
-(defn- inline-tables [st]
+(defn- inline-tables
+  "Row-bearing objects whose rows are still in the log.
+
+   Both `:table` and `:metric`: `chunks.clj` treats them as one kind, `hydrate`
+   keys off the handle rather than the kind, and nothing writes a `:metric`, so
+   filtering on `:table` alone would leave two objects inline forever with no
+   path out."
+  [st]
   (->> (sub/objects st) vals
-       (filter #(= :table (:kind %)))
+       (filter #(#{:table :metric} (:kind %)))
        (remove #(tbl/handle? (:value %)))))
+
+(defn- convert!
+  "One table, or a refusal. Never throws.
+
+   Returns `{:id … :rows n}` on success and `{:id … :why …}` otherwise. Each
+   table is its own transaction and its own verdict, because a migration that
+   dies on table 17 tells you less than one that finishes and names what it
+   skipped — the shape `loci.factmigrate` and `loci.corpus` already use."
+  [st ts o]
+  (try
+    (let [h (tbl/put-rows! ts (:id o) (:value o))]
+      (sub/commit! st {:op :assoc :id (:id o) :path [:value] :value h})
+      ;; verify against what is DURABLE, not against the rows we just held in
+      ;; RAM — the 2026-08-15 migration reported "verified" while its target
+      ;; silently lacked an event, because it compared to a stale in-process
+      ;; snapshot.
+      (let [back (tbl/rows ts (:value (sub/object st (:id o))) {})]
+        (if (= (vec (:value o)) (vec back))
+          {:id (:id o) :rows (count back)}
+          {:id (:id o) :why "rows did not round-trip"
+           :expected (count (:value o)) :got (count back)
+           :first-diff (first (remove nil? (map (fn [a b] (when (not= a b) [a b]))
+                                                (:value o) back)))})))
+    (catch Exception e {:id (:id o) :why (.getMessage e)})))
 
 (defn migrate-tables!
   "Report what would change; with `{:live? true}`, change it."
   ([st ts] (migrate-tables! st ts {}))
   ([st ts {:keys [live?]}]
    (let [cands (inline-tables st)
-         {ok true refused false} (group-by #(boolean (seq (:value %))) cands)
-         refused (mapv (fn [o] {:id (:id o) :why "no rows"}) refused)]
-     (when live?
-       (doseq [o ok]
-         (let [h (tbl/put-rows! ts (:id o) (:value o))]
-           (sub/commit! st {:op :assoc :id (:id o) :path [:value] :value h})
-           ;; verify against what is DURABLE, not against the rows we just held
-           ;; in RAM — the 2026-08-15 migration reported "verified" while its
-           ;; target silently lacked an event, because it compared to a stale
-           ;; in-process snapshot.
-           (let [back (tbl/rows ts (:value (sub/object st (:id o))) {})]
-             (when-not (= (vec (:value o)) (vec back))
-               (throw (ex-info "row mismatch after migration — stopping"
-                               {:id (:id o) :expected (count (:value o)) :got (count back)})))))))
+         {ok true empties false} (group-by #(boolean (seq (:value %))) cands)
+         empties (mapv (fn [o] {:id (:id o) :why "no rows"}) empties)
+         done    (when live? (mapv #(convert! st ts %) ok))
+         bad     (filterv :why done)]
      {:mode    (if live? :live :dry-run)
-      :tables  (count ok)
+      :tables  (if live? (- (count ok) (count bad)) (count ok))
       :rows    (reduce + 0 (map #(count (:value %)) ok))
-      :refused refused})))
+      :kinds   (frequencies (map :kind cands))
+      :refused (into empties bad)})))
 ```
+
+Note what `convert!` does **not** do: it does not roll back a table whose rows failed to
+round-trip. The `:assoc` is already committed at that point, so the object holds a handle whose
+rows differ from what it had. That is the honest outcome — the rows are in the lake and readable,
+they simply are not byte-identical — and `undo!` is right there if it matters. Rolling back would
+mean a second write to repair a first, which is more machinery than a case measured at 0 of 31.
+Say this in the docstring rather than leaving a reader to wonder.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -2481,9 +2586,13 @@ Then in the REPL attached to the server, dry run first:
 (tm/migrate-tables! @dlv/store @lake/lake)
 ```
 
-Expected: `{:mode :dry-run :tables 29 :rows … :refused []}` — confirm the count is 29, which
-is what the spec measured. If it is not 29, **stop and report the number** rather than
-proceeding.
+Expected: `{:mode :dry-run :tables 31 :kinds {:table 29 :metric 2} :rows … :refused []}` —
+confirm the count is 31 across both kinds. If it is not, **stop and report the number** rather
+than proceeding.
+
+**Confirm the dry run wrote nothing to the lake**, not merely nothing to the log — count lake
+tables and snapshots before and after. A dry run that leaves Parquet behind is the bug Task 7
+found in `import-corpus!`, and table GC is disabled (Task 10), so orphans never get reclaimed.
 
 Then live:
 
@@ -2491,7 +2600,23 @@ Then live:
 (tm/migrate-tables! @dlv/store @lake/lake {:live? true})
 ```
 
-Report the actual returned map.
+Report the actual returned map. Expect `tbl:extract-20-8413` in `:refused` with a round-trip
+reason — its `Long`/`String` column comes back widened by `read_json_auto` — and treat any
+*other* refusal as a finding to report rather than a result to accept.
+
+- [ ] **Step 6b: Confirm what the migration cost and what it bought**
+
+Three numbers, after the live run:
+
+1. **Log size.** The printed length of the whole event history before and after. This is what
+   the plan bought; Task 7 measured 88–279× per table on a fresh store, and this is the same
+   measurement on real data.
+2. **Chunk re-embeddings.** How many of the 31 stored chunk records now differ from what the
+   code computes. All 31 were already stale from Task 6f, so the answer should still be 31 —
+   not 62. If it is more than 31, something re-embedded twice and that is worth knowing.
+3. **A read still works.** `mold-payload` on a migrated table, end to end, returning rows —
+   because every other assertion in this plan has been about storage, and this is the one that
+   says the thing a user looks at still arrives.
 
 - [ ] **Step 7: Commit**
 
