@@ -142,6 +142,16 @@ changes every "Run:" step below:
 confirm the test **fails**, restore, confirm it passes. A test that passes either way is worse
 than no test, because it certifies. Report the actual failure output.
 
+**Sabotaging a `use-fixtures` line needs more than `:reload`** — found the hard way in Task 6,
+2026-08-16. `use-fixtures` writes to *namespace metadata*, and re-evaluating `(ns …)` does not
+clear it, so deleting the line and calling `(require 'loci.server-test :reload)` leaves the old
+fixture still registered. The suite then behaves as though the fixture were present, which
+reads as "removing it changes nothing" — a false negative that would retire a fixture that is
+actually load-bearing. The honest sequence is `(remove-ns 'loci.server-test)`, drop the symbol
+from `*loaded-libs*`, then `require`. `defonce` has the same shape of problem and wants
+`ns-unmap` (Task 4). Both are the environment masking the sabotage rather than the code being
+dead — the distinction the Task 1 note below insists on.
+
 ---
 
 ## Task 1: The DuckDB dependency and a lake that opens
@@ -1439,5 +1449,13 @@ not a number to update.
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
   Worth a measurement if a table ever comes back with a column the viewers stop treating as
   numeric.
+- **The cap is silent.** `hydrate` puts `:table/total` on the object, but `mold-payload` builds
+  its return map key by key — `:id :title :kind :view :label :rendered :alternatives` — and
+  drops it, so a capped table renders as though it were whole. Found in Task 6, left as Task 6
+  specified. It is latent for the same reason as the `query_table` item above: the largest
+  table is 1,000 rows against a cap of 2,000, so nothing is currently truncated. Whoever raises
+  the first table past 2,000 rows has to plumb `:table/total` through to the shell in the same
+  change, or the browser will quietly show a prefix and call it the table.
+
 Nothing else. The concurrency question that would otherwise be here was measured rather than
 deferred — see "One connection is enough" above.
