@@ -77,6 +77,35 @@
       (is (= rows3 (tbl/rows lk h {}))
           "a handle reads its own snapshot, not whatever the table became"))))
 
+(deftest a-write-after-undo-must-not-resurrect-the-undone-change
+  ;; The exact scenario measured 2026-08-16. Without restore-to!, the sum is
+  ;; 101200: the change at B is still in the table and comes back the moment
+  ;; anything else is written. With it, the sum is 1400.
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:u" (mapv (fn [i] {:id i :v 1}) (range 1000)))
+          t (:table h)
+          sum #(:s (first (lake/q lk (str "SELECT sum(v) AS s FROM " t))))]
+      (is (= 1000.0 (double (sum))))
+      (lake/x! lk (str "UPDATE " t " SET v = 999 WHERE id < 100"))   ; snapshot B
+      (is (= 100800.0 (double (sum))))
+      ;; loci pops the event: the substrate points at the handle's snapshot again.
+      ;; Reading is already correct...
+      (is (= 1000.0 (double (reduce + (map :v (tbl/rows lk h {}))))))
+      ;; ...but the write head is still at B, so it must be moved back.
+      (lake/restore-to! lk t (:snapshot h))
+      (lake/x! lk (str "UPDATE " t " SET v = 5 WHERE id >= 900"))    ; the write after undo
+      (is (= 1400.0 (double (sum)))
+          "the change at B must be gone, not merely unread"))))
+
+(deftest restore-preserves-every-row
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:u" (mapv (fn [i] {:id i :v 1}) (range 1000)))
+          t (:table h)]
+      (lake/x! lk (str "DELETE FROM " t " WHERE id < 500"))
+      (is (= 500 (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " t))))))
+      (lake/restore-to! lk t (:snapshot h))
+      (is (= 1000 (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " t)))))))))
+
 (deftest lake-singleton-is-lazy
   (is (instance? clojure.lang.Delay lake/lake))
   (is (not (realized? lake/lake))

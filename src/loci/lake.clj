@@ -152,6 +152,26 @@
   [lk]
   (:snapshot_id (first (q lk "SELECT max(snapshot_id) AS snapshot_id FROM ducklake_snapshots('lake')"))))
 
+(defn restore-to!
+  "Move `table`'s write head back to `snapshot`.
+
+   Measured 2026-08-16, and this is the finding that most changed the design:
+   DuckLake's `AT (VERSION => n)` is a READ, and a read does not move the write
+   head. A substrate that merely re-points its handle after `undo!` diverges
+   from the lake silently — the next write builds on the state the undo was
+   supposed to remove, and the undone change comes back.
+
+   There is no `ducklake_rollback`; all 26 `ducklake_*` functions were checked.
+   A CREATE OR REPLACE from the old version is the native way to say it, and it
+   is also the fast way: 182 ms at 10M rows against 520 ms for inverting the
+   native change feed, and flat in the size of the edit (a 50% edit restored in
+   211/245/260 ms across three runs). The change-feed approach was measured,
+   was slower, had four change types to get right, and is not here."
+  [lk table snapshot]
+  (x! lk (str "CREATE OR REPLACE TABLE " table
+              " AS SELECT * FROM " table " AT (VERSION => " snapshot ")"))
+  :ok)
+
 (defn- load-rows!
   "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the
    types, which is the same inference `read_csv` already gives `import-csv!`,
