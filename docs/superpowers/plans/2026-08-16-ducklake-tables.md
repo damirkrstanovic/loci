@@ -1413,6 +1413,200 @@ git commit -m "fix: chunk a table by its rows, and open the lake only for a hand
 
 ---
 
+## Task 6d: the round trip must return the same columns it was given
+
+**Files:**
+- Modify: `src/loci/lake.clj` (`rows`)
+- Modify: `src/loci/chunks.clj` (`all-chunks` docstring)
+- Modify: `src/loci/server.clj:573-576` (a measurement that is now stale by two orders of magnitude)
+- Test: `test/loci/lake_test.clj`, `test/loci/chunks_test.clj`
+
+**Added 2026-08-16, from Task 6c's review, and this is a correctness bug in Task 3's code —
+not in 6c.** It is here because it must be fixed before Task 7 lands handles and Task 9
+migrates the 31 real tables.
+
+`lake/q` derives its result keywords with `(sub/col-kw (.getColumnLabel md …))`. `col-kw` passes
+a **keyword** through when it already reads back cleanly, which is why `:tenure-band` survives
+in the log — but `getColumnLabel` returns a **String**, and the string path lowercases and
+squashes `[^a-z0-9]+` to `_`. So a table put into the lake and read back has different column
+names than it went in with.
+
+Measured against the live `data/` substrate, all 31 tables through a temp lake: **7 diverge.**
+
+- `tbl:revenue` — `tenure-band` → `tenure_band`
+- `tbl:opps` — `close-month` → `close_month`
+- `tbl:extract-14-588` — `Category, Property, Mercury_Venus_Earth_Mars` → all lowercased
+- `tbl:derived-2`, `tbl:extract-27-7904`, `tbl:extract-10-2125` — uppercase and `_AU` mangled
+- `tbl:extract-20-8413` — a `Long`+`String` column comes back JSON-quoted (a *type* issue, not a
+  name issue; see the type-fidelity note in "What this plan does not answer" — expect this one
+  to still diverge after this task)
+
+**The consequence that matters most is not the chunk text.** `content.clj:256` picks a series
+column from `#{:tenure-band :dept :channel :region :stage}` and `content.clj:320` gates the
+churn-cohort viewer on `(contains? (first x) :tenure-band)`. `tbl:revenue` has that column.
+Migrate it and the mold silently stops matching — a viewer disappears from a table with no
+error anywhere.
+
+There is also a latent collision: two columns `:a-b` and `:a_b` in one table both map to
+`:a_b`, so one silently overwrites the other in every row map.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test/loci/lake_test.clj`:
+
+```clojure
+(deftest a-round-trip-returns-the-columns-it-was-given
+  ;; `q` names result columns by running the JDBC label through `sub/col-kw`,
+  ;; which lowercases and squashes anything outside [a-z0-9]. `col-kw` leaves a
+  ;; readable *keyword* alone, so `:tenure-band` survives in the log and is
+  ;; renamed only on the way back out of the lake. Measured over the 31 live
+  ;; tables: 7 came back different, and `tbl:revenue`'s `:tenure-band` is the
+  ;; one `content.clj`'s churn-cohort viewer keys on by name.
+  (with-lake [lk]
+    (let [rs [{:tenure-band "0-6m" :Category "A" :rev_AU 1}]
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= [:tenure-band :Category :rev_AU] (:cols h)))
+      (is (= rs (tbl/rows lk h {}))
+          "the rows that come back must be the rows that went in"))))
+
+(deftest two-columns-that-differ-only-by-punctuation-stay-two-columns
+  (with-lake [lk]
+    (let [rs [{:a-b 1 :a_b 2}]
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= 2 (count (:cols h))))
+      (is (= rs (tbl/rows lk h {}))
+          "collapsing both to :a_b would silently drop one column"))))
+```
+
+`test/loci/chunks_test.clj` — encode the measurement Task 6c made by hand and left un-pinned.
+`all-chunks` is the only hydrate site on a timer, so it is the one that most needs this:
+
+```clojure
+(deftest all-chunks-opens-no-lake-for-a-store-with-no-handle
+  (let [boom (delay (throw (ex-info "the sweep opened the lake for tables that never left the log" {})))
+        st   (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "S"
+                                                  :value [{:a 1} {:a 2}]}})
+    (with-redefs [lake/lake boom]
+      (is (seq (ch/all-chunks st)))
+      (is (not (realized? boom))
+          "the 15-second sweep must not open a lake to chunk inline tables"))))
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `{:tenure_band "0-6m", :category "A", :rev_au 1}` against the input, and one column
+where there should be two. Paste both.
+
+- [ ] **Step 3: Implement**
+
+`src/loci/lake.clj`. `q` stays as it is — it is the general query helper and deriving keywords
+from labels is right when nobody knows better. `rows` **does** know better: it selected
+`(:cols h)` itself, in that order, so it can name the results rather than re-deriving them.
+
+```clojure
+(defn- q-as
+  "Like `q`, but names the result columns instead of deriving them from the
+   result set's labels.
+
+   `q` runs each JDBC label through `sub/col-kw`, which is right when the caller
+   has no idea what the columns are. A handle does: it recorded `:cols` when the
+   rows were written, and the SELECT names them in that order. Deriving them
+   again would be lossy — `col-kw` leaves a readable keyword alone but
+   lowercases and squashes a *string*, so `:tenure-band` goes in and
+   `:tenure_band` comes back, and `:a-b` and `:a_b` come back as one column."
+  [lk sql ks]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (loop [acc (transient [])]
+      (if (.next rs)
+        (recur (conj! acc (into {} (map-indexed (fn [i k] [k (.getObject rs (inc i))]) ks))))
+        (persistent! acc)))))
+```
+
+and `rows` in the `extend-type` block becomes:
+
+```clojure
+  (rows [lk h {:keys [offset limit]}]
+    (q-as lk (str "SELECT " (select-cols (:cols h))
+                  " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
+                  (when limit  (str " LIMIT "  (long limit)))
+                  (when offset (str " OFFSET " (long offset))))
+          (:cols h)))
+```
+
+`q` and `q-as` now share their shape; if you can factor the common loop without making either
+harder to read, do — but do not make `q` take an optional key vector, because the two callers
+want opposite defaults and an optional argument would hide which one is in play.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Re-measure the live corpus**
+
+The point of the fix. Run all 31 tables in `data/` through a temp lake and compare the synopsis
+text inline against handle-backed, exactly as Task 6c's review did:
+
+```clojure
+;; a temp lake, `ch/chunks-of` on the inline object vs `ch/all-chunks` on a
+;; store holding the handle — compare :text
+```
+
+Expected: **30 of 31 identical**, with `tbl:extract-20-8413` still divergent because its
+`Long`+`String` column comes back as VARCHAR from `read_json_auto`. Report the actual number. If
+more than one still diverges, name each and say why — that is a finding, not a failure of this
+task.
+
+`data/` is test data; read it freely. Do not write to it — a temp lake and a fresh store are all
+this needs.
+
+- [ ] **Step 6: Correct the `all-chunks` docstring**
+
+`chunks.clj:306-309` currently promises the synopsis "comes out byte-identical either way,
+which is what keeps Task 9's migration from retiring and re-embedding every table's chunk."
+After step 3 that is true for every table whose columns are single-typed — but **not**
+unconditionally, and the docstring should say which conditions rather than make a promise:
+
+> Byte-identical for a table whose columns hold one type each and whose rows
+> number `mold-cap` or fewer — which is all 31 in the substrate today, bar one
+> with a mixed `Long`/`String` column that `read_json_auto` widens to VARCHAR.
+> Past `mold-cap` the synopsis samples only the first 2,000 rows, so a table
+> sorted such that a column's variety begins later will chunk differently than
+> it did inline. Both are re-embeddings, not losses; the point of getting this
+> close is that Task 9's migration re-embeds almost nothing.
+
+- [ ] **Step 7: Update the stale measurement**
+
+`server.clj:573-576` records, of the `?deep=1` LEAP path: *"It re-chunks and re-hashes the whole
+substrate to answer: measured 4.2 ms over 101 chunks / 82 events, which is affordable HERE and
+nowhere else."* That was true when `all-chunks` touched no store. It is not now.
+
+Measured 2026-08-16, 29 tables × 1,000 rows in a temp DuckLake, median of 7: `all-chunks`
+**790 ms** handle-backed against **3.1 ms** for the same tables inline and **0.33 ms**
+pre-hydration — about 27 ms per lake-backed table, one versioned SELECT each, bounded by
+`mold-cap` (a single 100k-row table costs 41 ms).
+
+Rewrite the comment with the new number and keep its point: it was "affordable HERE and nowhere
+else", and it is now considerably less affordable here. Do not change the behaviour — that is
+the open question recorded in the plan, not this task's job.
+
+- [ ] **Step 8: Sabotage**
+
+Revert `rows` to call `q`. `a-round-trip-returns-the-columns-it-was-given` must FAIL showing
+`:tenure_band`; `two-columns-that-differ-only-by-punctuation-stay-two-columns` must FAIL with
+one column. Paste both.
+
+Then revert `all-chunks` to pass `@lake/lake`. `all-chunks-opens-no-lake-for-a-store-with-no-handle`
+must FAIL on `realized?`. Restore.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/loci/lake.clj src/loci/chunks.clj src/loci/server.clj test/
+git commit -m "fix: a table comes back with the columns it went in with"
+```
+
+---
+
 ## Task 7: The six writers land handles
 
 **Files:**
@@ -1880,6 +2074,18 @@ not a number to update.
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
   Worth a measurement if a table ever comes back with a column the viewers stop treating as
   numeric.
+- **The chunk sweep now reads the lake every 15 seconds.** `all-chunks` hydrates, and
+  `start-chunk-sweep!` (`server.clj:2828`) calls `sweep!` on a 15 s daemon — before the
+  `embedding-configured?` check, so it runs whether or not an embedder exists. Measured
+  2026-08-16, 29 tables × 1,000 rows, median of 7: **790 ms** per pass handle-backed against
+  **3.1 ms** inline and **0.33 ms** before hydration — ~27 ms per table, one versioned SELECT
+  each, bounded by `mold-cap` rather than by table size (a 100k-row table costs 41 ms). On a
+  fully migrated store the size of today's that is ~5.6% of one core, continuously, recomputing
+  synopses that have not changed. Two ways out, neither built: bound the read (a synopsis needs
+  ≤50 rows, not 2,000 — this would also fix the >`mold-cap` divergence in Task 6d), or cache by
+  handle, which is sound because writes never overwrite so a given handle's rows are immutable.
+  Measured and written down rather than fixed, because nothing is migrated yet and so nobody has
+  felt it.
 - **The cap now sits in front of three paths that *commit*.** `compute-clj!` (`server.clj:1124`
   → `:1162`), `fn-apply!` via `table-rows` (`:1188` → `:1244`) and `recompute` (`:1259` →
   `rerun!` at `:1306`) all build a derived table from hydrated rows and write it back. Over
