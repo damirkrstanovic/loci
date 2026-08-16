@@ -3137,6 +3137,150 @@ git commit -m "feat: table GC is off, and says which bugs are why"
 
 ---
 
+## Task 11: metadata readers stop fetching rows to count them
+
+**Files:** `src/loci/tablestore.clj`, `src/loci/tools.clj`, `src/loci/server.clj`;
+tests in `tablestore_test.clj`, `tools_test.clj`, `server_test.clj`.
+
+**Added 2026-08-17, after the live migration, and it is the one regression a user would feel.**
+
+Measured against the migrated store (31 objects, 3,957 rows), median of 5–11 warm runs:
+
+| | before migration | after |
+|---|---|---|
+| `mold-payload`, `tbl:orders` (1,000 rows) | 6.8 ms | **60.8 ms** |
+| `tools/dispatch "list_tables"` | — | **266 ms** |
+| `srv/agent-ctx` | — | **277 ms** |
+| `ch/all-chunks` | 16 ms | 14 ms |
+
+`all-chunks` is untouched because Task 6f already stopped it fetching rows. The other three are
+all the same cost: **DuckDB's JDBC driver is slow row-wise.** Measured directly — walking 1,000×8
+cells with `.getObject` and building *nothing* costs 42 ms, and `tbl/rows` costs 42 ms, so the
+map-building is free and there is nothing to optimise in our own code. It is not the versioned
+read either: `AT (VERSION => n)` and a bare `SELECT *` are both 43 ms, while `count(*)` is 3 ms.
+
+`mold-payload` at 61 ms is fine — a user opening a table does not feel that. **`agent-ctx` at
+277 ms is not**, because it runs on every chat turn, and it scales with the total rows in the
+workspace rather than with the table being looked at.
+
+**The fix is the one Task 6b deliberately deferred.** That task's note records it exactly:
+metadata readers "want columns + row count… should read the handle's `:cols`/`:rows` without
+fetching any rows at all", and the trade was recorded as acceptable because nobody had felt it.
+The migration is what makes someone feel it.
+
+A handle already carries `:cols` and `:rows`. These readers need nothing else.
+
+- [ ] **Step 1: Write the failing tests**
+
+```clojure
+;; tablestore_test.clj
+(deftest table-shape-costs-no-rows
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (is (= {:cols [:a :b] :rows 2} (tbl/table-shape ts {:kind :table :value h})))
+    (is (= {:cols [:a :b] :rows 2}
+           (tbl/table-shape ts {:kind :table :value [{:a 1 :b "p"} {:a 2 :b "q"}]}))
+        "a legacy inline table answers the same question")
+    (is (nil? (tbl/table-shape ts {:kind :doc :value "hi"})))))
+
+(deftest table-shape-never-reads-rows
+  (let [boom (reify tbl/TableStore
+               (put-rows! [_ _ _] (throw (ex-info "no" {})))
+               (rows [_ _ _] (throw (ex-info "table-shape fetched rows" {})))
+               (row-count [_ h] (:rows h))
+               (column-samples [_ _ _ _] (throw (ex-info "no" {}))))
+        h {:store :lake :table "t_x" :snapshot 1 :rows 1000 :cols [:a :b]}]
+    (is (= {:cols [:a :b] :rows 1000} (tbl/table-shape boom {:kind :table :value h}))
+        "the handle already knows; nothing may be fetched")))
+```
+
+```clojure
+;; tools_test.clj — the behaviour, not the helper
+(deftest list-tables-reads-no-rows
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (with-redefs [tbl/rows (fn [& _] (throw (ex-info "list_tables fetched rows" {})))]
+      (let [r (first (tools/dispatch st "list_tables" {}))]
+        (is (= ["a" "b"] (:columns r)))
+        (is (= 2 (:rows r)))))))
+```
+
+Write the equivalent for `srv/agent-ctx`'s catalog — with `tbl/rows` stubbed to throw, building
+the context for a store holding a handle-backed table must still name the table, its columns and
+its true row count.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: `No such var: tbl/table-shape`, then the two stubbed-`rows` tests throwing.
+
+- [ ] **Step 3: Implement**
+
+```clojure
+(defn table-shape
+  "`{:cols [...] :rows n}` for a table object, or nil if it is not one.
+
+   Reads the handle and fetches nothing. A handle recorded `:cols` and `:rows`
+   when the rows were written, which is everything a catalog, a table list or a
+   column menu needs — and DuckDB's JDBC driver is slow row-wise, so fetching
+   them to count them is the difference between a 15 ms chat turn and a 277 ms
+   one. Measured 2026-08-17 over the migrated store: `agent-ctx` 277 ms and
+   `list_tables` 266 ms, against 42 ms to walk 1,000×8 cells for a single table.
+
+   Falls back to counting a legacy inline vector, so a store that has not been
+   migrated answers the same question at the same cost it always did."
+  [ts o]
+  (let [v (:value o)]
+    (cond
+      (handle? v)      {:cols (vec (cols-of-handle v)) :rows (row-count ts v)}
+      (and (sequential? v) (seq v) (every? map? v))
+      {:cols (vec (keys (first v))) :rows (count v)}
+      :else nil)))
+```
+
+`cols-of-handle` is a placeholder for however you read `:cols` off a handle — use the real
+accessor, and if there isn't one, `(:cols v)` is fine and clearer than inventing one.
+
+- [ ] **Step 4: Convert the four metadata readers**
+
+`tools.clj` `do-list`, and the three catalog fragments in `server.clj` (in `ask!`, `delegate!`
+and `agent-ctx`) that read `(keys (first (:value o)))` and `(or (:table/total o) (count (:value o)))`.
+Each becomes a `table-shape` call. **Do not touch the row readers** — `do-query`, `table-rows`,
+`describe!`, `make-view!`, `compute-clj!`, `do!`, `obj-digest`, `recompute` and `mold-payload`
+all genuinely need rows and must keep hydrating.
+
+`obj-digest` is the judgement call: it prints a row count *and* a `table-digest` of sums and
+sample rows, so it genuinely needs rows. **Leave it hydrating** — but check whether the objects
+it is handed are hydrated once and shared with the catalog, and if so make sure your change does
+not cause them to be hydrated twice.
+
+`table-shaped?` (`server.clj`, used by `resolve-table-ref`) asks a boolean and can now answer it
+with `table-shape`. Convert it; the plan's open-questions section has recorded that cost as
+unfixed since Task 6b.
+
+- [ ] **Step 5: Measure again**
+
+Same three numbers, same method, against the migrated store. Report them beside the ones above.
+Expected: `list_tables` and `agent-ctx` fall to roughly `all-chunks`' 14 ms; `mold-payload` is
+**unchanged at ~61 ms**, because it genuinely needs the rows.
+
+If `mold-payload` also drops, something is wrong — you have removed a fetch a reader needed.
+
+- [ ] **Step 6: Sabotage**
+
+Point `table-shape`'s handle branch at `rows` instead of the handle. Both "reads no rows" tests
+must fail with the stub's exception. Restore.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/loci/tablestore.clj src/loci/tools.clj src/loci/server.clj test/
+git commit -m "perf: a catalog reads the handle, not the rows"
+```
+
+---
+
 ## Final verification
 
 - [ ] **Both suites, from a cold JVM.** This is the one time `clojure -M:test` is right:
