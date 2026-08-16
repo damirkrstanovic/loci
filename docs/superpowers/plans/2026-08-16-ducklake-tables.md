@@ -2651,6 +2651,14 @@ not a number to update.
   handle, which is sound because writes never overwrite so a given handle's rows are immutable.
   Measured and written down rather than fixed, because nothing is migrated yet and so nobody has
   felt it.
+- **The browser suite is not evidence about table storage.** `npm run test:browser` runs against
+  `content.clj`'s seed, which builds every object through its own local `obj` helper with inline
+  rows — deliberately, so that requiring `loci.content` never needs a lake. So 130/130 green
+  says nothing about whether a writer landed a handle. Found in Task 7. The seed should stay as
+  it is; the property it protects is worth more than the coverage it costs. Cite `server_test`'s
+  `every-server-writer-lands-a-handle` instead, which asserts `tbl/handle?` directly — a test
+  that reads through `hydrate` **cannot** detect an unconverted writer, because `hydrate` passes
+  literals through unchanged. That is the hole `rerun!` hid in.
 - **Six places assume the first row carries every key.** Measured in Task 6e's review, and
   latent only because **0 of the 31 live tables are ragged**: `content.clj:169` (`numeric-cols`),
   `:177` (`string-cols`), `:229` (`timeseries?`), `:256`, `:320`, plus `viewspec.clj:42` and
