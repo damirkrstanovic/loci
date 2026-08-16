@@ -1,7 +1,8 @@
 (ns loci.lake-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is]]
-            [loci.lake :as lake]))
+            [loci.lake :as lake]
+            [loci.tablestore :as tbl]))
 
 (defn- rm-rf [f]
   (let [f (io/file f)]
@@ -35,3 +36,43 @@
   ;; line is what stops all of them persisting into nothing.
   (with-lake [lk]
     (is (= [{:db "lake"}] (lake/q lk "SELECT current_database() AS db")))))
+
+(def ^:private rows3 [{:id 1 :name "a"} {:id 2 :name "b"} {:id 3 :name "c"}])
+
+(deftest lake-round-trips
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" rows3)]
+      (is (= :lake (:store h)))
+      (is (= 3 (:rows h)))
+      (is (= [:id :name] (:cols h)))
+      (is (integer? (:snapshot h)))
+      (is (= rows3 (tbl/rows lk h {}))))))
+
+(deftest lake-preserves-column-order
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" [{:zeta 1 :alpha 2}])]
+      (is (= [:zeta :alpha] (:cols h)))
+      (is (= [:zeta :alpha] (vec (keys (first (tbl/rows lk h {})))))))))
+
+(deftest lake-pages
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" rows3)]
+      (is (= [{:id 2 :name "b"}] (tbl/rows lk h {:offset 1 :limit 1})))
+      (is (= 3 (tbl/row-count lk h))))))
+
+(deftest two-tables-never-share-storage
+  (with-lake [lk]
+    (let [a (tbl/put-rows! lk "tbl:x" [{:v 1}])
+          b (tbl/put-rows! lk "tbl:x" [{:v 2}])]
+      (is (not= (:table a) (:table b))
+          "the same object id written twice must land in two lake tables")
+      (is (= [{:v 1}] (tbl/rows lk a {})))
+      (is (= [{:v 2}] (tbl/rows lk b {}))))))
+
+(deftest a-read-names-its-version
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" rows3)]
+      ;; move the lake's write head PAST the recorded snapshot
+      (lake/x! lk (str "UPDATE " (:table h) " SET name = 'CHANGED'"))
+      (is (= rows3 (tbl/rows lk h {}))
+          "a handle reads its own snapshot, not whatever the table became"))))

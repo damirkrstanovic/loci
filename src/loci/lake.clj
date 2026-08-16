@@ -6,8 +6,11 @@
    rows costs 75 ms against loci's ~14 s dependency load, and a versioned read
    at 10M rows is 34 ms — faster than reading the current version, because an
    old snapshot carries no deletion vectors."
-  (:require [clojure.java.io :as io]
-            [loci.substrate :as sub]))
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 (defn- conn-of [lk] (:conn lk))
 
@@ -86,3 +89,71 @@
        (catch Throwable t (.close conn) (throw t))))))
 
 (defn close! [lk] (when-let [c (conn-of lk)] (.close c)))
+
+(defn- table-name
+  "A loci object id → a lake table name that is a legal SQL identifier and
+   unique per call.
+
+   Two parts on purpose. The sanitised id keeps the name debuggable — you can
+   see which object `t_tbl_orders_1a2b3c4d` belongs to from a directory
+   listing. The suffix makes it unique, because sanitising is lossy
+   (`tbl:a-b` and `tbl:a_b` collide) and because writes never overwrite: the
+   same object id written twice must land in two tables."
+  [id n]
+  (let [safe (-> (str id)
+                 str/lower-case
+                 (str/replace #"[^a-z0-9]+" "_")
+                 (str/replace #"^_+|_+$" ""))
+        h    (-> (java.security.MessageDigest/getInstance "SHA-256")
+                 (.digest (.getBytes (str id "#" n) "UTF-8")))]
+    (str "t_" (if (str/blank? safe) "tbl" safe) "_"
+         (apply str (map #(format "%02x" %) (take 4 h))))))
+
+(defn- ident
+  "A column name as a quoted SQL identifier. Quoted, not interpolated bare:
+   column names arrive from CSV headers and from models, and `sub/col-kw` has
+   already made them safe for the LOG without making them safe for SQL."
+  [k]
+  (str "\"" (str/replace (name k) "\"" "\"\"") "\""))
+
+(defn- select-cols [cols] (str/join ", " (map ident cols)))
+
+(defn current-snapshot
+  "The snapshot id the lake's write head is at."
+  [lk]
+  (:snapshot_id (first (q lk "SELECT max(snapshot_id) AS snapshot_id FROM ducklake_snapshots('lake')"))))
+
+(defn- load-rows!
+  "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the
+   types, which is the same inference `read_csv` already gives `import-csv!`,
+   and it is the path that stays reasonable at millions of rows — measured
+   2.9 s for a 10M-row create."
+  [lk table cols rs]
+  (let [f (java.io.File/createTempFile "loci-rows-" ".ndjson")]
+    (try
+      (with-open [w (io/writer f)]
+        (doseq [r rs] (json/write r w) (.write w "\n")))
+      (x! lk (str "CREATE TABLE " table " AS SELECT " (select-cols cols)
+                  " FROM read_json_auto('" (.getAbsolutePath f)
+                  "', format='newline_delimited')"))
+      (finally (.delete f)))))
+
+(extend-type Lake
+  tbl/TableStore
+  (put-rows! [lk id rs]
+    (let [rs    (vec rs)
+          cols  (tbl/cols-of rs)
+          table (table-name id (System/nanoTime))]
+      (when (empty? rs)
+        (throw (ex-info "refusing to store a table with no rows" {:id id})))
+      (load-rows! lk table cols rs)
+      {:store :lake :table table :snapshot (current-snapshot lk)
+       :rows (count rs) :cols cols}))
+
+  (rows [lk h {:keys [offset limit]}]
+    (q lk (str "SELECT " (select-cols (:cols h))
+               " FROM " (:table h) " AT (VERSION => " (:snapshot h) ")"
+               (when limit  (str " LIMIT "  (long limit)))
+               (when offset (str " OFFSET " (long offset))))))
+
+  (row-count [_ h] (:rows h)))
