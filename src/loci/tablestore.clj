@@ -19,16 +19,50 @@
     "Up to `per-col` sample values for each of the first `max-cols` columns, as
      `{column [\"…\" …]}` with the values already stringified.
 
-     Distinct, ordered by string form, nulls dropped. Ordered rather than
-     first-seen because the lake has no row order to appeal to without an
-     `ORDER BY`, and a synopsis whose values vary between runs would move its
-     hash on every sweep and re-embed forever. Ordered *by string form* because
-     a column holding both `50` and `\"~13%\"` has no natural order, and the
-     string is what reaches the synopsis anyway.
+     Nulls dropped, each value clipped to `sample-max-chars`, then **distinct,
+     then ordered by that clipped string**. Clipped before deduplicating rather
+     than after, so two values sharing a 40-character prefix contribute one
+     sample and not two identical-looking ones.
+
+     Ordered rather than first-seen because the lake has no row order to appeal
+     to without an `ORDER BY`, and a synopsis whose values vary between runs
+     would move its hash on every sweep and re-embed forever. Ordered *by
+     string form* because a column mixing a number and a string has no natural
+     order, and the string is what reaches the synopsis anyway.
+
+     **The two implementations agree on the ordering but not always on the
+     string**, and the example that motivates ordering-by-string is itself the
+     exception: a column holding both `50` and `\"~13%\"` is widened to JSON by
+     `read_json_auto`, so the lake renders it `\"~13%\"` — quotes included — and
+     sorts it first, where inline renders `~13%` and sorts it last. See
+     `the-two-stores-disagree-on-a-mixed-type-column` in `loci.lake-test`, which
+     records the disagreement, and `loci.chunks/all-chunks`, which lists every
+     class of it measured over the live corpus.
 
      This is what a table's chunk is built from. It exists so that describing a
      10M-row table costs nine values rather than a page of rows, and so that the
      description covers the whole column rather than its first `mold-cap` rows."))
+
+(def sample-max-chars
+  "How long one sample value may be, in **Unicode code points**.
+
+   Code points rather than Java chars because that is the unit DuckDB's
+   `length` and `substr` count, and the two stores have to clip identically or
+   they produce different text for the same table. Measured 2026-08-16: they
+   agree exactly for ASCII, Cyrillic and CJK, and part company only above the
+   BMP — 45 `🙂` is 90 chars to Java and 45 to DuckDB, so a `subs`-based clip
+   would keep 20 of them and DuckDB 40."
+  40)
+
+(defn clip-sample
+  "One sample value, clipped to `sample-max-chars` code points with an ellipsis.
+
+   The reference for what the lake does in SQL; keep the two in step."
+  [s]
+  (let [n (.codePointCount ^String s 0 (.length ^String s))]
+    (if (> n sample-max-chars)
+      (str (subs s 0 (.offsetByCodePoints ^String s 0 sample-max-chars)) "…")
+      s)))
 
 (defn handle?
   "True for a handle this namespace produced. The `:store` key is explicit
@@ -58,7 +92,8 @@
   (column-samples [_ h per-col max-cols]
     (let [rs (:data h)]
       (into {} (for [c (take max-cols (:cols h))]
-                 [c (->> rs (keep #(get % c)) (map str) distinct sort (take per-col) vec)])))))
+                 [c (->> rs (keep #(get % c)) (map str) (map clip-sample)
+                         distinct sort (take per-col) vec)])))))
 
 (defn inline-table [] (->InlineTable))
 

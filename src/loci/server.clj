@@ -570,22 +570,45 @@
             ;; never built reports every chunk it implies rather than "0 awaiting"
             ;; over an empty group. ~170 on the live corpus before a first sweep.
             ;;
-            ;; It re-chunks and re-hashes the whole substrate to answer, and
-            ;; since tables moved to DuckLake that means a versioned SELECT per
-            ;; lake-backed table too — `all-chunks` hydrates on the way in.
+            ;; It re-chunks and re-hashes the whole substrate to answer. A
+            ;; lake-backed table no longer costs a row read for that:
+            ;; `all-chunks` builds its synopsis from `tbl/column-samples`, which
+            ;; the lake answers with one `SELECT DISTINCT … LIMIT 3` per column
+            ;; and memoizes per `[table, snapshot]`. A handle is immutable, so
+            ;; each one is queried once in the life of the process.
             ;;
             ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
-            ;; chunks / 31 row-bearing tables, median of 7: **297 ms** with every
-            ;; table handle-backed, against 16 ms with the same tables inline and
-            ;; 13 ms for the chunking alone. So the lake reads are ~280 ms of it,
-            ;; ~9 ms per table, each bounded by `tbl/mold-cap` rather than by the
-            ;; table's real size. (The old 4.2 ms here was 101 chunks / 82 events;
-            ;; the inline path has only tracked the corpus growing.)
+            ;; chunks / 31 row-bearing tables. Interleaved after 30 warmup
+            ;; rounds, median of 15 — an un-warmed first call reads 150-250 ms
+            ;; and will mislead whoever measures this next:
             ;;
-            ;; It was affordable HERE and nowhere else; it is now considerably
-            ;; less affordable here, and 100× the cost of the pure-chunking part.
-            ;; It is one of the reasons this function may only ever be reached by
-            ;; ?deep=1 — and the reason a cheaper answer is an open question.
+            ;;   14.8 ms  chunking and hashing alone, samples already in hand
+            ;;   15.2 ms  every table handle-backed, cache warm ← what a sweep pays
+            ;;   25.7 ms  the same tables inline
+            ;;   1061 ms  every table handle-backed, cache cold (fresh lake, median of 5)
+            ;;
+            ;; Warm is within a millisecond of pure chunking — the lake work
+            ;; disappears — and beats the inline path, which still walks 3,957
+            ;; rows in Clojure to sample them. Cold is 169 queries, one per
+            ;; column across the 31 tables, at 6.3 ms each; it is paid once per
+            ;; handle for the life of the process, where the hydrating version
+            ;; this replaced paid 297 ms on every 15-second sweep.
+            ;;
+            ;; The SHAPE of the cost changed with it, and that is the part worth
+            ;; knowing. Each query is a full column scan, NOT bounded by
+            ;; `tbl/mold-cap` the way hydrating was, so a cold miss scales with
+            ;; the table rather than being capped: measured on one 10M-row table,
+            ;; 20 ms for a 7-distinct-value column against 399-423 ms for
+            ;; high-cardinality ones. The trade is an unbounded one-time cost for
+            ;; a bounded recurring one, and a description that covers the whole
+            ;; column instead of its first 2,000 rows.
+            ;;
+            ;; So it is still affordable HERE and nowhere else, and now for a
+            ;; sharper reason: warm it is ~1× the pure-chunking cost, but the
+            ;; first ?deep=1 after a restart — or after any write that mints a
+            ;; new handle — is ~70×. It is one of the reasons this function may
+            ;; only ever be reached by ?deep=1, and the reason a cheaper answer
+            ;; is an open question.
             awaiting (count (ch/pending st cs model))]
         (cond-> hits
           (pos? awaiting)

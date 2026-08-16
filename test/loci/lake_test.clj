@@ -139,6 +139,53 @@
              (tbl/column-samples lk hl 3 3))
           "inline and lake must agree, or migration re-embeds every table"))))
 
+(deftest the-two-stores-disagree-on-a-mixed-type-column
+  ;; Recorded, not asserted away. `column-samples`' own docstring motivates
+  ;; ordering-by-string with "a column holding both 50 and \"~13%\"" — and that
+  ;; column is precisely where the two stores part company, so the example needs
+  ;; to carry its own exception. `read_json_auto` widens a Long/String column to
+  ;; JSON, the lake's values arrive quoted, and `\"` (0x22) sorts below a digit.
+  ;;
+  ;; Pin it here so that a future change to either store has to come past this
+  ;; test and say whether it closed the gap or widened it.
+  (with-lake [lk]
+    (let [rs [{:m 50} {:m "~13%"} {:m 7}]
+          hl (tbl/put-rows! lk "tbl:m" rs)
+          hi (tbl/put-rows! (tbl/inline-table) "tbl:m" rs)]
+      (is (= ["50" "7" "~13%"] (:m (tbl/column-samples (tbl/inline-table) hi 3 3)))
+          "inline sorts the raw string forms")
+      (is (= ["\"~13%\"" "50" "7"] (:m (tbl/column-samples lk hl 3 3)))
+          "the lake sorts JSON renderings, and the quote reorders them"))))
+
+(deftest clipping-happens-before-deduplicating
+  ;; Two values sharing a 40-point prefix are ONE sample. Deduplicating first
+  ;; and clipping afterwards prints the same string twice and says nothing.
+  (with-lake [lk]
+    (let [long-a #(str (apply str (repeat 44 "a")) %)
+          rs     [{:c (long-a "1")} {:c (long-a "2")} {:c "zzz"}]
+          hl     (tbl/put-rows! lk "tbl:c" rs)
+          hi     (tbl/put-rows! (tbl/inline-table) "tbl:c" rs)]
+      (is (= [(str (apply str (repeat 40 "a")) "…") "zzz"]
+             (:c (tbl/column-samples lk hl 3 3)))
+          "one clipped sample, not two that print alike")
+      (is (= (:c (tbl/column-samples (tbl/inline-table) hi 3 3))
+             (:c (tbl/column-samples lk hl 3 3)))
+          "and both stores clip at the same point"))))
+
+(deftest a-clip-counts-code-points-in-both-stores
+  ;; DuckDB's `length`/`substr` count code points; Clojure's `count`/`subs`
+  ;; count Java chars, and 45 🙂 is 45 to one and 90 to the other. A `subs`-based
+  ;; clip would keep 20 of them against DuckDB's 40 — one table, two synopses.
+  (with-lake [lk]
+    (let [rs [{:c (apply str (repeat 45 "🙂"))}]
+          hl (tbl/put-rows! lk "tbl:e" rs)
+          hi (tbl/put-rows! (tbl/inline-table) "tbl:e" rs)]
+      (is (= [(str (apply str (repeat tbl/sample-max-chars "🙂")) "…")]
+             (:c (tbl/column-samples lk hl 3 3))))
+      (is (= (:c (tbl/column-samples (tbl/inline-table) hi 3 3))
+             (:c (tbl/column-samples lk hl 3 3)))
+          "code points in both, or an emoji splits the stores"))))
+
 (deftest sampling-sees-past-the-mold-cap
   ;; The bug this task exists to fix. Sorted so a column's variety begins well
   ;; past `mold-cap`: hydrating 2,000 rows sees one region, the database sees

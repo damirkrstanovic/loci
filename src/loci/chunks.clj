@@ -80,8 +80,14 @@
 
 (def ^:private synopsis-samples
   "Sample values per column. Enough that \"Belgrade\" finds the roster; few
-   enough that the samples are a hint, not the data. Taken from the front of the
-   table, so appending rows does not churn the hash."
+   enough that the samples are a hint, not the data.
+
+   Not taken from the front of the table — `column-samples` returns the whole
+   column's distinct values ordered by their string form, and these are the
+   first three of those. Appending rows still does not churn the hash, but for
+   a stronger reason than row order gave: a new row moves this prefix only if
+   its value sorts *into* it, so appending 10,000 rows to a table whose
+   smallest three values are already present changes nothing at all."
   3)
 
 ;; ---------------------------------------------------------------------------
@@ -206,8 +212,10 @@
    absent: it would move the hash on every appended row and buy nothing anyone
    searches for."
   [title cols samples]
-  (let [line (fn [c] (str (col-name c) ": "
-                          (str/join ", " (map #(clip % 40) (get samples c)))))]
+  ;; No per-value clip here: `column-samples` already clipped to
+  ;; `tbl/sample-max-chars`, and re-clipping would cut an astral value a second
+  ;; time — the store counts code points, `clip` counts Java chars.
+  (let [line (fn [c] (str (col-name c) ": " (str/join ", " (get samples c))))]
     (clip (str/join "\n" (concat (when-not (str/blank? (str title)) [(str title)])
                                  [(str "columns: " (str/join ", " (map col-name cols)))]
                                  (map line cols)))
@@ -331,31 +339,41 @@
 
    Byte-identical to the inline path only where the two agree on how a value
    *prints*. Measured over the 31 live row-bearing tables, 2026-08-16: **27 of
-   31**. The four that differ do so because `CAST(… AS VARCHAR)` and Clojure's
-   `str` render the same value differently, never because the ordering differs
-   — DuckDB's VARCHAR collation and Clojure's `sort` were checked against each
-   other over 27 strings spanning punctuation, digits, case, accents and CJK
-   and agreed exactly.
+   31**. Never because the ordering differs — DuckDB's VARCHAR collation and
+   Clojure's `sort` were checked against each other over 27 strings spanning
+   punctuation, digits, case, accents and CJK and agreed exactly. Always
+   because `CAST(… AS VARCHAR)` and Clojure's `str` render the same value
+   differently, and **a value that renders differently also sorts differently,
+   so the whole sample list can change and not just the one value in it.**
 
-   Three of the four are the lake's own type inference and predate this
-   function — reading the rows back disagreed with inline in exactly the same
-   way, and sampling in row order simply never reached the offending value:
+   Three of the four are the lake's own type inference, and predate this
+   function: reading the rows back disagreed with inline in exactly the same
+   way, and sampling in row order simply never reached the offending value.
 
-   · `100` against `100.0` — a column mixing `Long` and `Double` is one
-     `DOUBLE` to `read_json_auto` (`tbl:csv-19-7071`).
-   · `\"\"` against `\"\\\"\\\"\"` — a column mixing a string with numbers is
-     widened to JSON, and a JSON value keeps its quotes (`tbl:csv-18-1542`,
-     `tbl:extract-20-8413`).
+   · A column mixing `Long` and `Double` is one `DOUBLE` to `read_json_auto`,
+     so `100` renders `100.0` — `tbl:csv-19-7071`'s `urban_pct`.
+   · A column mixing a string with numbers is widened to JSON, and a JSON value
+     keeps its quotes, so an empty string renders as `\"\"` — two characters,
+     sorting below every digit. Five columns: `density_per_km2`
+     (also `tbl:csv-19-7071`, which is why it is under both bullets),
+     `tbl:csv-18-1542`'s `inflation_pct`, `growth_pct` and `unemployment_pct`.
+     In `tbl:extract-20-8413`'s `approx_low_income_share` the quote also
+     reorders: `10, 50, ~13% (1 of 8 countries)` against
+     `\"~13% (1 of 8 countries)\", 10, 50`.
 
    The fourth is this function's own, and is the price of asking SQL rather
-   than Clojure to render:
-
-   · `1.24E7` against `12400000.0` — Clojure switches a `Double` to scientific
-     notation at 1e7 and below 1e-3, DuckDB never does (`tbl:corpus-2`).
+   than Clojure to render. `tbl:corpus-2`'s `production_tonnes` samples
+   `1.24E7, 1.4E7, 100.0` inline and `100.0, 1000.0, 10000.0` from the lake —
+   **three different values**, because the rendering decides the sort. Both
+   engines use scientific notation and neither can be made to imitate the
+   other: Clojure switches at 1e7 and 1e-3 and writes `1.0E7`, DuckDB switches
+   at 1e16 and 1e-5 and writes `1e+16` / `1e-05`, so there is no range in which
+   they agree on such a value.
 
    Not repaired by stringifying in Clojure instead: the values are *ordered* by
    the rendering, so printing one rendering and sorting by another is a worse
-   contract than either. All four are re-embeddings, not losses."
+   contract than either. All four are re-embeddings, not losses — one extra
+   model round trip apiece at migration, once."
   [st]
   (chunks-in (map with-samples (vals (sub/objects st)))))
 

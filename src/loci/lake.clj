@@ -237,16 +237,39 @@
    lake table and nothing overwrites one. So a hit is not a stale answer, it is
    the only answer.
 
-   Unbounded, and that is affordable: an entry is at most 24 columns × 3 clipped
-   strings, well under 1 KB, so a thousand table versions is about a megabyte.
-   Measure before replacing this with an eviction policy."
+   That is the same invariant `current-snapshot` above depends on, and it stops
+   holding on the same day: **whoever adds in-place mutation has to invalidate
+   this**. `restore-to!` is already a `CREATE OR REPLACE` and is the closest
+   thing to a counter-example, but it is not one — measured 2026-08-16, a
+   cached answer still matches a fresh one across an `UPDATE` and a
+   `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
+   snapshot and the rewrite only moves the write head.
+
+   Unbounded, and that is affordable *because the clip happens in SQL rather
+   than downstream*. An entry is at most `max-cols` × `per-col` values of
+   `tbl/sample-max-chars` code points — 24 × 3 × 41 ≈ 3 KB, or double that if
+   every code point is astral. Measured 2026-08-16 over the 31 live tables: a
+   median entry of 117 characters and a maximum of 879 (1,113 bytes of EDN). A
+   table with a 5,000-character text column, which without the clip would put
+   15 KB in one entry, produces 123 characters.
+
+   It retains more than the samples: the key holds the `Lake` it was asked
+   about, so an entry pins a JDBC connection. In the server there is one lake
+   and so one reference; a test run that opens many leaks one each until the
+   var is rebound. Measure before replacing this with an eviction policy."
   (memoize
    (fn [lk table snapshot cols per-col]
      (into {} (for [c cols]
                 [c (mapv #(str (first (vals %)))
-                         (q lk (str "SELECT DISTINCT CAST(" (ident c) " AS VARCHAR) AS v"
+                         ;; Clipped BEFORE the DISTINCT, matching
+                         ;; `tbl/clip-sample`: two values sharing a 40-point
+                         ;; prefix are one sample, not two that print alike.
+                         (q lk (str "SELECT DISTINCT CASE WHEN length(s) > " tbl/sample-max-chars
+                                    " THEN substr(s, 1, " tbl/sample-max-chars ") || '…'"
+                                    " ELSE s END AS v FROM ("
+                                    "SELECT CAST(" (ident c) " AS VARCHAR) AS s"
                                     " FROM " table " AT (VERSION => " (long snapshot) ")"
-                                    " WHERE " (ident c) " IS NOT NULL"
+                                    " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
 (extend-type Lake
