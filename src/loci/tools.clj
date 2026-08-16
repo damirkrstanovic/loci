@@ -10,8 +10,10 @@
             [clojure.string :as str]
             [org.httpkit.client :as hc]
             [loci.config :as config]
+            [loci.lake :as lake]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.viewspec :as vs]))
 
 (defn- table-objs [st] (->> (sub/objects st) vals (filter #(= :table (:kind %)))))
@@ -103,13 +105,14 @@
 
 ;; ---- handlers ----
 (defn- do-list [st _]
-  (mapv (fn [o] {:id (:id o) :title (:title o)
-                 :columns (mapv name (keys (first (:value o))))
-                 :rows (count (:value o))})
+  (mapv (fn [o] (let [o (tbl/hydrate @lake/lake o)]
+                  {:id (:id o) :title (:title o)
+                   :columns (mapv name (keys (first (:value o))))
+                   :rows (or (:table/total o) (count (:value o)))}))
         (table-objs st)))
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
-  (if-let [o (sub/object st table_id)]
+  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate @lake/lake))]
     (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
           rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
       (if save_as

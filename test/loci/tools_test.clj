@@ -1,8 +1,10 @@
 (ns loci.tools-test
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is use-fixtures]]
+            [loci.lake :as lake]
             [loci.lake-fixture]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools]))
 
 (use-fixtures :once loci.lake-fixture/with-temp-lake)
@@ -55,3 +57,26 @@
 (deftest parse-csv-sanitizes-headers
   (let [rows (tools/parse-csv "Key Proponent(s),Total Revenue ($)\nCanon,5")]
     (is (= {:key_proponent_s "Canon" :total_revenue 5} (first rows)))))
+
+;; ---- the agent's two table tools read through the handle, not around it ----
+;; A table's rows live in the lake and the log holds a handle. Both tools used
+;; to read `(:value o)` straight: list_tables died on the handle's keys, and
+;; query_table silently returned the handle's OWN keys as the user's data.
+
+(deftest list-tables-reads-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (let [r (first (tools/dispatch st "list_tables" {}))]
+      (is (= ["a" "b"] (:columns r)) "columns come from the rows, not the handle's keys")
+      (is (= 2 (:rows r))))))
+
+(deftest query-table-reads-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (is (= [{:a 1 :b "p"} {:a 2 :b "q"}]
+           (:rows (tools/dispatch st "query_table" {:table_id "tbl:x"})))
+        "the handle's own keys must never be returned as rows")))

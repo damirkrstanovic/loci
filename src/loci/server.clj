@@ -1059,7 +1059,7 @@
 ;; reversible object; it then appears in the object's "view this as…" menu.
 (defn describe! [st id prompt]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "describe works on tables"}
         (let [spec (agent/describe-view (mapv name (keys (first rows))) (take 2 rows) prompt)
@@ -1082,7 +1082,7 @@
 ;; if this ever serves untrusted users.
 (defn make-view! [st id prompt]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "code views work on tables"}
         (let [code (agent/make-applet (mapv name (keys (first rows))) (take 3 rows) prompt)
@@ -1121,7 +1121,7 @@
 
 (defn compute-clj! [st id prompt space]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "compute works on tables"}
         (let [cols    (mapv name (keys (first rows)))
@@ -1186,7 +1186,7 @@
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
 (defn- table-rows [st id]
-  (let [rows (:value (sub/object st id))]
+  (let [rows (:value (tbl/hydrate @lake/lake (sub/object st id)))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
 
 (defn fns-payload [st id]
@@ -1256,7 +1256,8 @@
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
-        rows   (or (get working src-id) (:value (sub/object st src-id)))
+        rows   (or (get working src-id)
+                   (:value (tbl/hydrate @lake/lake (sub/object st src-id))))
         via    (:via obj)]
     (cond
       (nil? rows) {:why (str "source " src-id " is gone")}
@@ -1312,7 +1313,7 @@
 ;; Clojure transform) and routes to it. No technique buttons — loci decides.
 (defn do! [st id prompt space]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "this works on tables"}
         (let [technique (agent/choose-technique (mapv name (keys (first rows))) (take 3 rows) prompt)]
@@ -1740,7 +1741,7 @@
       {:error (str "not a notebook: " space)}
       (try
         (let [digest (->> (nb/cells-of o) (keep #(sub/object st (:ref %)))
-                          (map obj-digest) (str/join "\n"))]
+                          (map #(obj-digest (tbl/hydrate @lake/lake %))) (str/join "\n"))]
           {:tags (vec (take 3 (agent/propose-tags (:title o)
                                                   (get-in o [:value :intent]) digest)))})
         (catch Exception e {:error (.getMessage e)})))))
@@ -1759,14 +1760,15 @@
     (let [objs    (if-let [sp (and space (sub/object st space))]
                     (keep #(sub/object st (:ref %)) (nb/cells-of sp))  ; scoped to this space
                     (vals (sub/objects st)))                                  ; whole workspace
-          objs    (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs)
+          objs    (mapv #(tbl/hydrate @lake/lake %)
+                        (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
           texty   (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
                                 (not (every? :block (:value %)))) objs) ; docs + reports (not tables)
           tbls    (filter #(= :table (:kind %)) objs)
           allowed (when space (set (map :id tbls)))
           catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
                                                    " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                   "; " (count (:value o)) " rows)")) tbls))
+                                                   "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))
           sys     (str "Answer the user's question about their workspace. Cite the object ids you used. "
                        "Do NOT guess any table figure — call query_table for exact numbers. "
                        "If the data doesn't say, say so plainly. Be concise, markdown.\n\n"
@@ -2014,13 +2016,14 @@
 (defn delegate! [st space]
   (let [sp (sub/object st space)
         members (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
-                     (remove #(#{:space :viewspec :applet :fn} (:kind %))))
+                     (remove #(#{:space :viewspec :applet :fn} (:kind %)))
+                     (mapv #(tbl/hydrate @lake/lake %)))
         texty   (remove #(= :table (:kind %)) members)
         tbls    (filter #(= :table (:kind %)) members)
         allowed (set (map :id tbls))
         catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
                                                  " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (count (:value o)) " rows)")) tbls))
+                                                 "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))
         sys (str "You are a concise analyst. Draft a short markdown brief (≤150 words, with a heading) "
                  "for this workspace space. Use query_table for any exact figure — never guess. Cite object ids.\n\n"
                  "Space: " (:title sp) ". Intent: " (get-in sp [:value :intent]) ".\n\n"
@@ -2045,13 +2048,14 @@
   (let [objs (if-let [sp (and space (sub/object st space))]
                (keep #(sub/object st (:ref %)) (nb/cells-of sp))
                (vals (sub/objects st)))
-        objs (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs)
+        objs (mapv #(tbl/hydrate @lake/lake %)
+                   (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
         texty (remove #(= :table (:kind %)) objs)
         tbls  (filter #(= :table (:kind %)) objs)
         allowed (when space (set (map :id tbls)))
         catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
                                                  " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (count (:value o)) " rows)")) tbls))]
+                                                 "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))]
     {:context (str "DOCS:\n" (str/join "\n\n" (map obj-digest texty))
                    "\n\nTABLES (query by id):\n" catalog)
      :tool-fn (fn [nm a]
@@ -2119,7 +2123,7 @@
       (if-not (= :space (:kind sp))
         {:error (str "not a notebook: " space)}
         (let [digest (str (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
-                               (map obj-digest) (str/join "\n"))
+                               (map #(obj-digest (tbl/hydrate @lake/lake %))) (str/join "\n"))
                           (remembered-context st (str (:title sp) " " (get-in sp [:value :intent])) space))]
           {:proposals (vec (take 3 (agent/propose-subtopics
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
@@ -2240,7 +2244,7 @@
     v))
 
 (defn- table-shaped? [st id]
-  (let [rows (:value (sub/object st id))]
+  (let [rows (:value (tbl/hydrate @lake/lake (sub/object st id)))]
     (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
 
 (defn- step-index->ref

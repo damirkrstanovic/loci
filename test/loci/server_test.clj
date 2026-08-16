@@ -13,7 +13,8 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
-            [loci.substrate :as sub])
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl])
   (:import [java.util Locale]))
 
 (use-fixtures :once loci.lake-fixture/with-temp-lake)
@@ -4112,3 +4113,31 @@
       (srv/flow-gate! st newer false)
       (is (= 0 (:flows-need-you (srv/state-payload st)))
           "rejecting clears the badge — nothing is waiting any more"))))
+
+;; ---------------------------------------------------------------------------
+;; every reader hydrates, not just mold-payload
+;;
+;; A table's rows live in the lake; the log holds a handle. Twelve places pull
+;; an object out of the substrate and read `:value` as rows. Two of them are
+;; pinned here: the ƒ palette (which answered "functions work on tables" for a
+;; real table) and the agent's own workspace digest (where a table vanished
+;; silently, because `obj-digest` returns "" for anything that is not rows).
+;; ---------------------------------------------------------------------------
+
+(deftest the-fn-palette-sees-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (let [r (srv/fns-payload st "tbl:x")]
+      (is (nil? (:error r)) "a handle-backed table must not read as 'not a table'")
+      (is (seq (:fns r))))))
+
+(deftest the-workspace-digest-still-describes-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "Sales" :value h}})
+    (let [c (:context (#'srv/agent-ctx st nil))]
+      (is (re-find #"tbl:x" c) "the table must appear in the agent's context at all")
+      (is (re-find #"2 rows" c) "and with its true row count"))))
