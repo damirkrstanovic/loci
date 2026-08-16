@@ -83,6 +83,12 @@ The tells, in order of how loudly they should stop you:
 2. You are **testing a requirement you wrote yourself**. Ask whose it is.
 3. You are **building infrastructure to preserve a property** — an id shape, an ordering, a
    format — that nothing in the docs asks for.
+4. You are **treating a cost nobody has hit as a constraint on the design**. On 2026-08-16 a
+   dependency that would double the uberjar got raised three times in one conversation — in
+   the research, in the spec's costs, and as an open question — for a jar nobody has
+   complained about, on a project with no distribution problem. Measure it, write the number
+   down, and move on. A cost becomes a constraint when someone feels it, not when you notice
+   it could exist.
 
 Ask. One question costs a message; a side-quest costs an afternoon and lands work nobody
 wanted. This is the same rule as "answer the question that was asked" above, one step

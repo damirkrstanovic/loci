@@ -183,9 +183,9 @@ becomes a translation layer. This is a real open question, not a formality.
 — ~1 GB/s per core against 300–400 MB/s, and it parallelises near-linearly while SHA-256 stays
 single-threaded. For multi-gigabyte video that is the difference between seconds and minutes.
 
-And yet: **start with SHA-256.** It is in the JDK with zero dependency, loci's jar is already
-doubling from DuckDB, and there is no media in the substrate at all — SHA-256 hashes a 100 MB
-image in about a third of a second.
+And yet: **start with SHA-256.** It is in the JDK, it hashes a 100 MB image in about a third
+of a second, and there is no media in the substrate at all — so the faster hash would be
+optimising a workload that does not exist.
 
 The reason this is a deferral and not a mistake is the self-describing handle. A CID carries
 its own multihash code, so BLAKE3 blobs can be added later beside SHA-256 ones, in the same
@@ -282,11 +282,10 @@ and must not be given back.
 
 ## What this costs
 
-- **`duckdb_jdbc` is 81.5 MB compressed, 246 MB unpacked**, bundling four platform natives
-  (osx-universal 103.6, linux-amd64 58.0, linux-arm64 51.1, windows-amd64 33.5). loci's
-  uberjar is 80.7 MB portable / 63.9 MB slim, image 191 MB — so this roughly doubles it.
-  `build.clj`'s `foreign-natives` already solves the shape; a fourth pattern leaves ~58 MB in
-  a slim build. **Open question: default dependency, or an optional `:lake` alias?**
+- **`duckdb_jdbc` is 81.5 MB compressed**, bundling four platform natives, which roughly
+  doubles the uberjar. Recorded as a fact, not as an objection: `build.clj`'s
+  `foreign-natives` already handles exactly this shape and a fourth pattern trims it in slim
+  builds. Nothing about it should influence the design, and it is not an open question.
 - Two new stores to open, close and check at boot, next to `data-dir-problem`'s existing
   checks.
 - `mold-payload` grows a branch: a table's rows may now need fetching rather than reading.
@@ -297,13 +296,11 @@ and must not be given back.
    threshold makes a table's *semantics* depend on its row count — "undo worked on my 900-row
    table but not my 1,100-row one" is the worst kind of surprise. `InlineTable` stays for
    tests.
-2. **Is the jar doubling acceptable**, or should DuckDB be an optional alias with tables
-   degrading to inline when it is absent?
-3. **Media scope.** Images are cheap — a kind, a route, an `<img>`. Video raises playback,
+2. **Media scope.** Images are cheap — a kind, a route, an `<img>`. Video raises playback,
    ranges, thumbnails and transcoding, none of which this design addresses.
-4. **Does a blob participate in LEAP and recall?** An image has no text. A caption or an
+3. **Does a blob participate in LEAP and recall?** An image has no text. A caption or an
    agent-written description would be the chunkable surface, and that is a separate design.
-5. **CIDv1 or `ni:`** — decided in favour of CIDv1 above, but contingent on a usable JVM
+4. **CIDv1 or `ni:`** — decided in favour of CIDv1 above, but contingent on a usable JVM
    multiformats library existing. If none does, is a translation layer for IPFS acceptable, or
    should the format follow whatever ships cleanly?
 
