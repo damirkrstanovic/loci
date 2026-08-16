@@ -71,10 +71,12 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.lake :as lake]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as server]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools]))
 
 (def hubs
@@ -465,7 +467,7 @@
   (let [tentry (get (by-file m) file)
         rows   (tools/parse-csv (slurp (io/file dir file)))
         tid    (server/next-id (view objm) "tbl:corpus-")
-        tobj   {:id tid :kind :table :title (:title tentry) :value rows}
+        tobj   (tbl/table-object @lake/lake tid (:title tentry) rows)
         objm   (assoc objm tid tobj)
         [objm docs]
         (reduce (fn [[objm acc] nm]

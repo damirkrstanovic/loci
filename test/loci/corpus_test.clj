@@ -19,17 +19,25 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [loci.content]
             [loci.corpus :as corpus]
             [loci.entities :as ent]
+            [loci.lake :as lake]
+            [loci.lake-fixture]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
+
+;; `mint-hub` lands its rows in the lake now, so every `import-corpus!` in here
+;; — including the DRY runs, which mint the same objects in order to report the
+;; plan — reaches `@lake/lake`. Without this the suite would open <data-dir>/lake.
+(use-fixtures :once loci.lake-fixture/with-temp-lake)
 
 (def ^:private dir "corpus")
 
@@ -218,8 +226,12 @@
     (doseq [{:keys [file coarse-column coarse-values rows]} (tables)]
       (testing file
         (let [tbl  (by-file file)
-              data (:value tbl)]
+              ;; the log holds a handle; the molds are asserted against the rows
+              data (:value (tbl/hydrate lake/lake tbl))]
           (is (some? tbl) "the table reached the store")
+          (is (tbl/handle? (:value tbl))
+              "and it reached it as a handle — hydrate would pass rows through, so
+               nothing else in this suite can tell whether the writer was converted")
           (is (= (:committed rows) (count data)) "with all its rows")
 
           (testing "the coarse column survived the round trip through the log"
@@ -237,7 +249,8 @@
 
     (testing "exactly one table is a time series, and it is the monthly one"
       (let [monthly (for [[f t] by-file
-                          :when (some #{:table/line} (map :id (mold/viewers-for (:value t))))]
+                          :when (some #{:table/line}
+                                      (map :id (mold/viewers-for (:value (tbl/hydrate lake/lake t)))))]
                       f)]
         (is (= ["interest-rates-monthly.csv"] (vec monthly)))))))
 

@@ -38,6 +38,17 @@
     (when (.isDirectory f) (run! rm-rf (.listFiles f)))
     (.delete f)))
 
+(defn- rows-of
+  "A table object's rows, through the same seam the server reads them through.
+
+   Since every writer lands a handle, `(:value (sub/object st id))` is no longer
+   rows and asserting on it asserts on the handle's own keys. `hydrate` is what
+   the fifteen production call sites use, and it passes a literal vector through
+   untouched — so a test that writes rows into `:value` by hand still reads back
+   what it wrote."
+  [st id]
+  (:value (tbl/hydrate lake/lake (sub/object st id))))
+
 (deftest exit-closes-a-lake-that-was-opened
   (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-hook-" (System/nanoTime))
         lk  (delay (lake/open-lake! dir))
@@ -381,7 +392,7 @@
                      :value {:id "fn:t-1" :kind :fn :title "fn: double it"
                              :value {:lang "clojure" :code "(fn [rows] (mapv #(update % :revenue * 2) rows))"}}})
     (let [r (srv/fn-apply! st "tbl:t" "fn:t-1" {} nil)]
-      (is (= [200 500] (map :revenue (:value (sub/object st (:openId r)))))))))
+      (is (= [200 500] (map :revenue (rows-of st (:openId r))))))))
 
 (deftest fn-apply-rejects-non-space-target
   (let [st (store-with-table)
@@ -467,7 +478,9 @@
     (is (= [{:region "EMEA" :revenue 900}] (:value (sub/object st b))))       ; top-1 follows the new data
     (is (= [1800 500] (map :revenue (:value (sub/object st c)))))             ; doubled fresh rows
     (sub/undo! st)                                                 ; one undo restores BOTH
-    (is (= [{:region "APAC" :revenue 250}] (:value (sub/object st b))))))
+    ;; undo puts back the handle `fn-apply!` landed — `rerun!` assoc'd rows over
+    ;; it, so this is the one assertion in the chain that reads through hydrate
+    (is (= [{:region "APAC" :revenue 250}] (rows-of st b)))))
 
 (deftest rerun-on-a-derived-table-refreshes-it-then-descendants
   (let [st (store-with-table)
@@ -636,7 +649,7 @@
           r  (srv/research! st "space:n" "extract a table of shares")]
       (is (clojure.string/starts-with? (str (:openId r)) "tbl:extract"))
       (is (= [{:name "A" :share_pct 30} {:name "B" :share_pct 20}]
-             (:value (sub/object st (:openId r))))))))
+             (rows-of st (:openId r)))))))
 
 (deftest compute-retries-once-with-error-feedback
   ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
@@ -652,7 +665,7 @@
         (is (= 2 (count @calls)))
         (is (nil? (first @calls)))                        ; first attempt: no error context
         (is (string? (second @calls)))                    ; retry got the eval error
-        (is (= 1 (:x (first (:value (sub/object st (:openId r)))))))))))
+        (is (= 1 (:x (first (rows-of st (:openId r))))))))))
 
 (deftest compute-fails-honestly-after-two-bad-attempts
   (with-redefs [agent/make-clj-transform (fn [& _] "(bad")]
@@ -4158,3 +4171,44 @@
     (let [c (:context (#'srv/agent-ctx st nil))]
       (is (re-find #"tbl:x" c) "the table must appear in the agent's context at all")
       (is (re-find #"2 rows" c) "and with its true row count"))))
+
+;; ---------------------------------------------------------------------------
+;; the three server writers land handles — and a filter that matched nothing
+;; still lands a table
+;; ---------------------------------------------------------------------------
+
+(deftest every-server-writer-lands-a-handle
+  ;; `rows-of` hydrates, so it reads an unconverted writer's literal rows just
+  ;; as happily as a handle — which means no assertion above can tell whether
+  ;; these three were converted at all. This is the one that can.
+  (let [st (store-with-table)
+        landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
+    (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
+        "import-csv!")
+    (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                         {:by "revenue" :n "1" :order "desc"} nil)))
+        "the ƒ apply")
+    (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+      (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
+          "compute-clj!"))))
+
+(deftest a-csv-with-only-a-header-is-an-empty-table-not-an-error
+  ;; `Lake/put-rows!` refuses a table with no rows. Of the six writers this is
+  ;; one of only two that can hand it one — `compute-clj!` and the ƒ apply
+  ;; cannot, because `run-clj-rows` and `fnlib/run-fn` both already answer
+  ;; "the function did not return rows" for an empty result, measured
+  ;; 2026-08-16. Before tables moved this committed `:value []` and the shell
+  ;; drew an empty table; it still must.
+  (let [st (store-with-table)
+        r  (srv/import-csv! st "C" "region,revenue" nil)]
+    (is (nil? (:error r)) "a header-only CSV must not become an error")
+    (is (= [] (rows-of st (:openId r))))))
+
+(deftest a-transform-that-keeps-nothing-never-reaches-the-writer
+  ;; the other half of the same measurement: this path refuses upstream, so the
+  ;; empty branch of `tbl/table-object` is unreachable from here — do not "fix"
+  ;; compute by removing a guard it does not use.
+  (with-redefs [agent/make-clj-transform (fn [& _] "(filterv (fn [_] false) rows)")]
+    (let [st (store-with-table)
+          r  (srv/compute-clj! st "tbl:t" "keep nothing" nil)]
+      (is (= "compute failed: the function did not return rows" (:error r))))))

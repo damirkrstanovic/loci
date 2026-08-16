@@ -1194,7 +1194,7 @@
                   ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
                   fobj {:id fid :kind :fn :title (str "fn: " p)
                         :value {:source id :prompt p :lang "clojure" :code code}}
-                  tobj {:id nid :kind :table :title ttl :value out :from id :via fid}
+                  tobj (tbl/table-object @lake/lake nid ttl out {:from id :via fid})
                   evs (cond-> [{:op :put :id fid :value fobj}
                                {:op :put :id nid :value tobj}]
                         (and space (space? st space))
@@ -1275,8 +1275,8 @@
                   lbl (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
                           (:title (sub/object st fid)) fid)
                   nid (next-id st "tbl:derived-")
-                  tobj {:id nid :kind :table :title (str (:title src) " · " lbl)
-                        :value (:rows r) :from id :via fid :params (or params {})}
+                  tobj (tbl/table-object @lake/lake nid (str (:title src) " · " lbl)
+                                         (:rows r) {:from id :via fid :params (or params {})})
                   evs (cond-> [{:op :put :id nid :value tobj}]
                         (and space (space? st space))
                         (conj (nb/append-cell-event st space {:ref nid})))]
@@ -1824,7 +1824,7 @@
   (try
     (let [rows (tools/parse-csv csv)
           nid (str "tbl:csv-" (count (filter #(= :table (:kind %)) (vals (sub/objects st)))) "-" (inc (rand-int 9999)))
-          obj {:id nid :kind :table :title (or (not-empty title) "Imported CSV") :value rows}
+          obj (tbl/table-object @lake/lake nid (or (not-empty title) "Imported CSV") rows)
           base [{:op :put :id nid :value obj}]
           evs (if (and space (space? st space))
                 (conj base (nb/append-cell-event st space {:ref nid}))

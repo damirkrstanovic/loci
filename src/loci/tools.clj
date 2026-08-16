@@ -117,7 +117,7 @@
           rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
       (if save_as
         (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-              obj {:id nid :kind :table :title save_as :value rendered}]
+              obj (tbl/table-object @lake/lake nid save_as rendered)]
           (sub/commit! st {:op :put :id nid :value obj})
           {:saved_as nid :rows rendered})
         {:rows rendered}))
@@ -146,21 +146,23 @@
   "Land agent-gathered/extracted rows as a reversible, moldable :table object.
    With a space, also assoc it into that space's members (one :tx step)."
   [st title rows & [space]]
-  ;; the model names its own columns — "Key Proponent(s)" must not become a
-  ;; keyword the log cannot read back (the substrate would refuse the event)
-  (let [rows (mapv (fn [r] (if (map? r)
-                             (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)
-                             r))
-                   (vec rows))]
+  ;; The model names its own columns — "Key Proponent(s)" must not become a
+  ;; keyword the log cannot read back. `put-rows!` normalizes (and refuses a
+  ;; collision), so this no longer does it by hand; what it must do instead is
+  ;; report the columns the store actually holds. `(keys (first rows))` would
+  ;; name "Total Sales" while the stored column is :total_sales, and the model's
+  ;; next `query_table` would then ask for a column that does not exist.
+  (let [rows (vec rows)]
     (if (empty? rows)
       {:error "no rows to save"}
       (let [nid (str "tbl:extract-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-            obj {:id nid :kind :table :title (or title "Extracted table") :value rows}]
+            obj (tbl/table-object @lake/lake nid (or title "Extracted table") rows)
+            h   (:value obj)]
         (sub/commit! st (if (and space (sub/object st space))
                           {:op :tx :events [{:op :put :id nid :value obj}
                                             (nb/append-cell-event st space {:ref nid})]}
                           {:op :put :id nid :value obj}))
-        {:saved_as nid :rows (count rows) :columns (mapv name (keys (first rows)))}))))
+        {:saved_as nid :rows (:rows h) :columns (mapv name (:cols h))}))))
 
 (defn dispatch [st name args]
   (case name

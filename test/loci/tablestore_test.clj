@@ -139,3 +139,13 @@
         o    (tbl/hydrate ts {:kind :table :value (tbl/put-rows! ts "tbl:big" many)})]
     (is (= tbl/mold-cap (count (:value o))))
     (is (= 5000 (:table/total o)) "the true count survives the cap")))
+
+(deftest table-object-lands-rows-and-returns-a-handle
+  (let [ts (tbl/inline-table)
+        o  (tbl/table-object ts "tbl:x" "Title" rows {:from "tbl:src"})]
+    (is (= "tbl:x" (:id o)))
+    (is (= :table (:kind o)))
+    (is (= "Title" (:title o)))
+    (is (= "tbl:src" (:from o)) "extra keys survive")
+    (is (tbl/handle? (:value o)))
+    (is (= rows (tbl/rows ts (:value o) {})))))

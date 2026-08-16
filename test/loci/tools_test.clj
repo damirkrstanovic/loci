@@ -49,10 +49,13 @@
         r  (tools/save-table! st "T" [{(keyword "Key Proponent(s)") "Canon"
                                        (keyword "How It Works") "stamp"
                                        :year 2026}])
-        rows (:value (sub/object st (:saved_as r)))]
+        h    (:value (sub/object st (:saved_as r)))
+        rows (tbl/rows @lake/lake h {})]
     (is (= {:key_proponent_s "Canon" :how_it_works "stamp" :year 2026} (first rows)))
     (is (= #{"key_proponent_s" "how_it_works" "year"} (set (:columns r))))
-    (is (= rows (edn/read-string (pr-str rows))))))
+    ;; the log now holds the handle, so the handle is what has to read back —
+    ;; and `:cols` is where the column keywords travel through it as a *value*
+    (is (= h (edn/read-string (pr-str h))))))
 
 (deftest parse-csv-sanitizes-headers
   (let [rows (tools/parse-csv "Key Proponent(s),Total Revenue ($)\nCanon,5")]
@@ -80,3 +83,50 @@
     (is (= [{:a 1 :b "p"} {:a 2 :b "q"}]
            (:rows (tools/dispatch st "query_table" {:table_id "tbl:x"})))
         "the handle's own keys must never be returned as rows")))
+
+;; ---- the writers land a handle: the point of the whole move ----
+
+(deftest saved-table-stores-a-handle-not-rows
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{:a 1}])]
+    (is (tbl/handle? (:value (sub/object st (:saved_as r))))
+        "rows must not be in the event")))
+
+(deftest a-writer-reports-the-columns-it-stored
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{(keyword "Total Sales") 1}])]
+    (is (= ["total_sales"] (:columns r))
+        "the model must be told the name query_table will accept, not the one it sent")
+    (is (= [:total_sales] (:cols (:value (sub/object st (:saved_as r))))))))
+
+(deftest the-log-holds-a-handle-and-not-the-rows
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" (mapv (fn [i] {:i i}) (range 100)))
+        ev (last (sub/history st))]
+    (is (not (re-find #"\{:i 7\}" (pr-str ev)))
+        "a row must not appear anywhere in the event")
+    (is (= 100 (:rows (:value (:value ev)))))))
+
+(deftest a-table-with-no-rows-keeps-them-in-the-object
+  ;; `Lake/put-rows!` refuses an empty table, and a filter that matched nothing
+  ;; is not an error — `compute-clj!`, the ƒ apply and `query_table :save_as` all
+  ;; committed `:value []` before tables moved and must go on doing so.
+  (let [o (tbl/table-object @lake/lake "tbl:empty" "Nothing" [])]
+    (is (= [] (:value o)))
+    (is (not (tbl/handle? (:value o))))
+    (is (= [] (:value (tbl/hydrate lake/lake o)))
+        "and it hydrates to the empty table the shell already draws")))
+
+(deftest a-save_as-that-filtered-everything-out-is-an-empty-table
+  ;; the reachable half of the empty-rows change: `vs/interpret` with a filter
+  ;; that matched nothing returns [], and `Lake/put-rows!` refuses it. Left
+  ;; unguarded the throw escapes `dispatch` into the agent's tool loop, where
+  ;; `draft-brief!` turns the whole brief into "(agent unavailable: …)".
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])
+        _  (sub/commit! st {:op :put :id "tbl:x"
+                            :value {:id "tbl:x" :kind :table :title "X" :value h}})
+        r  (tools/dispatch st "query_table" {:table_id "tbl:x" :save_as "nothing"
+                                             :filter {:col "b" :op "=" :val "zzz"}})]
+    (is (= [] (:rows r)))
+    (is (= [] (:value (sub/object st (:saved_as r)))))))
