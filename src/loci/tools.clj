@@ -104,11 +104,15 @@
                             :required ["title" "rows"]}}}])
 
 ;; ---- handlers ----
+;; A LIST of tables is metadata: ids, titles, columns, counts. It used to
+;; hydrate every table to read the columns off the first row and count the
+;; rest — 271 ms over the migrated store, for an answer every handle already
+;; carries. `table-shape` is the reader that fetches nothing.
 (defn- do-list [st _]
-  (mapv (fn [o] (let [o (tbl/hydrate lake/lake o)]
+  (mapv (fn [o] (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
                   {:id (:id o) :title (:title o)
-                   :columns (mapv name (keys (first (:value o))))
-                   :rows (or (:table/total o) (count (:value o)))}))
+                   :columns (mapv name cols)
+                   :rows (or rows 0)}))
         (table-objs st)))
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]

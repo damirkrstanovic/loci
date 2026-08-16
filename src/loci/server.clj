@@ -1471,6 +1471,30 @@
            (table-digest v) "\nsample rows: " (json/write-str (vec (take 3 v))))
       :else "")))
 
+(defn- table-catalog
+  "The `TABLES (query by id)` block the agent is given — one line per table,
+   naming its id, title, columns and row count.
+
+   **Reads the handle; fetches no rows.** Three call sites built this by hand
+   out of `(keys (first (:value o)))` and `(or (:table/total o) (count …))`,
+   which needed the object hydrated — and hydrating a whole workspace to write
+   three dozen characters per table cost 282 ms on every chat turn once the
+   rows moved to the lake. A catalog is metadata, and `tbl/table-shape` answers
+   it from the handle in microseconds. `obj-digest` is the reader that really
+   does need rows, and it still gets them.
+
+   Takes UNHYDRATED objects. Handing it hydrated ones still works — a legacy
+   inline vector is `table-shape`'s other branch — but it would pay the cost
+   this function exists to avoid."
+  [tbls]
+  (str/join "\n"
+            (map (fn [o]
+                   (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
+                     (str "- " (:id o) " — " (:title o)
+                          " (cols: " (str/join ", " (map name cols))
+                          "; " (or rows 0) " rows)")))
+                 tbls)))
+
 (defn- descendant-sources
   "DOWN. The notebook, the ids of its cells, and the same for everything it
    spawned and everything merged into it — transitively.
@@ -1813,15 +1837,19 @@
     (let [objs    (if-let [sp (and space (sub/object st space))]
                     (keep #(sub/object st (:ref %)) (nb/cells-of sp))  ; scoped to this space
                     (vals (sub/objects st)))                                  ; whole workspace
-          objs    (mapv #(tbl/hydrate lake/lake %)
-                        (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
-          texty   (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
-                                (not (every? :block (:value %)))) objs) ; docs + reports (not tables)
-          tbls    (filter #(= :table (:kind %)) objs)
+          objs    (vec (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
+          tbls    (filterv #(= :table (:kind %)) objs)
+          ;; Tables go to the catalog, which reads their handles; only the DOCS
+          ;; are hydrated, because only `obj-digest` needs rows. The shape test
+          ;; that follows still stands: it is what keeps a non-`:table` object
+          ;; whose value happens to BE rows out of the prose digest.
+          texty   (->> objs
+                       (remove #(= :table (:kind %)))
+                       (mapv #(tbl/hydrate lake/lake %))
+                       (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
+                                     (not (every? :block (:value %)))))) ; docs + reports (not tables)
           allowed (when space (set (map :id tbls)))
-          catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                   " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                   "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))
+          catalog (table-catalog tbls)
           sys     (str "Answer the user's question about their workspace. Cite the object ids you used. "
                        "Do NOT guess any table figure — call query_table for exact numbers. "
                        "If the data doesn't say, say so plainly. Be concise, markdown.\n\n"
@@ -2070,13 +2098,13 @@
   (let [sp (sub/object st space)
         members (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
                      (remove #(#{:space :viewspec :applet :fn} (:kind %)))
-                     (mapv #(tbl/hydrate lake/lake %)))
-        texty   (remove #(= :table (:kind %)) members)
-        tbls    (filter #(= :table (:kind %)) members)
+                     vec)
+        tbls    (filterv #(= :table (:kind %)) members)
+        ;; docs hydrate (obj-digest reads rows); tables do not (the catalog
+        ;; reads their handles) — see `table-catalog`
+        texty   (mapv #(tbl/hydrate lake/lake %) (remove #(= :table (:kind %)) members))
         allowed (set (map :id tbls))
-        catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                 " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))
+        catalog (table-catalog tbls)
         sys (str "You are a concise analyst. Draft a short markdown brief (≤150 words, with a heading) "
                  "for this workspace space. Use query_table for any exact figure — never guess. Cite object ids.\n\n"
                  "Space: " (:title sp) ". Intent: " (get-in sp [:value :intent]) ".\n\n"
@@ -2101,14 +2129,15 @@
   (let [objs (if-let [sp (and space (sub/object st space))]
                (keep #(sub/object st (:ref %)) (nb/cells-of sp))
                (vals (sub/objects st)))
-        objs (mapv #(tbl/hydrate lake/lake %)
-                   (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
-        texty (remove #(= :table (:kind %)) objs)
-        tbls  (filter #(= :table (:kind %)) objs)
+        objs (vec (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
+        tbls  (filterv #(= :table (:kind %)) objs)
+        ;; `obj-digest` genuinely needs rows; the catalog does not. So hydrate
+        ;; the DOCS only. Hydrating everything cost 282 ms on every chat turn
+        ;; over the migrated store, scaling with the workspace's total rows
+        ;; rather than with the table anyone asked about.
+        texty (mapv #(tbl/hydrate lake/lake %) (remove #(= :table (:kind %)) objs))
         allowed (when space (set (map :id tbls)))
-        catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                 " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (or (:table/total o) (count (:value o))) " rows)")) tbls))]
+        catalog (table-catalog tbls)]
     {:context (str "DOCS:\n" (str/join "\n\n" (map obj-digest texty))
                    "\n\nTABLES (query by id):\n" catalog)
      :tool-fn (fn [nm a]
@@ -2297,17 +2326,20 @@
     v))
 
 (defn- table-shaped?
-  "Does `id` name something whose value is rows? Hydrates first, because a
-   handle is a MAP and would read as 'not a table'.
+  "Does `id` name something whose value is rows? A handle counts — it IS a
+   table, it just keeps its rows in the lake.
 
    The failure that needs is a flow with a **non-table step before the table**:
    with one step `resolve-ref` has already produced that step's own `:out` and
    `resolve-table-ref`'s `or` falls back to it either way. With a doc in front,
-   an unhydrated scan skips past the lake-backed table and the compute step
-   runs on prose."
+   a scan that reads a handle as 'not a table' skips past the lake-backed table
+   and the compute step runs on prose.
+
+   It used to hydrate to find that out — fetching every row of every candidate
+   to answer a boolean, on a scan that runs over earlier steps until one
+   matches. `tbl/table-shape` answers it from the handle."
   [st id]
-  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
-    (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
+  (some? (tbl/table-shape lake/lake (sub/object st id))))
 
 (defn- step-index->ref
   "A bare step index — `0`, `\"0\"` — as the `$`-ref the planner meant.

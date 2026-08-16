@@ -269,6 +269,35 @@
   (merge {:id id :kind :table :title title :value (table-value ts id rows)}
          extra))
 
+(defn table-shape
+  "`{:cols [...] :rows n}` for a table object, or nil if it is not one.
+
+   Reads the handle and fetches nothing. A handle recorded `:cols` and `:rows`
+   when the rows were written, which is everything a catalog, a table list or a
+   column menu needs — and DuckDB's JDBC driver is slow row-wise, so fetching
+   them to count them is the difference between a 10 ms chat turn and a 282 ms
+   one. Measured 2026-08-17 over the migrated store (31 tables, 3,957 rows):
+   `agent-ctx` 282 ms → 10 ms and `list_tables` 271 ms → 0.05 ms, against 42 ms
+   to walk 1,000×8 cells with `.getObject` and build nothing — so there is
+   nothing to optimise in our own row-building, and nothing in the versioned
+   read either
+   (`AT (VERSION => n)` and a bare `SELECT *` are both 43 ms, `count(*)` 3 ms).
+   The only fix available is not to ask for rows.
+
+   Falls back to counting a legacy inline vector, so a store that has not been
+   migrated answers the same question at the same cost it always did.
+
+   Takes the store **or a delay of one**, and forces it only for a handle —
+   `hydrate`'s rule, for `hydrate`'s reason: most callers run on workspaces
+   holding no lake-backed table, and answering them must not open the lake."
+  [ts o]
+  (let [v (:value o)]
+    (cond
+      (handle? v) {:cols (vec (:cols v)) :rows (row-count (force ts) v)}
+      (and (sequential? v) (seq v) (every? map? v))
+      {:cols (vec (keys (first v))) :rows (count v)}
+      :else nil)))
+
 (defn hydrate
   "An object whose `:value` is a table handle → the same object with rows in
    its place, capped, plus `:table/total`.

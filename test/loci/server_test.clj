@@ -4184,6 +4184,21 @@
       (is (re-find #"tbl:x" c) "the table must appear in the agent's context at all")
       (is (re-find #"2 rows" c) "and with its true row count"))))
 
+(deftest the-workspace-digest-reads-no-rows
+  ;; …and it must name the table WITHOUT fetching a row. `agent-ctx` runs on
+  ;; every chat turn and scales with the total rows in the workspace, not with
+  ;; the table being asked about: measured 282 ms over the migrated store's
+  ;; 3,957 rows, against 14 ms once it reads the handle instead.
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "Sales" :value h}})
+    (with-redefs [tbl/rows (fn [& _] (throw (ex-info "agent-ctx fetched rows" {})))]
+      (let [c (:context (#'srv/agent-ctx st nil))]
+        (is (re-find #"tbl:x — Sales" c) "the table is still named")
+        (is (re-find #"cols: a, b" c) "with its columns")
+        (is (re-find #"2 rows" c) "and its true row count")))))
+
 ;; ---------------------------------------------------------------------------
 ;; the three server writers land handles — and a filter that matched nothing
 ;; still lands a table

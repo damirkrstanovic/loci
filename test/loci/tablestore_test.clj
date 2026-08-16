@@ -170,3 +170,26 @@
       "a ragged table still has a nested column")
   (is (some? (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:a 1 :b "s" :c nil :d true}]))
       "scalars, nil and booleans are untouched"))
+
+;; ---------------------------------------------------------------------------
+;; a catalog reads the handle, not the rows
+;; ---------------------------------------------------------------------------
+
+(deftest table-shape-costs-no-rows
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (is (= {:cols [:a :b] :rows 2} (tbl/table-shape ts {:kind :table :value h})))
+    (is (= {:cols [:a :b] :rows 2}
+           (tbl/table-shape ts {:kind :table :value [{:a 1 :b "p"} {:a 2 :b "q"}]}))
+        "a legacy inline table answers the same question")
+    (is (nil? (tbl/table-shape ts {:kind :doc :value "hi"})))))
+
+(deftest table-shape-never-reads-rows
+  (let [boom (reify tbl/TableStore
+               (put-rows! [_ _ _] (throw (ex-info "no" {})))
+               (rows [_ _ _] (throw (ex-info "table-shape fetched rows" {})))
+               (row-count [_ h] (:rows h))
+               (column-samples [_ _ _ _] (throw (ex-info "no" {}))))
+        h {:store :lake :table "t_x" :snapshot 1 :rows 1000 :cols [:a :b]}]
+    (is (= {:cols [:a :b] :rows 1000} (tbl/table-shape boom {:kind :table :value h}))
+        "the handle already knows; nothing may be fetched")))

@@ -152,3 +152,17 @@
         r  (tools/dispatch st "query_table" {:table_id "tbl:x" :save_as "kept"})]
     (is (tbl/handle? (:value (sub/object st (:saved_as r)))))
     (is (= 2 (:rows (:value (sub/object st (:saved_as r))))))))
+
+(deftest list-tables-reads-no-rows
+  ;; `list_tables` wants columns and a row count, and a handle already carries
+  ;; both. It used to hydrate to get them, which on the migrated store cost
+  ;; 271 ms for 31 tables — DuckDB's JDBC driver is slow row-wise, and this
+  ;; reader never needed a row.
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! (tbl/inline-table) "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (with-redefs [tbl/rows (fn [& _] (throw (ex-info "list_tables fetched rows" {})))]
+      (let [r (first (tools/dispatch st "list_tables" {}))]
+        (is (= ["a" "b"] (:columns r)))
+        (is (= 2 (:rows r)))))))
