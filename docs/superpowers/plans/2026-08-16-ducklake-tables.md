@@ -2115,6 +2115,38 @@ Six sites build a table object as a map literal. Rather than edit each to talk t
 add one constructor and have each call it — DRY, and it means a seventh site added later gets
 the behaviour by using the obvious function.
 
+**Three things changed under this task while Tasks 6b–6f ran. Read these before Step 1.**
+
+**(a) Writers force the lake; readers do not.** Task 6c made every *reader* pass `lake/lake` —
+the delay — so `hydrate` forces it only when there is a handle to resolve. A writer always
+writes, so `@lake/lake` at these call sites is correct and deliberate. Do not "make it
+consistent" with the readers. `grep -n "@lake/lake" src/loci/*.clj` should end this task showing
+the boot force plus the six writers, and nothing else.
+
+**(b) `put-rows!` now normalizes, so a writer must report the columns it *stored*.**
+`tbl/normalize-rows` runs every column keyword through `sub/col-kw`, and since Task 6e a
+collision throws rather than silently merging. Two consequences:
+
+- `save-table!` (`tools.clj:148-152`) hand-rolls exactly that normalization. Delete it and let
+  `put-rows!` do it — `tbl/normalize-rows` is public for this reason.
+- But `save-table!` then computes `:columns (mapv name (keys (first rows)))` from those
+  *pre-normalized* rows. Once the hand-rolled pass is gone, that would report the model's
+  original names — `"Total Sales"` — while the stored column is `:total_sales`, and the model
+  would then call `query_table` with a column that does not exist. **Report `(:cols h)` from the
+  handle instead**, at every writer that returns column names to a caller.
+
+**(c) `Lake/put-rows!` refuses an empty table; `InlineTable` does not.** `lake.clj` throws
+`"refusing to store a table with no rows"`. Today a compute or an import that yields zero rows
+writes an object with `:value []`. After this task it throws. **That is a user-visible behaviour
+change on at least `compute-clj!` and the ƒ apply**, both of which can legitimately produce zero
+rows from a filter.
+
+Before converting anything, walk all six sites and report, for each: is there an empty-rows path,
+what happens today, and what would happen after. Then keep each site's existing guard, or add the
+smallest one that preserves today's behaviour. `save-table!` already returns
+`{:error "no rows to save"}` and needs nothing. **Do not let a zero-row filter start throwing a
+500** — if preserving today's behaviour needs a decision rather than a guard, stop and report.
+
 - [ ] **Step 1: Write the failing test**
 
 Add to `test/loci/tablestore_test.clj`:
@@ -2221,6 +2253,40 @@ test instead. Add one to `tools_test` first if none exists:
 ```
 
 Confirm it fails with the literal restored, then re-apply the fix and confirm it passes.
+
+Add a second behavioural test, for (b) — the one that would otherwise send a model chasing a
+column that does not exist:
+
+```clojure
+(deftest a-writer-reports-the-columns-it-stored
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{(keyword "Total Sales") 1}])]
+    (is (= ["total_sales"] (:columns r))
+        "the model must be told the name query_table will accept, not the one it sent")
+    (is (= [:total_sales] (:cols (:value (sub/object st (:saved_as r))))))))
+```
+
+Sabotage it by reporting `(keys (first rows))` from the un-normalized input; it must fail with
+`["Total Sales"]`.
+
+- [ ] **Step 7b: Prove the log no longer holds rows**
+
+The point of the whole plan, and nothing yet asserts it end to end. `save-table!` a table, then
+read the raw event back out of the log and confirm the rows are not in it:
+
+```clojure
+(deftest the-log-holds-a-handle-and-not-the-rows
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" (mapv (fn [i] {:i i}) (range 100)))
+        ev (last (sub/history st))]
+    (is (not (re-find #"\{:i 7\}" (pr-str ev)))
+        "a row must not appear anywhere in the event")
+    (is (= 100 (:rows (:value (:value ev)))))))
+```
+
+Read `sub/history`'s actual shape before writing this — the nesting of `:value` inside the event
+map is worth checking rather than assuming. Report the raw event's printed length before and
+after the conversion; that number is what this plan bought.
 
 - [ ] **Step 8: Commit**
 
