@@ -18,7 +18,10 @@
             [clojure.test :refer [deftest is]]
             [loci.chunks :as ch]
             [loci.embed :as embed]
+            [loci.lake :as lake]
+            [loci.lake-fixture :as lf]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [org.httpkit.server :as server])
   (:import [java.net ServerSocket]))
 
@@ -252,6 +255,27 @@
   (let [cs (ch/chunks-of (table-obj "tbl:empty" "Nothing here yet" []))]
     (is (= 1 (count cs)))
     (is (= "Nothing here yet" (:text (first cs))))))
+
+(deftest a-table-chunks-the-same-whether-its-rows-are-inline-or-in-the-lake
+  ;; The synopsis is what LEAP searches to answer "which table holds this?".
+  ;; A handle fails `rows?`, so before this fix a lake-backed table chunked to
+  ;; its bare title — columns and sample values gone, silently. And because
+  ;; :hash covers the chunk text, migrating a table would retire its synopsis
+  ;; chunk and re-embed a weaker one: a model round trip per table, for nothing.
+  (let [inline {:id "tbl:x" :kind :table :title "Sales"
+                :value [{:region "EMEA" :rev 10} {:region "APAC" :rev 20}]}]
+    (lf/with-temp-lake
+      (fn []
+        (let [h      (tbl/put-rows! @lake/lake "tbl:x" (:value inline))
+              handle (assoc inline :value h)
+              st     (sub/fresh-store)]
+          (sub/commit! st {:op :put :id "tbl:x" :value handle})
+          (is (= (map :text (ch/chunks-of inline))
+                 (map :text (ch/all-chunks st)))
+              "same text — so migrating a table re-embeds nothing")
+          (is (= (map :hash (ch/chunks-of inline))
+                 (map :hash (ch/all-chunks st)))
+              "and therefore the same hashes"))))))
 
 ;; ---- reports ----
 

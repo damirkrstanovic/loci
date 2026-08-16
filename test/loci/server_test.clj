@@ -4118,10 +4118,12 @@
 ;; every reader hydrates, not just mold-payload
 ;;
 ;; A table's rows live in the lake; the log holds a handle. Twelve places pull
-;; an object out of the substrate and read `:value` as rows. Two of them are
+;; an object out of the substrate and read `:value` as rows. Three of them are
 ;; pinned here: the ƒ palette (which answered "functions work on tables" for a
-;; real table) and the agent's own workspace digest (where a table vanished
-;; silently, because `obj-digest` returns "" for anything that is not rows).
+;; real table), the agent's own workspace digest (where a table vanished
+;; silently, because `obj-digest` returns "" for anything that is not rows),
+;; and `table-shaped?`, the scan a compute step uses to find the table an
+;; earlier step produced.
 ;; ---------------------------------------------------------------------------
 
 (deftest the-fn-palette-sees-a-handle-backed-table
@@ -4132,6 +4134,21 @@
     (let [r (srv/fns-payload st "tbl:x")]
       (is (nil? (:error r)) "a handle-backed table must not read as 'not a table'")
       (is (seq (:fns r))))))
+
+(deftest a-compute-step-resolves-past-a-doc-to-the-handle-backed-table
+  ;; `table-shaped?` is the scan `resolve-table-ref` runs over earlier outputs.
+  ;; A handle is a MAP, so an unhydrated scan reads a lake-backed table as "not
+  ;; a table" and stops at whatever `resolve-ref` already returned — here the
+  ;; doc — and the compute step runs on prose. A single-step flow cannot show
+  ;; this: `resolve-ref` has already produced the step's own `:out` and the `or`
+  ;; falls back to it either way. It needs a non-table step in front.
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "doc:n" :value {:id "doc:n" :kind :doc :title "N" :value "text"}})
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (is (= "tbl:x"
+           (#'srv/resolve-table-ref st {:steps [{:out "doc:n"} {:out "tbl:x"}]} 0))
+        "the scan must skip the doc and find the table, wherever its rows live")))
 
 (deftest the-workspace-digest-still-describes-a-handle-backed-table
   (let [st (sub/fresh-store)

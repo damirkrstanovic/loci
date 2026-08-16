@@ -59,10 +59,18 @@
    `content.clj`'s predicates — receives rows exactly as it did before tables
    moved, which is the point: one call here instead of a handle branch in each
    of them. Anything that is not a handle passes through untouched, so a legacy
-   inline table and a doc both survive."
+   inline table and a doc both survive.
+
+   Takes the store **or a delay of one**, and forces it only when there is
+   actually a handle to resolve. Fifteen call sites reach this function, most of
+   them on paths — `list_tables`, the ƒ palette, the chunk sweep — that run on
+   workspaces holding no lake-backed table at all. Forcing eagerly would open
+   `<data-dir>/lake` to answer questions about rows that never left the log,
+   which is the trap `mold-payload`'s own docstring describes for `mem/memory`."
   [ts o]
   (if (and o (handle? (:value o)))
-    (let [h (:value o)]
+    (let [ts (force ts)
+          h  (:value o)]
       (assoc o :value       (rows ts h {:limit mold-cap})
                :table/total (row-count ts h)))
     o))

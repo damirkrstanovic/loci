@@ -392,7 +392,7 @@
    read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
    pass it."
   [st m id view]
-  (let [o (tbl/hydrate @lake/lake (sub/object st id))]
+  (let [o (tbl/hydrate lake/lake (sub/object st id))]
     (cond
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
       ;; materialization, out of the same payload. A `mold/mold` viewer could not
@@ -1059,7 +1059,7 @@
 ;; reversible object; it then appears in the object's "view this as…" menu.
 (defn describe! [st id prompt]
   (try
-    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "describe works on tables"}
         (let [spec (agent/describe-view (mapv name (keys (first rows))) (take 2 rows) prompt)
@@ -1082,7 +1082,7 @@
 ;; if this ever serves untrusted users.
 (defn make-view! [st id prompt]
   (try
-    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "code views work on tables"}
         (let [code (agent/make-applet (mapv name (keys (first rows))) (take 3 rows) prompt)
@@ -1121,7 +1121,7 @@
 
 (defn compute-clj! [st id prompt space]
   (try
-    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "compute works on tables"}
         (let [cols    (mapv name (keys (first rows)))
@@ -1186,7 +1186,7 @@
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
 (defn- table-rows [st id]
-  (let [rows (:value (tbl/hydrate @lake/lake (sub/object st id)))]
+  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
 
 (defn fns-payload [st id]
@@ -1257,7 +1257,7 @@
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
         rows   (or (get working src-id)
-                   (:value (tbl/hydrate @lake/lake (sub/object st src-id))))
+                   (:value (tbl/hydrate lake/lake (sub/object st src-id))))
         via    (:via obj)]
     (cond
       (nil? rows) {:why (str "source " src-id " is gone")}
@@ -1313,7 +1313,7 @@
 ;; Clojure transform) and routes to it. No technique buttons — loci decides.
 (defn do! [st id prompt space]
   (try
-    (let [o (tbl/hydrate @lake/lake (sub/object st id)) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "this works on tables"}
         (let [technique (agent/choose-technique (mapv name (keys (first rows))) (take 3 rows) prompt)]
@@ -1741,7 +1741,7 @@
       {:error (str "not a notebook: " space)}
       (try
         (let [digest (->> (nb/cells-of o) (keep #(sub/object st (:ref %)))
-                          (map #(obj-digest (tbl/hydrate @lake/lake %))) (str/join "\n"))]
+                          (map #(obj-digest (tbl/hydrate lake/lake %))) (str/join "\n"))]
           {:tags (vec (take 3 (agent/propose-tags (:title o)
                                                   (get-in o [:value :intent]) digest)))})
         (catch Exception e {:error (.getMessage e)})))))
@@ -1760,7 +1760,7 @@
     (let [objs    (if-let [sp (and space (sub/object st space))]
                     (keep #(sub/object st (:ref %)) (nb/cells-of sp))  ; scoped to this space
                     (vals (sub/objects st)))                                  ; whole workspace
-          objs    (mapv #(tbl/hydrate @lake/lake %)
+          objs    (mapv #(tbl/hydrate lake/lake %)
                         (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
           texty   (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
                                 (not (every? :block (:value %)))) objs) ; docs + reports (not tables)
@@ -2017,7 +2017,7 @@
   (let [sp (sub/object st space)
         members (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
                      (remove #(#{:space :viewspec :applet :fn} (:kind %)))
-                     (mapv #(tbl/hydrate @lake/lake %)))
+                     (mapv #(tbl/hydrate lake/lake %)))
         texty   (remove #(= :table (:kind %)) members)
         tbls    (filter #(= :table (:kind %)) members)
         allowed (set (map :id tbls))
@@ -2048,7 +2048,7 @@
   (let [objs (if-let [sp (and space (sub/object st space))]
                (keep #(sub/object st (:ref %)) (nb/cells-of sp))
                (vals (sub/objects st)))
-        objs (mapv #(tbl/hydrate @lake/lake %)
+        objs (mapv #(tbl/hydrate lake/lake %)
                    (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
         texty (remove #(= :table (:kind %)) objs)
         tbls  (filter #(= :table (:kind %)) objs)
@@ -2123,7 +2123,7 @@
       (if-not (= :space (:kind sp))
         {:error (str "not a notebook: " space)}
         (let [digest (str (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
-                               (map #(obj-digest (tbl/hydrate @lake/lake %))) (str/join "\n"))
+                               (map #(obj-digest (tbl/hydrate lake/lake %))) (str/join "\n"))
                           (remembered-context st (str (:title sp) " " (get-in sp [:value :intent])) space))]
           {:proposals (vec (take 3 (agent/propose-subtopics
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
@@ -2243,8 +2243,17 @@
       v)
     v))
 
-(defn- table-shaped? [st id]
-  (let [rows (:value (tbl/hydrate @lake/lake (sub/object st id)))]
+(defn- table-shaped?
+  "Does `id` name something whose value is rows? Hydrates first, because a
+   handle is a MAP and would read as 'not a table'.
+
+   The failure that needs is a flow with a **non-table step before the table**:
+   with one step `resolve-ref` has already produced that step's own `:out` and
+   `resolve-table-ref`'s `or` falls back to it either way. With a doc in front,
+   an unhydrated scan skips past the lake-backed table and the compute step
+   runs on prose."
+  [st id]
+  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
     (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
 
 (defn- step-index->ref

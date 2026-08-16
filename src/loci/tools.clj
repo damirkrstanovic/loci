@@ -105,14 +105,14 @@
 
 ;; ---- handlers ----
 (defn- do-list [st _]
-  (mapv (fn [o] (let [o (tbl/hydrate @lake/lake o)]
+  (mapv (fn [o] (let [o (tbl/hydrate lake/lake o)]
                   {:id (:id o) :title (:title o)
                    :columns (mapv name (keys (first (:value o))))
                    :rows (or (:table/total o) (count (:value o)))}))
         (table-objs st)))
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
-  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate @lake/lake))]
+  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
     (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
           rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
       (if save_as

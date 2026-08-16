@@ -36,6 +36,20 @@
     (is (= "hello" (:value (tbl/hydrate ts {:kind :doc :value "hello"}))))
     (is (nil? (tbl/hydrate ts nil)))))
 
+(deftest hydrate-opens-nothing-when-there-is-no-handle
+  (let [boom (delay (throw (ex-info "the lake was opened for a table that never left the log" {})))]
+    (is (= [{:a 1}] (:value (tbl/hydrate boom {:kind :table :value [{:a 1}]}))))
+    (is (= "hi"     (:value (tbl/hydrate boom {:kind :doc   :value "hi"}))))
+    (is (nil? (tbl/hydrate boom nil)))
+    (is (not (realized? boom))
+        "a store with no handle-backed table must never force the lake")))
+
+(deftest hydrate-still-takes-a-store-directly
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" rows)]
+    (is (= rows (:value (tbl/hydrate ts {:kind :table :value h})))
+        "passing the store itself, not a delay, must keep working")))
+
 (deftest hydrate-caps-a-large-table
   (let [ts   (tbl/inline-table)
         many (mapv (fn [i] {:id i}) (range 5000))

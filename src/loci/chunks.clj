@@ -47,8 +47,10 @@
             [clojure.string :as str]
             [loci.dlv :as dlv]
             [loci.embed :as embed]
+            [loci.lake :as lake]
             [loci.notebook :as nb]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 ;; ---------------------------------------------------------------------------
 ;; sizes — the two bounds this namespace makes claims about
@@ -298,9 +300,15 @@
 
 (defn all-chunks
   "Every chunk the substrate currently implies. Reads the store; writes nothing
-   to it, ever."
+   to it, ever.
+
+   Hydrates on the way in, so a table's synopsis is built from its rows whether
+   they sit in the log or in the lake. `chunks-of` stays pure — it never learns
+   that a lake exists — and the synopsis text comes out byte-identical either
+   way, which is what keeps Task 9's migration from retiring and re-embedding
+   every table's chunk."
   [st]
-  (chunks-in (vals (sub/objects st))))
+  (chunks-in (map #(tbl/hydrate lake/lake %) (vals (sub/objects st)))))
 
 ;; ---------------------------------------------------------------------------
 ;; the sidecar — append-only EDN lines, last-wins by :id
