@@ -180,30 +180,68 @@ Three candidates, all portable, differing in what they are self-describing about
   so a chunked blob is a different codec under the same identifier scheme, and nothing above
   `ContentStore` changes. With `sha256:<hex>` that distinction has nowhere to live.
 
-**Check before committing:** whether a usable multiformats/CID library exists for the JVM. If
-it does not, the fallback is `ni:` — an IETF standard, trivial to encode — and IPFS interop
-becomes a translation layer. This is a real open question, not a formality.
+**Verified 2026-08-16, in a REPL against the real library.** `mvxcvi/multiformats` (Greg Look)
+provides `multiformats.hash` and `multiformats.cid`, and produces real CIDs that round-trip:
 
-### Which hash, and why it can be deferred
+```
+sha2-256   bafkreihnuim2vbzphn3quytkyf6ic5illcoqswoqjlxlmiw34j4chkhxey
+blake3     bafkr4iaha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4
+```
 
-[BLAKE3 is 3–10× faster than SHA-256](https://ssojet.com/compare-hashing-algorithms/sha-256-vs-blake3)
-— ~1 GB/s per core against 300–400 MB/s, and it parallelises near-linearly while SHA-256 stays
-single-threaded. For multi-gigabyte video that is the difference between seconds and minutes.
+The `bafkrei…` form is exactly what IPFS uses for raw blocks, so these are IPFS addresses and
+not merely IPFS-shaped. BLAKE3 is not in the library's keyword table, but `mhash/create`
+accepts a raw multicodec, so `(mhash/create 0x1e digest)` expresses it today with **no patch
+and no fork** — which is what makes the algorithm decision above reversible rather than
+theoretical. The `ni:` fallback is not needed.
 
-For the workload this design targets, that gap is real rather than theoretical: a 4 GB video
-is roughly 11 seconds of single-threaded SHA-256, against about a second of BLAKE3 across six
-cores. Ingesting video is exactly where it would be felt.
+### Which hash: SHA-256, decided by measurement that reversed the first answer
 
-**So: prefer BLAKE3 if a sound JVM implementation exists, and fall back to SHA-256 — which is
-in the JDK — if not.** Either way the decision is reversible, because a self-describing
-handle lets BLAKE3 blobs sit beside SHA-256 ones in the same store with every old handle
-still resolving.
+The published comparison says BLAKE3 is 3–10× faster than SHA-256 — ~1 GB/s per core against
+300–400 MB/s — because BLAKE3 is a Merkle tree over 1 KB chunks and parallelises, while
+SHA-256's Merkle–Damgård chain is inherently sequential. On that basis this spec first chose
+BLAKE3, and the choice was approved.
 
-The reason this is a deferral and not a mistake is the self-describing handle. A CID carries
-its own multihash code, so BLAKE3 blobs can be added later beside SHA-256 ones, in the same
-store, with every old handle still resolving and no migration. **That is the concrete payoff
-for paying multiformats' complexity, and it is why the format decision matters more than the
-algorithm one.**
+**Then it was measured on the JVM, and it inverted.** Same run, same methodology, 256 MB
+through each:
+
+| | throughput |
+|---|---|
+| SHA-256, `java.security.MessageDigest` | **417 MB/s** |
+| BLAKE3, `io.github.rctcwyvrn/blake3` (pure Java) | **97 MB/s** |
+
+BLAKE3 is **4.3× slower** here. The reason is that all of BLAKE3's advantage is SIMD, which
+pure Java cannot express, while the JDK's SHA-256 has hand-written JIT intrinsics. This is not
+a hardware-acceleration artifact either: the machine is an i5-8400 with **no `sha_ni` flag**,
+so SHA-256 wins without any help from the CPU.
+
+**So: SHA-256.** Zero dependencies, in the JDK, and 417 MB/s puts a 4 GB video at about ten
+seconds of ingest — a one-time cost per file.
+
+Revisit only with a **JNI or vectorised** BLAKE3, and only if ingest is felt. The published
+numbers are real for the algorithm; they are not real for a pure-Java implementation, and the
+distinction is the entire finding.
+
+### What depends on the hash staying the same: nothing
+
+This is the property the self-describing handle was chosen for, so it is worth stating
+explicitly. An old handle names its own algorithm, so an event written today keeps resolving
+unchanged whatever future content is hashed with. Nothing is rewritten, `as-of` is unaffected,
+and GC marks by handle string and is algorithm-blind. The BLAKE3 reversal above changed which
+algorithm ships first and **not one thing about the design**, which is the demonstration.
+
+Three consequences, small but not surprises:
+
+- **Verification of old algorithms must be kept forever.** Not used — checked. "We switched to
+  X" can never mean "we dropped Y", or every handle predating the switch becomes unverifiable.
+- **Dedup does not span an algorithm change.** Identical bytes ingested either side of a switch
+  get different CIDs and are two blobs. A storage miss, not a correctness problem.
+- **The same applies to the chunking upgrade, which is likelier.** A video later stored as a
+  chunk list gets a different CID — different codec, hash of a DAG rather than of raw bytes.
+  Old handles keep working; re-ingesting the same file afterwards yields a second identity.
+
+The failure this avoids is a format that does *not* record its algorithm: adding a second one
+then means you cannot tell old from new, and the only ways out are migrating every event or
+guessing.
 
 ## Garbage collection, and why it is not undo
 
@@ -313,9 +351,9 @@ and must not be given back.
    ranges, thumbnails and transcoding, none of which this design addresses.
 3. **Does a blob participate in LEAP and recall?** An image has no text. A caption or an
    agent-written description would be the chunkable surface, and that is a separate design.
-4. **CIDv1 or `ni:`** — decided in favour of CIDv1 above, but contingent on a usable JVM
-   multiformats library existing. If none does, is a translation layer for IPFS acceptable, or
-   should the format follow whatever ships cleanly?
+
+**Closed since first draft:** CIDv1 vs `ni:` (CIDv1, library verified in a REPL), and which
+hash (SHA-256, by measurement that reversed the first answer).
 
 ## What to measure before building
 
@@ -324,6 +362,5 @@ and must not be given back.
 2. **Boot cost** of attaching the lake, against loci's existing ~14 s Datalevin load — the
    startup budget is already the thing that made every test run expensive.
 3. **`undo!` latency** when it moves a snapshot pointer versus popping an inline table.
-4. **Hash throughput on this machine**, SHA-256 and BLAKE3 against a realistic video, before
-   choosing — the figures above are from published benchmarks, not from here. And whether a
-   sound JVM BLAKE3 implementation exists at all.
+4. ~~Hash throughput on this machine~~ — **done.** SHA-256 417 MB/s, pure-Java BLAKE3
+   97 MB/s, no `sha_ni` on this CPU. Recorded above.
