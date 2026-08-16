@@ -31,19 +31,33 @@
           (persistent! acc))))))
 
 (defn- ensure-extension!
-  "LOAD first, INSTALL only if that fails — so that the one line which can reach
-   the network is written down here, where a packaged build can hoist it to
-   image-build time instead of a user's first boot.
+  "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
+   on any machine that has already run loci, and it is the only reason a machine
+   that has not can open a lake at all.
 
-   It is a signpost, not a guard, and the difference was measured on DuckDB
-   1.5.5 (2026-08-16). `ATTACH 'ducklake:…'` loads the extension by itself:
-   `duckdb_extensions()` reports ducklake unloaded immediately before the ATTACH
-   and loaded immediately after, and it does this even with
-   `autoload_known_extensions` and `autoinstall_known_extensions` both SET
-   false. So nothing this function does is observable from outside, no test can
-   be made to fail by breaking it, and it must not be relied on to keep an
-   offline machine off the network — if that guarantee is ever wanted, it has to
-   come from shipping the extension into the image, not from this call."
+   Measured twice on DuckDB 1.5.5 (2026-08-16), because the first measurement
+   supported the opposite conclusion and was incomplete.
+
+   What is true, and is what makes this look dead: `ATTACH 'ducklake:…'` LOADS
+   the extension by itself. `duckdb_extensions()` reports ducklake unloaded
+   immediately before an ATTACH and loaded immediately after, on a connection
+   that issued neither LOAD nor INSTALL, and it does this even with
+   `autoload_known_extensions` and `autoinstall_known_extensions` both SET false.
+   So breaking this function changes nothing observable here, and the sabotage
+   step that should have proven the tests bite could not.
+
+   What is also true, and is why it stays: **ATTACH loads, but it does not
+   install.** Pointed at an empty `extension_directory` — a machine that has
+   never seen the extension — ATTACH fails outright with
+   `IO Error: Extension \"…/ducklake.duckdb_extension\" not found`, and the
+   catalog never opens. Running the sequence below by hand in that same state
+   gives: LOAD fails, INSTALL succeeds, LOAD succeeds, ATTACH succeeds.
+
+   So this is a guard after all, and the thing it guards is first run. The
+   INSTALL is the one line here that can reach the network; a packaged build
+   should hoist it to image-build time so a user's first boot does not, and
+   until it does, an air-gapped first run cannot work no matter what this
+   function says."
   [lk]
   (try (x! lk "LOAD ducklake")
        (catch Exception _
