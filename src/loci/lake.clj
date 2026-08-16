@@ -20,18 +20,41 @@
   (with-open [st (.createStatement (conn-of lk))] (.execute st sql))
   :ok)
 
+(defn- rs->maps
+  "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)`. The
+   only thing `q` and `q-as` disagree about is where `ks` comes from."
+  [rs ks]
+  (loop [acc (transient [])]
+    (if (.next rs)
+      (recur (conj! acc (into {} (map-indexed (fn [i k] [k (.getObject rs (inc i))]) ks))))
+      (persistent! acc))))
+
 (defn q
-  "Execute one query. Returns a vector of maps with keyword columns."
+  "Execute one query. Returns a vector of maps with keyword columns derived from
+   the result set's own labels — which is the right guess when the caller has no
+   idea what the columns are. A caller that does know names them itself; see
+   `q-as`, and do not add an optional key vector here."
   [lk sql]
   (with-open [st (.createStatement (conn-of lk))
               rs (.executeQuery st sql)]
     (let [md (.getMetaData rs)
-          n  (.getColumnCount md)
-          ks (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n))]
-      (loop [acc (transient [])]
-        (if (.next rs)
-          (recur (conj! acc (into {} (map-indexed (fn [i k] [k (.getObject rs (inc i))]) ks))))
-          (persistent! acc))))))
+          n  (.getColumnCount md)]
+      (rs->maps rs (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n))))))
+
+(defn- q-as
+  "Like `q`, but names the result columns instead of deriving them from the
+   result set's labels.
+
+   `q` runs each JDBC label through `sub/col-kw`, which is right when the caller
+   has no idea what the columns are. A handle does: it recorded `:cols` when the
+   rows were written, and the SELECT names them in that order. Deriving them
+   again would be lossy — `col-kw` leaves a readable keyword alone but
+   lowercases and squashes a *string*, so `:tenure-band` goes in and
+   `:tenure_band` comes back, and `:a-b` and `:a_b` come back as one column."
+  [lk sql ks]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (rs->maps rs ks)))
 
 (defn- ensure-extension!
   "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
@@ -219,9 +242,10 @@
        :rows (count rs) :cols cols}))
 
   (rows [lk h {:keys [offset limit]}]
-    (q lk (str "SELECT " (select-cols (:cols h))
-               " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
-               (when limit  (str " LIMIT "  (long limit)))
-               (when offset (str " OFFSET " (long offset))))))
+    (q-as lk (str "SELECT " (select-cols (:cols h))
+                  " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
+                  (when limit  (str " LIMIT "  (long limit)))
+                  (when offset (str " OFFSET " (long offset))))
+          (:cols h)))
 
   (row-count [_ h] (:rows h)))

@@ -54,6 +54,28 @@
       (is (= [:zeta :alpha] (:cols h)))
       (is (= [:zeta :alpha] (vec (keys (first (tbl/rows lk h {})))))))))
 
+(deftest a-round-trip-returns-the-columns-it-was-given
+  ;; `q` names result columns by running the JDBC label through `sub/col-kw`,
+  ;; which lowercases and squashes anything outside [a-z0-9]. `col-kw` leaves a
+  ;; readable *keyword* alone, so `:tenure-band` survives in the log and is
+  ;; renamed only on the way back out of the lake. Measured over the 31 live
+  ;; tables: 7 came back different, and `tbl:revenue`'s `:tenure-band` is the
+  ;; one `content.clj`'s churn-cohort viewer keys on by name.
+  (with-lake [lk]
+    (let [rs [{:tenure-band "0-6m" :Category "A" :rev_AU 1}]
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= [:tenure-band :Category :rev_AU] (:cols h)))
+      (is (= rs (tbl/rows lk h {}))
+          "the rows that come back must be the rows that went in"))))
+
+(deftest two-columns-that-differ-only-by-punctuation-stay-two-columns
+  (with-lake [lk]
+    (let [rs [{:a-b 1 :a_b 2}]
+          h  (tbl/put-rows! lk "tbl:x" rs)]
+      (is (= 2 (count (:cols h))))
+      (is (= rs (tbl/rows lk h {}))
+          "collapsing both to :a_b would silently drop one column"))))
+
 (deftest lake-pages
   (with-lake [lk]
     (let [h (tbl/put-rows! lk "tbl:x" rows3)]

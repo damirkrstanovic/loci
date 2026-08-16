@@ -570,10 +570,22 @@
             ;; never built reports every chunk it implies rather than "0 awaiting"
             ;; over an empty group. ~170 on the live corpus before a first sweep.
             ;;
-            ;; It re-chunks and re-hashes the whole substrate to answer: measured
-            ;; 4.2 ms over 101 chunks / 82 events, which is affordable HERE and
-            ;; nowhere else. It is one of the reasons this function may only ever
-            ;; be reached by ?deep=1.
+            ;; It re-chunks and re-hashes the whole substrate to answer, and
+            ;; since tables moved to DuckLake that means a versioned SELECT per
+            ;; lake-backed table too — `all-chunks` hydrates on the way in.
+            ;;
+            ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
+            ;; chunks / 31 row-bearing tables, median of 7: **297 ms** with every
+            ;; table handle-backed, against 16 ms with the same tables inline and
+            ;; 13 ms for the chunking alone. So the lake reads are ~280 ms of it,
+            ;; ~9 ms per table, each bounded by `tbl/mold-cap` rather than by the
+            ;; table's real size. (The old 4.2 ms here was 101 chunks / 82 events;
+            ;; the inline path has only tracked the corpus growing.)
+            ;;
+            ;; It was affordable HERE and nowhere else; it is now considerably
+            ;; less affordable here, and 100× the cost of the pure-chunking part.
+            ;; It is one of the reasons this function may only ever be reached by
+            ;; ?deep=1 — and the reason a cheaper answer is an open question.
             awaiting (count (ch/pending st cs model))]
         (cond-> hits
           (pos? awaiting)

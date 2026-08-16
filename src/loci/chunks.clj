@@ -304,9 +304,16 @@
 
    Hydrates on the way in, so a table's synopsis is built from its rows whether
    they sit in the log or in the lake. `chunks-of` stays pure — it never learns
-   that a lake exists — and the synopsis text comes out byte-identical either
-   way, which is what keeps Task 9's migration from retiring and re-embedding
-   every table's chunk."
+   that a lake exists.
+
+   Byte-identical for a table whose columns hold one type each and whose rows
+   number `mold-cap` or fewer — which is all 31 in the substrate today, bar one
+   with a mixed `Long`/`String` column that `read_json_auto` widens to a JSON
+   column, so its values come back JSON-quoted. Past `mold-cap` the synopsis
+   samples only the first 2,000 rows, so a table sorted such that a column's
+   variety begins later will chunk differently than it did inline. Both are
+   re-embeddings, not losses; the point of getting this close is that Task 9's
+   migration re-embeds almost nothing."
   [st]
   (chunks-in (map #(tbl/hydrate lake/lake %) (vals (sub/objects st)))))
 

@@ -277,6 +277,16 @@
                  (map :hash (ch/all-chunks st)))
               "and therefore the same hashes"))))))
 
+(deftest all-chunks-opens-no-lake-for-a-store-with-no-handle
+  (let [boom (delay (throw (ex-info "the sweep opened the lake for tables that never left the log" {})))
+        st   (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "S"
+                                                  :value [{:a 1} {:a 2}]}})
+    (with-redefs [lake/lake boom]
+      (is (seq (ch/all-chunks st)))
+      (is (not (realized? boom))
+          "the 15-second sweep must not open a lake to chunk inline tables"))))
+
 ;; ---- reports ----
 
 (deftest a-report-is-chunked-by-its-headings-and-carries-no-rows
