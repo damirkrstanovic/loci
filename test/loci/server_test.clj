@@ -7,6 +7,7 @@
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.lake :as lake]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -16,6 +17,50 @@
 
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))
+
+;; ---------------------------------------------------------------------------
+;; the boot path: what exit does about the lake
+;;
+;; `-main` cannot be called from a test — it binds a port and blocks on a
+;; promise — so the hook is registered by `close-lake-at-exit!`, which hands
+;; back the thread. `.run` on it is the hook's body on this thread, which is
+;; the only way to see a shutdown hook without shutting down. The hook is
+;; always removed again: it is registered against the real JVM, and a suite
+;; that left them behind would close a stranger's connection at exit.
+;; ---------------------------------------------------------------------------
+
+(defn- rm-rf [f]
+  (let [f (io/file f)]
+    (when (.isDirectory f) (run! rm-rf (.listFiles f)))
+    (.delete f)))
+
+(deftest exit-closes-a-lake-that-was-opened
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-hook-" (System/nanoTime))
+        lk  (delay (lake/open-lake! dir))
+        t   (#'srv/close-lake-at-exit! lk)]
+    (try
+      (is (= [{:answer 2}] (lake/q @lk "SELECT 1 + 1 AS answer")))
+      (.run t)
+      (is (thrown-with-msg? java.sql.SQLException #"Connection was closed"
+                            (lake/q @lk "SELECT 1 AS answer"))
+          "exit must close the connection, not just let the process drop it")
+      (finally
+        (.removeShutdownHook (Runtime/getRuntime) t)
+        (rm-rf dir)))))
+
+(deftest exit-opens-no-lake-that-was-never-opened
+  ;; The guard `close-lake-at-exit!` exists for. A bare `@lk` in the hook opens
+  ;; a lake on the way out of a process that never wanted one — and against a
+  ;; delay whose body threw, rethrows on the shutdown thread. This is the test
+  ;; that fails if the `realized?` check goes, and the reason the hook is
+  ;; registered before `-main` forces anything.
+  (let [forced (atom 0)
+        lk     (delay (swap! forced inc))
+        t      (#'srv/close-lake-at-exit! lk)]
+    (try
+      (.run t)
+      (is (zero? @forced) "a hook that runs before the boot force must open nothing")
+      (finally (.removeShutdownHook (Runtime/getRuntime) t)))))
 
 (def ^:private no-memory
   "The memory `mold-payload` must not open — a delay that throws if it is forced.

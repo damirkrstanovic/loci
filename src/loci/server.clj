@@ -2849,6 +2849,43 @@
   (.join thread 2000)
   (not (.isAlive thread)))
 
+(defn- close-lake-at-exit!
+  "Register the shutdown hook that closes `lk`, and return the thread.
+
+   Returns it so the two things that matter here can be run by a test: the JVM
+   will not run a hook on demand, and both behaviours live in the hook's body.
+
+   Takes the delay rather than reading `lake/lake` for the same reason — a test
+   passing its own delay proves the guard without opening the user's lake, and
+   proving it is the only way to know the guard is a guard. `-main` registers
+   this BEFORE it forces the lake, which is what leaves the `realized?` check
+   with something to decide: registered and never forced, exit closes nothing.
+   Registered after the force it would always be true and read as a check that
+   is not one.
+
+   The catch is not defensive noise. `realized?` does not mean \"opened\" — a
+   delay whose body THREW is realized too, and every later deref rethrows the
+   cached exception, here on the shutdown thread where nothing is left to
+   report it. Same shape `start-chunk-sweep!` puts around its background work.
+
+   What the close buys, measured 2026-08-16: DuckDB holds uncheckpointed
+   commits in `catalog.duckdb.wal` and checkpoints them into the catalog on
+   close, releasing the file lock. After a 100k-row write: `catalog.duckdb`
+   12,288 B beside a 12,281 B WAL while open, 3,944,448 B and no WAL after.
+   Replaying the WAL on open is DuckDB's own recovery path, so this is a
+   checkpoint and a released lock, not data loss avoided — the substrate's LMDB
+   env is left to process exit and loses nothing either."
+  [lk]
+  (let [t (Thread. ^Runnable
+                   #(when (realized? lk)
+                      (try (lake/close! @lk)
+                           (catch Throwable e
+                             (binding [*out* *err*]
+                               (println "loci.server: closing the lake threw:" e)))))
+                   "loci-lake-close")]
+    (.addShutdownHook (Runtime/getRuntime) t)
+    t))
+
 (defn -main [& _]
   ;; FIRST, before the store is touched — `(store)` below opens LMDB, and once
   ;; Datalevin has failed the only thing the user sees is a stack trace that
@@ -2858,6 +2895,9 @@
   (when-let [problem (sub/data-dir-problem)]
     (binding [*out* *err*] (println problem))
     (System/exit 1))
+  ;; Before the force, not after — see `close-lake-at-exit!`, which is where
+  ;; the order is the difference between a guard and a line that always passes.
+  (close-lake-at-exit! lake/lake)
   ;; Force the lake at boot rather than on first use. 75 ms, measured against
   ;; a lake holding 10M rows — 0.5% of the dependency load already paid — and
   ;; it turns "tables are broken" into a startup error naming the directory.
@@ -2865,15 +2905,6 @@
   ;; under the data directory, and a permissions failure should be reported by
   ;; the check that names the uid rather than by DuckDB.
   @lake/lake
-  ;; The substrate's LMDB env is left to the process exit — an unclosed LMDB
-  ;; environment loses nothing. DuckDB is not that: the catalog is a database
-  ;; file of its own, so the one connection this process owns is closed
-  ;; explicitly. `realized?` and not a bare deref, so a JVM that died before
-  ;; boot finished does not open a lake on its way out.
-  (.addShutdownHook (Runtime/getRuntime)
-                    (Thread. ^Runnable
-                             #(when (realized? lake/lake) (lake/close! @lake/lake))
-                             "loci-lake-close"))
   ;; PORT because that is what every container runtime sets. Through
   ;; `loci.config` like everything else, so that a PORT in loci.env is honoured
   ;; rather than silently ignored by a local run while compose obeys it — the

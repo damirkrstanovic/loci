@@ -94,12 +94,24 @@
 
    A delay, so requiring this namespace still opens nothing — the rule the
    whole codebase keeps, and the reason `loci.dlv/store` is shaped the same
-   way. Tests rebind it with `with-redefs` and a delay of their own.
+   way. Nothing rebinds this: the tests never touch it, because `open-lake!`
+   takes a directory and every test passes a temp one.
 
-   One connection, because loci is single-writer: one process owns the store,
-   and the three legitimate ways to reach it are the running app's HTTP API, a
-   `loci.*` facade called in the server's own process, and direct access with
-   the app stopped."}
+   **DuckDB refuses a second attach of one catalog file, process-wide**, the
+   same way Datalevin refuses a second connection to one directory. Measured
+   2026-08-16 — a second `open-lake!` on a directory this JVM already holds
+   fails with
+
+     Binder Error: Failed to attach DuckLake MetaData
+     \"__ducklake_metadata_lake\" at path + \"…/catalog.duckdb\"Unique file handle
+     conflict: Cannot attach \"__ducklake_metadata_lake\" - the database file
+     \"…/catalog.duckdb\" is already attached by database
+     \"__ducklake_metadata_lake\"
+
+   which is why the laziness matters more here than it does for chunks or the
+   memory: forcing this delay in a process that already holds the lake is not
+   an unwanted file, it is a hard failure. So there is one handle and everyone
+   shares it — which loci can do because it is single-writer."}
   lake
   (delay (open-lake!)))
 
@@ -166,10 +178,17 @@
    is also the fast way: 182 ms at 10M rows against 520 ms for inverting the
    native change feed, and flat in the size of the edit (a 50% edit restored in
    211/245/260 ms across three runs). The change-feed approach was measured,
-   was slower, had four change types to get right, and is not here."
+   was slower, had four change types to get right, and is not here.
+
+   **Unconditional — do not call it speculatively.** It rewrites the table
+   whether or not the version asked for is the one already current, and each
+   rewrite is a snapshot and a Parquet file. Measured: three restores to the
+   current version took the catalog from 2 snapshots and 1 file to 5 and 4, for
+   one 1000-row table. The files staying is correct — older versions still read
+   through them — so the caller is the one that has to know it needs this."
   [lk table snapshot]
   (x! lk (str "CREATE OR REPLACE TABLE " table
-              " AS SELECT * FROM " table " AT (VERSION => " snapshot ")"))
+              " AS SELECT * FROM " table " AT (VERSION => " (long snapshot) ")"))
   :ok)
 
 (defn- load-rows!
@@ -201,7 +220,7 @@
 
   (rows [lk h {:keys [offset limit]}]
     (q lk (str "SELECT " (select-cols (:cols h))
-               " FROM " (:table h) " AT (VERSION => " (:snapshot h) ")"
+               " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
                (when limit  (str " LIMIT "  (long limit)))
                (when offset (str " OFFSET " (long offset))))))
 

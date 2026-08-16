@@ -104,9 +104,12 @@
       (lake/x! lk (str "DELETE FROM " t " WHERE id < 500"))
       (is (= 500 (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " t))))))
       (lake/restore-to! lk t (:snapshot h))
-      (is (= 1000 (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " t)))))))))
+      (is (= 1000 (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " t))))))
+      (is (= 1000 (count (tbl/rows lk h {})))
+          "restore replaces the table; the handle must still resolve its own version"))))
 
-(deftest lake-singleton-is-lazy
-  (is (instance? clojure.lang.Delay lake/lake))
+(deftest requiring-this-namespace-opens-no-lake
+  (is (delay? lake/lake)
+      "the process lake is a delay — requiring loci.lake must not touch the data dir")
   (is (not (realized? lake/lake))
-      "requiring loci.lake must open nothing — the rule the whole codebase keeps"))
+      "nothing in this suite has forced it; every test passes an explicit temp dir"))
