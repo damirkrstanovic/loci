@@ -1312,9 +1312,20 @@
 (defn rerun!
   "Refresh id (if derived) and everything derived from it, transitively.
    Children recompute against their parent's NEW rows. All updates land as
-   one :tx. Returns {:state :refreshed [ids] :skipped [{:id :why}]}."
+   one :tx. Returns {:state :refreshed [ids] :skipped [{:id :why}]}.
+
+   The `try` is the one every sibling has — `fn-apply!`, `compute-clj!`,
+   `import-csv!`, `describe!`, `make-view!`, `do!` — and this was the only writer
+   without it. `handler` has no top-level catch, so `/api/rerun` answered a
+   throw with a 500 and a stack trace. Reachable since `normalize-rows` began
+   refusing a column collision: `lib:pivot` names its columns from data VALUES
+   (`fnlib.clj:63`), so a source that grows a `\"a b\"` beside an `\"a_b\"`
+   makes a recompute collide where the original apply did not. And because the
+   commit is one `:tx` after the whole reduce, a throw meant NOTHING refreshed —
+   not even the levels that had already succeeded."
   [st id]
-  (let [o (sub/object st id)]
+  (try
+   (let [o (sub/object st id)]
     (if-not (and o (= :table (:kind o)))
       {:error (str "not a table: " id)}
       (let [objs     (vals (sub/objects st))
@@ -1347,7 +1358,8 @@
                                                     :value (tbl/table-value @lake/lake cid
                                                                             (get working cid))})
                                                  refreshed)}))
-        {:state (state-payload st) :refreshed refreshed :skipped skipped}))))
+        {:state (state-payload st) :refreshed refreshed :skipped skipped})))
+   (catch Exception e {:error (.getMessage e)})))
 
 ;; ONE verb over a table: the user says what they want, the agent picks the
 ;; simplest mechanism (declarative view-spec / browser applet / server-side

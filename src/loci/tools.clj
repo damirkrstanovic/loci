@@ -152,17 +152,28 @@
   ;; report the columns the store actually holds. `(keys (first rows))` would
   ;; name "Total Sales" while the stored column is :total_sales, and the model's
   ;; next `query_table` would then ask for a column that does not exist.
+  ;;
+  ;; And normalizing can now REFUSE: a model that emits both "Total Sales" and
+  ;; "total_sales" names two columns that become one, and `normalize-rows`
+  ;; throws rather than silently keep one value. Nothing above catches it —
+  ;; `agent/chat-tools` does not wrap `tool-fn` (agent.clj:139) — so the throw
+  ;; runs to `draft-brief!`'s catch and blanks the whole brief with
+  ;; `_(agent unavailable: two column names would become one column…)_`. A tool
+  ;; handler answers with `{:error …}`; this one already does for no rows.
   (let [rows (vec rows)]
     (if (empty? rows)
       {:error "no rows to save"}
       (let [nid (str "tbl:extract-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-            obj (tbl/table-object @lake/lake nid (or title "Extracted table") rows)
-            h   (:value obj)]
-        (sub/commit! st (if (and space (sub/object st space))
-                          {:op :tx :events [{:op :put :id nid :value obj}
-                                            (nb/append-cell-event st space {:ref nid})]}
-                          {:op :put :id nid :value obj}))
-        {:saved_as nid :rows (:rows h) :columns (mapv name (:cols h))}))))
+            obj (try (tbl/table-object @lake/lake nid (or title "Extracted table") rows)
+                     (catch Exception e e))]
+        (if (instance? Exception obj)
+          {:error (.getMessage ^Exception obj)}                 ; and commit nothing
+          (let [h (:value obj)]
+            (sub/commit! st (if (and space (sub/object st space))
+                              {:op :tx :events [{:op :put :id nid :value obj}
+                                                (nb/append-cell-event st space {:ref nid})]}
+                              {:op :put :id nid :value obj}))
+            {:saved_as nid :rows (:rows h) :columns (mapv name (:cols h))}))))))
 
 (defn dispatch [st name args]
   (case name

@@ -4244,3 +4244,39 @@
     (is (not (re-find #":region \"r99\"" (pr-str ev)))
         "and no row may appear anywhere in the :assoc event")
     (is (= 50 (count (rows-of st b))) "the refreshed rows are still readable")))
+
+(deftest rerun-answers-a-refusal-instead-of-a-500
+  ;; `rerun!` was the only writer with no `try`, and `handler` has no top-level
+  ;; catch, so /api/rerun answered a throw with a stack trace. Reachable since
+  ;; `normalize-rows` began refusing a collision: `lib:pivot` names its columns
+  ;; from data VALUES, so a source that grows "a b" beside "a_b" collides on
+  ;; recompute where the original apply did not.
+  (let [st (sub/fresh-store)
+        _  (sub/commit! st {:op :put :id "tbl:t"
+                            :value (tbl/table-object @lake/lake "tbl:t" "T"
+                                                     [{:r "r1" :c "x" :m 1} {:r "r2" :c "y" :m 2}])})
+        b  (:openId (srv/fn-apply! st "tbl:t" "lib:pivot"
+                                   {:rows_col "r" :cols_col "c" :measure "m" :agg "sum"} nil))
+        _  (sub/commit! st {:op :assoc :id "tbl:t" :path [:value]
+                            :value [{:r "r1" :c "a b" :m 1} {:r "r2" :c "a_b" :m 2}]})
+        before (count (sub/history st))
+        r  (srv/rerun! st "tbl:t")]
+    (is (some? b))
+    (is (re-find #"two column names would become one column" (str (:error r))))
+    (is (= before (count (sub/history st))) "and nothing was committed")))
+
+(deftest the-seed-lands-handles-not-rows
+  ;; The EIGHTH writer, missed for the same reason as the seventh: `content/obj`
+  ;; takes `kind` as a parameter, so it spells no `:kind :table` literal for a
+  ;; grep to find. This is production code — `content/store` seeds whenever the
+  ;; log is empty, so a fresh boot after a migration re-created ten inline
+  ;; tables. Measured before the conversion: 10 objects, 1,810 rows, 230,300
+  ;; characters of :put events, `tbl:orders` alone 134,630 in one event.
+  (let [st      (sub/fresh-store)
+        _       (c/seed! st @lake/lake)
+        tbl-evs (filterv #(= :table (:kind (:value %))) (sub/history st))]
+    (is (= 10 (count tbl-evs)) "ten seeded tables")
+    (is (every? #(tbl/handle? (:value (:value %))) tbl-evs))
+    (is (< (reduce + (map (comp count pr-str) tbl-evs)) 5000)
+        "the ten :put events together, against 230,300 before")
+    (is (= 1000 (count (rows-of st "tbl:orders"))) "and the rows are still all there")))

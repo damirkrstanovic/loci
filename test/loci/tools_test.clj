@@ -130,3 +130,25 @@
                                              :filter {:col "b" :op "=" :val "zzz"}})]
     (is (= [] (:rows r)))
     (is (= [] (:value (sub/object st (:saved_as r)))))))
+
+(deftest a-column-collision-is-a-tool-error-not-a-throw
+  ;; A model that emits both "Total Sales" and "total_sales" names two columns
+  ;; that become one, and `normalize-rows` refuses. Nothing above catches it —
+  ;; `agent/chat-tools` does not wrap `tool-fn` — so the throw ran all the way to
+  ;; `draft-brief!`'s catch and blanked the whole brief.
+  (let [st (sub/fresh-store)
+        r  (tools/save-table! st "T" [{(keyword "Total Sales") 1 :total_sales 2}])]
+    (is (re-find #"two column names would become one column" (str (:error r))))
+    (is (nil? (:saved_as r)))
+    (is (zero? (count (sub/history st))) "and it commits nothing on that path")))
+
+(deftest a-save_as-with-rows-lands-a-handle
+  ;; the converted writer's positive case — the existing save_as test covers
+  ;; only the empty branch, and `hydrate` cannot tell a literal from a handle
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])
+        _  (sub/commit! st {:op :put :id "tbl:x"
+                            :value {:id "tbl:x" :kind :table :title "X" :value h}})
+        r  (tools/dispatch st "query_table" {:table_id "tbl:x" :save_as "kept"})]
+    (is (tbl/handle? (:value (sub/object st (:saved_as r)))))
+    (is (= 2 (:rows (:value (sub/object st (:saved_as r))))))))

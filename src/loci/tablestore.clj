@@ -205,12 +205,24 @@
   (if (seq rows) (put-rows! ts id rows) []))
 
 (defn table-object
-  "The one way to build a `:kind :table` object. Lands the rows in `ts` and
-   returns the object carrying a handle.
+  "Build a `:kind :table` object, landing its rows in `ts`, so that the log holds
+   a handle and not the rows.
 
-   One function rather than six map literals, so that a site added later gets
-   lake storage by using the obvious constructor rather than by remembering to.
-   `table-value` is the half of it a site that only replaces a `:value` can use."
+   One function rather than a map literal per writer, so that a site added later
+   gets lake storage by using the obvious constructor rather than by remembering
+   to. `table-value` is the half of it a site that only replaces an existing
+   object's `:value` can use — `server/rerun!` is the one.
+
+   **Eight writers, and the grep found six.** `rerun!` assocs over `:value` and
+   constructs no object; `content/seed!` builds its objects through a helper that
+   takes `kind` as a parameter. Both spell no `:kind :table` literal, both were
+   found by measuring what the log actually held after a write rather than by
+   searching for the shape, and between them they were putting a 1,599-character
+   event on every refresh and 230,300 characters on every fresh boot. So:
+   `grep :kind :table` coming back clean is not the invariant. The invariant is
+   that a `:table` object's `:value` is a handle, and the only tests that can see
+   it are the ones reading `(:value (sub/object …))` raw — anything going through
+   `hydrate` passes a literal vector along and reports success."
   [ts id title rows & [extra]]
   (merge {:id id :kind :table :title title :value (table-value ts id rows)}
          extra))

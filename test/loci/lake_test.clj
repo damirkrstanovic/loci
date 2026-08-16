@@ -1,5 +1,6 @@
 (ns loci.lake-test
-  (:require [clojure.java.io :as io]
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is]]
             [loci.lake :as lake]
             [loci.tablestore :as tbl]))
@@ -267,3 +268,30 @@
       "the process lake is a delay — requiring loci.lake must not touch the data dir")
   (is (not (realized? lake/lake))
       "nothing in this suite has forced it; every test passes an explicit temp dir"))
+
+(deftest a-mixed-type-column-round-trips-as-its-own-values
+  ;; `read_json_auto` widens a column holding a Long and a String to DuckDB
+  ;; JSON, and JDBC hands those cells back as `org.duckdb.JsonNode` — which
+  ;; `clojure.data.json/write-str` refuses, so ONE such cell makes the whole
+  ;; object unopenable in the shell. Three tables in the live substrate carry
+  ;; one. Unwrapping is lossless, so none of them needs refusing.
+  (with-lake [lk]
+    (let [rs [{:pct 50} {:pct "~13% (1 of 8 countries)"} {:pct 10}]
+          h  (tbl/put-rows! lk "tbl:x" rs)
+          back (tbl/rows lk h {})]
+      (is (= rs back))
+      (is (every? #(or (number? %) (string? %)) (map :pct back)))
+      (is (string? (json/write-str back))))))
+
+(deftest a-nested-json-value-comes-back-with-string-keys
+  ;; The `:key-fn` choice, pinned. These keys are values DuckDB parsed out of
+  ;; user data, not loci column names, and `:key-fn keyword` on "odd key" mints
+  ;; a keyword that does not read back — the trap `sub/col-kw` exists for, one
+  ;; layer in. A SQL NULL is Java null and never reaches `unwrap` at all.
+  (with-lake [lk]
+    (let [rs   [{:v {"a" 1 "odd key" [1 2]}} {:v "plain"} {:v nil}]
+          back (tbl/rows lk (tbl/put-rows! lk "tbl:n" rs) {})]
+      (is (= {"a" 1 "odd key" [1 2]} (:v (first back))))
+      (is (= "plain" (:v (second back))))
+      (is (nil? (:v (nth back 2))))
+      (is (string? (json/write-str back))))))

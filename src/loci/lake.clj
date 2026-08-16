@@ -20,13 +20,50 @@
   (with-open [st (.createStatement (conn-of lk))] (.execute st sql))
   :ok)
 
+(defn- unwrap
+  "A JDBC value as something the rest of loci can hold and serialize.
+
+   `read_json_auto` widens a column holding more than one type to DuckDB `JSON`,
+   and JDBC hands those cells back as `org.duckdb.JsonNode`. That class is not a
+   Clojure value and not a `clojure.data.json` one: `json-resp` is `write-str`
+   (`server.clj:44-47`), so a single such cell makes the whole object
+   **unopenable in the shell** — measured on `tbl:csv-18-1542` round-tripped
+   through a real lake:
+
+     Don't know how to write JSON of class org.duckdb.JsonNode
+
+   and `query_table` on it throws into the agent's tool loop. Three tables in
+   the live substrate carry one: `tbl:csv-18-1542` (`:inflation_pct`,
+   `:growth_pct`, `:unemployment_pct`), `tbl:csv-19-7071` (`:density_per_km2`)
+   and `tbl:extract-20-8413` (`:approx_low_income_share`).
+
+   A `JsonNode`'s `toString` is the JSON text of the value it holds, so parsing
+   it back is lossless and none of the three needs refusing: `50` returns as
+   `50` and `\"~13% (1 of 8 countries)\"` as that string. Refusing them was the
+   remedy Task 9 planned; a storage layer handing its callers values they cannot
+   serialize is the actual defect.
+
+   **String keys for a genuinely nested JSON object**, which is `read-str`'s
+   default and is deliberate. These keys are values DuckDB parsed out of user
+   data, not loci column names — `sub/col-kw` normalizes columns and nothing
+   normalizes these — and `:key-fn keyword` on `{\"odd key\": …}` mints `:odd
+   key`, a keyword that does not read back. Measured 2026-08-16.
+
+   **Two spellings of \"no value\", one result.** A SQL NULL never reaches here
+   at all: JDBC returns Java `null` for it, JsonNode or not. A JSON `null`
+   literal parses to `nil`. Both land on `nil`, which is what every other column
+   type already gives."
+  [v]
+  (if (instance? org.duckdb.JsonNode v) (json/read-str (str v)) v))
+
 (defn- rs->maps
-  "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)`. The
-   only thing `q` and `q-as` disagree about is where `ks` comes from."
-  [rs ks]
+  "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)` and
+   passing each value through `vf`. The only things `q` and `q-as` disagree
+   about are where `ks` comes from and whether values are unwrapped."
+  [rs ks vf]
   (loop [acc (transient [])]
     (if (.next rs)
-      (recur (conj! acc (into {} (map-indexed (fn [i k] [k (.getObject rs (inc i))]) ks))))
+      (recur (conj! acc (into {} (map-indexed (fn [i k] [k (vf (.getObject rs (inc i)))]) ks))))
       (persistent! acc))))
 
 (defn q
@@ -39,7 +76,11 @@
               rs (.executeQuery st sql)]
     (let [md (.getMetaData rs)
           n  (.getColumnCount md)]
-      (rs->maps rs (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n))))))
+      ;; `identity`, not `unwrap`: this is the general helper over this
+      ;; namespace's OWN SQL — snapshot ids, table names, the CAST-to-VARCHAR
+      ;; `column-samples` runs — none of which produces a JSON column, and one
+      ;; of which (`column-samples`) depends on seeing the JSON rendering.
+      (rs->maps rs (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n)) identity))))
 
 (defn- q-as
   "Like `q`, but names the result columns instead of deriving them from the
@@ -50,11 +91,14 @@
    rows were written, and the SELECT names them in that order. Deriving them
    again would be lossy — `col-kw` leaves a readable keyword alone but
    lowercases and squashes a *string*, so `:tenure-band` goes in and
-   `:tenure_band` comes back, and `:a-b` and `:a_b` come back as one column."
+   `:tenure_band` comes back, and `:a-b` and `:a_b` come back as one column.
+
+   It also `unwrap`s, because this is the path a table's ROWS come back on and
+   they go straight to `json-resp`."
   [lk sql ks]
   (with-open [st (.createStatement (conn-of lk))
               rs (.executeQuery st sql)]
-    (rs->maps rs ks)))
+    (rs->maps rs ks unwrap)))
 
 (defn- ensure-extension!
   "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
