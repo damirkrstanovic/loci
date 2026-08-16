@@ -1219,6 +1219,200 @@ git commit -m "fix: every reader hydrates, not just mold-payload"
 
 ---
 
+## Task 6c: the fourteenth reader, and a lake that opens when it is needed
+
+**Files:**
+- Modify: `src/loci/tablestore.clj` (`hydrate`)
+- Modify: `src/loci/chunks.clj:302` (`all-chunks`)
+- Modify: `src/loci/server.clj`, `src/loci/tools.clj` — every `@lake/lake` → `lake/lake`
+- Test: `test/loci/chunks_test.clj`, `test/loci/tablestore_test.clj`, `test/loci/server_test.clj`
+
+**Added 2026-08-16, after Task 6b's review.** Three findings, and the first two compose — fixing
+either alone makes the other worse.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test/loci/tablestore_test.clj` — hydrate must not open a lake it has no use for:
+
+```clojure
+(deftest hydrate-opens-nothing-when-there-is-no-handle
+  (let [boom (delay (throw (ex-info "the lake was opened for a table that never left the log" {})))]
+    (is (= [{:a 1}] (:value (tbl/hydrate boom {:kind :table :value [{:a 1}]}))))
+    (is (= "hi"     (:value (tbl/hydrate boom {:kind :doc   :value "hi"}))))
+    (is (nil? (tbl/hydrate boom nil)))
+    (is (not (realized? boom))
+        "a store with no handle-backed table must never force the lake")))
+
+(deftest hydrate-still-takes-a-store-directly
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:x" rows)]
+    (is (= rows (:value (tbl/hydrate ts {:kind :table :value h})))
+        "passing the store itself, not a delay, must keep working")))
+```
+
+`test/loci/chunks_test.clj` — the synopsis must not depend on where the rows live:
+
+```clojure
+(deftest a-table-chunks-the-same-whether-its-rows-are-inline-or-in-the-lake
+  ;; The synopsis is what LEAP searches to answer "which table holds this?".
+  ;; A handle fails `rows?`, so before this fix a lake-backed table chunked to
+  ;; its bare title — columns and sample values gone, silently. And because
+  ;; :hash covers the chunk text, migrating a table would retire its synopsis
+  ;; chunk and re-embed a weaker one: a model round trip per table, for nothing.
+  (let [inline {:id "tbl:x" :kind :table :title "Sales"
+                :value [{:region "EMEA" :rev 10} {:region "APAC" :rev 20}]}]
+    (lf/with-temp-lake
+      (fn []
+        (let [h      (tbl/put-rows! @lake/lake "tbl:x" (:value inline))
+              handle (assoc inline :value h)
+              st     (sub/fresh-store)]
+          (sub/commit! st {:op :put :id "tbl:x" :value handle})
+          (is (= (map :text (ch/chunks-of inline))
+                 (map :text (ch/all-chunks st)))
+              "same text — so migrating a table re-embeds nothing")
+          (is (= (map :hash (ch/chunks-of inline))
+                 (map :hash (ch/all-chunks st)))
+              "and therefore the same hashes"))))))
+```
+
+`test/loci/server_test.clj` — pin `table-shaped?` with the case that actually bites. Task 6b
+converted it on a rationale that does not reproduce: with a single-step flow, `resolve-ref` has
+already turned `"$0"` into the step's `:out`, and `resolve-table-ref`'s `or` falls back to that
+resolved id either way. The failure needs a *non-table earlier step*:
+
+```clojure
+(deftest a-compute-step-resolves-past-a-doc-to-the-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "doc:n" :value {:id "doc:n" :kind :doc :title "N" :value "text"}})
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (is (= "tbl:x"
+           (#'srv/resolve-table-ref st {:steps [{:out "doc:n"} {:out "tbl:x"}]} 0))
+        "the scan must skip the doc and find the table, wherever its rows live")))
+```
+
+Read `resolve-table-ref` at `server.clj:2293` and match its real arity and argument shape — the
+call above is the review's reproduction, not necessarily its signature. The point the test must
+pin is: **an earlier non-table step, a later handle-backed table, and the table wins.**
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: the `boom` delay throws (`hydrate` forces unconditionally today); the chunk texts
+differ, `["Sales\ncolumns: region, rev\nregion: EMEA, APAC\nrev: 10, 20"]` against `["Sales"]`;
+and `resolve-table-ref` returns `"doc:n"` with `table-shaped?` reverted.
+
+- [ ] **Step 3: Make `hydrate` force lazily**
+
+`src/loci/tablestore.clj`. Only the first line of the body changes, plus the docstring:
+
+```clojure
+  [ts o]
+  (if (and o (handle? (:value o)))
+    (let [ts (force ts)
+          h  (:value o)]
+      (assoc o :value       (rows ts h {:limit mold-cap})
+               :table/total (row-count ts h)))
+    o))
+```
+
+`force` is identity on anything that is not a delay, so a caller may pass either the store or a
+delay of one, and `hydrate-still-takes-a-store-directly` holds that open.
+
+Add to the docstring:
+
+> Takes the store **or a delay of one**, and forces it only when there is
+> actually a handle to resolve. Fifteen call sites reach this function, most of
+> them on paths — `list_tables`, the ƒ palette, the chunk sweep — that run on
+> workspaces holding no lake-backed table at all. Forcing eagerly would open
+> `<data-dir>/lake` to answer questions about rows that never left the log,
+> which is the trap `mold-payload`'s own docstring describes for `mem/memory`.
+
+- [ ] **Step 4: Pass the delay, not its value**
+
+Every `@lake/lake` in a *reader* becomes `lake/lake`. In `src/loci/server.clj`: `:395`
+(`mold-payload`), `:1062`, `:1085`, `:1124`, `:1188`, `:1259`, `:1316`, `:1743`, `:1763`,
+`:2018`, `:2051`, `:2126`, `:2247`. In `src/loci/tools.clj`: `:105`, `:112`.
+
+```bash
+grep -n "@lake/lake" src/loci/*.clj
+```
+
+Expected after this step: **one** hit, `server.clj`'s `-main` boot force, which is meant to be
+eager. Everything else passes the delay.
+
+- [ ] **Step 5: Hydrate at the chunk seam**
+
+`src/loci/chunks.clj:302`. `chunks-of` is documented at the top of that namespace as "a **pure
+function of one object**. No store, no file, no embedder, no clock", and that contract is what
+makes chunks rebuildable — do not hydrate inside it. `all-chunks` is the one function there
+that already takes `st`:
+
+```clojure
+(defn all-chunks
+  "Every chunk the substrate currently implies. Reads the store; writes nothing
+   to it, ever.
+
+   Hydrates on the way in, so a table's synopsis is built from its rows whether
+   they sit in the log or in the lake. `chunks-of` stays pure — it never learns
+   that a lake exists — and the synopsis text comes out byte-identical either
+   way, which is what keeps Task 9's migration from retiring and re-embedding
+   every table's chunk."
+  [st]
+  (chunks-in (map #(tbl/hydrate lake/lake %) (vals (sub/objects st)))))
+```
+
+Add `[loci.tablestore :as tbl]` and `[loci.lake :as lake]` to `chunks.clj`'s requires. Check
+first for a require cycle — if `loci.lake` or `loci.tablestore` reaches `loci.chunks`, stop and
+report rather than restructuring.
+
+- [ ] **Step 6: Convert `table-shaped?` on the rationale that reproduces**
+
+Task 6b already hydrated `server.clj:2247`. Leave the code; fix the comment if it states the
+single-step rationale, and let the new test carry the real one.
+
+- [ ] **Step 7: Run the suites**
+
+```clojure
+(doseq [n '[loci.tablestore loci.lake loci.chunks loci.tools loci.server]] (require n :reload))
+(clojure.test/run-tests 'loci.chunks-test 'loci.tools-test 'loci.server-test
+                        'loci.tablestore-test 'loci.lake-test)
+```
+
+Baselines: `server-test` 207/765, `tools-test` 8/18, `tablestore-test` 6/14, `lake-test` 11/25.
+
+- [ ] **Step 8: Prove the lake stays shut**
+
+The measurement that motivates this task. Install a delay that throws, seed a store with
+**only inline tables and docs**, and run every namespace:
+
+```clojure
+(with-redefs [loci.lake/lake (delay (throw (ex-info "SOMETHING FORCED THE REAL LAKE" {})))]
+  (clojure.test/run-tests 'loci.corpus-test 'loci.agent-test 'loci.leap-deep-test
+                          'loci.memory-dlv-test 'loci.repair-test 'loci.chunks-test))
+```
+
+Before Task 6c this probe made `list_tables`, `query_table`, `fns-payload` and `agent-ctx` throw
+on a workspace with zero handles. After it, all six namespaces must pass. Report both.
+
+- [ ] **Step 9: Sabotage**
+
+Remove `force` from `hydrate`, restoring the eager deref.
+`hydrate-opens-nothing-when-there-is-no-handle` must FAIL on the `boom` delay. Restore.
+
+Revert `all-chunks` to `(chunks-in (vals (sub/objects st)))`.
+`a-table-chunks-the-same-whether-its-rows-are-inline-or-in-the-lake` must FAIL showing `["Sales"]`
+against the full synopsis — paste both strings, because the difference between them is what LEAP
+would have lost.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/loci/tablestore.clj src/loci/chunks.clj src/loci/server.clj src/loci/tools.clj test/
+git commit -m "fix: chunk a table by its rows, and open the lake only for a handle"
+```
+
+---
+
 ## Task 7: The six writers land handles
 
 **Files:**
@@ -1686,6 +1880,14 @@ not a number to update.
   coerces to long/double/string, so the risk is at ingest of new data rather than at migration.
   Worth a measurement if a table ever comes back with a column the viewers stop treating as
   numeric.
+- **The cap now sits in front of three paths that *commit*.** `compute-clj!` (`server.clj:1124`
+  → `:1162`), `fn-apply!` via `table-rows` (`:1188` → `:1244`) and `recompute` (`:1259` →
+  `rerun!` at `:1306`) all build a derived table from hydrated rows and write it back. Over
+  `mold-cap` that means a transform, a ƒ verb or a downstream refresh silently produces a table
+  computed from the first 2,000 rows. Found in Task 6b's review; worse than the digest item
+  below, and the same threshold. Inert today — largest table 1,000 rows against a cap of 2,000
+  — and the real fix is the HoneySQL pushdown that would stop materializing rows to transform
+  them at all.
 - **What an agent digest of a huge table should say.** `obj-digest` (`server.clj:1416`) reports
   `(count v)` rows, which after hydration is the capped 2,000. Task 6b deliberately left it:
   `table-digest`'s sums and the three sample rows just below come from the same capped `v`, so
