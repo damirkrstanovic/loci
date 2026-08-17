@@ -4453,3 +4453,42 @@
             "the healthy table answers")
         (is (:table/reclaimed (tbl/hydrate lake/lake (sub/object frozen "tbl:gone")))
             "and the reclaimed one says so, without stopping the other two")))))
+
+;; ---------------------------------------------------------------------------
+;; the flow engine — the eighth reader, and the one where "per operation"
+;; failure was still reachable
+;; ---------------------------------------------------------------------------
+
+(deftest a-flow-steps-over-a-reclaimed-table-to-the-live-one
+  ;; `table-shaped?` answers from the handle, and a handle survives its rows:
+  ;; same cols, same count, forever. So `resolve-table-ref`'s reverse scan —
+  ;; whose entire job is to find a table the compute step can USE — stopped at
+  ;; the reclaimed one, `compute-clj!` answered "compute works on tables", and
+  ;; `run-flow!` marked that step AND the whole flow failed. One reclaimed table
+  ;; stopping every remaining step is failure per operation, where the
+  ;; requirement is per object — with a live table sitting two outputs earlier.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (sub/commit! st {:op :put :id "doc:prose"
+                       :value {:id "doc:prose" :kind :doc :title "P" :value "prose"}})
+      (sub/commit! st {:op :put :id "space:s"
+                       :value {:id "space:s" :kind :space :title "S" :value {:intent "i" :cells []}}})
+      (let [flow {:id "flow:f" :kind :flow :title "F"
+                  :value {:goal "g" :space "space:s" :status "running"
+                          :steps [{:verb "research" :status "done" :out "tbl:good"}
+                                  {:verb "research" :status "done" :out "doc:prose"}
+                                  {:verb "research" :status "done" :out "tbl:gone"}
+                                  {:verb "compute" :args {:id "$2" :prompt "keep it"}
+                                   :status "pending"}]}}]
+        (sub/commit! st {:op :put :id "flow:f" :value flow})
+        (is (false? (#'srv/table-shaped? st "tbl:gone"))
+            "a table whose rows are gone is not one this scan can use")
+        (is (true? (#'srv/table-shaped? st "tbl:good")))
+        (is (= "tbl:good" (srv/resolve-table-ref st (:value flow) "$2"))
+            "the scan walks PAST the reclaimed output to the live table behind it")
+        ;; and the flow runs to the end. The model is stubbed — what is being
+        ;; measured is which table the step was handed, not what it computed.
+        (with-redefs [agent/make-clj-transform (fn [& _] "(fn [rows] rows)")]
+          (let [r (srv/run-flow! st "flow:f")]
+            (is (= "done" (:status r))
+                "the flow completes rather than failing at a table it never needed")))))))

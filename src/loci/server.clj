@@ -1328,7 +1328,7 @@
     (cond
       ;; Before `nil?`: `[]` passes that check.
       (:table/reclaimed src) {:why (str "source " src-id "'s rows were reclaimed on "
-                                        (:table/reclaimed src))}
+                                        (tbl/reclaimed-str (:table/reclaimed src)))}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]
@@ -1505,6 +1505,34 @@
            (table-digest v) "\nsample rows: " (json/write-str (vec (take 3 v))))
       :else "")))
 
+(defn- dropped-lookup
+  "`{table-name when}` for the whole lake, or nil when nothing in `os` is
+   handle-backed — the reclamation question asked ONCE for a whole read.
+
+   Every reader that answers about a LIST of objects wants this rather than
+   `tbl/reclaimed-at` per table. Measured 2026-08-17 over the 29-table store: the
+   cost is the round trip and not the scan, so asking per table took
+   `list_tables` from 0.10 ms to 100 ms where one query costs 3.5 ms.
+
+   Nil when no candidate is handle-backed, so a workspace whose tables never left
+   the log does not open `<data-dir>/lake` to be told nothing was dropped —
+   `tbl/table-shape`'s rule, for its reason. `reclaimed-on` reads nil as
+   \"nothing was dropped\", which is the truth in that case."
+  [os]
+  (when (some #(tbl/handle? (:value %)) os)
+    (lake/dropped-tables (force lake/lake))))
+
+(defn- reclaimed-on
+  "When `o`'s rows were reclaimed, or nil — answered against a `dropped-lookup`
+   map rather than by asking the catalog again.
+
+   Reads `:table/reclaimed` first so a HYDRATED object answers without the map,
+   and falls back to the handle's table name so an UNHYDRATED one answers too.
+   Both shapes reach these readers: `tbl/hydrate` sets the key, and
+   `table-catalog` is handed unhydrated objects on purpose."
+  [dropped o]
+  (or (:table/reclaimed o) (get dropped (:table (:value o)))))
+
 (defn- table-catalog
   "The `TABLES (query by id)` block the agent is given — one line per table,
    naming its id, title, columns and row count.
@@ -1536,13 +1564,11 @@
    back onto every chat turn over the 29-table store, which is the cost this
    function was rewritten to remove."
   [tbls]
-  (let [dropped (when (some #(tbl/handle? (:value %)) tbls)
-                  (lake/dropped-tables (force lake/lake)))]
+  (let [dropped (dropped-lookup tbls)]
     (str/join "\n"
               (keep (fn [o]
                       (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
-                        (when-not (or (:table/reclaimed o)
-                                      (get dropped (:table (:value o))))
+                        (when-not (reclaimed-on dropped o)
                           (str "- " (:id o) " — " (:title o)
                                " (cols: " (str/join ", " (map name cols))
                                "; " (or rows 0) " rows)"))))
@@ -2379,8 +2405,8 @@
     v))
 
 (defn- table-shaped?
-  "Does `id` name something whose value is rows? A handle counts — it IS a
-   table, it just keeps its rows in the lake.
+  "Does `id` name something whose value is rows **that are still there**? A
+   handle counts — it IS a table, it just keeps its rows in the lake.
 
    The failure that needs is a flow with a **non-table step before the table**:
    with one step `resolve-ref` has already produced that step's own `:out` and
@@ -2390,9 +2416,25 @@
 
    It used to hydrate to find that out — fetching every row of every candidate
    to answer a boolean, on a scan that runs over earlier steps until one
-   matches. `tbl/table-shape` answers it from the handle."
-  [st id]
-  (some? (tbl/table-shape lake/lake (sub/object st id))))
+   matches. `tbl/table-shape` answers it from the handle.
+
+   **And a handle whose rows were reclaimed is not a table this caller can
+   use.** The handle survives the reclamation intact — same cols, same count —
+   so shape alone says yes forever, and the one caller asking is a scan looking
+   for a table it can COMPUTE on. Measured before this clause, on a flow whose
+   outputs were `[tbl:good doc:prose tbl:gone]`: `resolve-table-ref` returned
+   `tbl:gone`, `compute-clj!` answered `\"compute works on tables\"`, and
+   `run-flow!` marked that step and the whole flow `failed` — so one reclaimed
+   table stopped every remaining step of a flow that had a live table sitting
+   two outputs earlier. Per operation, where the requirement is per object.
+
+   The 3-arity takes a `dropped-lookup` map so a scan asks the catalog once for
+   the whole flow rather than once per candidate; the 2-arity asks for itself."
+  ([st id] (table-shaped? st id (dropped-lookup [(sub/object st id)])))
+  ([st id dropped]
+   (let [o (sub/object st id)]
+     (and (some? (tbl/table-shape lake/lake o))
+          (nil? (reclaimed-on dropped o))))))
 
 (defn- step-index->ref
   "A bare step index — `0`, `\"0\"` — as the `$`-ref the planner meant.
@@ -2432,14 +2474,28 @@
    one somebody named by hand is the worse error.
 
    No tabular output anywhere → the unresolved value, so the failure
-   downstream stays honest rather than becoming a confident wrong table."
+   downstream stays honest rather than becoming a confident wrong table.
+
+   **A reclaimed output is stepped OVER, not stopped on.** The reverse scan
+   exists to find a table this step can use, and a table whose rows are gone is
+   not one — `table-shaped?` answers false for it, so the `filter` walks past to
+   the next candidate. Measured on outputs `[tbl:good doc:prose tbl:gone]`: this
+   returned `tbl:gone` and failed the whole flow, where `tbl:good` was live and
+   two outputs earlier. Every candidate reclaimed still falls through to `r` and
+   the honest downstream failure, which is the same answer as no table at all.
+
+   One `dropped-lookup` for the whole scan rather than one catalog read per
+   candidate, and it covers `r` as well as the outputs — `r` can be a literal id
+   naming a table no step produced."
   [st flow v]
   (let [ref (step-index->ref v)]
     (if (and (string? ref) (str/starts-with? ref "$"))
-      (let [r (resolve-ref flow ref)]
-        (if (and (string? r) (table-shaped? st r))
+      (let [r       (resolve-ref flow ref)
+            outs    (vec (keep :out (:steps flow)))
+            dropped (dropped-lookup (keep #(sub/object st %) (cons r outs)))]
+        (if (and (string? r) (table-shaped? st r dropped))
           r
-          (or (->> (:steps flow) (keep :out) reverse (filter #(table-shaped? st %)) first)
+          (or (->> outs reverse (filter #(table-shaped? st % dropped)) first)
               r)))
       ;; the ORIGINAL value, not the normalized one: a literal id passes through
       ;; untouched exactly as it always did, and only a reference is resolved

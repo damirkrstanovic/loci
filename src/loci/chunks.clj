@@ -265,7 +265,10 @@
    no chunks until it is named here, which is the safe direction to fail: an
    unembedded object is found lexically, an embedded viewspec is noise in every
    result."
-  [{:keys [id kind title value] :table/keys [cols samples]}]
+  ;; `:table/synopsis-cols` is read off `o` rather than destructured, because the
+  ;; obvious local would shadow the `synopsis-cols` DEF this function uses two
+  ;; branches down.
+  [{:keys [id kind title value] :table/keys [samples] :as o}]
   (case kind
     :space  (let [head (str/trim (str title "\n" (str (:intent value))))]
               (into (if (str/blank? head) [] [head])
@@ -278,7 +281,7 @@
     :report (prose-chunks (report-body value))
     (:table :metric)
     (cond
-      samples [(synopsis title cols samples)]
+      samples [(synopsis title (:table/synopsis-cols o) samples)]
 
       (rows? value)
       (let [h (tbl/put-rows! inline-store id value)]
@@ -349,9 +352,14 @@
   (if (tbl/handle? (:value o))
     (let [h (:value o)]
       (try
-        (assoc o :table/cols    (vec (take synopsis-cols (:cols h)))
-                 :table/samples (tbl/column-samples (force lake/lake) h
-                                                    synopsis-samples synopsis-cols))
+        ;; `:table/synopsis-cols` and NOT `:table/cols`, which `tbl/hydrate`
+        ;; already owns and fills with the table's FULL column list. This one is
+        ;; truncated to `synopsis-cols` — two different meanings under one key,
+        ;; kept apart today only by `texts-of` gating on `:table/samples`, which
+        ;; is one refactor from being wrong.
+        (assoc o :table/synopsis-cols (vec (take synopsis-cols (:cols h)))
+                 :table/samples       (tbl/column-samples (force lake/lake) h
+                                                          synopsis-samples synopsis-cols))
         (catch Exception e
           ;; `o` unchanged on purpose: with no `:table/samples`, `texts-of`'s
           ;; `(:table :metric)` branch falls to the title, which is already how

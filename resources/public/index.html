@@ -184,6 +184,13 @@
   table.mold tbody tr:first-child td{border-top:none}
   table.mold td:first-child{font-weight:500;color:var(--ink)}
   .moldtext{white-space:pre-wrap;font-size:13px;line-height:1.5} .moldlist{margin:0;padding-left:18px}
+  /* a table whose rows the store reclaimed. --attn, like every other state the
+     page raises rather than reports: the missing-object cell and a failed flow
+     step are the two neighbours. */
+  .reclaimed{border:1px solid var(--attn);background:var(--attn-soft);border-radius:9px;padding:11px 13px}
+  .reclaimed .sec-h{color:var(--attn);margin-bottom:7px}
+  .reclaimed p{margin:0;font-size:13px;line-height:1.55;color:var(--ink-2)}
+  .reclaimed p+p{margin-top:7px}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
   .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
@@ -1310,6 +1317,11 @@ function startEdit(i,m){
 
 function renderMold(m){
   const d=m.rendered;
+  // BEFORE the switch, not a case in it: the payload's `kind` is still "table",
+  // because the object still IS a table — only its rows are gone. Both callers
+  // reach this one function, so the molder (renderDetail) and every notebook
+  // cell say it with one guard.
+  if(m.reclaimed) return reclaimedHTML(m);
   switch(m.kind){
     case 'table':  return tableHTML(d);
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
@@ -1381,6 +1393,29 @@ function renderFlow(f, fid){
   return h;
 }
 function fmtNum(n){ return (+n).toLocaleString(); }
+// A table whose rows the store reclaimed — the page saying so, instead of
+// drawing the table that is no longer there.
+//
+// Without this the payload's `kind` is "table" and its `rendered` is [], so
+// tableHTML returned the italic word `empty` — which is what a table somebody
+// emptied on purpose looks like, and mold-payload's own comment calls the worst
+// available shape for this answer. The server ships `reclaimed`, `total` and
+// `cols` for no other reason than to let this say what was there. Note the keys:
+// clojure.data.json DROPS the namespace, so :table/total and :table/cols arrive
+// as `total` and `cols`.
+//
+// The instant goes through toLocaleString like every other date the page draws
+// (see the time-mode label). The wire carries ISO-UTC because that is what an
+// agent reads; a reader gets their own clock.
+function reclaimedHTML(m){
+  const cols=m.cols||[], n=m.total, when=m.reclaimed?new Date(m.reclaimed).toLocaleString():null;
+  return '<div class="reclaimed"><div class="sec-h">rows reclaimed</div>'+
+    '<p>'+(typeof n==='number'?'The '+fmtNum(n)+' row'+(n===1?'':'s')+' of this table are':'This table’s rows are')+
+    ' no longer stored'+(when?', reclaimed '+esc(when):'')+'.</p>'+
+    (cols.length?'<p>It had '+cols.length+' column'+(cols.length===1?'':'s')+': '+
+       cols.map(c=>'<span class="chip">'+esc(c)+'</span>').join(' ')+'</p>':'')+
+    '</div>';
+}
 function renderCards(rows){
   if(!rows||!rows.length) return '<i>empty</i>';
   const cap=24, shown=rows.slice(0,cap);

@@ -142,7 +142,8 @@
     ;; where it would commit an empty derived table over the answer. An `:error`
     ;; naming the date is something the model can act on and say out loud.
     (if (:table/reclaimed o)
-      {:error (str "table " table_id " was reclaimed on " (:table/reclaimed o)
+      {:error (str "table " table_id " was reclaimed on "
+                   (tbl/reclaimed-str (:table/reclaimed o))
                    " — its rows are no longer stored")}
       (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
             rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]

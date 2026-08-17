@@ -1,5 +1,7 @@
 (ns loci.tools-test
-  (:require [clojure.edn :as edn]
+  (:require [clojure.data.json :as json]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
@@ -188,3 +190,19 @@
       (let [r (tools/dispatch st "query_table" {:table_id "tbl:gone"})]
         (is (:error r) "the model gets something it can act on")
         (is (re-find #"reclaimed" (:error r)))))))
+
+(deftest one-reclamation-is-spelled-one-way-on-the-agent-surface
+  ;; `list_tables` ships a Date, which clojure.data.json renders ISO-UTC;
+  ;; `query_table` builds a string, which used to interpolate the same Date and
+  ;; get `Date/toString`'s "Mon Aug 17 13:40:29 CEST 2026". Same instant, same
+  ;; tool loop, one message apart, and nothing tells a model they are the same
+  ;; event.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [row  (first (filter #(= "tbl:gone" (:id %)) (tools/dispatch st "list_tables" {})))
+            wire (json/read-str (json/write-str row) :key-fn keyword)
+            err  (:error (tools/dispatch st "query_table" {:table_id "tbl:gone"}))]
+        (is (re-find #"\d{4}-\d{2}-\d{2}T[\d:.]+Z" (:reclaimed wire))
+            "list_tables no longer reaches the model as ISO-UTC")
+        (is (str/includes? err (:reclaimed wire))
+            (str "two spellings of one instant: " (pr-str (:reclaimed wire)) " vs " (pr-str err)))))))

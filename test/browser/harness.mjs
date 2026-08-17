@@ -78,6 +78,41 @@ const FAMILY_FIXTURE = `
                                     (mk "space:fam-a1" "Fixture grandchild" "space:fam-a")]}))
 `;
 
+// A table whose rows have really been reclaimed — DROP TABLE plus every Parquet
+// it owned — in a notebook of its own.
+//
+// NOT in the shared SERVER_MAIN below: it adds one notebook and one object, and
+// tags.test.mjs counts the corpus. Measured with it in the shared fixture, both
+// of the assertions overview.test.mjs already names went red — a "2/14 split"
+// that read 15 and a "1 of 16" crumb that read 17. So reclaimed.test.mjs passes
+// this to `startServer({ fresh: true, extra: RECLAIMED_FIXTURE })` and pays a
+// cold JVM, exactly as overview.test.mjs does and for the same reason.
+//
+// Its own notebook rather than space:cosmos so the cell surface has somewhere to
+// be drawn without moving the outline's cell count either.
+//
+// 100 rows is load-bearing: below ~10–20 DuckLake inlines the insert into
+// catalog.duckdb, the table owns no Parquet, there is nothing to delete, and it
+// would read back perfectly — the fixture would look right and prove nothing.
+// The assert on the file list is what makes that a failure. And the list must be
+// taken BEFORE the drop: ducklake_list_files refuses a dropped table's name
+// rather than reporting no files.
+export const RECLAIMED_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      h  (tbl/put-rows! lk "tbl:reclaimed" (vec (for [n (range 100)] {:region (str "r" (mod n 5)) :amount n})))
+      fs (mapv :data_file (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '" (:table h) "')")))]
+  (assert (= 1 (count fs)) "no Parquet to delete — the reclaimed fixture would prove nothing")
+  (sub/commit! st {:op :tx :events
+                   [{:op :put :id "tbl:reclaimed"
+                     :value {:id "tbl:reclaimed" :kind :table :title "Reclaimed fixture" :value h}}
+                    {:op :put :id "space:reclaimed"
+                     :value {:id "space:reclaimed" :kind :space :title "Reclaimed fixture"
+                             :value {:intent "a table whose rows are gone" :cells [{:ref "tbl:reclaimed"}]}}}]})
+  (lake/x! lk (str "DROP TABLE " (:table h)))
+  (run! #(clojure.java.io/delete-file % true) fs))
+`;
+
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `
@@ -96,13 +131,15 @@ const TAG_FIXTURE = `
 // invocations of their own. Requiring loci.content loads the namespace and seeds the
 // store, measured at 9.9s; paying that four times per test file was the whole cost of
 // the browser suite. One JVM per file writes the same events in the same order.
-const SERVER_MAIN = `
+const serverMain = extra => `
 (require '[loci.server :as srv] '[loci.content :as c] '[loci.substrate :as sub]
-         '[loci.notebook :as nb] 'org.httpkit.server)
+         '[loci.notebook :as nb] '[loci.lake :as lake] '[loci.tablestore :as tbl]
+         'clojure.java.io 'org.httpkit.server)
 ${FLOW_FIXTURE}
 ${SOURCES_FIXTURE}
 ${FAMILY_FIXTURE}
 ${TAG_FIXTURE}
+${extra}
 (let [s (org.httpkit.server/run-server (var loci.server/handler)
           {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
   (println "LOCI-READY" (org.httpkit.server/server-port s))
@@ -137,7 +174,7 @@ function installCleanup() {
   process.on('SIGHUP', () => { reap(); process.exit(129); });
 }
 
-async function bootServer() {
+async function bootServer(extra = '') {
   installCleanup();
   const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
   const rec = { pid: null, dir };
@@ -145,7 +182,7 @@ async function bootServer() {
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
-  const proc = spawn('clojure', ['-M', '-e', SERVER_MAIN],
+  const proc = spawn('clojure', ['-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
 
@@ -194,8 +231,14 @@ async function bootServer() {
 //
 // `{ fresh: true }` opts out into a private server and a private substrate.
 let sharedServer = null, serverUsers = 0;
-export async function startServer({ fresh = false } = {}) {
-  if (fresh) return bootServer();
+export async function startServer({ fresh = false, extra = '' } = {}) {
+  // `extra` seeds fixtures this file needs and no other file should see. It is
+  // only meaningful on a private server: the shared one is memoized, so the
+  // first caller's `extra` would silently become everyone's — or, worse,
+  // silently not apply because someone else booted it first. Refuse rather than
+  // pick one of those.
+  if (extra && !fresh) throw new Error('startServer: `extra` requires `fresh: true`');
+  if (fresh) return bootServer(extra);
   serverUsers++;
   sharedServer ??= bootServer().then(s => ({
     url: s.url,

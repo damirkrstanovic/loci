@@ -306,6 +306,29 @@
       {:cols (vec (keys (first v))) :rows (count v)}
       :else nil)))
 
+(defn reclaimed-str
+  "A reclamation instant as text, in the ONE spelling everything downstream
+   uses: ISO-8601 in UTC, `2026-08-17T11:40:29.190Z`.
+
+   Exists because two readers on the SAME agent surface were spelling one
+   instant two ways — `list_tables` shipped `\"2026-08-17T11:40:29.190Z\"`
+   (`clojure.data.json` renders a `Date` as ISO-UTC) while `query_table`'s error
+   string interpolated it and got `Date/toString`'s
+   `\"Mon Aug 17 13:40:29 CEST 2026\"`. Same instant, same tool loop, one message
+   apart, and nothing tells a model they are the same event. `recompute`'s
+   `:why` had the local form too.
+
+   ISO-UTC rather than the local form because it is the one the JSON boundary
+   already produces and cannot be talked out of: choosing the other spelling
+   would mean overriding `data.json` at every writer instead of formatting at
+   the three that build strings.
+
+   `(str (.toInstant d))` and not a `SimpleDateFormat`, because that is exactly
+   what `data.json` emits — verified byte for byte, 2026-08-17 — so the two
+   paths cannot drift."
+  [^java.util.Date d]
+  (when d (str (.toInstant d))))
+
 (defn hydrate
   "An object whose `:value` is a table handle → the same object with rows in
    its place, capped, plus `:table/total`.
