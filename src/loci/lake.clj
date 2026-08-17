@@ -578,10 +578,23 @@
     (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
 
 (defn sweep!
-  "Table GC. Disabled, deliberately, and it reports that rather than returning
-   a zero that reads like a completed sweep.
+  "Automatic table GC. Disabled, deliberately, and it reports that rather than
+   returning a zero that reads like a completed sweep.
 
-   Two reasons, and the second is the load-bearing one.
+   **It is snapshot expiry that is off, not reclamation.**
+   `loci.lakegc/report` and `loci.lakegc/reclaim!` are the manual per-table path
+   and they work — read the first for what every object's versions cost, call
+   the second to free one object's out-of-window ones. They work *precisely
+   because they never expire a snapshot*: `reclaim!` issues `DROP TABLE` and
+   deletes that table's own Parquet, and a drop MINTS a snapshot rather than
+   removing one, so every other handle in the log goes on reading. Everything
+   below is why the automatic path cannot borrow that safety — a caller who
+   reads only this function's `:why` and stops must not conclude that nothing in
+   loci can reclaim table space, because that has not been true since
+   `loci.lakegc` shipped.
+
+   Two reasons the automatic path stays off, and the second is the load-bearing
+   one.
 
    **Today: DuckLake's expiry is not safe to run.** It cannot expire the latest
    snapshot (duckdb/ducklake#261) — which is exactly the state an undo leaves —
@@ -603,16 +616,26 @@
    collect every `{:store :lake}` value, keep those versions — and that
    machinery does not exist. `live` is the argument it would take.
 
-   Blob GC has no such dependency and ships in its own plan, which means loci
-   will for a while reclaim blob space and not table space. Retention here is:
-   keep everything. Saying so is the whole point of this function existing
-   before it works — the same job `embedding-configured?` does for semantic
-   recall, and the failure it avoids is a sweep that *implies* it was complete."
+   Blob GC has no such dependency and ships in its own plan. Automatic
+   retention here is: keep everything. Saying so is the whole point of this
+   function existing before it works — the same job `embedding-configured?`
+   does for semantic recall, and the failure it avoids is a sweep that
+   *implies* it was complete.
+
+   `live` is the argument the automatic path would take, and it is exactly the
+   question `loci.lakegc/classify` already answers per table. The gap is not
+   knowledge; it is that expiry is catalog-wide and reclamation has to be
+   per-table."
   [_lk _live]
   {:mode :disabled
    :freed 0
-   :why (str "table GC is off: DuckLake cannot expire the latest snapshot "
-             "(duckdb/ducklake#261) and snapshot expiry has open data-loss bugs "
-             "(#527, #529) — and even fixed, expiring a snapshot invalidates "
-             "every handle that reads AT (VERSION => it), which loci does not "
-             "yet track. Retention is: keep everything.")})
+   :why (str "automatic table GC is off: DuckLake cannot expire the latest "
+             "snapshot (duckdb/ducklake#261) and snapshot expiry has open "
+             "data-loss bugs (#527, #529) — and even fixed, expiring a snapshot "
+             "invalidates every handle that reads AT (VERSION => it), which "
+             "loci does not yet track. Reclaiming table space is done by hand "
+             "instead: loci.lakegc/report says what each object's versions "
+             "cost and loci.lakegc/reclaim! frees one object's out-of-window "
+             "ones, by dropping those tables and deleting their Parquet — "
+             "never by expiring a snapshot, which is why it is safe. Automatic "
+             "retention is: keep everything.")})

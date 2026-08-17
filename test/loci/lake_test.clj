@@ -423,6 +423,14 @@
       (is (string? (:why r)))
       (is (re-find #"261|527|529" (:why r)) "the reason names the upstream issues"))))
 
+(deftest sweep-points-at-the-thing-that-does-work
+  (with-lake [lk]
+    (let [r (lake/sweep! lk #{})]
+      (is (= :disabled (:mode r)))
+      (is (re-find #"261|527|529" (:why r)) "the upstream issues are still named")
+      (is (re-find #"lakegc" (:why r))
+          "and so is the manual path, or a reader concludes nothing can reclaim anything"))))
+
 ;; ---------------------------------------------------------------------------
 ;; a reclaimed table, and what still reads
 ;; ---------------------------------------------------------------------------
