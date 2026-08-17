@@ -201,6 +201,48 @@
                    (lake/x! lk (str "CREATE TABLE " (:table (hs 0))
                                     " AS SELECT * FROM " (:table (hs 0)) " AT (VERSION => 1)")))))))
 
+(deftest reclaim-takes-the-parquet-a-restore-left-behind
+  ;; The test the directory sabotage could not be. `restore-to!` is a CREATE OR
+  ;; REPLACE: it mints a new `table_id` under the same name and leaves the old
+  ;; one's Parquet in the same directory. `ducklake_list_files` names only the
+  ;; live one, so reclaiming through it dropped the table, freed half the bytes,
+  ;; and left the table recreatable from its pre-restore version — measured
+  ;; 2026-08-17, `CREATE TABLE t AS SELECT * FROM t AT (VERSION => 1)` returned
+  ;; all 100 rows against a table that had just been reclaimed.
+  ;;
+  ;; Removing the directory would also have passed this and is still wrong: it
+  ;; is safe only because the whole name is doomed here.
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)
+          h1 (tbl/put-rows! lk "tbl:x" (vec (for [n (range 100)] {:a n})))]
+      (sub/commit! st {:op :put :id "tbl:x"
+                       :value {:id "tbl:x" :kind :table :title "X" :value h1}})
+      ;; the undo path: move the write head back, re-point the handle
+      (lake/restore-to! lk (:table h1) (:snapshot h1))
+      (sub/commit! st {:op :assoc :id "tbl:x" :path [:value]
+                       :value (assoc h1 :snapshot (:snapshot_id (first (lake/q lk "SELECT max(snapshot_id) AS snapshot_id FROM ducklake_snapshots('lake')"))))})
+      ;; and push it out of the window
+      (dotimes [i 4]
+        (let [h (tbl/put-rows! lk "tbl:x" (vec (for [n (range 100)] {:a n :i i})))]
+          (sub/commit! st {:op :put :id "tbl:x"
+                           :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+      (let [w   {:versions 3 :days 0}
+            dir (str (:dir lk) "/files/main/" (:table h1))
+            b0  (dir-bytes dir)
+            pre (:reclaimable (first (:tables (gc/report st lk w))))
+            r   (gc/reclaim! st lk "tbl:x" w)]
+        (is (= 2 (count (lake/table-files lk (:table h1))))
+            "two table_ids bore this name, so there are two Parquets to take")
+        (is (= 0 (dir-bytes dir))
+            "the restored table's directory lost every byte, not just the live half")
+        (is (= pre (:freed r))
+            "and report predicted the whole of it — the two must not drift apart")
+        (is (thrown? Exception
+                     (lake/x! lk (str "CREATE TABLE " (:table h1)
+                                      " AS SELECT * FROM " (:table h1) " AT (VERSION => 1)")))
+            "the pre-restore version cannot be recreated either")
+        (is (pos? b0))))))
+
 (deftest reclaim-refuses-an-unknown-object
   (lf/with-lake [lk]
     (is (:error (gc/reclaim! (sub/fresh-store) lk "tbl:nope" gc/default-window)))))

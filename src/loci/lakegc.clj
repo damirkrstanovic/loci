@@ -108,8 +108,15 @@
         objs  (sub/objects st)
         rows  (for [[object ts] (group-by :object (map #(assoc (val %) :table (key %)) cls))
                     :when object
+                    ;; No `:orphaned` here, and no per-row orphan column: an
+                    ;; orphan is a table no handle names, so `classify` gives it
+                    ;; `:object nil` and it can never land in an object's group
+                    ;; at all. The `:orphaned` key this row used to carry was 0
+                    ;; in every row it was ever computed for. Orphans are
+                    ;; reported once, at the top level, which is the only place
+                    ;; that can be true.
                     :let [by-class (group-by :class ts)
-                          recl (concat (:reclaimable by-class) (:orphaned by-class))]]
+                          recl (:reclaimable by-class)]]
                 {:id      object
                  :title   (:title (get objs object))
                  :versions (count ts)
@@ -126,7 +133,6 @@
                                (count (:in-window by-class)))
                  :reclaimable (reduce + 0 (map #(bytes (:table %)) recl))
                  :reclaimable-versions (count recl)
-                 :orphaned (reduce + 0 (map #(bytes (:table %)) (:orphaned by-class)))
                  :inlined? (every? #(zero? (or (:file_count (sizes (:table %))) 0))
                                    (:current by-class))})
         orph  (filter #(nil? (:object (val %))) cls)]
@@ -164,11 +170,10 @@
    bytes and leave the gap unlooked-at; the only useful outcome of the
    classifier and the live set disagreeing is that someone reads this.
 
-   **Incomplete for a table that was `restore-to!`d** — see `lake/table-files`,
-   which names the live `table_id`'s Parquet and not the tombstoned sibling's,
-   so such a table stays readable at its pre-restore version after this claims
-   to have reclaimed it. Latent: nothing outside `loci.lake-test` calls
-   `restore-to!` yet."
+   **A restored table is reclaimed whole.** `lake/table-files` finds every
+   `table_id` that ever bore the name, so the Parquet a `restore-to!` left
+   tombstoned in the same directory goes too — without that, the table stayed
+   readable at its pre-restore version after this claimed to have reclaimed it."
   [st lk object window]
   (let [cls    (classify st lk window)
         mine   (into {} (filter #(= object (:object (val %)))) cls)
@@ -193,10 +198,12 @@
                  "the other versions would hide it.")}
 
       :else
-      ;; List every file BEFORE any drop. `ducklake_list_files` resolves through
-      ;; the live catalog and THROWS for a dropped table rather than reporting
-      ;; no files — measured 2026-08-17 — so a listing interleaved with the
-      ;; drops would leave Parquet behind for every table after the first.
+      ;; List every file BEFORE any drop, and hold the paths across both loops.
+      ;; `table-files` reads the metadata rows, which survive a tombstone, so
+      ;; this order is no longer load-bearing the way it was against
+      ;; `ducklake_list_files` — that one THROWS for a dropped table. Keep it
+      ;; anyway: nothing is gained by asking the catalog a question after
+      ;; mutating it.
       (let [files (into [] (mapcat #(lake/table-files lk %)) doomed)]
         (run! #(lake/drop-table! lk %) doomed)
         (run! #(io/delete-file (:data_file %) true) files)

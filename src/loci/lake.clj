@@ -312,10 +312,35 @@
    round trips. A **dropped** table is absent from this, which is what makes
    `dropped-at` a question worth asking separately. An **inlined** table has
    `file_count` 0: DuckLake keeps small tables inside `catalog.duckdb` rather
-   than as Parquet, so there is no file to delete and nothing to reclaim."
+   than as Parquet, so there is no file to delete and nothing to reclaim.
+
+   **The bytes are every `table_id` that ever bore the name, not just the live
+   one** — which is why this counts `ducklake_data_file` itself instead of
+   asking `ducklake_table_info('lake')`. That function reports the live
+   `table_id` only, and `restore-to!` is a `CREATE OR REPLACE` that leaves a
+   tombstoned sibling's Parquet in the same directory. Measured 2026-08-17 on a
+   restored 100-row table: `ducklake_table_info` said `file_count` 1 and 906
+   bytes with **1812** bytes on disk.
+
+   The half of that which matters is that `loci.lakegc/reclaim!` deletes what
+   `table-files` finds, and `report` has to predict the same number, so both
+   have to be counting the same files. `table_id` stays in the shape and is the
+   live one; the whole point is that it is no longer the only one.
+
+   Restricted to names with a live catalog row, so a reclaimed table stays
+   absent even though its metadata rows survive the drop."
   [lk]
-  (q lk (str "SELECT table_name, table_id, file_count, file_size_bytes "
-             "FROM ducklake_table_info('lake')")))
+  (q lk (str "SELECT t.table_name AS table_name,"
+             "       max(t.table_id) AS table_id,"
+             "       count(df.data_file_id) AS file_count,"
+             "       coalesce(sum(df.file_size_bytes), 0) AS file_size_bytes"
+             "  FROM __ducklake_metadata_lake.main.ducklake_table t"
+             "  LEFT JOIN __ducklake_metadata_lake.main.ducklake_data_file df"
+             "    ON df.table_id = t.table_id"
+             " WHERE EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
+             "                WHERE live.table_name = t.table_name"
+             "                  AND live.end_snapshot IS NULL)"
+             " GROUP BY t.table_name")))
 
 (defn dropped-tables
   "`{table-name when}` for every table this lake has dropped — `dropped-at`'s
@@ -400,7 +425,7 @@
   (get (dropped-tables lk) table))
 
 (defn table-files
-  "The absolute paths of one table's Parquet files, with their sizes.
+  "The absolute paths of every Parquet file `table` owns, with their sizes.
 
    Files, not the directory. `restore-to!` is a `CREATE OR REPLACE`, which mints
    a new `table_id` under the **same** table name and directory — measured
@@ -408,29 +433,52 @@
    removing a directory can destroy live data. The individual path is the only
    safe unit.
 
-   Must be called BEFORE the table is dropped: this resolves its argument
-   through the live catalog and throws `Catalog Error: Table with name … does
-   not exist!` for a dropped one.
+   **Every `table_id` that ever bore the name, which is why this reads
+   `ducklake_data_file` rather than `ducklake_list_files`.** That function
+   resolves through the live catalog and names the live `table_id`'s files only.
+   Measured 2026-08-17: reclaiming a restored table through it left the
+   pre-restore Parquet on disk, and `CREATE TABLE t AS SELECT * FROM t AT
+   (VERSION => 1)` then returned all 100 rows against a table that had just been
+   reclaimed — so the reclamation was not real, and a later undo would appear to
+   restore rows that are gone. The bytes were also uncollectable afterwards: the
+   name leaves `live-tables` on the drop, so nothing would ever offer them
+   again.
 
-   **It reports the LIVE `table_id`'s files only, so for a restored table it is
-   incomplete.** Measured 2026-08-17 on the same directory: after a
-   `restore-to!`, `ducklake_data_file` holds two rows — `table_id` 1's Parquet
-   (tombstoned) and `table_id` 2's (live) — and this names only the second.
-   `loci.lakegc/reclaim!` therefore leaves the pre-restore Parquet on disk, and
-   `CREATE TABLE t AS SELECT * FROM t AT (VERSION => 1)` still returned all 100
-   rows against a table that had just been reclaimed. The bytes also go
-   uncollectable: the name leaves `live-tables` on the drop, so `classify` never
-   sees it again.
+   **The path is composed, not read.** DuckLake stores all three levels
+   relative — `ducklake_schema.path` is `main/`, `ducklake_table.path` is
+   `t_tbl_x_…/`, and `ducklake_data_file.path` is the bare
+   `ducklake-….parquet` — so this joins the two parents and prefixes the lake's
+   own root. Each level carries `path_is_relative`, and a level that says false
+   is already absolute and stops the composition there.
 
-   Latent as of 2026-08-17 — nothing outside `loci.lake-test` calls
-   `restore-to!` — and deliberately not repaired here, because the honest fix is
-   to select from `ducklake_data_file` across every `table_id` that ever bore
-   the name, which changes what `loci.lakegc/report` must predict too. Removing
-   the *directory* is not the fix: it happens to be safe only when the whole
-   name is doomed, and `restore-to!` is exactly the operation that puts a live
-   file in a directory a stale path could name."
+   The root is `(:dir lk)`, never `ducklake_options`. That is the same authority
+   `open-lake!`'s `OVERRIDE_DATA_PATH` establishes: the catalog still reports
+   the path the lake was *created* at, which is the wrong answer for a lake that
+   has been moved, copied or mounted.
+
+   Unlike `ducklake_list_files`, this does not throw for a dropped table — the
+   metadata rows survive the tombstone (measured: still two rows after the
+   `DROP`). `loci.lakegc/reclaim!` still lists before it drops, because the
+   paths are what it is about to delete and there is no reason to hold them
+   across a mutation."
   [lk table]
-  (q lk (str "SELECT data_file, data_file_size_bytes FROM ducklake_list_files('lake', '" table "')")))
+  (let [under (fn [parent rel? p] (if rel? (str parent p) p))]
+    (mapv (fn [r]
+            {:data_file (-> (str (:dir lk) "/files/")
+                            (under (:s_rel r) (:s_path r))
+                            (under (:t_rel r) (:t_path r))
+                            (under (:f_rel r) (:f_path r)))
+             :data_file_size_bytes (:file_size_bytes r)})
+          (q lk (str "SELECT df.path AS f_path, df.path_is_relative AS f_rel,"
+                     "       df.file_size_bytes AS file_size_bytes,"
+                     "       t.path AS t_path, t.path_is_relative AS t_rel,"
+                     "       s.path AS s_path, s.path_is_relative AS s_rel"
+                     "  FROM __ducklake_metadata_lake.main.ducklake_data_file df"
+                     "  JOIN __ducklake_metadata_lake.main.ducklake_table t"
+                     "    ON t.table_id = df.table_id"
+                     "  JOIN __ducklake_metadata_lake.main.ducklake_schema s"
+                     "    ON s.schema_id = t.schema_id"
+                     " WHERE t.table_name = '" table "'")))))
 
 (defn drop-table!
   "Drop `table` from the catalog. Frees no bytes on its own — a DuckLake drop is
