@@ -4436,3 +4436,20 @@
         (is (re-find #"tbl:good" c) "the healthy table is still catalogued")
         (is (not (re-find #"tbl:gone" c))
             "and the reclaimed one is omitted rather than advertised with rows it cannot serve")))))
+
+(deftest as-of-answers-for-every-object-when-one-was-reclaimed
+  ;; Phase 1's governing requirement, and the only test that states it whole:
+  ;; failure is per object, never per operation. Each of the seven reader sites
+  ;; has its own test; this one is the claim they were all changed to support —
+  ;; that landing on a state containing one reclaimed table still lets every
+  ;; other object answer normally.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (sub/commit! st {:op :put :id "doc:d"
+                       :value {:id "doc:d" :kind :doc :title "D" :value "prose"}})
+      (let [frozen (sub/frozen-at st (count (sub/history st)))]
+        (is (= "prose" (:value (sub/object frozen "doc:d"))) "the doc answers")
+        (is (= [{:b 1}] (:value (tbl/hydrate lake/lake (sub/object frozen "tbl:good"))))
+            "the healthy table answers")
+        (is (:table/reclaimed (tbl/hydrate lake/lake (sub/object frozen "tbl:gone")))
+            "and the reclaimed one says so, without stopping the other two")))))
