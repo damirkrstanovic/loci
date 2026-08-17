@@ -113,6 +113,54 @@ export const RECLAIMED_FIXTURE = `
   (run! #(clojure.java.io/delete-file % true) fs))
 `;
 
+// The three storage shapes the panel has to draw, in one lake: a table with
+// versions old enough to reclaim, a table DuckLake inlined into catalog.duckdb,
+// and an orphan.
+//
+// Its own server for RECLAIMED_FIXTURE's reason — it adds objects, and
+// tags.test.mjs counts the corpus — and additionally because `/api/storage`
+// reports what the WHOLE lake costs. Sharing a lake directory with another
+// file's tables makes every figure in this panel somebody else's arithmetic.
+//
+// 300 rows per version, above the ~10–20 at which DuckLake inlines: an inlined
+// version owns no Parquet, so a reclaim would free 0 bytes and the panel's
+// reclaimable figure would be 0 however right or wrong it was. `tbl:inline` is
+// the deliberate other half of that, at 5 rows, and both asserts below fail
+// loudly if DuckLake ever moves the threshold under us.
+//
+// The backdating is the load-bearing part. `sub/commit!` stamps `:ts` with
+// `(System/currentTimeMillis)` and takes no argument for it, and the HTTP route
+// reclaims against `gc/default-window` — `{:versions 3 :days 30}`, kept if
+// EITHER holds. So five versions written in one second are five versions inside
+// the window, `:reclaimable` is 0, the reclaim control is disabled, and the test
+// that matters most here — one click deletes files forever — has nothing to
+// click. Ageing the log in place is the only way to reach that state through the
+// real route: the file on disk is left as it was, which costs nothing because
+// this store is a throwaway LOCI_DATA and the server is already running off
+// this atom rather than off a replay. (`:!db` is DatalevinStore's one published
+// value, `{:log … :state …}`; only the log carries `:ts`, and only the log is
+// what `lakegc/classify` reads.)
+export const STORAGE_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      aged (vec (for [n (range 300)] {:region (str "r" (mod n 5)) :amount n}))]
+  (dotimes [_ 5]
+    (let [h (tbl/put-rows! lk "tbl:aged" aged)]
+      (sub/commit! st {:op :put :id "tbl:aged"
+                       :value {:id "tbl:aged" :kind :table :title "Aged fixture" :value h}})))
+  (let [h  (tbl/put-rows! lk "tbl:inline" (vec (for [n (range 5)] {:k n :v (* n n)})))
+        fc (:file_count (first (filter #(= (:table h) (:table_name %)) (lake/live-tables lk))))]
+    (assert (= 0 fc) "DuckLake stopped inlining a 5-row table — the inlined row would prove nothing")
+    (sub/commit! st {:op :put :id "tbl:inline"
+                     :value {:id "tbl:inline" :kind :table :title "Inline fixture" :value h}}))
+  ;; rows in the lake that no handle in the log ever names — which is what undo!
+  ;; leaves behind, and what the panel's orphan line is about. Never committed.
+  (tbl/put-rows! lk "tbl:orphan" aged)
+  (let [old (- (System/currentTimeMillis) (* 400 24 60 60 1000))]
+    (swap! (:!db st) update :log
+           (fn [l] (mapv #(cond-> % (= "tbl:aged" (:id %)) (assoc :ts old)) l)))))
+`;
+
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `

@@ -448,6 +448,39 @@
   .entmeta{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin:3px 0 12px}
   .entmeta.warn{color:var(--attn)}
   .entsrc{font-size:11.5px;color:var(--muted);margin-top:10px}
+
+  /* what the lake costs. THREE figures side by side and never one, because the
+     one a reader reaches for — "how much would this free" — answers almost
+     nothing on its own: measured on the real store, reclaiming every object's
+     history moves the directory by 1.8%, since catalog.duckdb is 98% of it and
+     never shrinks. Equal columns so no figure reads as the headline. */
+  .stfigs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:2px 0 12px}
+  .stfig{border:1px solid var(--line);border-radius:9px;padding:9px 11px;background:var(--panel)}
+  .stfig .stnum{display:block;font-family:var(--mono);font-size:17px;color:var(--ink);font-weight:500}
+  .stfig .stlab{display:block;font-size:11px;line-height:1.35;color:var(--muted);margin-top:2px}
+  /* --attn, not red: the catalog is not a fault, it is the part of the answer
+     that does not move. The reader has to see it to read the other two. */
+  .stfig.storage-catalog{border-color:var(--attn);background:var(--attn-soft)}
+  .stfig.storage-catalog .stlab{color:var(--attn)}
+  .stnote{font-size:11.5px;line-height:1.5;color:var(--muted);margin:0 0 12px}
+  .storphan{border:1px solid var(--line);border-left:3px solid var(--attn);border-radius:7px;
+            padding:8px 10px;margin:0 0 12px;font-size:11.5px;line-height:1.5;color:var(--ink-2)}
+  .storphan code{font-family:var(--mono);font-size:10.5px;color:var(--ink)}
+  .strow{border-top:1px solid var(--line-2);padding:9px 0;display:flex;align-items:baseline;gap:10px}
+  .strow:first-of-type{border-top:0}
+  .strow .stmain{flex:1;min-width:0}
+  .strow .stid{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .strow .sttitle{font-size:12px;color:var(--muted);margin-left:7px}
+  .strow .stmeta{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:2px}
+  /* an inlined table costs nothing in Parquet because DuckLake keeps it inside
+     catalog.duckdb. "0 B" is true and unreadable — it looks like a table that
+     failed to write. The phrase points at the figure above that DOES hold it. */
+  .strow .stinlined{color:var(--attn)}
+  .strow .stnone{font-family:var(--mono);font-size:10.5px;color:var(--faint);white-space:nowrap}
+  .strow .st-reclaim{font:inherit;font-family:var(--mono);font-size:10.5px;color:var(--muted);
+    background:none;border:1px solid var(--line);border-radius:6px;padding:1px 7px;cursor:pointer;white-space:nowrap}
+  .strow .st-reclaim:hover{color:var(--attn);border-color:var(--attn)}
+  .strow .st-reclaim[disabled]{opacity:.5;cursor:default}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -459,6 +492,7 @@
   <button class="undoBtn" id="memBtn" title="what the agent remembers — distilled facts with provenance">⌾ memory</button>
   <button class="undoBtn" id="fnBtn" title="peek at the functions in this substrate (for the curious — not the everyday flow)">ƒ functions</button>
   <button class="undoBtn" id="flowBtn" title="every flow in the substrate — what ran, what is running, what is waiting on you">⑂ flows<span class="fbadge" id="flowBadge" hidden></span></button>
+  <button class="undoBtn" id="storageBtn" data-open-storage title="what the table rows cost on disk, and which old versions can be reclaimed">▤ storage</button>
   <button class="undoBtn" id="timeBtn" title="scrub the substrate's history — view any past moment, read-only">⏱ time</button>
   <button class="undoBtn" id="undoBtn" title="revert the last substrate event">↺ undo</button>
 </div>
@@ -544,6 +578,15 @@ const API = {
   // one reversible commit — the :entity object AND the notebook about it. Answers
   // {state, entity, spaceId}; `spaceId` is always a key and null is a real answer.
   entityNotebook: name => POST('/api/entity-notebook',{name}),
+  // What the lake costs. THIS IS THE DRY RUN — there is no preview endpoint,
+  // because the report names exactly the versions a reclaim will delete and the
+  // bytes it will free, and `reclaim!` asserts the same numbers back.
+  storage: () => fetch('/api/storage').then(r=>r.json()),
+  // …and the irreversible half. POST, never GET: a bodyless GET carries no
+  // `:id`, and `nil` means THE ORPHANS to lakegc/reclaim! — the server guards
+  // that twice (method, then a missing id) and this spelling is the third.
+  // Answers {object, tables, versions, files, freed} or a 200 with {error}.
+  storageReclaim: id => POST('/api/storage/reclaim',{id}),
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -2582,8 +2625,123 @@ function renderFlowBadge(){
   b.hidden=!n; b.textContent=n;
   document.getElementById('flowBtn').classList.toggle('needs', !!n);
 }
+// ---------------- storage: what the lake costs, and what it will go on costing ----------------
+//
+// Table rows do not live in the substrate log — the log holds a HANDLE, and the
+// rows live in a DuckLake catalog. Writes never overwrite: every save mints a
+// new lake table, so a table refreshed ten times leaves ten behind. This is
+// where you see that and act on it.
+//
+// THREE figures and never one. The number a reader reaches for is "how much
+// would this free", and on its own it is close to meaningless: measured on the
+// real store, reclaiming EVERY object's history moves the lake directory by
+// 1.8%, because `catalog.duckdb` is 98% of it and never shrinks. A panel showing
+// only the reclaimable bytes would make a correct reclaim look like it did
+// nothing, and the reader would go looking for a bug that is not there.
+//
+// `/api/storage` IS the dry run. There is no preview endpoint because the report
+// names exactly the versions a reclaim will delete and the bytes it will free,
+// and `lakegc/reclaim!` asserts the same numbers back.
+function fmtBytes(n){
+  n=+n||0;
+  if(n<1024) return n+' B';
+  const u=['KB','MB','GB','TB']; let v=n/1024, i=0;
+  while(v>=1024&&i<u.length-1){ v/=1024; i++; }
+  return (v<10?v.toFixed(1):Math.round(v))+' '+u[i];
+}
+async function openStorage(){
+  const p=await API.storage();
+  const tables=p.tables||[], lake=p.lake||{}, win=p.window||{};
+  const files=+lake.files||0, catalog=+lake.catalog||0;
+  const recl=tables.reduce((a,t)=>a+(+t.reclaimable||0),0);
+  const orph=p.orphaned||{};
+  let h='<div class="modalcard storage-panel" style="max-width:720px"><div class="modal-h">'+
+    '<span class="modalbadge">STORAGE</span>'+
+    '<span class="q">'+tables.length+' object'+(tables.length===1?'':'s')+' with rows in the lake</span>'+
+    '</div><div class="modal-b">'+
+    '<div class="stfigs">'+
+      '<div class="stfig storage-total"><b class="stnum">'+fmtBytes(files+catalog)+'</b>'+
+        '<span class="stlab">the lake on disk — Parquet and catalog together</span></div>'+
+      '<div class="stfig storage-reclaimable"><b class="stnum">'+fmtBytes(recl)+'</b>'+
+        '<span class="stlab">older versions, reclaimable below</span></div>'+
+      // the point of this panel. It is the bulk of the total, and it is the part
+      // that does not move — say so here, not in a footnote nobody reads.
+      '<div class="stfig storage-catalog"><b class="stnum">'+fmtBytes(catalog)+'</b>'+
+        '<span class="stlab">catalog — never reclaimed, and it never shrinks</span></div>'+
+    '</div>'+
+    '<div class="stnote">catalog.duckdb holds every table’s metadata, and DuckLake keeps small '+
+      'tables inside it rather than as Parquet. Nothing here shrinks it — a reclaim can only '+
+      'ever move the middle figure.</div>';
+  // Shown only when there are any: a line reading "0 orphaned tables" every day
+  // is noise, and on the real store that is what it would read. Named rather
+  // than actionable — `POST /api/storage/reclaim` refuses a request with no
+  // `:id` on purpose, because a bodyless POST is also how you would sweep every
+  // orphan by accident. Without this line the bytes are simply missing from the
+  // reader's arithmetic: they are inside the total, in no row, and unexplained.
+  if(+orph.tables>0)
+    h+='<div class="storphan"><b>'+orph.tables+' orphaned table'+(+orph.tables===1?'':'s')+
+       ' · '+fmtBytes(orph.bytes)+'</b> — lake rows no handle in the log names any more, which is '+
+       'what undoing a table write leaves behind. Not reclaimable from this panel: they belong to '+
+       'no object, so there is nothing here to name. From a REPL attached to this server, '+
+       '<code>(loci.lakegc/reclaim! store lake nil window)</code>.</div>';
+  if(!tables.length) h+='<div style="color:var(--muted);font-size:13px">No object stores rows in the lake yet.</div>';
+  tables.forEach(t=>{
+    const vs=+t.versions||0, kept=+t['in-window']||0, rv=+t['reclaimable-versions']||0, rb=+t.reclaimable||0;
+    // `inlined?` keeps its question mark over the wire — clojure.data.json drops
+    // key NAMESPACES, not punctuation — so it is read with a bracket, like
+    // `merged-from` and `durable?` in the memory pane.
+    //
+    // An inlined table's rows are not missing and its size is not zero: DuckLake
+    // keeps a table under ~10–20 rows inside catalog.duckdb, so it owns no
+    // Parquet. Drawing that as "0 B" is true and reads as a table that failed to
+    // write. The phrase points at the figure above that does hold it.
+    const cur=t['inlined?']
+      ? '<span class="stinlined" title="DuckLake keeps a table this small inside catalog.duckdb rather than as Parquet — its bytes are in the catalog figure above, and dropping it would free none of them">in the catalog</span>'
+      : fmtBytes(t.current);
+    h+='<div class="strow"><div class="stmain">'+
+      '<span class="stid">'+esc(t.id)+'</span>'+(t.title?'<span class="sttitle">'+esc(t.title)+'</span>':'')+
+      '<div class="stmeta">'+cur+' · '+vs+' version'+(vs===1?'':'s')+
+        (rv?', '+kept+' kept · '+rv+' older, '+fmtBytes(rb):'')+'</div></div>'+
+      // The control exists only where there is something for it to do. A live
+      // button on a row with nothing older would fire an irreversible-sounding
+      // confirm for a no-op, which is exactly how a reader learns to click
+      // through the dialog that matters.
+      (rv?'<button type="button" class="st-reclaim" data-reclaim="'+esc(t.id)+
+          '" data-versions="'+rv+'" data-bytes="'+rb+'">reclaim '+rv+' older</button>'
+         :'<span class="stnone">nothing older</span>')+
+      '</div>';
+  });
+  h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
+    '<span style="font-size:11.5px;color:var(--muted)">keeps the last '+(win.versions||0)+
+    ' versions or '+(win.days||0)+' days, whichever keeps more — reclaiming is permanent</span></div></div>';
+  modal.innerHTML=h; modal.classList.add('on');
+  modal.querySelector('#closeModal').addEventListener('click',closeModal);
+  modal.querySelectorAll('.st-reclaim').forEach(el=>el.addEventListener('click',async ()=>{
+    const id=el.dataset.reclaim, n=+el.dataset.versions, b=+el.dataset.bytes;
+    // The sentence before the act, and the only one there is. The memory pane's
+    // `forget` deliberately has no dialog, because its toast carries the text
+    // back and typing it in again IS the recovery. Nothing carries a deleted
+    // Parquet file back — undo reverts an event, not a file — so this one asks.
+    if(!confirm('Reclaim '+n+' older version'+(n===1?'':'s')+' of '+id+'?\n\n'+
+                'This deletes '+fmtBytes(b)+' of Parquet from the lake, permanently. '+
+                'It cannot be undone: undo reverts an event, not a file, and reading this '+
+                'table at a moment before the kept window will stop working.\n\n'+
+                'The current rows are not touched.')) return;
+    el.disabled=true;                        // one reclaim, not a double-click's two
+    let res;
+    try{ res=await API.storageReclaim(id); }
+    catch(e){ el.disabled=false; showToast('could not reach the server — nothing was reclaimed'); return; }
+    // a refusal is a 200 with {error, why} — the server's own sentence, and the
+    // panel keeps what it is showing rather than re-rendering as if it worked
+    if(res.error){ el.disabled=false; showToast(res.why||('reclaim: '+res.error)); return; }
+    await openStorage();
+    showToast('reclaimed '+res.versions+' version'+(res.versions===1?'':'s')+' of '+id+
+              ' — '+fmtBytes(res.freed)+' freed, '+res.files+' file'+(res.files===1?'':'s')+' deleted');
+  }));
+}
 document.getElementById('flowBtn').addEventListener('click',openFlows);
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));
+document.getElementById('storageBtn').addEventListener('click',openStorage);
 modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
 
 // ---------------- a subject, and the place it has ----------------
