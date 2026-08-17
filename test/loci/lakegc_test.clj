@@ -82,3 +82,41 @@
       (sub/undo! st)
       (is (= :orphaned (get-in (gc/classify st lk {:versions 3 :days 30}) [(:table h1) :class]))
           "undo! deletes the event, so nothing can ever name this table again"))))
+
+(deftest report-adds-up-per-object
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)]
+      (dotimes [i 5]
+        (let [h (tbl/put-rows! lk "tbl:x" (vec (for [n (range 200)] {:a n :b (str "r" n)})))]
+          (sub/commit! st {:op :put :id "tbl:x"
+                           :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+      (let [r (gc/report st lk {:versions 3 :days 0})
+            t (first (:tables r))]
+        (is (= "tbl:x" (:id t)))
+        (is (= 5 (:versions t)))
+        (is (= 3 (:in-window t)))
+        (is (= 2 (:reclaimable-versions t)))
+        (is (pos? (:reclaimable t)) "and it costs real bytes")
+        (is (pos? (:current t)))
+        (is (pos? (get-in r [:lake :catalog]))
+            "the catalog is reported separately — it never shrinks and would otherwise make a reclaim look like it did nothing")))))
+
+(deftest report-fetches-no-rows
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)
+          h  (tbl/put-rows! lk "tbl:x" [{:a 1}])]
+      (sub/commit! st {:op :put :id "tbl:x"
+                       :value {:id "tbl:x" :kind :table :title "X" :value h}})
+      (with-redefs [tbl/rows (fn [& _] (throw (ex-info "report fetched rows" {})))]
+        (is (seq (:tables (gc/report st lk gc/default-window)))
+            "a storage panel that costs a row read per table defeats itself")))))
+
+(deftest report-marks-an-inlined-table
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)
+          h  (tbl/put-rows! lk "tbl:tiny" [{:a 1}])]
+      (sub/commit! st {:op :put :id "tbl:tiny"
+                       :value {:id "tbl:tiny" :kind :table :title "T" :value h}})
+      (let [t (first (:tables (gc/report st lk gc/default-window)))]
+        (is (:inlined? t) "a 1-row table lives in the catalog, not in Parquet")
+        (is (= 0 (:reclaimable t)) "so there is nothing to reclaim for it")))))

@@ -87,3 +87,50 @@
                (or (< (:age-rank m) versions)
                    (>= (or (:ts m) 0) cutoff)) (assoc m :class :in-window)
                :else                       (assoc m :class :reclaimable))]))))
+
+(defn report
+  "What every object's tables cost, and what a reclaim would free.
+
+   Walks the log once and asks the catalog for sizes in one query. **Fetches no
+   rows** — a storage panel that costs a row read per table would be slower than
+   the thing it is reporting on, and DuckDB's JDBC driver is slow row-wise
+   (42 ms to walk 1,000×8 cells, measured 2026-08-17).
+
+   `:lake` reports `:files` and `:catalog` separately because `catalog.duckdb`
+   never shrinks and was 98% of the lake at fixture scale — a panel showing only
+   reclaimable bytes would make a correct reclaim look like it did nothing."
+  [st lk window]
+  (let [cls   (classify st lk window)
+        sizes (into {} (map (juxt :table_name identity)) (lake/live-tables lk))
+        bytes #(or (:file_size_bytes (sizes %)) 0)
+        objs  (sub/objects st)
+        rows  (for [[object ts] (group-by :object (map #(assoc (val %) :table (key %)) cls))
+                    :when object
+                    :let [by-class (group-by :class ts)
+                          recl (concat (:reclaimable by-class) (:orphaned by-class))]]
+                {:id      object
+                 :title   (:title (get objs object))
+                 :versions (count ts)
+                 :current  (reduce + 0 (map #(bytes (:table %)) (:current by-class)))
+                 ;; The current version counts as kept, so that the three
+                 ;; version columns add up: `:versions` = `:in-window` +
+                 ;; `:reclaimable-versions`. Counting only the `:in-window`
+                 ;; CLASS leaves the current one in no column at all, and a
+                 ;; panel reading "5 versions, 2 in window, 2 reclaimable"
+                 ;; invites the reader to hunt for the fifth. It is also what
+                 ;; `{:versions 3}` says on its face: three versions are kept,
+                 ;; and one of the three is the one being read right now.
+                 :in-window (+ (count (:current by-class))
+                               (count (:in-window by-class)))
+                 :reclaimable (reduce + 0 (map #(bytes (:table %)) recl))
+                 :reclaimable-versions (count recl)
+                 :orphaned (reduce + 0 (map #(bytes (:table %)) (:orphaned by-class)))
+                 :inlined? (every? #(zero? (or (:file_count (sizes (:table %))) 0))
+                                   (:current by-class))})
+        orph  (filter #(nil? (:object (val %))) cls)]
+    {:window window
+     :lake   {:files   (reduce + 0 (map :file_size_bytes (vals sizes)))
+              :catalog (.length (java.io.File. (str (:dir lk) "/catalog.duckdb")))}
+     :orphaned {:tables (count orph)
+                :bytes  (reduce + 0 (map #(bytes (key %)) orph))}
+     :tables (vec (sort-by (comp - :reclaimable) rows))}))
