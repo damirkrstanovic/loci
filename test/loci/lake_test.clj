@@ -1,8 +1,10 @@
 (ns loci.lake-test
   (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.lake :as lake]
-            [loci.lake-fixture :refer [with-lake]]
+            [loci.lake-fixture :refer [rm-rf with-lake]]
             [loci.tablestore :as tbl]))
 
 (deftest opens-and-answers
@@ -27,6 +29,118 @@
     (is (= [{:db "lake"}] (lake/q lk "SELECT current_database() AS db")))))
 
 (def ^:private rows3 [{:id 1 :name "a"} {:id 2 :name "b"} {:id 3 :name "c"}])
+
+;; ---------------------------------------------------------------------------
+;; the lake is relocatable
+;; ---------------------------------------------------------------------------
+
+(def ^:private rows100
+  "Enough rows that the write lands a **Parquet file**, which is what the tests
+   below are actually about.
+
+   Measured 2026-08-17 on DuckDB 1.5.5: DuckLake inlines a small insert into
+   `catalog.duckdb` itself — the snapshot's change list says `inlined_insert`
+   and `files/` holds nothing but an empty directory. The threshold is between
+   10 and 20 rows. A move test written with `rows3` would therefore move one
+   file and prove nothing about whether the *data* was found again."
+  (mapv (fn [i] {:id i :name (str "n" i)}) (range 100)))
+
+(defn- tmpdir [tag] (str (System/getProperty "java.io.tmpdir") "/loci-lake-" tag "-" (System/nanoTime)))
+
+(defn- parquets [dir]
+  (filter #(str/ends-with? (.getName ^java.io.File %) ".parquet") (file-seq (io/file dir))))
+
+(deftest a-lake-opens-after-its-directory-moves
+  ;; DuckLake records DATA_PATH in the catalog and compares it on every attach,
+  ;; so a lake created at one path refused to open at another — which broke
+  ;; copying data/, restoring a backup, running the uberjar from another
+  ;; directory, and mounting a local data/ into a Docker volume. loci owns the
+  ;; whole lake directory, so the catalog's remembered path is never authority.
+  ;;
+  ;; Without OVERRIDE_DATA_PATH the reopen below throws, before any row is read:
+  ;;   Invalid Configuration Error: DATA_PATH parameter
+  ;;   "/tmp/loci-lake-moved-…/files/" does not match existing data path in the
+  ;;   catalog "/tmp/loci-lake-made-…/files/".
+  (let [made  (tmpdir "made")
+        moved (tmpdir "moved")]
+    (try
+      (let [h (let [lk (lake/open-lake! made)]
+                (try (tbl/put-rows! lk "tbl:x" rows100) (finally (lake/close! lk))))]
+        (is (seq (parquets made))
+            "the rows must be in a Parquet file under files/, or the move proves nothing")
+        (is (.renameTo (io/file made) (io/file moved)) "the move itself must succeed")
+        (let [lk (lake/open-lake! moved)]
+          (try
+            (is (= rows100 (tbl/rows lk h {}))
+                "a handle written before the move must still read its rows after it")
+            (finally (lake/close! lk)))))
+      (finally (rm-rf made) (rm-rf moved)))))
+
+(deftest a-lake-opens-when-its-catalog-remembers-a-relative-path
+  ;; The case this really is. The live data/lake was created with the default
+  ;; RELATIVE data directory and has `data/lake/files/` baked into its catalog
+  ;; — a string that names a different directory from every working directory
+  ;; but one, so `java -jar loci-standalone.jar` from anywhere else could not
+  ;; open it.
+  ;;
+  ;; Constructed the way the live store was rather than by moving the JVM's
+  ;; working directory, which a test cannot do: a lake created UNDER the
+  ;; working directory and attached by its relative name, then reopened the way
+  ;; `open-lake!` now does it. That is also why canonicalizing the path is not
+  ;; on its own the fix — measured against the live store, canonicalizing
+  ;; without the override REFUSES a lake that used to open:
+  ;;   Invalid Configuration Error: DATA_PATH parameter
+  ;;   "/home/damirk/src/loci/data/lake/files/" does not match existing data
+  ;;   path in the catalog "data/lake/files/".
+  (let [rel (str "target/loci-lake-rel-" (System/nanoTime))
+        abs (.getCanonicalPath (io/file rel))]
+    (try
+      (.mkdirs (io/file rel))
+      ;; create it the pre-fix way: relative DATA_PATH, no override
+      (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
+            lk   (lake/->Lake conn rel)]
+        (try
+          (#'lake/ensure-extension! lk)
+          (lake/x! lk (str "ATTACH 'ducklake:" rel "/catalog.duckdb' AS lake (DATA_PATH '" rel "/files/')"))
+          (lake/x! lk "USE lake")
+          (lake/x! lk "CREATE TABLE t_rel AS SELECT * FROM range(100) t(id)")
+          (finally (.close conn))))
+      (is (seq (parquets rel))
+          "the rows must be in a Parquet file under files/, or the reopen proves nothing")
+      (is (= [{:key "data_path" :value (str rel "/files/")}]
+             (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
+                   lk   (lake/->Lake conn abs)]
+               (try
+                 (lake/x! lk (str "ATTACH '" abs "/catalog.duckdb' AS cat (READ_ONLY)"))
+                 (lake/q lk "SELECT key, value FROM cat.main.ducklake_metadata WHERE key = 'data_path'")
+                 (finally (.close conn)))))
+          "the catalog must really hold the relative path, or this test is about nothing")
+      ;; and now the absolute path `open-lake!` derives must still open it
+      (let [lk (lake/open-lake! abs)]
+        (try
+          (is (= 100 (:n (first (lake/q lk "SELECT count(*) AS n FROM t_rel")))))
+          (finally (lake/close! lk))))
+      (finally (rm-rf rel)))))
+
+(deftest a-new-lake-records-where-it-actually-is
+  ;; The other half, and the half nothing else would notice — which is how it
+  ;; would come to be deleted as dead code. With OVERRIDE_DATA_PATH on, the
+  ;; recorded data_path is never read back, so a relative one costs nothing at
+  ;; runtime and says nothing to anyone: `data/lake/files/` in a catalog opened
+  ;; with the duckdb CLI names a different directory from every working
+  ;; directory but one. Canonicalizing costs one syscall at boot and makes the
+  ;; value mean something. It is NOT what makes the lake relocatable; the two
+  ;; tests above are.
+  (let [rel (str "target/loci-lake-abs-" (System/nanoTime))
+        abs (.getCanonicalPath (io/file rel))]
+    (try
+      (let [lk (lake/open-lake! rel)]
+        (try
+          (is (= [{:value (str abs "/files/")}]
+                 (lake/q lk "SELECT value FROM ducklake_options('lake') WHERE option_name = 'data_path'"))
+              "a lake opened by a relative name must record the absolute one")
+          (finally (lake/close! lk))))
+      (finally (rm-rf rel)))))
 
 (deftest lake-round-trips
   (with-lake [lk]

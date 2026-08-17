@@ -86,6 +86,38 @@
       (is (zero? @forced) "a hook that runs before the boot force must open nothing")
       (finally (.removeShutdownHook (Runtime/getRuntime) t)))))
 
+(deftest exit-says-nothing-about-a-lake-that-failed-to-open
+  ;; `realized?` is true for a delay whose body THREW, and every later deref
+  ;; rethrows the cached exception — so a boot that could not open the lake
+  ;; printed "closing the lake threw:" and the open failure's whole stack trace
+  ;; on the way out, UNDER the real error `-main` had just printed. The guard
+  ;; exists to keep exit quiet about a lake nobody opened; a lake that could
+  ;; not be opened is the same case and was getting the loudest treatment.
+  (let [lk  (delay (throw (ex-info "ATTACH failed" {})))
+        err (java.io.StringWriter.)]
+    (is (thrown? clojure.lang.ExceptionInfo @lk) "realize it by failing it")
+    (is (realized? lk) "which is exactly the trap: a thrown body still realizes")
+    (let [t (#'srv/close-lake-at-exit! lk)]
+      (try
+        (binding [*err* err] (.run t))
+        (is (= "" (str err)) "a failed boot has nothing to close and nothing to say")
+        (finally (.removeShutdownHook (Runtime/getRuntime) t))))))
+
+(deftest exit-still-reports-a-close-that-fails
+  ;; The other side of the same line, and the reason the `try` stays: a lake
+  ;; that opened and then would not close is news, and silence there would lose
+  ;; an uncheckpointed WAL without saying so.
+  (let [lk  (delay {:conn (reify java.io.Closeable
+                            (close [_] (throw (ex-info "connection is wedged" {}))))})
+        err (java.io.StringWriter.)]
+    @lk
+    (let [t (#'srv/close-lake-at-exit! lk)]
+      (try
+        (binding [*err* err] (.run t))
+        (is (str/includes? (str err) "closing the lake threw")
+            "a genuine close failure must still be reported")
+        (finally (.removeShutdownHook (Runtime/getRuntime) t))))))
+
 (def ^:private no-memory
   "The memory `mold-payload` must not open — a delay that throws if it is forced.
 

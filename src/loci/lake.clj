@@ -145,7 +145,45 @@
 (defrecord Lake [conn dir])
 
 (defn open-lake!
-  "Open (or create) the DuckLake catalog in `dir`. Defaults to <data-dir>/lake."
+  "Open (or create) the DuckLake catalog in `dir`. Defaults to <data-dir>/lake.
+
+   **`OVERRIDE_DATA_PATH` is what makes the lake relocatable, and it is not
+   optional.** DuckLake writes DATA_PATH into the catalog when the lake is
+   created and compares it on every later attach; without the override, a lake
+   opened from anywhere but the directory it was created in fails at boot with
+
+     Invalid Configuration Error: DATA_PATH parameter \"/tmp/x/lake/files/\"
+     does not match existing data path in the catalog \"data/lake/files/\".
+
+   which breaks copying `data/`, restoring a backup, running the uberjar from
+   another working directory, and mounting a locally-created `data/` into a
+   container. loci owns the whole lake directory and the files are always at
+   `<dir>/files/`, so the catalog's remembered path is never the authority —
+   `dir` is.
+
+   Measured 2026-08-17 on DuckDB 1.5.5, because \"override\" could mean several
+   things and only one of them is safe:
+
+   - It is a **per-session re-root, not a rewrite.** After attaching a moved
+     lake with it, `ducklake_options('lake')` still reports the path the lake
+     was created at. Nothing in the catalog is modified, so an override that
+     turns out to be wrong is one attach, not a migration.
+   - It is **total**, because every path under the catalog is stored relative:
+     `ducklake_table.path` is `t_tbl_x/` and `ducklake_data_file.path` is the
+     bare `ducklake-….parquet`. A 5,000-row table read back all 5,000 rows from
+     a moved directory, and a write *after* the move landed its Parquet under
+     the new root, not the old one.
+   - It is **quiet** — no SQLWarning on the connection — and it is accepted on a
+     brand-new catalog too, which still records the DATA_PATH it was given.
+
+   The canonical path is the other half, and on its own it would be a
+   regression rather than a fix: the live `data/lake` was created before this
+   and has the relative `data/lake/files/` baked in, so canonicalizing without
+   the override *refuses a store that used to open*. Measured — that is exactly
+   the error above. What canonicalizing buys is that a new catalog records
+   where it actually is, so `data_path` means something to someone reading the
+   catalog with the duckdb CLI, instead of a bare `data/` that names a
+   different directory from every working directory but one."
   ([] (open-lake! (str (sub/data-dir) "/lake")))
   ([dir]
    (io/make-parents (io/file dir "catalog.duckdb"))
@@ -153,11 +191,13 @@
    ;; DriverManager: DriverManager cannot see a driver loaded by a child
    ;; classloader, which is how this namespace gets exercised from a REPL that
    ;; added the dep with `add-lib`. Direct instantiation works in both.
-   (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
+   (let [dir  (.getCanonicalPath (io/file dir))
+         conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
          lk   (->Lake conn dir)]
      (try
        (ensure-extension! lk)
-       (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake (DATA_PATH '" dir "/files/')"))
+       (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"
+                   " (DATA_PATH '" dir "/files/', OVERRIDE_DATA_PATH true)"))
        (x! lk "USE lake")
        lk
        (catch Throwable t (.close conn) (throw t))))))
@@ -169,7 +209,7 @@
    A delay, so requiring this namespace still opens nothing — the rule the
    whole codebase keeps, and the reason `loci.dlv/store` is shaped the same
    way. Nothing rebinds this: the tests never touch it, because `open-lake!`
-   takes a directory and every test passes a temp one.
+   takes a directory and every test passes its own.
 
    **DuckDB refuses a second attach of one catalog file, process-wide**, the
    same way Datalevin refuses a second connection to one directory. Measured

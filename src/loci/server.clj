@@ -2964,8 +2964,18 @@
 
    The catch is not defensive noise. `realized?` does not mean \"opened\" — a
    delay whose body THREW is realized too, and every later deref rethrows the
-   cached exception, here on the shutdown thread where nothing is left to
-   report it. Same shape `start-chunk-sweep!` puts around its background work.
+   cached exception. Same shape `start-chunk-sweep!` puts around its background
+   work.
+
+   **A failed boot has nothing to close, and says nothing.** Which is why the
+   deref is separated from the close and only the close is reported. With one
+   `try` around both, a lake that failed to open printed
+   `loci.server: closing the lake threw:` and a full stack trace of the *open*
+   failure on the way out — after `-main` had already printed the real error,
+   and therefore under it, burying the one line the user needed. The guard was
+   added to keep exit quiet about a lake nobody opened; a lake that could not
+   be opened is the same case and was getting the opposite treatment. A close
+   that genuinely fails still reports, because that is news.
 
    What the close buys, measured 2026-08-16: DuckDB holds uncheckpointed
    commits in `catalog.duckdb.wal` and checkpoints them into the catalog on
@@ -2976,8 +2986,14 @@
    env is left to process exit and loses nothing either."
   [lk]
   (let [t (Thread. ^Runnable
-                   #(when (realized? lk)
-                      (try (lake/close! @lk)
+                   #(when-let [opened (when (realized? lk)
+                                        ;; A delay whose body threw is realized
+                                        ;; and rethrows here; that is a boot
+                                        ;; failure already reported, not a
+                                        ;; close failure, and there is nothing
+                                        ;; open to close.
+                                        (try @lk (catch Throwable _ nil)))]
+                      (try (lake/close! opened)
                            (catch Throwable e
                              (binding [*out* *err*]
                                (println "loci.server: closing the lake threw:" e)))))
