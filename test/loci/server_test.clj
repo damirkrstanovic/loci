@@ -4492,3 +4492,56 @@
           (let [r (srv/run-flow! st "flow:f")]
             (is (= "done" (:status r))
                 "the flow completes rather than failing at a table it never needed")))))))
+
+;; ---------------------------------------------------------------------------
+;; /api/storage and /api/storage/reclaim
+;;
+;; A nested `with-temp-lake` inside the namespace's `:once` one: these ask what
+;; a WHOLE lake costs and how many versions a reclaim took, and both numbers are
+;; wrong the moment another test's tables share the directory.
+;; ---------------------------------------------------------------------------
+
+(deftest storage-endpoint-reports-and-serializes
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1}])]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "X" :value h}})
+        (let [r (#'srv/storage-payload st)]
+          (is (= 1 (count (:tables r))))
+          (is (get-in r [:lake :catalog]))
+          (is (string? (json/write-str r))
+              "no DuckDBArray may reach the payload — ducklake_snapshots' :changes holds one"))))))
+
+(deftest storage-reclaim-endpoint-frees-and-reports
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (dotimes [_ 5]
+          (let [h (tbl/put-rows! @lake/lake "tbl:x" (vec (for [n (range 300)] {:a n})))]
+            (sub/commit! st {:op :put :id "tbl:x"
+                             :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+        (let [r (#'srv/storage-reclaim! st "tbl:x" {:versions 3 :days 0})]
+          (is (pos? (:freed r)))
+          (is (= 2 (:versions r))))))))
+
+(deftest storage-reclaim-refuses-a-request-that-named-no-object
+  ;; The route reads `:id` out of a JSON body, and `json/read-str` cannot tell a
+  ;; missing key from an explicit null. `gc/reclaim!` gives `nil` a meaning —
+  ;; **the orphans** — so without this guard `POST /api/storage/reclaim {}`, or a
+  ;; stray GET with no body at all, irreversibly deletes every orphaned table in
+  ;; the lake and answers as if that is what was asked for. Measured before the
+  ;; guard: `{:object nil :tables ["t_tbl_orphan_…"] :versions 1 :freed 2176}`.
+  ;;
+  ;; This is the one place the surrounding routes' habit — pass the body value
+  ;; through raw and let the callee refuse it by name — does not hold, because
+  ;; the callee does not refuse it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (tbl/put-rows! @lake/lake "tbl:orphan" (vec (for [n (range 300)] {:a n})))
+        (let [r (#'srv/storage-reclaim! st nil nil)]
+          (is (= :no-object (:error r)) "a refusal, not a sweep of the orphans")
+          (is (= 0 (:freed r)))
+          (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))

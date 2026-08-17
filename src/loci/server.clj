@@ -18,6 +18,7 @@
             [loci.entities :as ent]
             [loci.fnlib :as fnlib]
             [loci.lake :as lake]
+            [loci.lakegc :as gc]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -2906,6 +2907,54 @@
                 (mem/append-line! log rec)
                 (dissoc rec :vec))))))))
 
+;; ---- storage: what the lake costs, and reclaiming one object's history ----
+
+(defn- storage-payload
+  "What every object's lake tables cost, for the storage panel.
+
+   `st` and not just the lake because the classification is a property of the
+   *log*, not of the catalog: `gc/classify` walks every event ever committed to
+   decide which lake table is current, which is still inside the window undo and
+   `?at=` can reach, and which no handle names at all. The catalog alone cannot
+   tell those apart — it sees thirty-one equally live tables.
+
+   `(force lake/lake)` rather than `@lake/lake` only to read the same way the
+   rest of this namespace does; the route is a read and forces the singleton the
+   first time a panel is opened, which is the intended moment."
+  [st]
+  (gc/report st (force lake/lake) gc/default-window))
+
+(defn- storage-reclaim!
+  "Reclaim one object's out-of-window versions. Irreversible, so it refuses a
+   request that named no object.
+
+   **`nil` is a meaningful argument to `gc/reclaim!` — it means *the orphans*.**
+   And `json/read-str` cannot distinguish a body that omitted `:id` from one
+   that sent an explicit null, so without this guard `POST /api/storage/reclaim`
+   with an empty body deletes every orphaned table in the lake and answers with
+   a completed sweep. Measured before the guard, against a lake holding one
+   orphan: `{:object nil :tables [\"t_tbl_orphan_3f55a4d0\"] :versions 1 :freed 2176}`.
+
+   That makes this the one route where the house habit — hand the body value
+   through raw and let the callee refuse it by name, as `/api/memory-durable`
+   does — is not available: the callee does not refuse it. An unknown or
+   non-table id needs no guard, because `gc/reclaim!` does refuse that one
+   (`{:error :unknown-object …}`), and the refusal travels as a 200 with an
+   `:error` key like every other refusal this server issues.
+
+   **The orphans are therefore not reachable over HTTP at all.** Deliberate: the
+   caller who wants them is a person reading `report`'s `:orphaned` count, and
+   giving them a spelling here would mean choosing one before a panel exists to
+   need it. `loci.lakegc/reclaim!` with `nil` is the path, from a REPL attached
+   to the server."
+  [st id window]
+  (if-not (and (string? id) (seq id))
+    {:error :no-object :versions 0 :freed 0
+     :why (str "no object named — refusing rather than reclaiming the orphans, "
+               "which is what a nil id means to lakegc/reclaim! and is not what "
+               "a request with no :id is asking for")}
+    (gc/reclaim! st (force lake/lake) id (or window gc/default-window))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -2986,6 +3035,15 @@
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
                                   (json-resp (suggest-run-start! st space items destination)))
+      (= uri "/api/storage") (json-resp (storage-payload st))
+      ;; The only route here besides `/api/notebook` that tests the method, and
+      ;; the reason is that this one deletes Parquet: bodyless GETs happen — a
+      ;; prefetch, a pasted URL, a curl without `-X POST` — and this reaching
+      ;; `storage-reclaim!` with no `:id` is exactly the shape the guard inside
+      ;; it refuses. Two cheap answers to one irreversible call, and a GET here
+      ;; falls through to the 404 rather than to a reclaim.
+      (and (= :post (:request-method req)) (= uri "/api/storage/reclaim"))
+      (json-resp (storage-reclaim! st (:id (body-json req)) nil))
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
