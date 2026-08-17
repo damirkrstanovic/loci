@@ -7,7 +7,9 @@
    would not be an incident, but two suites sharing one lake interfere with
    each other, which is reason enough."
   (:require [clojure.java.io :as io]
-            [loci.lake :as lake]))
+            [loci.lake :as lake]
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 (defn rm-rf [x]
   (let [x (io/file x)]
@@ -49,6 +51,34 @@
     (lake/x! lk (str "DROP TABLE " table))
     (run! #(io/delete-file % true) files)
     files))
+
+(defn with-reclaimed-table
+  "A store holding one table whose rows have been reclaimed, and one healthy.
+
+   Here rather than in either suite because `loci.server-test` and
+   `loci.tools-test` both need it, for the same reason `with-lake` moved here.
+
+   **100 rows on the reclaimed one is load-bearing.** Below ~10–20 rows DuckLake
+   inlines the insert into `catalog.duckdb`, so the table owns no Parquet, there
+   is nothing for `reclaim!` to delete, and the read afterwards succeeds — every
+   test built on it would pass while exercising the happy path. The assert on
+   `reclaim!`'s return is what makes that a failure rather than a false green.
+
+   Calls `f` with the store; the temp lake is closed and removed after."
+  [f]
+  (with-temp-lake
+    (fn []
+      (let [lk   @lake/lake
+            gone (tbl/put-rows! lk "tbl:gone" (vec (for [n (range 100)] {:a n})))
+            good (tbl/put-rows! lk "tbl:good" [{:b 1}])
+            st   (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:gone"
+                         :value {:id "tbl:gone" :kind :table :title "Gone" :value gone}})
+        (sub/commit! st {:op :put :id "tbl:good"
+                         :value {:id "tbl:good" :kind :table :title "Good" :value good}})
+        (assert (= 1 (count (reclaim! lk (:table gone))))
+                "no Parquet was deleted — the test would prove nothing")
+        (f st)))))
 
 (defmacro with-lake
   "A fresh DuckLake in a temp directory, always removed.

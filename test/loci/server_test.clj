@@ -8,7 +8,7 @@
             [loci.embed :as embed]
             [loci.entities :as ent]
             [loci.lake :as lake]
-            [loci.lake-fixture]
+            [loci.lake-fixture :as lf]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
@@ -4412,3 +4412,27 @@
     (is (nil? (sub/object frozen b))  "the second did not")
     (is (= [{:v 1}] (:value (tbl/hydrate lake/lake (sub/object frozen a))))
         "and its rows still resolve, from a store that cannot commit")))
+
+;; ---------------------------------------------------------------------------
+;; a reclaimed table, on the two reader paths server.clj owns
+;;
+;; `hydrate` degrades rather than throwing, so both of these already answered
+;; *something* before the fix — an empty table, and a catalog line advertising
+;; 100 rows the store cannot serve. Saying "reclaimed" is the whole change.
+;; ---------------------------------------------------------------------------
+
+(deftest mold-payload-says-a-table-was-reclaimed
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [p (srv/mold-payload st no-memory "tbl:gone" nil)]
+        (is (:reclaimed p) "the payload says so rather than showing an empty table")
+        (is (= 100 (:table/total p)) "and still reports what was there")
+        (is (string? (json/write-str p)) "and the shell can render it")))))
+
+(deftest the-agent-catalog-skips-a-reclaimed-table
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [c (:context (#'srv/agent-ctx st nil))]
+        (is (re-find #"tbl:good" c) "the healthy table is still catalogued")
+        (is (not (re-find #"tbl:gone" c))
+            "and the reclaimed one is omitted rather than advertised with rows it cannot serve")))))

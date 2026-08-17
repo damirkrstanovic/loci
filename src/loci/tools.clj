@@ -108,23 +108,50 @@
 ;; hydrate every table to read the columns off the first row and count the
 ;; rest — 271 ms over the migrated store, for an answer every handle already
 ;; carries. `table-shape` is the reader that fetches nothing.
+;;
+;; Reading the handle is also why this reader alone has to ASK about
+;; reclamation. Every other table reader goes through `hydrate`, which discovers
+;; a reclamation by failing to read the rows and then confirming with the
+;; catalog; this one never reads a row, so nothing fails and the handle goes on
+;; reporting the count it was written with long after the Parquet is gone.
+;; It is the read `lake/dropped-at`'s docstring anticipated.
+;;
+;; `lake/dropped-tables` and NOT `tbl/reclaimed-at` per table, because the cost
+;; is the round trip and not the scan: one call per table measured 100 ms over
+;; the 29-table store, against 0.10 ms before this reader asked at all and 3.5 ms
+;; asking once. Per-table would have handed back every millisecond the move to
+;; `table-shape` bought. The lake is forced only when some table is handle-backed
+;; — `table-shape`'s rule, for its reason.
 (defn- do-list [st _]
-  (mapv (fn [o] (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
-                  {:id (:id o) :title (:title o)
-                   :columns (mapv name cols)
-                   :rows (or rows 0)}))
-        (table-objs st)))
+  (let [os      (table-objs st)
+        dropped (when (some #(tbl/handle? (:value %)) os)
+                  (lake/dropped-tables (force lake/lake)))]
+    (mapv (fn [o] (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)
+                        at (get dropped (:table (:value o)))]
+                    (cond-> {:id (:id o) :title (:title o)
+                             :columns (mapv name cols)
+                             :rows (or rows 0)}
+                      at (assoc :reclaimed at))))
+          os)))
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
   (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
-    (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
-          rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
-      (if save_as
-        (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-              obj (tbl/table-object @lake/lake nid save_as rendered)]
-          (sub/commit! st {:op :put :id nid :value obj})
-          {:saved_as nid :rows rendered})
-        {:rows rendered}))
+    ;; `hydrate` degrades a reclaimed table to `:value []` rather than throwing,
+    ;; so without this the tool answers `{:rows []}` — "your filter matched
+    ;; nothing" — and the model reports a real zero. Worse on the `save_as` path,
+    ;; where it would commit an empty derived table over the answer. An `:error`
+    ;; naming the date is something the model can act on and say out loud.
+    (if (:table/reclaimed o)
+      {:error (str "table " table_id " was reclaimed on " (:table/reclaimed o)
+                   " — its rows are no longer stored")}
+      (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
+            rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
+        (if save_as
+          (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
+                obj (tbl/table-object @lake/lake nid save_as rendered)]
+            (sub/commit! st {:op :put :id nid :value obj})
+            {:saved_as nid :rows rendered})
+          {:rows rendered})))
     {:error (str "no table " table_id)}))
 
 ;; Through `loci.config`, like every other configured value: `TAVILY_API_KEY` is

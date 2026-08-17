@@ -305,6 +305,43 @@
               " AS SELECT * FROM " table " AT (VERSION => " (long snapshot) ")"))
   :ok)
 
+(defn dropped-tables
+  "`{table-name when}` for every table this lake has dropped — `dropped-at`'s
+   answer for all of them at once, and the function `dropped-at` is now one
+   lookup into.
+
+   **One query, because the cost here is per query and not per table.** Measured
+   2026-08-17 over the migrated store (29 tables): this whole map costs 3.38 ms
+   and a single `dropped-at` costs 3.29 ms, so asking once per table is 29× the
+   work for the same answer. `list_tables` measured 0.10 ms before it asked about
+   reclamation and **100 ms** asking table by table — undoing the entire reason
+   that reader stopped hydrating — against 3.5 ms batched. `table-catalog` sits
+   on the same cliff, on every chat turn.
+
+   The `NOT EXISTS` is the load-bearing clause and it is `dropped-at`'s: a
+   tombstoned row does not mean a dead table, because `restore-to!` is a
+   `CREATE OR REPLACE` that stamps `end_snapshot` on the old row while minting a
+   live one under the same name. The question is not \"is there a tombstone\" but
+   \"is there no live row\". `arg_max` over `end_snapshot` picks the newest
+   tombstone, which is what `ORDER BY dt.end_snapshot DESC LIMIT 1` did per
+   table.
+
+   Note the metadata tables are invisible to `duckdb_tables()` and must be named
+   in full."
+  [lk]
+  (into {}
+        (map (fn [r] [(:table_name r) (java.util.Date/from (.toInstant (:t r)))]))
+        (q lk (str "SELECT dt.table_name AS table_name,"
+                   "       arg_max(s.snapshot_time, dt.end_snapshot) AS t"
+                   "  FROM __ducklake_metadata_lake.main.ducklake_table dt"
+                   "  JOIN ducklake_snapshots('lake') s"
+                   "    ON s.snapshot_id = dt.end_snapshot"
+                   " WHERE dt.end_snapshot IS NOT NULL"
+                   "   AND NOT EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
+                   "                    WHERE live.table_name = dt.table_name"
+                   "                      AND live.end_snapshot IS NULL)"
+                   " GROUP BY dt.table_name"))))
+
 (defn dropped-at
   "When `table` was dropped from this lake, or nil if it was never dropped.
 
@@ -338,23 +375,17 @@
    so the question it asks is not \"is there a tombstone\" but **\"is there no
    live row\"**.
 
-   Latent while `restore-to!` has no production callers; it stops being latent
-   the day `list_tables` filters on `reclaimed-at`, because a restored table
-   would vanish from the catalog the agent sees."
+   No longer latent: as of 2026-08-17 `list_tables` and `table-catalog` both
+   filter on this answer — through `dropped-tables`, but it is the same
+   question — so a restored table would vanish from the catalog the agent sees.
+
+   **One lookup into `dropped-tables` rather than its own query**, so the
+   `NOT EXISTS` above is written once. Measured the same 2026-08-17: a
+   table-filtered query costs 3.29 ms and the whole map costs 3.38 ms, because
+   the catalog is 29 tables and the cost is the round trip, not the scan. There
+   was no cheaper single-table query to keep."
   [lk table]
-  (some-> (first (q lk (str "SELECT s.snapshot_time AS t"
-                            "  FROM __ducklake_metadata_lake.main.ducklake_table dt"
-                            "  JOIN ducklake_snapshots('lake') s"
-                            "    ON s.snapshot_id = dt.end_snapshot"
-                            " WHERE dt.table_name = '" table "'"
-                            "   AND dt.end_snapshot IS NOT NULL"
-                            "   AND NOT EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
-                            "                    WHERE live.table_name = dt.table_name"
-                            "                      AND live.end_snapshot IS NULL)"
-                            " ORDER BY dt.end_snapshot DESC LIMIT 1")))
-          :t
-          (.toInstant)
-          (java.util.Date/from)))
+  (get (dropped-tables lk) table))
 
 (defn- load-rows!
   "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the

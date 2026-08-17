@@ -394,6 +394,20 @@
   [st m id view]
   (let [o (tbl/hydrate lake/lake (sub/object st id))]
     (cond
+      ;; RECLAIMED — first, and before the view branches, because a reclaimed
+      ;; table can still have a viewspec pointed at it and `vs/interpret` over
+      ;; `[]` would draw an empty chart rather than say anything.
+      ;;
+      ;; `hydrate` handed us `:value []`, and every branch below would render
+      ;; that as a table with no rows in it — indistinguishable from a table the
+      ;; user emptied themselves, which is the worst available shape for this
+      ;; answer. The cols and the true count come off the handle, so the page can
+      ;; still say what was there. `:rendered` and `:alternatives` are present
+      ;; and empty because the shell reads both on every payload.
+      (:table/reclaimed o)
+      {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
+       :table/total (:table/total o) :table/cols (:table/cols o)
+       :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
       ;; materialization, out of the same payload. A `mold/mold` viewer could not
       ;; be this page: a viewer's `:render` only ever receives `(:value o)`,
@@ -1505,15 +1519,34 @@
 
    Takes UNHYDRATED objects. Handing it hydrated ones still works — a legacy
    inline vector is `table-shape`'s other branch — but it would pay the cost
-   this function exists to avoid."
+   this function exists to avoid.
+
+   **A table whose rows were reclaimed is left out entirely.** The handle still
+   says `100 rows`, so without the filter this block advertises a table by id and
+   row count and the agent's very next move is a `query_table` that cannot be
+   served. Omitting it is the honest answer for a catalog, whose whole job is to
+   say what can be queried; `list_tables` is the reader that says *reclaimed* out
+   loud, because a tool result has somewhere to put the word.
+
+   Reading `:table/reclaimed` off the object would be the cheap way and it does
+   not work here: only `hydrate` sets that key, and this function is fed
+   unhydrated objects on purpose. So it asks the catalog, in ONE query for the
+   whole workspace — `lake/dropped-tables` and never `reclaimed-at` per table.
+   Measured 2026-08-17: 3.4 ms either way, so per-table would have put 100 ms
+   back onto every chat turn over the 29-table store, which is the cost this
+   function was rewritten to remove."
   [tbls]
-  (str/join "\n"
-            (map (fn [o]
-                   (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
-                     (str "- " (:id o) " — " (:title o)
-                          " (cols: " (str/join ", " (map name cols))
-                          "; " (or rows 0) " rows)")))
-                 tbls)))
+  (let [dropped (when (some #(tbl/handle? (:value %)) tbls)
+                  (lake/dropped-tables (force lake/lake)))]
+    (str/join "\n"
+              (keep (fn [o]
+                      (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
+                        (when-not (or (:table/reclaimed o)
+                                      (get dropped (:table (:value o))))
+                          (str "- " (:id o) " — " (:title o)
+                               " (cols: " (str/join ", " (map name cols))
+                               "; " (or rows 0) " rows)"))))
+                    tbls))))
 
 (defn- descendant-sources
   "DOWN. The notebook, the ids of its cells, and the same for everything it

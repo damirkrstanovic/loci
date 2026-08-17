@@ -2,7 +2,7 @@
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
-            [loci.lake-fixture]
+            [loci.lake-fixture :as lf]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools]))
@@ -166,3 +166,25 @@
       (let [r (first (tools/dispatch st "list_tables" {}))]
         (is (= ["a" "b"] (:columns r)))
         (is (= 2 (:rows r)))))))
+
+;; ---------------------------------------------------------------------------
+;; a reclaimed table, on the two reader paths tools.clj owns
+;; ---------------------------------------------------------------------------
+
+(deftest list-tables-says-reclaimed-instead-of-a-stale-count
+  ;; `do-list` reads the HANDLE and never hydrates, which is what makes it fast
+  ;; — and is exactly why it cannot see a reclamation the way the other readers
+  ;; do: the handle still says 100 rows long after the Parquet is gone.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [by-id (into {} (map (juxt :id identity)) (tools/dispatch st "list_tables" {}))]
+        (is (:reclaimed (get by-id "tbl:gone"))
+            "reading the handle would otherwise report 100 rows that cannot be fetched")
+        (is (= 1 (:rows (get by-id "tbl:good"))))))))
+
+(deftest query-table-returns-an-error-for-a-reclaimed-table
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [r (tools/dispatch st "query_table" {:table_id "tbl:gone"})]
+        (is (:error r) "the model gets something it can act on")
+        (is (re-find #"reclaimed" (:error r)))))))
