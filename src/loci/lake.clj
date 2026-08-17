@@ -305,6 +305,18 @@
               " AS SELECT * FROM " table " AT (VERSION => " (long snapshot) ")"))
   :ok)
 
+(defn live-tables
+  "Every table the lake currently holds, with its file count and bytes.
+
+   One query for the whole catalog — a report over 31 tables must not be 31
+   round trips. A **dropped** table is absent from this, which is what makes
+   `dropped-at` a question worth asking separately. An **inlined** table has
+   `file_count` 0: DuckLake keeps small tables inside `catalog.duckdb` rather
+   than as Parquet, so there is no file to delete and nothing to reclaim."
+  [lk]
+  (q lk (str "SELECT table_name, table_id, file_count, file_size_bytes "
+             "FROM ducklake_table_info('lake')")))
+
 (defn dropped-tables
   "`{table-name when}` for every table this lake has dropped — `dropped-at`'s
    answer for all of them at once, and the function `dropped-at` is now one
