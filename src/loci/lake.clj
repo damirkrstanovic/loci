@@ -305,6 +305,42 @@
               " AS SELECT * FROM " table " AT (VERSION => " (long snapshot) ")"))
   :ok)
 
+(defn dropped-at
+  "When `table` was dropped from this lake, or nil if it was never dropped.
+
+   The catalog is the record, so nothing here keeps a parallel one. DuckLake
+   sets `ducklake_table.end_snapshot` on a drop and `ducklake_snapshots` carries
+   that snapshot's time, so \"was this reclaimed, and when\" is a question the
+   store that did the reclaiming can already answer.
+
+   Returns nil for a name that was never a table at all — absent is not the same
+   as reclaimed, and a read that fails for any other reason must stay an error
+   rather than being reported to a user as a successful cleanup.
+
+   Note the metadata tables are invisible to `duckdb_tables()` and must be named
+   in full.
+
+   The `end_snapshot IS NOT NULL` clause is **explicit, not load-bearing**, and
+   is worth knowing before anyone tries to prove it matters: the inner join
+   already excludes a live table, because `end_snapshot` is NULL for one and
+   `NULL = s.snapshot_id` is never true. Measured 2026-08-17 — deleting the
+   clause changes no result, so a sabotage of it cannot bite. What is
+   load-bearing is the column (`begin_snapshot` in its place reports a live
+   table's *creation* time as a drop) and the `table_name` filter (without it a
+   live table inherits a sibling's drop time). Both of those sabotages fail the
+   tests."
+  [lk table]
+  (some-> (first (q lk (str "SELECT s.snapshot_time AS t"
+                            "  FROM __ducklake_metadata_lake.main.ducklake_table dt"
+                            "  JOIN ducklake_snapshots('lake') s"
+                            "    ON s.snapshot_id = dt.end_snapshot"
+                            " WHERE dt.table_name = '" table "'"
+                            "   AND dt.end_snapshot IS NOT NULL"
+                            " ORDER BY dt.end_snapshot DESC LIMIT 1")))
+          :t
+          (.toInstant)
+          (java.util.Date/from)))
+
 (defn- load-rows!
   "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the
    types, which is the same inference `read_csv` already gives `import-csv!`,

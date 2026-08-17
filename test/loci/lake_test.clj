@@ -422,3 +422,22 @@
       (is (= :disabled (:mode r)))
       (is (string? (:why r)))
       (is (re-find #"261|527|529" (:why r)) "the reason names the upstream issues"))))
+
+;; ---------------------------------------------------------------------------
+;; a reclaimed table, and what still reads
+;; ---------------------------------------------------------------------------
+
+(deftest dropped-at-knows-a-dropped-table
+  (with-lake [lk]
+    (let [h1 (tbl/put-rows! lk "tbl:x" [{:a 1}])
+          h2 (tbl/put-rows! lk "tbl:x" [{:a 2}])]
+      (is (nil? (lake/dropped-at lk (:table h1))) "a live table was not reclaimed")
+      (lake/x! lk (str "DROP TABLE " (:table h1)))
+      (is (inst? (lake/dropped-at lk (:table h1)))
+          "a dropped table reports when it was dropped")
+      (is (nil? (lake/dropped-at lk (:table h2))) "and its sibling is untouched"))))
+
+(deftest dropped-at-is-nil-for-a-table-that-never-existed
+  (with-lake [lk]
+    (is (nil? (lake/dropped-at lk "t_never_existed_00000000"))
+        "absent is not the same as reclaimed — a genuine error must stay an error")))
