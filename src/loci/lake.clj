@@ -399,6 +399,52 @@
   [lk table]
   (get (dropped-tables lk) table))
 
+(defn table-files
+  "The absolute paths of one table's Parquet files, with their sizes.
+
+   Files, not the directory. `restore-to!` is a `CREATE OR REPLACE`, which mints
+   a new `table_id` under the **same** table name and directory — measured
+   2026-08-17, one directory held a dead and a live Parquet at once — so
+   removing a directory can destroy live data. The individual path is the only
+   safe unit.
+
+   Must be called BEFORE the table is dropped: this resolves its argument
+   through the live catalog and throws `Catalog Error: Table with name … does
+   not exist!` for a dropped one.
+
+   **It reports the LIVE `table_id`'s files only, so for a restored table it is
+   incomplete.** Measured 2026-08-17 on the same directory: after a
+   `restore-to!`, `ducklake_data_file` holds two rows — `table_id` 1's Parquet
+   (tombstoned) and `table_id` 2's (live) — and this names only the second.
+   `loci.lakegc/reclaim!` therefore leaves the pre-restore Parquet on disk, and
+   `CREATE TABLE t AS SELECT * FROM t AT (VERSION => 1)` still returned all 100
+   rows against a table that had just been reclaimed. The bytes also go
+   uncollectable: the name leaves `live-tables` on the drop, so `classify` never
+   sees it again.
+
+   Latent as of 2026-08-17 — nothing outside `loci.lake-test` calls
+   `restore-to!` — and deliberately not repaired here, because the honest fix is
+   to select from `ducklake_data_file` across every `table_id` that ever bore
+   the name, which changes what `loci.lakegc/report` must predict too. Removing
+   the *directory* is not the fix: it happens to be safe only when the whole
+   name is doomed, and `restore-to!` is exactly the operation that puts a live
+   file in a directory a stale path could name."
+  [lk table]
+  (q lk (str "SELECT data_file, data_file_size_bytes FROM ducklake_list_files('lake', '" table "')")))
+
+(defn drop-table!
+  "Drop `table` from the catalog. Frees no bytes on its own — a DuckLake drop is
+   a versioned tombstone, and the table still reads `AT` a version where it
+   existed. `loci.lakegc` deletes the files afterwards; that is what makes it
+   real.
+
+   It also **mints** a snapshot rather than removing one (measured 2026-08-17:
+   3 snapshots before a drop, 4 after), which is the whole reason reclamation
+   can be done this way — every other object's handle still finds the version it
+   reads at."
+  [lk table]
+  (x! lk (str "DROP TABLE " table)))
+
 (defn- load-rows!
   "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the
    types, which is the same inference `read_csv` already gives `import-csv!`,

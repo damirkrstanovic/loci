@@ -14,7 +14,9 @@
    at — measured, that broke three unrelated handles. `DROP TABLE` plus deleting
    that table's own Parquet frees the same bytes, expires nothing, and leaves
    every other handle reading."
-  (:require [loci.lake :as lake]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [loci.lake :as lake]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -134,3 +136,72 @@
      :orphaned {:tables (count orph)
                 :bytes  (reduce + 0 (map #(bytes (key %)) orph))}
      :tables (vec (sort-by (comp - :reclaimable) rows))}))
+
+(defn reclaim!
+  "Reclaim one object's out-of-window and orphaned versions. Irreversible.
+
+   `DROP TABLE`, then delete that table's own Parquet files. Never
+   `ducklake_expire_snapshots` — expiry is catalog-wide, and freeing one
+   object's history that way expires the snapshots every other object's handles
+   read at (measured: three unrelated handles broke). A drop *mints* a snapshot
+   instead of removing one, which is why it is safe.
+
+   There is no dry-run flag because `report` is the dry run: it names exactly
+   the versions this will delete and the bytes it will free, and this asserts
+   the same numbers back.
+
+   **`object` is nil for the orphans.** `classify` cannot attribute an orphan —
+   an orphan is precisely a table no handle names, so there is no object to name
+   it — and `nil` is therefore how you ask for them, not a missing argument.
+
+   **It refuses rather than filters.** Before anything is dropped, the set it is
+   about to delete is checked against the tables live objects are reading, and
+   any overlap aborts the whole call. That is not defence in depth against
+   nothing: `classify`'s `cond` tests `(nil? m)` before `(live table_name)` on
+   purpose, so a gap in `event-handles`' coverage — a new event shape that can
+   carry a handle — surfaces as a live table classified `:orphaned`, and orphans
+   ignore the window. Deleting the rest and skipping the overlap would free the
+   bytes and leave the gap unlooked-at; the only useful outcome of the
+   classifier and the live set disagreeing is that someone reads this.
+
+   **Incomplete for a table that was `restore-to!`d** — see `lake/table-files`,
+   which names the live `table_id`'s Parquet and not the tombstoned sibling's,
+   so such a table stays readable at its pre-restore version after this claims
+   to have reclaimed it. Latent: nothing outside `loci.lake-test` calls
+   `restore-to!` yet."
+  [st lk object window]
+  (let [cls    (classify st lk window)
+        mine   (into {} (filter #(= object (:object (val %)))) cls)
+        doomed (into #{} (comp (filter #(#{:reclaimable :orphaned} (:class (val %))))
+                               (map key))
+                     mine)
+        live   (set (keep #(:table (:value %)) (vals (sub/objects st))))
+        alive  (vec (filter live doomed))]
+    (cond
+      (empty? mine)
+      {:error :unknown-object :object object :versions 0 :freed 0
+       :why (str "no table in this lake is named by a handle for "
+                 (pr-str object) " — nothing to reclaim, and a typo must not "
+                 "read as a completed sweep")}
+
+      (seq alive)
+      {:error :live-table :object object :versions 0 :freed 0 :tables alive
+       :why (str "refusing the whole reclaim: " (str/join ", " alive)
+                 " " (if (= 1 (count alive)) "is" "are")
+                 " still read by a live object, so the classifier and the live "
+                 "set disagree. That means event-handles has a gap; deleting "
+                 "the other versions would hide it.")}
+
+      :else
+      ;; List every file BEFORE any drop. `ducklake_list_files` resolves through
+      ;; the live catalog and THROWS for a dropped table rather than reporting
+      ;; no files — measured 2026-08-17 — so a listing interleaved with the
+      ;; drops would leave Parquet behind for every table after the first.
+      (let [files (into [] (mapcat #(lake/table-files lk %)) doomed)]
+        (run! #(lake/drop-table! lk %) doomed)
+        (run! #(io/delete-file (:data_file %) true) files)
+        {:object   object
+         :tables   (vec doomed)
+         :versions (count doomed)
+         :files    (count files)
+         :freed    (reduce + 0 (map #(or (:data_file_size_bytes %) 0) files))}))))

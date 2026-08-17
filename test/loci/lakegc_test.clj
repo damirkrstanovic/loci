@@ -1,10 +1,21 @@
 (ns loci.lakegc-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.java.io :as io]
+            [clojure.set :as set]
+            [clojure.test :refer [deftest is]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.lakegc :as gc]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
+
+(defn- dir-bytes
+  "Bytes actually on disk under `f`."
+  [f]
+  (let [f (io/file f)]
+    (if (.isDirectory f) (reduce + 0 (map dir-bytes (.listFiles f))) (.length f))))
+
+(defn- snapshot-ids [lk]
+  (set (map :snapshot_id (lake/q lk "SELECT snapshot_id FROM ducklake_snapshots('lake')"))))
 
 (deftest classify-names-the-current-version
   (lf/with-lake [lk]
@@ -120,3 +131,126 @@
       (let [t (first (:tables (gc/report st lk gc/default-window)))]
         (is (:inlined? t) "a 1-row table lives in the catalog, not in Parquet")
         (is (= 0 (:reclaimable t)) "so there is nothing to reclaim for it")))))
+
+(deftest reclaim-frees-what-the-report-predicted
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)]
+      (dotimes [_ 5]
+        (let [h (tbl/put-rows! lk "tbl:x" (vec (for [n (range 500)] {:a n :b (str "row" n)})))]
+          (sub/commit! st {:op :put :id "tbl:x"
+                           :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+      (let [w      {:versions 3 :days 0}
+            files  (str (:dir lk) "/files")
+            before (:reclaimable (first (:tables (gc/report st lk w))))
+            b0     (dir-bytes files)
+            s0     (snapshot-ids lk)
+            r      (gc/reclaim! st lk "tbl:x" w)]
+        (is (= before (:freed r)) "freed exactly what the report promised")
+        (is (= 2 (:versions r)))
+        ;; Against the disk and not only against `:freed`. `:freed` is summed
+        ;; from the catalog's own file listing, so it is right whether or not
+        ;; anything was deleted — measured 2026-08-17 by removing the deletion
+        ;; and leaving the DROP: every other assertion in this test still
+        ;; passed, over 906 bytes still sitting in `files/`.
+        (is (= before (- b0 (dir-bytes files)))
+            "and the bytes left the disk, not just the catalog")
+        (is (= 0 (:reclaimable (first (:tables (gc/report st lk w)))))
+            "and there is nothing left to reclaim")
+        ;; A DuckLake drop MINTS a snapshot (3 → 4, measured), so this cannot be
+        ;; an equality on the count. What must hold is that no snapshot went
+        ;; away: expiry is catalog-wide and would break every other object's
+        ;; handles, which is why reclamation is a drop and never an expiry.
+        (is (set/subset? s0 (snapshot-ids lk))
+            "no snapshot was expired — expiry is catalog-wide and would break other handles")
+        (is (= (+ (count s0) 2) (count (snapshot-ids lk)))
+            "two drops, two new snapshots — a tombstone is added, not removed")))))
+
+(deftest reclaim-leaves-every-other-handle-reading
+  (lf/with-lake [lk]
+    (let [st    (sub/fresh-store)
+          other (tbl/put-rows! lk "tbl:other" [{:z 9}])]
+      (sub/commit! st {:op :put :id "tbl:other"
+                       :value {:id "tbl:other" :kind :table :title "O" :value other}})
+      (dotimes [i 5]
+        (let [h (tbl/put-rows! lk "tbl:x" [{:a i}])]
+          (sub/commit! st {:op :put :id "tbl:x"
+                           :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+      (gc/reclaim! st lk "tbl:x" {:versions 3 :days 0})
+      (is (= [{:z 9}] (tbl/rows lk other {})) "an unrelated table is untouched")
+      (is (= [{:a 4}] (tbl/rows lk (:value (sub/object st "tbl:x")) {}))
+          "and the current version still reads"))))
+
+(deftest a-reclaimed-table-cannot-be-recreated-from-its-old-version
+  ;; Measured 2026-08-17: `CREATE TABLE t AS SELECT * FROM t AT (VERSION => n)`
+  ;; succeeds against a merely-dropped table. Deleting the Parquet is what makes
+  ;; the reclamation real — without this, a later undo would appear to restore
+  ;; rows that are gone.
+  ;;
+  ;; 100 rows a version, not 1: DuckLake inlines a table below ~10-20 rows into
+  ;; `catalog.duckdb`, so it owns no Parquet, nothing is deleted, and the CREATE
+  ;; succeeds for a reason that has nothing to do with reclamation.
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)
+          hs (vec (for [i (range 5)]
+                    (let [h (tbl/put-rows! lk "tbl:x" (vec (for [n (range 100)] {:a n :i i})))]
+                      (sub/commit! st {:op :put :id "tbl:x"
+                                       :value {:id "tbl:x" :kind :table :title "X" :value h}})
+                      h)))]
+      (gc/reclaim! st lk "tbl:x" {:versions 3 :days 0})
+      (is (thrown? Exception
+                   (lake/x! lk (str "CREATE TABLE " (:table (hs 0))
+                                    " AS SELECT * FROM " (:table (hs 0)) " AT (VERSION => 1)")))))))
+
+(deftest reclaim-refuses-an-unknown-object
+  (lf/with-lake [lk]
+    (is (:error (gc/reclaim! (sub/fresh-store) lk "tbl:nope" gc/default-window)))))
+
+(deftest reclaim-collects-the-orphans-undo-left
+  ;; An orphan is a table no handle names, so `classify` has no object to
+  ;; attribute it to and nil is how you ask for them.
+  (lf/with-lake [lk]
+    (let [st   (sub/fresh-store)
+          gone (tbl/put-rows! lk "tbl:x" (vec (for [n (range 100)] {:a n})))]
+      (sub/commit! st {:op :put :id "tbl:x"
+                       :value {:id "tbl:x" :kind :table :title "X" :value gone}})
+      (sub/undo! st)
+      (let [b0 (dir-bytes (str (:dir lk) "/files"))
+            r  (gc/reclaim! st lk nil gc/default-window)]
+        (is (= 1 (:versions r)))
+        (is (pos? (:freed r)))
+        (is (= (:freed r) (- b0 (dir-bytes (str (:dir lk) "/files"))))
+            "the bytes left the disk, not just the catalog")
+        (is (= 0 (get-in (gc/report st lk gc/default-window) [:orphaned :tables])))))))
+
+(deftest reclaim-refuses-when-the-classifier-offers-a-live-table
+  ;; `classify`'s `cond` tests `(nil? m)` before `(live table_name)` on purpose,
+  ;; so a gap in `event-handles`' coverage surfaces as a LIVE table classified
+  ;; `:orphaned` — loud — rather than as a live table quietly called `:current`.
+  ;; Orphans ignore the window and carry no object, so `(reclaim! … nil …)` is
+  ;; exactly the call that would delete it. `bad` is the map that gap produces.
+  ;;
+  ;; `reclaim!` must stop dead on it. Filtering the live table out and deleting
+  ;; the rest would be the wrong repair: it frees the bytes and leaves the
+  ;; disagreement unlooked-at.
+  (lf/with-lake [lk]
+    (let [st (sub/fresh-store)
+          hs (vec (for [i (range 5)]
+                    (let [h (tbl/put-rows! lk "tbl:x" (vec (for [n (range 100)] {:a n :i i})))]
+                      (sub/commit! st {:op :put :id "tbl:x"
+                                       :value {:id "tbl:x" :kind :table :title "X" :value h}})
+                      h)))
+          w    {:versions 3 :days 0}
+          bad  (assoc (gc/classify st lk w)
+                      ;; the shape classify emits for an orphan, over the table
+                      ;; the live object is reading right now
+                      (:table (hs 4)) {:class :orphaned :object nil :ts nil}
+                      (:table (hs 0)) {:class :orphaned :object nil :ts nil})
+          b0   (dir-bytes (str (:dir lk) "/files"))
+          r    (with-redefs [gc/classify (fn [& _] bad)]
+                 (gc/reclaim! st lk nil w))]
+      (is (:error r) "a live table offered for deletion is a refusal, not a filter")
+      (is (= 0 (:freed r)) "and nothing was freed")
+      (is (= 5 (count (lake/live-tables lk))) "nothing was dropped")
+      (is (= b0 (dir-bytes (str (:dir lk) "/files"))) "nothing was deleted")
+      (is (= 100 (count (tbl/rows lk (hs 0) {})))
+          "not even the genuinely deletable one it was offered alongside"))))
