@@ -189,7 +189,20 @@
                (put-rows! [_ _ _] (throw (ex-info "no" {})))
                (rows [_ _ _] (throw (ex-info "table-shape fetched rows" {})))
                (row-count [_ h] (:rows h))
+               (reclaimed-at [_ _] (throw (ex-info "no" {})))
                (column-samples [_ _ _ _] (throw (ex-info "no" {}))))
         h {:store :lake :table "t_x" :snapshot 1 :rows 1000 :cols [:a :b]}]
     (is (= {:cols [:a :b] :rows 1000} (tbl/table-shape boom {:kind :table :value h}))
         "the handle already knows; nothing may be fetched")))
+
+(deftest hydrate-still-throws-for-a-real-failure
+  (let [boom (reify tbl/TableStore
+               (put-rows! [_ _ _] nil)
+               (rows [_ _ _] (throw (ex-info "disk on fire" {})))
+               (row-count [_ h] (:rows h))
+               (reclaimed-at [_ _] nil)
+               (column-samples [_ _ _ _] nil))
+        h {:store :lake :table "t_x" :snapshot 1 :rows 2 :cols [:a]}]
+    (is (thrown-with-msg? Exception #"disk on fire"
+          (tbl/hydrate boom {:kind :table :value h}))
+        "only a table the catalog says was dropped may be swallowed")))

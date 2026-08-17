@@ -441,3 +441,40 @@
   (with-lake [lk]
     (is (nil? (lake/dropped-at lk "t_never_existed_00000000"))
         "absent is not the same as reclaimed — a genuine error must stay an error")))
+
+(deftest listing-a-dropped-tables-files-throws-rather-than-returning-none
+  ;; Whoever deletes files for real has to collect the paths BEFORE the DROP.
+  ;; `ducklake_list_files` resolves its argument through the live catalog, so
+  ;; after the tombstone it does not report an empty file list — it refuses the
+  ;; name outright, and a sweep that dropped first would take the exception
+  ;; instead of the disk space.
+  (with-lake [lk]
+    (let [h   (tbl/put-rows! lk "tbl:x" rows100)
+          sql (str "SELECT data_file FROM ducklake_list_files('lake', '" (:table h) "')")]
+      (is (= 1 (count (lake/q lk sql))) "a live table lists its Parquet")
+      (lake/x! lk (str "DROP TABLE " (:table h)))
+      (is (thrown-with-msg? Exception #"does not exist" (lake/q lk sql))))))
+
+(deftest hydrate-marks-a-reclaimed-table-instead-of-throwing
+  (with-lake [lk]
+    (let [rs    (mapv (fn [i] {:a i :b (str "p" i)}) (range 100))
+          h     (tbl/put-rows! lk "tbl:x" rs)
+          o     {:id "tbl:x" :kind :table :title "X" :value h}
+          ;; Before the DROP, for the reason the test above records.
+          files (mapv :data_file
+                      (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '"
+                                      (:table h) "')")))]
+      ;; 100 rows rather than a handful, and this is load-bearing: DuckLake
+      ;; inlines a small insert into the catalog, so a 2-row table has NO
+      ;; Parquet to delete and still reads back perfectly after the DROP —
+      ;; the same measurement `rows100` above was written for. Such a test
+      ;; would exercise the happy path and report that degradation works.
+      (is (= 1 (count files)) "the rows are in a file, so deleting it can break the read")
+      (lake/x! lk (str "DROP TABLE " (:table h)))
+      (doseq [f files] (io/delete-file f true))
+      (let [r (tbl/hydrate lk o)]
+        (is (= [] (:value r)) "an empty table, so every downstream shape guard still holds")
+        (is (inst? (:table/reclaimed r)) "and it says when")
+        (is (= 100 (:table/total r)) "the row count survives — it lives on the handle")
+        (is (= [:a :b] (:table/cols r)) "and so do the column names")
+        (is (= "X" (:title r)) "everything else survives")))))

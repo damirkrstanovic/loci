@@ -17,6 +17,13 @@
   (rows [this handle opts]
     "A page of rows for `handle`. `opts` may carry :offset and :limit.")
   (row-count [this handle] "How many rows `handle` names, without fetching them.")
+  (reclaimed-at [this handle]
+    "When this handle's rows were reclaimed, or nil if they were not.
+
+     On the protocol because only the store can answer it, and `hydrate` needs
+     the answer to tell a deliberate reclamation apart from a failing disk. An
+     `InlineTable` carries its rows in the handle, so nothing can reclaim them
+     and the answer is always nil.")
   (column-samples [this handle per-col max-cols]
     "Up to `per-col` sample values for each of the first `max-cols` columns, as
      `{column [\"…\" …]}` with the values already stringified.
@@ -199,6 +206,7 @@
       limit  (take limit)
       true   vec))
   (row-count [_ h] (:rows h))
+  (reclaimed-at [_ _] nil)
   (column-samples [_ h per-col max-cols]
     (let [rs (:data h)]
       (into {} (for [c (take max-cols (:cols h))]
@@ -318,6 +326,17 @@
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
           h  (:value o)]
-      (assoc o :value       (rows ts h {:limit mold-cap})
-               :table/total (row-count ts h)))
+      (try
+        (assoc o :value       (rows ts h {:limit mold-cap})
+                 :table/total (row-count ts h))
+        (catch Exception e
+          (if-let [at (reclaimed-at ts h)]
+            ;; `:value []` rather than the handle, so every downstream shape
+            ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
+            ;; in a dozen readers — behaves as it does for an empty table, which
+            ;; is a state they all already handle. The cols and the true row
+            ;; count survive because they live on the handle, not in the rows.
+            (assoc o :value [] :table/total (:rows h)
+                     :table/cols (:cols h) :table/reclaimed at)
+            (throw e)))))
     o))

@@ -420,6 +420,8 @@
 
   (row-count [_ h] (:rows h))
 
+  (reclaimed-at [lk h] (dropped-at lk (:table h)))
+
   (column-samples [lk h per-col max-cols]
     (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
 
