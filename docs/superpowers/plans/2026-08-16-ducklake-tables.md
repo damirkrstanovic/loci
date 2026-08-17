@@ -3339,6 +3339,50 @@ not a number to update.
   handle, which is sound because writes never overwrite so a given handle's rows are immutable.
   Measured and written down rather than fixed, because nothing is migrated yet and so nobody has
   felt it.
+- **Per-table GC: measured 2026-08-17, viable but pointless today.** Asked whether a user could
+  see the space each table's old versions occupy and reclaim them one at a time, without ever
+  calling the dangerous `expire_snapshots`. Findings, so nobody re-derives them:
+
+  - **DuckLake's own cleanup cannot do it.** `DROP TABLE` is a *versioned tombstone* — it frees
+    zero bytes and the dropped table's own handle still reads, because that handle names a
+    version where the table existed. `ducklake_cleanup_old_files` will not touch a file until
+    **every** snapshot below its `end_snapshot` is expired. Measured: expiring one snapshot
+    freed 0 bytes; only expiring snapshots 1–5 freed the 915,918-byte file, and that broke three
+    unrelated live handles. Snapshots are catalog-wide, so "expire enough to free A's old
+    version" always means "expire the snapshots B and C read at". The native path is dead.
+  - **`DROP TABLE` plus deleting that table's own Parquet files works.** Measured end to end:
+    exact bytes freed, zero snapshots expired, every other handle still reading, catalog healthy
+    across a reopen, and a later `cleanup_old_files` tolerant of the already-missing file.
+  - **There is nothing to reclaim.** On the real store: 31 lake tables, **31 current, 0
+    superseded, 0 orphaned, 0 reclaimable bytes**. The catalog's table set is exactly the
+    current-handle set.
+  - **And Parquet is 1.8% of the lake at this scale** — `catalog.duckdb` is 6,565,888 bytes
+    against 117,278 of Parquet, and never shrinks. That inverts at scale (a 10M-row table is
+    ~107 MB per version), so the feature targets a workspace that does not exist yet.
+  - **8 of 31 tables have no Parquet at all.** Small tables (3–8 rows) are inlined into
+    `catalog.duckdb` as `ducklake_inlined_data_*`. Cleanup must not assume a file exists, and
+    reclaims nothing for them.
+  - **Delete files, never directories.** `restore-to!` is `CREATE OR REPLACE`, which mints a new
+    `table_id` under the *same* directory — one directory was seen holding a dead and a live
+    Parquet. The safe unit is the individual `ducklake_data_file.path`.
+  - **The failure mode is a hard throw, not a degradation.** A handle whose file is gone makes
+    `hydrate`, `mold-payload`, `query_table` **and `all-chunks`** raise
+    `IO Error: Cannot open file …`. `all-chunks` is whole-substrate, so one reclaimed table
+    stops semantic-recall indexing for every object. `list_tables` does the opposite — Task 11
+    made it read the handle, so it cheerfully reports the old row count for a table with no rows
+    left. Any cleanup feature has to ship with per-object catching in all four.
+
+- **An orphan can be created by a crash, not just by `undo!`.** Found during that campaign: a
+  `put-rows!` whose caller dies between DuckLake's commit and `sub/commit!` of the event leaves a
+  fully-committed, permanently unreferenced lake table. Reproduced accidentally — an eval timed
+  out, the thread committed the table anyway, and no event was ever written. There is a live
+  window for this in the server (any exception in a handler after the write). It cannot be closed
+  by making the two writes atomic — they are different stores — so it is an argument for
+  eventual orphan cleanup rather than a bug with a local fix. Note
+  `ducklake_delete_orphaned_files` does **not** help: the table is properly in the catalog, it is
+  loci that has no reference to it, so classification has to happen at loci's level. M3 proved
+  that classification works.
+
 - **The browser suite is not evidence about table storage.** `npm run test:browser` runs against
   `content.clj`'s seed, which builds every object through its own local `obj` helper with inline
   rows — deliberately, so that requiring `loci.content` never needs a lake. So 130/130 green
