@@ -25,6 +25,31 @@
         (lake/close! lk)
         (rm-rf dir)))))
 
+(defn reclaim!
+  "Reclaim `table` for real — `DROP TABLE` plus every Parquet it owned — and
+   return the files that were deleted, so a caller can assert there was one.
+
+   **The order is the whole helper.** `ducklake_list_files` resolves its argument
+   through the live catalog, so after the tombstone it does not report an empty
+   file list, it refuses the name outright — see
+   `listing-a-dropped-tables-files-throws-rather-than-returning-none` in
+   `loci.lake-test`. Every test that injures a table for real has written this
+   sequence out by hand and every one of them got the order right only because
+   the previous one had already paid for it.
+
+   Asserting on the return value matters as much as the order: DuckLake **inlines
+   a small insert into `catalog.duckdb`**, so a table below ~10–20 rows owns no
+   Parquet at all, there is nothing to delete, and the read afterwards succeeds.
+   A degradation test built on such a table passes while exercising the happy
+   path. `rows100` in `loci.lake-test` is the measured threshold."
+  [lk table]
+  (let [files (mapv :data_file
+                    (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '"
+                                    table "')")))]
+    (lake/x! lk (str "DROP TABLE " table))
+    (run! #(io/delete-file % true) files)
+    files))
+
 (defmacro with-lake
   "A fresh DuckLake in a temp directory, always removed.
 

@@ -319,13 +319,46 @@
 
 (defn- with-samples
   "A handle-backed table, described. Attaches what `texts-of` needs and nothing
-   else — the rows are never fetched."
+   else — the rows are never fetched.
+
+   A table whose rows are gone loses its samples and nothing else: `texts-of`
+   falls through to the title, which is the same chunk an untitled-value table
+   has always produced. The sweep is whole-substrate and runs on a timer, so one
+   unreadable table must never cost more than its own chunk — before this, a
+   single deleted Parquet stopped semantic-recall indexing for **every** object
+   in the substrate, every 15 seconds, until somebody noticed.
+
+   Only a store that says the rows were reclaimed may be swallowed, and asking
+   it is itself wrapped — the same shape as `tbl/hydrate`, for the same two
+   reasons. A failing disk must stay a failing disk rather than becoming a
+   substrate of bare titles nothing raised about, and a catalog too damaged to
+   answer must not replace the error the caller actually needs to see.
+
+   **The catch fires only on a cold `lake/sample-cache`, and in the server that
+   means after a restart.** Samples are memoized per `[table snapshot]`, so a
+   table the 15-second sweep has already described keeps producing its full
+   synopsis from the memo after its Parquet is deleted — measured 2026-08-17:
+   two identically injured tables, the sampled one answered `{:a [\"0\" \"1\"
+   \"10\"]}` and the unsampled one threw `IO Error: Cannot open file`. So
+   reclaiming costs nothing at all until the process next starts cold, and then
+   exactly one re-embedding for that one chunk: the text goes from synopsis to
+   title, so its `:hash` moves, and `sweep!` reports `{:embedded 1 :retired 0}`
+   and asks the model for `[\"Gone\"]`. Nothing is retired — the chunk id is the
+   object's id plus its index, which does not move."
   [o]
   (if (tbl/handle? (:value o))
     (let [h (:value o)]
-      (assoc o :table/cols    (vec (take synopsis-cols (:cols h)))
-               :table/samples (tbl/column-samples (force lake/lake) h
-                                                  synopsis-samples synopsis-cols)))
+      (try
+        (assoc o :table/cols    (vec (take synopsis-cols (:cols h)))
+                 :table/samples (tbl/column-samples (force lake/lake) h
+                                                    synopsis-samples synopsis-cols))
+        (catch Exception e
+          ;; `o` unchanged on purpose: with no `:table/samples`, `texts-of`'s
+          ;; `(:table :metric)` branch falls to the title, which is already how
+          ;; it handles a table it cannot describe.
+          (if (try (tbl/reclaimed-at (force lake/lake) h) (catch Exception _ nil))
+            o
+            (throw e)))))
     o))
 
 (defn all-chunks
