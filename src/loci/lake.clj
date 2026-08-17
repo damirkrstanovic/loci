@@ -320,15 +320,27 @@
    Note the metadata tables are invisible to `duckdb_tables()` and must be named
    in full.
 
-   The `end_snapshot IS NOT NULL` clause is **explicit, not load-bearing**, and
-   is worth knowing before anyone tries to prove it matters: the inner join
-   already excludes a live table, because `end_snapshot` is NULL for one and
-   `NULL = s.snapshot_id` is never true. Measured 2026-08-17 — deleting the
-   clause changes no result, so a sabotage of it cannot bite. What is
-   load-bearing is the column (`begin_snapshot` in its place reports a live
-   table's *creation* time as a drop) and the `table_name` filter (without it a
-   live table inherits a sibling's drop time). Both of those sabotages fail the
-   tests."
+   **A tombstoned row does not mean a dead table, and the `NOT EXISTS` is what
+   makes the answer true.** `restore-to!` is a `CREATE OR REPLACE`, which mints
+   a *new* `table_id` under the same table name and directory while stamping
+   `end_snapshot` on the old one — so one live table can own two catalog rows,
+   one of them tombstoned:
+
+     table_id 2  t_tbl_y_c41a2b1d  begin 2  end 3    ← replaced
+     table_id 3  t_tbl_y_c41a2b1d  begin 3  end nil  ← live
+
+   Filtering to non-null `end_snapshot` and taking the newest therefore finds
+   the tombstone and never sees the live sibling. Measured 2026-08-17 on two
+   tables given identical injury — every Parquet deleted, `DROP TABLE` never
+   issued — the plain one answered nil and `hydrate` rethrew, and the restored
+   one answered an instant and `hydrate` reported a reclamation for rows that
+   were never reclaimed. That is the one thing this function exists to prevent,
+   so the question it asks is not \"is there a tombstone\" but **\"is there no
+   live row\"**.
+
+   Latent while `restore-to!` has no production callers; it stops being latent
+   the day `list_tables` filters on `reclaimed-at`, because a restored table
+   would vanish from the catalog the agent sees."
   [lk table]
   (some-> (first (q lk (str "SELECT s.snapshot_time AS t"
                             "  FROM __ducklake_metadata_lake.main.ducklake_table dt"
@@ -336,6 +348,9 @@
                             "    ON s.snapshot_id = dt.end_snapshot"
                             " WHERE dt.table_name = '" table "'"
                             "   AND dt.end_snapshot IS NOT NULL"
+                            "   AND NOT EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
+                            "                    WHERE live.table_name = dt.table_name"
+                            "                      AND live.end_snapshot IS NULL)"
                             " ORDER BY dt.end_snapshot DESC LIMIT 1")))
           :t
           (.toInstant)

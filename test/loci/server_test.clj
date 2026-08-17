@@ -551,6 +551,48 @@
       (is (string? (:why (first (:skipped r)))))
       (is (= before (count (sub/history st)))))))                  ; nothing to refresh → no event
 
+(deftest rerun-refuses-a-reclaimed-source-rather-than-emptying-its-children
+  ;; `recompute` is a SEVENTH reader of a hydrated table, and the one with
+  ;; teeth. A reclaimed source hydrates to `:value []` — not nil — so the
+  ;; "source is gone" branch cannot fire and the chain recomputes over zero
+  ;; rows. Before `hydrate` learned to degrade, that case raised and the chain
+  ;; stopped; the marker check is what replaces that.
+  ;;
+  ;; **The `via` here has to be an aggregate, and that is the whole test.**
+  ;; Measured 2026-08-17: all six `lib:` builtins answer "no rows came out —
+  ;; nothing to keep" for an empty input, so with a `lib:` via the marker
+  ;; changes only the message a skip reports. An agent-written fn that counts
+  ;; returns `[{:n 0}]` from no rows — non-empty, so nothing downstream refuses
+  ;; it — and `rerun!` commits it over the good table and reports success.
+  ;; Sabotaged, this test goes from `[{:n 100}]` to `[{:n 0}]` and `:refreshed`.
+  (let [st  (sub/fresh-store)
+        lk  @lake/lake
+        ;; 100 rows so the write lands a Parquet there is something to delete —
+        ;; DuckLake inlines a small insert and the source would keep reading.
+        _   (sub/commit! st {:op :put :id "tbl:t"
+                             :value (tbl/table-object
+                                     lk "tbl:t" "T"
+                                     (mapv (fn [i] {:region (str "r" i) :revenue i}) (range 100)))})
+        _   (sub/commit! st {:op :put :id "fn:agg"
+                             :value {:id "fn:agg" :kind :fn :title "fn: count"
+                                     :value {:lang "clojure" :code "(fn [rows] [{:n (count rows)}])"}}})
+        b   (:openId (srv/fn-apply! st "tbl:t" "fn:agg" {} nil))
+        before (rows-of st b)
+        h   (:value (sub/object st "tbl:t"))            ; raw: the handle, not rows
+        files (mapv :data_file
+                    (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '"
+                                    (:table h) "')")))]
+    (is (= [{:n 100}] before) "the derived table starts with a real count")
+    (lake/x! lk (str "DROP TABLE " (:table h)))          ; reclaim the SOURCE for real
+    (doseq [f files] (io/delete-file f true))
+    (let [hist (count (sub/history st))
+          r    (srv/rerun! st "tbl:t")]
+      (is (= [] (:refreshed r)) "nothing could be refreshed")
+      (is (= b (:id (first (:skipped r)))) "the child is skipped, by name")
+      (is (re-find #"reclaimed" (str (:why (first (:skipped r))))) "and it says why")
+      (is (= before (rows-of st b)) "the child's rows are UNCHANGED, not recounted to zero")
+      (is (= hist (count (sub/history st))) "and nothing was committed"))))
+
 (deftest rerun-validates
   (let [st (store-with-table)]
     (is (:error (srv/rerun! st "nope")))

@@ -442,6 +442,56 @@
     (is (nil? (lake/dropped-at lk "t_never_existed_00000000"))
         "absent is not the same as reclaimed — a genuine error must stay an error")))
 
+(deftest dropped-at-sees-past-a-restores-tombstone
+  ;; `restore-to!` is a CREATE OR REPLACE, so it stamps `end_snapshot` on the
+  ;; old `table_id` and mints a live one under the SAME name. Asking "is there
+  ;; a tombstone" answers yes for a table that is perfectly alive; the question
+  ;; has to be "is there no live row".
+  (with-lake [lk]
+    (let [ha (tbl/put-rows! lk "tbl:a" rows100)
+          hb (tbl/put-rows! lk "tbl:b" rows100)]
+      (lake/restore-to! lk (:table ha) (:snapshot ha))
+      (lake/restore-to! lk (:table hb) (:snapshot hb))
+      (is (= 2 (count (lake/q lk (str "SELECT table_id FROM"
+                                      " __ducklake_metadata_lake.main.ducklake_table"
+                                      " WHERE table_name = '" (:table ha) "'"))))
+          "one live table, two catalog rows — the state that made this wrong")
+      (is (nil? (lake/dropped-at lk (:table ha)))
+          "a restored table is live, however many tombstones it has behind it")
+      (lake/x! lk (str "DROP TABLE " (:table hb)))
+      (is (inst? (lake/dropped-at lk (:table hb)))
+          "and dropping a restored table is still a drop"))))
+
+(deftest a-dropped-table-still-serves-its-rows-until-its-files-go
+  ;; The tombstone alone frees nothing and breaks nothing: every handle reads
+  ;; `AT (VERSION => n)`, which time-travels straight past it. Deleting the
+  ;; Parquet is what a reader can feel — which is why Task 8 has to do both,
+  ;; and why a test that only drops would prove nothing about degradation.
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" rows100)]
+      (lake/x! lk (str "DROP TABLE " (:table h)))
+      (is (inst? (lake/dropped-at lk (:table h))) "the catalog says it was dropped")
+      (is (= 100 (count (tbl/rows lk h {:limit 2000})))
+          "and yet every row still reads")
+      (is (nil? (:table/reclaimed (tbl/hydrate lk {:kind :table :value h})))
+          "so hydrate returns real rows, not a reclamation marker"))))
+
+(deftest hydrate-rethrows-when-a-live-restored-tables-files-vanish
+  ;; The `reify` in `loci.tablestore-test` cannot see this class of bug — its
+  ;; `reclaimed-at` is hardcoded nil, so it agrees with any implementation.
+  ;; This is the one that bites: a real catalog, a real restore, real rows that
+  ;; were never reclaimed, and a real IO error that must reach the caller.
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" rows100)]
+      (lake/restore-to! lk (:table h) (:snapshot h))
+      ;; Every Parquet the table ever had — `ducklake_list_files` reports only
+      ;; the current version's, and the handle reads the one before it.
+      (doseq [f (parquets (:dir lk))] (io/delete-file f true))
+      (is (nil? (lake/dropped-at lk (:table h))) "nothing dropped this table")
+      (is (thrown-with-msg? Exception #"Cannot open file"
+            (tbl/hydrate lk {:kind :table :value h}))
+          "a live table with no files is a broken disk, not a tidy reclamation"))))
+
 (deftest listing-a-dropped-tables-files-throws-rather-than-returning-none
   ;; Whoever deletes files for real has to collect the paths BEFORE the DROP.
   ;; `ducklake_list_files` resolves its argument through the live catalog, so

@@ -206,3 +206,18 @@
     (is (thrown-with-msg? Exception #"disk on fire"
           (tbl/hydrate boom {:kind :table :value h}))
         "only a table the catalog says was dropped may be swallowed")))
+
+(deftest hydrate-keeps-the-read-error-when-the-catalog-is-broken-too
+  ;; Asking "was this reclaimed" is itself a read, and a store damaged enough
+  ;; to fail the first one can fail the second. The answer the user needs is
+  ;; why their rows would not load — not why the bookkeeping would not load.
+  (let [boom (reify tbl/TableStore
+               (put-rows! [_ _ _] nil)
+               (rows [_ _ _] (throw (ex-info "disk on fire" {})))
+               (row-count [_ h] (:rows h))
+               (reclaimed-at [_ _] (throw (ex-info "catalog unreadable" {})))
+               (column-samples [_ _ _ _] nil))
+        h {:store :lake :table "t_x" :snapshot 1 :rows 2 :cols [:a]}]
+    (is (thrown-with-msg? Exception #"disk on fire"
+          (tbl/hydrate boom {:kind :table :value h}))
+        "the original read error survives, not the one from asking about it")))

@@ -321,7 +321,24 @@
    them on paths — `list_tables`, the ƒ palette, the chunk sweep — that run on
    workspaces holding no lake-backed table at all. Forcing eagerly would open
    `<data-dir>/lake` to answer questions about rows that never left the log,
-   which is the trap `mold-payload`'s own docstring describes for `mem/memory`."
+   which is the trap `mold-payload`'s own docstring describes for `mem/memory`.
+
+   **A table whose rows were reclaimed degrades instead of throwing**, and that
+   is a second shape a caller has to expect: `:value []`, `:table/total` and
+   `:table/cols` from the handle, and `:table/reclaimed` carrying the instant.
+   `[]` rather than the handle because every downstream shape guard —
+   `(and (sequential? v) (seq v) (every? map? v))`, repeated in a dozen readers
+   — then behaves as it does for an empty table, a state they all already
+   handle. **A reader that acts on the rows must check `:table/reclaimed`
+   first**, because `[]` and \"no rows\" are indistinguishable otherwise:
+   `server/recompute` refuses on the marker for exactly this reason, having
+   otherwise been ready to recompute a derived table from zero rows and commit
+   the empty result over good data.
+
+   Only a store that says the rows were reclaimed may be swallowed. Any other
+   failure is rethrown untouched, so a broken disk stays a broken disk — and
+   asking the store is itself wrapped, because a catalog too damaged to answer
+   must not replace the error the caller actually needs to see."
   [ts o]
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
@@ -330,7 +347,7 @@
         (assoc o :value       (rows ts h {:limit mold-cap})
                  :table/total (row-count ts h))
         (catch Exception e
-          (if-let [at (reclaimed-at ts h)]
+          (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
             ;; `:value []` rather than the handle, so every downstream shape
             ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
             ;; in a dozen readers — behaves as it does for an empty table, which

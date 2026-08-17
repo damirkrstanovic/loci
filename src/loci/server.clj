@@ -1291,10 +1291,30 @@
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
-        rows   (or (get working src-id)
-                   (:value (tbl/hydrate lake/lake (sub/object st src-id))))
+        ;; The hydrated OBJECT, not just its `:value` — a source whose rows were
+        ;; reclaimed hydrates to `:value []`, which is not nil, so the "is gone"
+        ;; branch below cannot see it and the chain recomputes over zero rows.
+        ;; Before tables could degrade, that case raised and the chain stopped.
+        ;;
+        ;; What that costs depends on the `via`, measured 2026-08-17: all six
+        ;; `lib:` builtins answer "no rows came out — nothing to keep", so they
+        ;; skip with a misleading reason and lose nothing. An agent-written fn
+        ;; that AGGREGATES is the one that destroys data — `(fn [rows] [{:n
+        ;; (count rows)}])` returns `[{:n 0}]` from no rows, nothing downstream
+        ;; refuses a non-empty result, and `rerun!` commits it over the good
+        ;; table and reports it as refreshed. Measured `[{:n 100}]` → `[{:n 0}]`.
+        ;; Still only hydrated when the ancestor was NOT already refreshed in
+        ;; this run: fresh rows supersede whatever the stored source says, and
+        ;; hydrating regardless would both cost a lake read per link in the
+        ;; chain and refuse a source that has just been recomputed.
+        known  (get working src-id)
+        src    (when-not known (tbl/hydrate lake/lake (sub/object st src-id)))
+        rows   (or known (:value src))
         via    (:via obj)]
     (cond
+      ;; Before `nil?`: `[]` passes that check.
+      (:table/reclaimed src) {:why (str "source " src-id "'s rows were reclaimed on "
+                                        (:table/reclaimed src))}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]
