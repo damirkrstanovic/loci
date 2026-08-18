@@ -9,6 +9,7 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.config :as config]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -107,6 +108,47 @@
               rs (.executeQuery st sql)]
     (rs->maps rs ks unwrap)))
 
+(defn- extension-dir
+  "Where DuckDB should keep its extensions, or nil to leave DuckDB's own default
+   alone — see `open-lake!` for why loci has to be able to say this at all.
+
+   Read through `loci.config/env`, not `System/getenv`, so `loci.env` sets it the
+   same way it sets everything else and a non-Docker deployment has one place to
+   write it."
+  []
+  (config/env "LOCI_DUCKDB_EXTENSIONS"))
+
+(defn- extension-problem
+  "One paragraph naming the directory, the uid and the fix — `data-dir-problem`'s
+   job, for the other directory loci needs.
+
+   Without it the reader gets DuckDB's own error, which names neither loci nor
+   anything actionable:
+
+     IO Error: Failed to create directory \"/.duckdb\": Permission denied
+
+   That is the failure this whole mechanism exists for, and it killed the
+   container before the listener. `/.duckdb` is the filesystem root because
+   DuckDB composes its extension directory from $HOME and the runtime image sets
+   none — see `open-lake!`."
+  [^Throwable cause]
+  (let [dir  (extension-dir)
+        home (System/getenv "HOME")]
+    (str "loci cannot load DuckDB's ducklake extension, so the lake cannot open.\n"
+         "  looking in " (cond dir  (str dir " (LOCI_DUCKDB_EXTENSIONS)")
+                               home (str home "/.duckdb — DuckDB's default, from HOME")
+                               :else "/.duckdb — DuckDB's default, and HOME is unset")
+         "\n"
+         "  running as " (sub/running-as) "\n"
+         "  DuckDB said: " (.getMessage cause) "\n"
+         "\n"
+         "  Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension.\n"
+         "  A container should set it at build time and install the extension\n"
+         "  into the image then: INSTALL is the one step here that reaches the\n"
+         "  network, and the directory it writes need never be writable again —\n"
+         "  LOAD only reads.\n"
+         "\nFailing here rather than at the first table read.")))
+
 (defn- ensure-extension!
   "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
    on any machine that has already run loci, and it is the only reason a machine
@@ -139,8 +181,10 @@
   [lk]
   (try (x! lk "LOAD ducklake")
        (catch Exception _
-         (x! lk "INSTALL ducklake")
-         (x! lk "LOAD ducklake"))))
+         (try (x! lk "INSTALL ducklake")
+              (x! lk "LOAD ducklake")
+              (catch Exception e
+                (throw (ex-info (extension-problem e) {:dir (extension-dir)} e)))))))
 
 (defrecord Lake [conn dir])
 
@@ -183,7 +227,30 @@
    the error above. What canonicalizing buys is that a new catalog records
    where it actually is, so `data_path` means something to someone reading the
    catalog with the duckdb CLI, instead of a bare `data/` that names a
-   different directory from every working directory but one."
+   different directory from every working directory but one.
+
+   **`extension_directory` is the other thing this connection has to be told,
+   and `HOME` is not a substitute for it.** DuckDB composes that directory from
+   `$HOME`; the runtime image sets no HOME — `USER` does not set one and
+   `debian:bookworm-slim` does not either — so `getenv(\"HOME\")` is null, the
+   path becomes `/.duckdb`, and `docker compose up` died with
+
+     IO Error: Failed to create directory \"/.duckdb\": Permission denied
+
+   before the listener ever started.
+
+   `ENV HOME=/home/loci` in the image looks like the fix and covers only half of
+   how loci is run. `compose.yaml` sets `user: \"${LOCI_UID:-10001}:…\"` and tells
+   you to put your own uid there, because the substrate is a bind mount of a
+   directory you own — so loci commonly runs as a uid with no `/etc/passwd` entry
+   in the container and no claim on `/home/loci`. Anything resolved through HOME
+   is right for the named-volume path and wrong for the bind-mount one. Naming
+   the directory outright is right for both, and it is also what lets the image
+   ship the extension read-only: a writable extension directory would let a
+   version mismatch quietly re-download 36 MB at boot instead of failing.
+
+   Unset leaves DuckDB's default alone, which is what a developer on a laptop
+   with a real HOME wants."
   ([] (open-lake! (str (sub/data-dir) "/lake")))
   ([dir]
    (io/make-parents (io/file dir "catalog.duckdb"))
@@ -191,9 +258,12 @@
    ;; DriverManager: DriverManager cannot see a driver loaded by a child
    ;; classloader, which is how this namespace gets exercised from a REPL that
    ;; added the dep with `add-lib`. Direct instantiation works in both.
-   (let [dir  (.getCanonicalPath (io/file dir))
-         conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
-         lk   (->Lake conn dir)]
+   (let [dir   (.getCanonicalPath (io/file dir))
+         props (java.util.Properties.)
+         _     (when-let [ext (extension-dir)]
+                 (.setProperty props "extension_directory" ext))
+         conn  (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" props)
+         lk    (->Lake conn dir)]
      (try
        (ensure-extension! lk)
        (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"

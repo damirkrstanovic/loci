@@ -171,15 +171,33 @@
 ;; predicate can be tested and a branch of `-main` cannot.
 ;; ----------------------------------------------------------------------------
 
-(defn- effective-user
+(defn effective-user
   "uid and name of the process, best effort. UnixSystem is in `jdk.security.auth`
    — present in the JREs we ship on, but a jlinked runtime could drop it, and a
    missing uid must degrade the message rather than replace it with a
-   ClassNotFoundException."
+   ClassNotFoundException.
+
+   Public because a test that would otherwise pass vacuously needs it: a
+   permission refusal cannot be provoked as root, so `loci.lake-test` asks the
+   uid and says out loud that it skipped."
   []
   {:name (System/getProperty "user.name")
    :uid  (try (.getUid (com.sun.security.auth.module.UnixSystem.))
               (catch Throwable _ nil))})
+
+(defn running-as
+  "\"uid 10001 (loci)\", degrading through whatever `effective-user` could find.
+
+   Shared rather than written twice: both messages that name a permission
+   problem — the data directory's and the extension directory's — have to say
+   who we are, and a container's whole difficulty is that the uid is not the one
+   the image expected."
+  []
+  (let [{:keys [uid name]} (effective-user)]
+    (cond (and uid name) (str "uid " uid " (" name ")")
+          uid            (str "uid " uid)
+          name           (str "user " name)
+          :else          "an unknown user")))
 
 (defn- write-probe
   "nil if we can actually create a file in `dir`, else the reason we could not.
@@ -215,11 +233,7 @@
                    (cond (nil? c)    nil
                          (.exists c) c
                          :else       (recur (.getParentFile c))))
-         {:keys [uid name]} (effective-user)
-         who    (cond (and uid name) (str "uid " uid " (" name ")")
-                      uid            (str "uid " uid)
-                      name           (str "user " name)
-                      :else          "an unknown user")
+         who    (running-as)
          header (fn [why]
                   (str "loci cannot use its data directory: " dir "\n"
                        "  " why "\n"

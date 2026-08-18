@@ -3,8 +3,10 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
+            [loci.config :as config]
             [loci.lake :as lake]
             [loci.lake-fixture :refer [rm-rf with-lake]]
+            [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
 (deftest opens-and-answers
@@ -536,3 +538,96 @@
         (is (= 100 (:table/total r)) "the row count survives — it lives on the handle")
         (is (= [:a :b] (:table/cols r)) "and so do the column names")
         (is (= "X" (:title r)) "everything else survives")))))
+
+;; ---------------------------------------------------------------------------
+;; where DuckDB's extensions live
+;; ---------------------------------------------------------------------------
+
+(defn- seed-extension-dir!
+  "Put the already-installed ducklake extension into `dir`, laid out the way an
+   `INSTALL` into `dir` would lay it out.
+
+   Without it this test hands DuckDB an EMPTY directory, `ensure-extension!`
+   falls through to INSTALL, and every run of the suite pulls **36 MB** over the
+   network — measured 2026-08-18 at 508 ms and 36,436,086 bytes, on a machine
+   that already had the extension. It also makes the suite unrunnable offline,
+   which would be a poor thing to introduce in the same change that makes the
+   *container* boot offline.
+
+   `duckdb_extensions().install_path` is the absolute path of the extension this
+   DuckDB has loaded, and its last three components are exactly
+   `<version>/<platform>/<file>` — the layout `INSTALL` writes under an explicit
+   `extension_directory`. So neither the version nor the platform is hardcoded
+   here, and a DuckDB upgrade needs no edit."
+  [dir]
+  (let [src  (io/file (with-redefs [config/env (constantly nil)]
+                        (with-lake [lk]
+                          (:install_path
+                           (first (lake/q lk (str "SELECT install_path FROM duckdb_extensions()"
+                                                  " WHERE extension_name = 'ducklake'")))))))
+        plat (.getParentFile src)
+        ver  (.getParentFile plat)
+        dest (io/file dir (.getName ver) (.getName plat) (.getName src))]
+    (io/make-parents dest)
+    (io/copy src dest)
+    dest))
+
+(deftest an-explicit-extension-directory-is-honoured
+  ;; The container has no usable HOME — `USER` does not set it and compose runs
+  ;; loci as the host uid, which has no passwd entry — so DuckDB composes
+  ;; "/.duckdb" and dies with EACCES before the listener starts. loci must be
+  ;; able to say where the extension lives without depending on HOME.
+  (let [ext (str (System/getProperty "java.io.tmpdir") "/loci-ext-" (System/nanoTime))]
+    (.mkdirs (io/file ext))
+    (try
+      (is (.exists (seed-extension-dir! ext))
+          "the extension has to BE there, or this measures an INSTALL instead")
+      (with-redefs [config/env {"LOCI_DUCKDB_EXTENSIONS" ext}]
+        (with-lake [lk]
+          (is (= ext (:d (first (lake/q lk "SELECT current_setting('extension_directory') AS d"))))
+              "DuckDB was told where to look")
+          (is (= [{:db "lake"}] (lake/q lk "SELECT current_database() AS db"))
+              "and the lake still opens")))
+      (finally (rm-rf ext)))))
+
+(deftest no-explicit-directory-changes-nothing
+  (with-redefs [config/env (constantly nil)]
+    (with-lake [lk]
+      (is (= [{:db "lake"}] (lake/q lk "SELECT current_database() AS db"))
+          "an unset value must leave DuckDB's own default alone"))))
+
+(deftest an-unusable-extension-directory-says-so
+  ;; The failure this whole mechanism exists for used to surface as DuckDB's own
+  ;;
+  ;;   IO Error: Failed to create directory "/.duckdb": Permission denied
+  ;;
+  ;; out of a stack that named `ensure-extension!` and nothing a reader could
+  ;; act on. The replacement has to name the variable, or it is the same trace
+  ;; with more words.
+  (let [ext (str (System/getProperty "java.io.tmpdir") "/loci-ext-ro-" (System/nanoTime))
+        dir (str (System/getProperty "java.io.tmpdir") "/loci-lake-ro-" (System/nanoTime))
+        f   (io/file ext)]
+    (if (= 0 (:uid (sub/effective-user)))
+      ;; Root can write a 0555 directory, so there is no refusal to provoke and
+      ;; the assertions below would pass without exercising anything. Say so
+      ;; rather than reporting a green.
+      (println "SKIPPED an-unusable-extension-directory-says-so: running as root,"
+               "an unwritable directory is not unwritable to us")
+      (do
+        (.mkdirs f)
+        (.setWritable f false)
+        (try
+          (with-redefs [config/env {"LOCI_DUCKDB_EXTENSIONS" ext}]
+            (let [t (try (lake/close! (lake/open-lake! dir)) nil
+                         (catch clojure.lang.ExceptionInfo e e))
+                  m (or (some-> ^Throwable t .getMessage) "")]
+              (is (some? t) "an unwritable extension directory must refuse to open")
+              (is (str/includes? m "LOCI_DUCKDB_EXTENSIONS") "the message names the variable")
+              (is (str/includes? m ext) "and the directory DuckDB tried")
+              (is (str/includes? m "ducklake") "and which extension")
+              ;; Losing the cause would throw away the OS's own reason — the
+              ;; difference between a permission bit, a read-only mount and a
+              ;; full disk, none of which loci can diagnose for itself.
+              (is (str/includes? (or (some-> ^Throwable t .getCause .getMessage) "") "Permission denied")
+                  "and DuckDB's own error survives as the cause")))
+          (finally (.setWritable f true) (rm-rf ext) (rm-rf dir)))))))
