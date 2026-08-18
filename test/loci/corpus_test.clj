@@ -19,17 +19,25 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [loci.content]
             [loci.corpus :as corpus]
             [loci.entities :as ent]
+            [loci.lake :as lake]
+            [loci.lake-fixture]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
+
+;; `mint-hub` lands its rows in the lake now, so every `import-corpus!` in here
+;; — including the DRY runs, which mint the same objects in order to report the
+;; plan — reaches `@lake/lake`. Without this the suite would open <data-dir>/lake.
+(use-fixtures :once loci.lake-fixture/with-temp-lake)
 
 (def ^:private dir "corpus")
 
@@ -218,8 +226,12 @@
     (doseq [{:keys [file coarse-column coarse-values rows]} (tables)]
       (testing file
         (let [tbl  (by-file file)
-              data (:value tbl)]
+              ;; the log holds a handle; the molds are asserted against the rows
+              data (:value (tbl/hydrate lake/lake tbl))]
           (is (some? tbl) "the table reached the store")
+          (is (tbl/handle? (:value tbl))
+              "and it reached it as a handle — hydrate would pass rows through, so
+               nothing else in this suite can tell whether the writer was converted")
           (is (= (:committed rows) (count data)) "with all its rows")
 
           (testing "the coarse column survived the round trip through the log"
@@ -237,7 +249,8 @@
 
     (testing "exactly one table is a time series, and it is the monthly one"
       (let [monthly (for [[f t] by-file
-                          :when (some #{:table/line} (map :id (mold/viewers-for (:value t))))]
+                          :when (some #{:table/line}
+                                      (map :id (mold/viewers-for (:value (tbl/hydrate lake/lake t)))))]
                       f)]
         (is (= ["interest-rates-monthly.csv"] (vec monthly)))))))
 
@@ -876,3 +889,25 @@
         "every quoted fact quotes an extract the manifest describes")
     (is (= tbl (set (map :table corpus/derived))) "and every table is read")
     (is (= prs (set (map :doc corpus/quoted))) "and every extract is quoted")))
+
+(deftest a-dry-run-writes-nothing-to-the-lake-either
+  ;; "Returns the plan it would have applied without applying any of it" has to
+  ;; cover the lake as well as the log. Minting IS how the plan is computed, so a
+  ;; dry run runs `mint-hub` in full — and once tables moved to DuckLake that
+  ;; meant every preview left orphan Parquet behind for a plan nobody applied.
+  ;; Measured before the fix: 5 tables and 6 snapshots per dry run.
+  (let [count-of (fn [sql] (:n (first (lake/q @lake/lake sql))))
+        tables   #(count-of "SELECT count(*) AS n FROM duckdb_tables()")
+        snaps    #(count-of "SELECT count(*) AS n FROM ducklake_snapshots('lake')")
+        [t0 s0]  [(tables) (snaps)]
+        st       (sub/fresh-store)
+        r        (corpus/import-corpus! st {:dir dir})]      ; DRY RUN
+    (is (:ok? r))
+    (is (= 5 (:commits (:plan r))) "it planned all five notebooks")
+    (is (zero? (count (sub/history st))) "and committed none of them")
+    (is (= t0 (tables)) "no table may be left in the lake")
+    (is (= s0 (snaps)) "and no snapshot")
+    ;; the same run live does write — otherwise the assertions above would pass
+    ;; on a lake nothing can reach
+    (ran! st)
+    (is (= (+ t0 5) (tables)) "a live run lands one table per notebook")))

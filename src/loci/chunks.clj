@@ -47,8 +47,10 @@
             [clojure.string :as str]
             [loci.dlv :as dlv]
             [loci.embed :as embed]
+            [loci.lake :as lake]
             [loci.notebook :as nb]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 ;; ---------------------------------------------------------------------------
 ;; sizes — the two bounds this namespace makes claims about
@@ -78,8 +80,14 @@
 
 (def ^:private synopsis-samples
   "Sample values per column. Enough that \"Belgrade\" finds the roster; few
-   enough that the samples are a hint, not the data. Taken from the front of the
-   table, so appending rows does not churn the hash."
+   enough that the samples are a hint, not the data.
+
+   Not taken from the front of the table — `column-samples` returns the whole
+   column's distinct values ordered by their string form, and these are the
+   first three of those. Appending rows still does not churn the hash, but for
+   a stronger reason than row order gave: a new row moves this prefix only if
+   its value sorts *into* it, so appending 10,000 rows to a table whose
+   smallest three values are already present changes nothing at all."
   3)
 
 ;; ---------------------------------------------------------------------------
@@ -180,6 +188,12 @@
 
 (defn- rows? [v] (and (sequential? v) (seq v) (every? map? v)))
 
+(def ^:private inline-store
+  "The reference `TableStore`. Lifted to a def rather than constructed per call
+   so that `chunks-of` staying **pure** is obvious: `InlineTable` is a record
+   with no fields, so this is a value, not a store to be reached."
+  (tbl/inline-table))
+
 (defn- col-name [c] (if (keyword? c) (name c) (str c)))
 
 (defn- clip [s n] (if (> (count s) n) (str (subs s 0 n) "…") s))
@@ -192,16 +206,16 @@
    clip at the end makes that a guarantee rather than an expectation — a caller
    can assert on the length and the assertion holds for any table.
 
-   Columns come from the first rows in order of first appearance, so the answer
-   does not depend on how a map happens to iterate. The row *count* is
-   deliberately absent: it would move the hash on every appended row and buy
-   nothing anyone searches for."
-  [title rows]
-  (let [cols (->> (take 50 rows) (mapcat keys) distinct (take synopsis-cols) vec)
-        line (fn [c]
-               (let [vs (->> rows (keep #(get % c)) (map #(clip (str %) 40))
-                             distinct (take synopsis-samples))]
-                 (str (col-name c) ": " (str/join ", " vs))))]
+   Takes samples rather than rows so that a lake-backed table can be described
+   without fetching any: the store answers `column-samples` from SQL, and this
+   function never learns which store it was. The row *count* is deliberately
+   absent: it would move the hash on every appended row and buy nothing anyone
+   searches for."
+  [title cols samples]
+  ;; No per-value clip here: `column-samples` already clipped to
+  ;; `tbl/sample-max-chars`, and re-clipping would cut an astral value a second
+  ;; time — the store counts code points, `clip` counts Java chars.
+  (let [line (fn [c] (str (col-name c) ": " (str/join ", " (get samples c))))]
     (clip (str/join "\n" (concat (when-not (str/blank? (str title)) [(str title)])
                                  [(str "columns: " (str/join ", " (map col-name cols)))]
                                  (map line cols)))
@@ -251,7 +265,10 @@
    no chunks until it is named here, which is the safe direction to fail: an
    unembedded object is found lexically, an embedded viewspec is noise in every
    result."
-  [{:keys [kind title value]}]
+  ;; `:table/synopsis-cols` is read off `o` rather than destructured, because the
+  ;; obvious local would shadow the `synopsis-cols` DEF this function uses two
+  ;; branches down.
+  [{:keys [id kind title value] :table/keys [samples] :as o}]
   (case kind
     :space  (let [head (str/trim (str title "\n" (str (:intent value))))]
               (into (if (str/blank? head) [] [head])
@@ -262,10 +279,17 @@
     ;; leaving the object to be found the way it is found today, by title.
     :doc    (if (string? value) (prose-chunks value) [])
     :report (prose-chunks (report-body value))
-    (:table :metric) (cond
-                       (rows? value)                 [(synopsis title value)]
-                       (not (str/blank? (str title))) [(str title)]
-                       :else [])
+    (:table :metric)
+    (cond
+      samples [(synopsis title (:table/synopsis-cols o) samples)]
+
+      (rows? value)
+      (let [h (tbl/put-rows! inline-store id value)]
+        [(synopsis title (vec (take synopsis-cols (:cols h)))
+                   (tbl/column-samples inline-store h synopsis-samples synopsis-cols))])
+
+      (not (str/blank? (str title))) [(str title)]
+      :else [])
     []))
 
 (defn chunks-of
@@ -296,11 +320,111 @@
   [objs]
   (vec (mapcat chunks-of (sort-by #(str (:id %)) objs))))
 
+(defn- with-samples
+  "A handle-backed table, described. Attaches what `texts-of` needs and nothing
+   else — the rows are never fetched.
+
+   A table whose rows are gone loses its samples and nothing else: `texts-of`
+   falls through to the title, which is the same chunk an untitled-value table
+   has always produced. The sweep is whole-substrate and runs on a timer, so one
+   unreadable table must never cost more than its own chunk — before this, a
+   single deleted Parquet stopped semantic-recall indexing for **every** object
+   in the substrate, every 15 seconds, until somebody noticed.
+
+   Only a store that says the rows were reclaimed may be swallowed, and asking
+   it is itself wrapped — the same shape as `tbl/hydrate`, for the same two
+   reasons. A failing disk must stay a failing disk rather than becoming a
+   substrate of bare titles nothing raised about, and a catalog too damaged to
+   answer must not replace the error the caller actually needs to see.
+
+   **The catch fires only on a cold `lake/sample-cache`, and in the server that
+   means after a restart.** Samples are memoized per `[table snapshot]`, so a
+   table the 15-second sweep has already described keeps producing its full
+   synopsis from the memo after its Parquet is deleted — measured 2026-08-17:
+   two identically injured tables, the sampled one answered `{:a [\"0\" \"1\"
+   \"10\"]}` and the unsampled one threw `IO Error: Cannot open file`. So
+   reclaiming costs nothing at all until the process next starts cold, and then
+   exactly one re-embedding for that one chunk: the text goes from synopsis to
+   title, so its `:hash` moves, and `sweep!` reports `{:embedded 1 :retired 0}`
+   and asks the model for `[\"Gone\"]`. Nothing is retired — the chunk id is the
+   object's id plus its index, which does not move."
+  [o]
+  (if (tbl/handle? (:value o))
+    (let [h (:value o)]
+      (try
+        ;; `:table/synopsis-cols` and NOT `:table/cols`, which `tbl/hydrate`
+        ;; already owns and fills with the table's FULL column list. This one is
+        ;; truncated to `synopsis-cols` — two different meanings under one key,
+        ;; kept apart today only by `texts-of` gating on `:table/samples`, which
+        ;; is one refactor from being wrong.
+        (assoc o :table/synopsis-cols (vec (take synopsis-cols (:cols h)))
+                 :table/samples       (tbl/column-samples (force lake/lake) h
+                                                          synopsis-samples synopsis-cols))
+        (catch Exception e
+          ;; `o` unchanged on purpose: with no `:table/samples`, `texts-of`'s
+          ;; `(:table :metric)` branch falls to the title, which is already how
+          ;; it handles a table it cannot describe.
+          (if (try (tbl/reclaimed-at (force lake/lake) h) (catch Exception _ nil))
+            o
+            (throw e)))))
+    o))
+
 (defn all-chunks
   "Every chunk the substrate currently implies. Reads the store; writes nothing
-   to it, ever."
+   to it, ever.
+
+   A table's synopsis comes from `column-samples`, which the lake answers in SQL
+   and memoizes per handle, so this costs no row reads in steady state and stays
+   bounded whatever a table's size. `chunks-of` stays pure — it never learns
+   that a lake exists.
+
+   Byte-identical to the inline path only where the two agree on how a value
+   *prints*. Measured over the 31 live row-bearing objects, 2026-08-16: **27 of
+   31**, and re-measured unchanged on 2026-08-17 after `lake/unwrap` landed —
+   the JSON columns it fixed are read through `q-as`, and these samples come
+   from `q` over a `CAST(… AS VARCHAR)` that happens before any value reaches
+   JDBC.
+
+   *Objects*, not tables: 29 tables and the two `:metric`s, which carry rows the
+   same way and which a `:kind :table` filter silently drops. That word cost a
+   round — it made the count look wrong, and the two it hid are exactly the two
+   `content/seed!` was failing to convert. Never because the ordering differs — DuckDB's VARCHAR collation and
+   Clojure's `sort` were checked against each other over 27 strings spanning
+   punctuation, digits, case, accents and CJK and agreed exactly. Always
+   because `CAST(… AS VARCHAR)` and Clojure's `str` render the same value
+   differently, and **a value that renders differently also sorts differently,
+   so the whole sample list can change and not just the one value in it.**
+
+   Three of the four are the lake's own type inference, and predate this
+   function: reading the rows back disagreed with inline in exactly the same
+   way, and sampling in row order simply never reached the offending value.
+
+   · A column mixing `Long` and `Double` is one `DOUBLE` to `read_json_auto`,
+     so `100` renders `100.0` — `tbl:csv-19-7071`'s `urban_pct`.
+   · A column mixing a string with numbers is widened to JSON, and a JSON value
+     keeps its quotes, so an empty string renders as `\"\"` — two characters,
+     sorting below every digit. Five columns: `density_per_km2`
+     (also `tbl:csv-19-7071`, which is why it is under both bullets),
+     `tbl:csv-18-1542`'s `inflation_pct`, `growth_pct` and `unemployment_pct`.
+     In `tbl:extract-20-8413`'s `approx_low_income_share` the quote also
+     reorders: `10, 50, ~13% (1 of 8 countries)` against
+     `\"~13% (1 of 8 countries)\", 10, 50`.
+
+   The fourth is this function's own, and is the price of asking SQL rather
+   than Clojure to render. `tbl:corpus-2`'s `production_tonnes` samples
+   `1.24E7, 1.4E7, 100.0` inline and `100.0, 1000.0, 10000.0` from the lake —
+   **three different values**, because the rendering decides the sort. Both
+   engines use scientific notation and neither can be made to imitate the
+   other: Clojure switches at 1e7 and 1e-3 and writes `1.0E7`, DuckDB switches
+   at 1e16 and 1e-5 and writes `1e+16` / `1e-05`, so there is no range in which
+   they agree on such a value.
+
+   Not repaired by stringifying in Clojure instead: the values are *ordered* by
+   the rendering, so printing one rendering and sorting by another is a worse
+   contract than either. All four are re-embeddings, not losses — one extra
+   model round trip apiece at migration, once."
   [st]
-  (chunks-in (vals (sub/objects st))))
+  (chunks-in (map with-samples (vals (sub/objects st)))))
 
 ;; ---------------------------------------------------------------------------
 ;; the sidecar — append-only EDN lines, last-wins by :id

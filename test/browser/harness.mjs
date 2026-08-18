@@ -78,6 +78,89 @@ const FAMILY_FIXTURE = `
                                     (mk "space:fam-a1" "Fixture grandchild" "space:fam-a")]}))
 `;
 
+// A table whose rows have really been reclaimed — DROP TABLE plus every Parquet
+// it owned — in a notebook of its own.
+//
+// NOT in the shared SERVER_MAIN below: it adds one notebook and one object, and
+// tags.test.mjs counts the corpus. Measured with it in the shared fixture, both
+// of the assertions overview.test.mjs already names went red — a "2/14 split"
+// that read 15 and a "1 of 16" crumb that read 17. So reclaimed.test.mjs passes
+// this to `startServer({ fresh: true, extra: RECLAIMED_FIXTURE })` and pays a
+// cold JVM, exactly as overview.test.mjs does and for the same reason.
+//
+// Its own notebook rather than space:cosmos so the cell surface has somewhere to
+// be drawn without moving the outline's cell count either.
+//
+// 100 rows is load-bearing: below ~10–20 DuckLake inlines the insert into
+// catalog.duckdb, the table owns no Parquet, there is nothing to delete, and it
+// would read back perfectly — the fixture would look right and prove nothing.
+// The assert on the file list is what makes that a failure. And the list must be
+// taken BEFORE the drop: ducklake_list_files refuses a dropped table's name
+// rather than reporting no files.
+export const RECLAIMED_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      h  (tbl/put-rows! lk "tbl:reclaimed" (vec (for [n (range 100)] {:region (str "r" (mod n 5)) :amount n})))
+      fs (mapv :data_file (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '" (:table h) "')")))]
+  (assert (= 1 (count fs)) "no Parquet to delete — the reclaimed fixture would prove nothing")
+  (sub/commit! st {:op :tx :events
+                   [{:op :put :id "tbl:reclaimed"
+                     :value {:id "tbl:reclaimed" :kind :table :title "Reclaimed fixture" :value h}}
+                    {:op :put :id "space:reclaimed"
+                     :value {:id "space:reclaimed" :kind :space :title "Reclaimed fixture"
+                             :value {:intent "a table whose rows are gone" :cells [{:ref "tbl:reclaimed"}]}}}]})
+  (lake/x! lk (str "DROP TABLE " (:table h)))
+  (run! #(clojure.java.io/delete-file % true) fs))
+`;
+
+// The three storage shapes the panel has to draw, in one lake: a table with
+// versions old enough to reclaim, a table DuckLake inlined into catalog.duckdb,
+// and an orphan.
+//
+// Its own server for RECLAIMED_FIXTURE's reason — it adds objects, and
+// tags.test.mjs counts the corpus — and additionally because `/api/storage`
+// reports what the WHOLE lake costs. Sharing a lake directory with another
+// file's tables makes every figure in this panel somebody else's arithmetic.
+//
+// 300 rows per version, above the ~10–20 at which DuckLake inlines: an inlined
+// version owns no Parquet, so a reclaim would free 0 bytes and the panel's
+// reclaimable figure would be 0 however right or wrong it was. `tbl:inline` is
+// the deliberate other half of that, at 5 rows, and both asserts below fail
+// loudly if DuckLake ever moves the threshold under us.
+//
+// The backdating is the load-bearing part. `sub/commit!` stamps `:ts` with
+// `(System/currentTimeMillis)` and takes no argument for it, and the HTTP route
+// reclaims against `gc/default-window` — `{:versions 3 :days 30}`, kept if
+// EITHER holds. So five versions written in one second are five versions inside
+// the window, `:reclaimable` is 0, the reclaim control is disabled, and the test
+// that matters most here — one click deletes files forever — has nothing to
+// click. Ageing the log in place is the only way to reach that state through the
+// real route: the file on disk is left as it was, which costs nothing because
+// this store is a throwaway LOCI_DATA and the server is already running off
+// this atom rather than off a replay. (`:!db` is DatalevinStore's one published
+// value, `{:log … :state …}`; only the log carries `:ts`, and only the log is
+// what `lakegc/classify` reads.)
+export const STORAGE_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      aged (vec (for [n (range 300)] {:region (str "r" (mod n 5)) :amount n}))]
+  (dotimes [_ 5]
+    (let [h (tbl/put-rows! lk "tbl:aged" aged)]
+      (sub/commit! st {:op :put :id "tbl:aged"
+                       :value {:id "tbl:aged" :kind :table :title "Aged fixture" :value h}})))
+  (let [h  (tbl/put-rows! lk "tbl:inline" (vec (for [n (range 5)] {:k n :v (* n n)})))
+        fc (:file_count (first (filter #(= (:table h) (:table_name %)) (lake/live-tables lk))))]
+    (assert (= 0 fc) "DuckLake stopped inlining a 5-row table — the inlined row would prove nothing")
+    (sub/commit! st {:op :put :id "tbl:inline"
+                     :value {:id "tbl:inline" :kind :table :title "Inline fixture" :value h}}))
+  ;; rows in the lake that no handle in the log ever names — which is what undo!
+  ;; leaves behind, and what the panel's orphan line is about. Never committed.
+  (tbl/put-rows! lk "tbl:orphan" aged)
+  (let [old (- (System/currentTimeMillis) (* 400 24 60 60 1000))]
+    (swap! (:!db st) update :log
+           (fn [l] (mapv #(cond-> % (= "tbl:aged" (:id %)) (assoc :ts old)) l)))))
+`;
+
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `
@@ -96,13 +179,15 @@ const TAG_FIXTURE = `
 // invocations of their own. Requiring loci.content loads the namespace and seeds the
 // store, measured at 9.9s; paying that four times per test file was the whole cost of
 // the browser suite. One JVM per file writes the same events in the same order.
-const SERVER_MAIN = `
+const serverMain = extra => `
 (require '[loci.server :as srv] '[loci.content :as c] '[loci.substrate :as sub]
-         '[loci.notebook :as nb] 'org.httpkit.server)
+         '[loci.notebook :as nb] '[loci.lake :as lake] '[loci.tablestore :as tbl]
+         'clojure.java.io 'org.httpkit.server)
 ${FLOW_FIXTURE}
 ${SOURCES_FIXTURE}
 ${FAMILY_FIXTURE}
 ${TAG_FIXTURE}
+${extra}
 (let [s (org.httpkit.server/run-server (var loci.server/handler)
           {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
   (println "LOCI-READY" (org.httpkit.server/server-port s))
@@ -137,7 +222,7 @@ function installCleanup() {
   process.on('SIGHUP', () => { reap(); process.exit(129); });
 }
 
-async function bootServer() {
+async function bootServer(extra = '') {
   installCleanup();
   const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
   const rec = { pid: null, dir };
@@ -145,7 +230,7 @@ async function bootServer() {
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
-  const proc = spawn('clojure', ['-M', '-e', SERVER_MAIN],
+  const proc = spawn('clojure', ['-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
 
@@ -194,8 +279,14 @@ async function bootServer() {
 //
 // `{ fresh: true }` opts out into a private server and a private substrate.
 let sharedServer = null, serverUsers = 0;
-export async function startServer({ fresh = false } = {}) {
-  if (fresh) return bootServer();
+export async function startServer({ fresh = false, extra = '' } = {}) {
+  // `extra` seeds fixtures this file needs and no other file should see. It is
+  // only meaningful on a private server: the shared one is memoized, so the
+  // first caller's `extra` would silently become everyone's — or, worse,
+  // silently not apply because someone else booted it first. Refuse rather than
+  // pick one of those.
+  if (extra && !fresh) throw new Error('startServer: `extra` requires `fresh: true`');
+  if (fresh) return bootServer(extra);
   serverUsers++;
   sharedServer ??= bootServer().then(s => ({
     url: s.url,

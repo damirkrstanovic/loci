@@ -1,0 +1,715 @@
+(ns loci.lake
+  "Tables live here. The substrate's log holds a handle; the rows are Parquet
+   under a DuckLake catalog, and every read names the snapshot it wants.
+
+   Measured 2026-08-16 (see the big-content spec): attaching a lake holding 10M
+   rows costs 75 ms against loci's ~14 s dependency load, and a versioned read
+   at 10M rows is 34 ms — faster than reading the current version, because an
+   old snapshot carries no deletion vectors."
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
+            [loci.config :as config]
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
+
+(defn- conn-of [lk] (:conn lk))
+
+(defn x!
+  "Execute one statement. Returns :ok."
+  [lk sql]
+  (with-open [st (.createStatement (conn-of lk))] (.execute st sql))
+  :ok)
+
+(defn- unwrap
+  "A JDBC value as something the rest of loci can hold and serialize.
+
+   `read_json_auto` widens a column holding more than one type to DuckDB `JSON`,
+   and JDBC hands those cells back as `org.duckdb.JsonNode`. That class is not a
+   Clojure value and not a `clojure.data.json` one: `json-resp` is `write-str`
+   (`server.clj:44-47`), so a single such cell makes the whole object
+   **unopenable in the shell** — measured on `tbl:csv-18-1542` round-tripped
+   through a real lake:
+
+     Don't know how to write JSON of class org.duckdb.JsonNode
+
+   and `query_table` on it throws into the agent's tool loop. Three tables in
+   the live substrate carry one: `tbl:csv-18-1542` (`:inflation_pct`,
+   `:growth_pct`, `:unemployment_pct`), `tbl:csv-19-7071` (`:density_per_km2`)
+   and `tbl:extract-20-8413` (`:approx_low_income_share`).
+
+   A `JsonNode`'s `toString` is the JSON text of the value it holds, so parsing
+   it back is lossless and none of the three needs refusing: `50` returns as
+   `50` and `\"~13% (1 of 8 countries)\"` as that string. Refusing them was the
+   remedy Task 9 planned; a storage layer handing its callers values they cannot
+   serialize is the actual defect.
+
+   **String keys for a genuinely nested JSON object**, which is `read-str`'s
+   default and is deliberate. These keys are values DuckDB parsed out of user
+   data, not loci column names — `sub/col-kw` normalizes columns and nothing
+   normalizes these — and `:key-fn keyword` on `{\"odd key\": …}` mints `:odd
+   key`, a keyword that does not read back. Measured 2026-08-16.
+
+   **Two spellings of \"no value\", one result.** A SQL NULL never reaches here
+   at all: JDBC returns Java `null` for it, JsonNode or not. A JSON `null`
+   literal parses to `nil`. Both land on `nil`, which is what every other column
+   type already gives."
+  [v]
+  (if (instance? org.duckdb.JsonNode v) (json/read-str (str v)) v))
+
+(defn- rs->maps
+  "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)` and
+   passing each value through `vf`. The only things `q` and `q-as` disagree
+   about are where `ks` comes from and whether values are unwrapped."
+  [rs ks vf]
+  (loop [acc (transient [])]
+    (if (.next rs)
+      (recur (conj! acc (into {} (map-indexed (fn [i k] [k (vf (.getObject rs (inc i)))]) ks))))
+      (persistent! acc))))
+
+(defn q
+  "Execute one query. Returns a vector of maps with keyword columns derived from
+   the result set's own labels — which is the right guess when the caller has no
+   idea what the columns are. A caller that does know names them itself; see
+   `q-as`, and do not add an optional key vector here."
+  [lk sql]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (let [md (.getMetaData rs)
+          n  (.getColumnCount md)]
+      ;; `identity`, not `unwrap`, on scope rather than on need: this is the
+      ;; general helper over this namespace's OWN SQL — snapshot ids, table
+      ;; names, the CAST-to-VARCHAR `column-samples` runs — and none of those
+      ;; result sets has a JSON column in it, so there is nothing to unwrap.
+      ;;
+      ;; It is NOT that `column-samples` depends on seeing the JSON rendering.
+      ;; That was written here and is false: measured 2026-08-17 by installing
+      ;; `unwrap` in `q` and re-running the synopsis parity over the live
+      ;; tables, the samples came back byte-identical. The quotes that reorder
+      ;; them come from `CAST(… AS VARCHAR)`, which happens in SQL before any
+      ;; value reaches JDBC.
+      (rs->maps rs (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n)) identity))))
+
+(defn- q-as
+  "Like `q`, but names the result columns instead of deriving them from the
+   result set's labels.
+
+   `q` runs each JDBC label through `sub/col-kw`, which is right when the caller
+   has no idea what the columns are. A handle does: it recorded `:cols` when the
+   rows were written, and the SELECT names them in that order. Deriving them
+   again would be lossy — `col-kw` leaves a readable keyword alone but
+   lowercases and squashes a *string*, so `:tenure-band` goes in and
+   `:tenure_band` comes back, and `:a-b` and `:a_b` come back as one column.
+
+   It also `unwrap`s, because this is the path a table's ROWS come back on and
+   they go straight to `json-resp`."
+  [lk sql ks]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (rs->maps rs ks unwrap)))
+
+(defn- extension-dir
+  "Where DuckDB should keep its extensions, or nil to leave DuckDB's own default
+   alone — see `open-lake!` for why loci has to be able to say this at all.
+
+   Read through `loci.config/env`, not `System/getenv`, so `loci.env` sets it the
+   same way it sets everything else and a non-Docker deployment has one place to
+   write it."
+  []
+  (config/env "LOCI_DUCKDB_EXTENSIONS"))
+
+(defn- extension-problem
+  "One paragraph naming the directory, the uid and the fix — `data-dir-problem`'s
+   job, for the other directory loci needs.
+
+   Without it the reader gets DuckDB's own error, which names neither loci nor
+   anything actionable:
+
+     IO Error: Failed to create directory \"/.duckdb\": Permission denied
+
+   That is the failure this whole mechanism exists for, and it killed the
+   container before the listener. `/.duckdb` is the filesystem root because
+   DuckDB composes its extension directory from $HOME and the runtime image sets
+   none — see `open-lake!`."
+  [^Throwable cause]
+  (let [dir  (extension-dir)
+        home (System/getenv "HOME")]
+    (str "loci cannot load DuckDB's ducklake extension, so the lake cannot open.\n"
+         "  looking in " (cond dir  (str dir " (LOCI_DUCKDB_EXTENSIONS)")
+                               home (str home "/.duckdb — DuckDB's default, from HOME")
+                               :else "/.duckdb — DuckDB's default, and HOME is unset")
+         "\n"
+         "  running as " (sub/running-as) "\n"
+         "  DuckDB said: " (.getMessage cause) "\n"
+         "\n"
+         "  Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension.\n"
+         "  A container should set it at build time and install the extension\n"
+         "  into the image then: INSTALL is the one step here that reaches the\n"
+         "  network, and the directory it writes need never be writable again —\n"
+         "  LOAD only reads.\n"
+         "\nFailing here rather than at the first table read.")))
+
+(defn- ensure-extension!
+  "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
+   on any machine that has already run loci, and it is the only reason a machine
+   that has not can open a lake at all.
+
+   Measured twice on DuckDB 1.5.5 (2026-08-16), because the first measurement
+   supported the opposite conclusion and was incomplete.
+
+   What is true, and is what makes this look dead: `ATTACH 'ducklake:…'` LOADS
+   the extension by itself. `duckdb_extensions()` reports ducklake unloaded
+   immediately before an ATTACH and loaded immediately after, on a connection
+   that issued neither LOAD nor INSTALL, and it does this even with
+   `autoload_known_extensions` and `autoinstall_known_extensions` both SET false.
+   So breaking this function changes nothing observable here, and the sabotage
+   step that should have proven the tests bite could not.
+
+   What is also true, and is why it stays: **ATTACH loads, but it does not
+   install.** Pointed at an empty `extension_directory` — a machine that has
+   never seen the extension — ATTACH fails outright with
+   `IO Error: Extension \"…/ducklake.duckdb_extension\" not found`, and the
+   catalog never opens. Running this function's own sequence by hand in that
+   same state gives: LOAD fails, INSTALL succeeds, LOAD succeeds — and the
+   ATTACH that follows then succeeds.
+
+   So this is a guard after all, and the thing it guards is first run. The
+   INSTALL is the one line here that can reach the network — and **the image no
+   longer reaches it**: since 2026-08-18 the Dockerfile installs the extension in
+   the build stage into `/opt/duckdb-extensions` and sets
+   `LOCI_DUCKDB_EXTENSIONS`, so in a container LOAD succeeds on the first try and
+   this fallback never fires. Verified with `docker run --network none`. It stays
+   for the machine that is not a container: a `clojure -M:serve` on a laptop that
+   has never opened a lake still needs it, and there this branch is the whole
+   reason that works."
+  [lk]
+  (try (x! lk "LOAD ducklake")
+       (catch Exception _
+         (try (x! lk "INSTALL ducklake")
+              (x! lk "LOAD ducklake")
+              (catch Exception e
+                (throw (ex-info (extension-problem e) {:dir (extension-dir)} e)))))))
+
+(defrecord Lake [conn dir])
+
+(defn open-lake!
+  "Open (or create) the DuckLake catalog in `dir`. Defaults to <data-dir>/lake.
+
+   **`OVERRIDE_DATA_PATH` is what makes the lake relocatable, and it is not
+   optional.** DuckLake writes DATA_PATH into the catalog when the lake is
+   created and compares it on every later attach; without the override, a lake
+   opened from anywhere but the directory it was created in fails at boot with
+
+     Invalid Configuration Error: DATA_PATH parameter \"/tmp/x/lake/files/\"
+     does not match existing data path in the catalog \"data/lake/files/\".
+
+   which breaks copying `data/`, restoring a backup, running the uberjar from
+   another working directory, and mounting a locally-created `data/` into a
+   container. loci owns the whole lake directory and the files are always at
+   `<dir>/files/`, so the catalog's remembered path is never the authority —
+   `dir` is.
+
+   Measured 2026-08-17 on DuckDB 1.5.5, because \"override\" could mean several
+   things and only one of them is safe:
+
+   - It is a **per-session re-root, not a rewrite.** After attaching a moved
+     lake with it, `ducklake_options('lake')` still reports the path the lake
+     was created at. Nothing in the catalog is modified, so an override that
+     turns out to be wrong is one attach, not a migration.
+   - It is **total**, because every path under the catalog is stored relative:
+     `ducklake_table.path` is `t_tbl_x/` and `ducklake_data_file.path` is the
+     bare `ducklake-….parquet`. A 5,000-row table read back all 5,000 rows from
+     a moved directory, and a write *after* the move landed its Parquet under
+     the new root, not the old one.
+   - It is **quiet** — no SQLWarning on the connection — and it is accepted on a
+     brand-new catalog too, which still records the DATA_PATH it was given.
+
+   The canonical path is the other half, and on its own it would be a
+   regression rather than a fix: the live `data/lake` was created before this
+   and has the relative `data/lake/files/` baked in, so canonicalizing without
+   the override *refuses a store that used to open*. Measured — that is exactly
+   the error above. What canonicalizing buys is that a new catalog records
+   where it actually is, so `data_path` means something to someone reading the
+   catalog with the duckdb CLI, instead of a bare `data/` that names a
+   different directory from every working directory but one.
+
+   **`extension_directory` is the other thing this connection has to be told,
+   and `HOME` is not a substitute for it.** DuckDB composes that directory from
+   `$HOME`; the runtime image sets no HOME — `USER` does not set one and
+   `debian:bookworm-slim` does not either — so `getenv(\"HOME\")` is null, the
+   path becomes `/.duckdb`, and `docker compose up` died with
+
+     IO Error: Failed to create directory \"/.duckdb\": Permission denied
+
+   before the listener ever started.
+
+   `ENV HOME=/home/loci` in the image looks like the fix and covers only half of
+   how loci is run. `compose.yaml` sets `user: \"${LOCI_UID:-10001}:…\"` and tells
+   you to put your own uid there, because the substrate is a bind mount of a
+   directory you own — so loci commonly runs as a uid with no `/etc/passwd` entry
+   in the container and no claim on `/home/loci`. Anything resolved through HOME
+   is right for the named-volume path and wrong for the bind-mount one. Naming
+   the directory outright is right for both, and it is also what lets the image
+   ship the extension read-only: a writable extension directory would let a
+   version mismatch quietly re-download 36 MB at boot instead of failing.
+
+   Unset leaves DuckDB's default alone, which is what a developer on a laptop
+   with a real HOME wants."
+  ([] (open-lake! (str (sub/data-dir) "/lake")))
+  ([dir]
+   (io/make-parents (io/file dir "catalog.duckdb"))
+   ;; The driver is instantiated directly rather than reached through
+   ;; DriverManager: DriverManager cannot see a driver loaded by a child
+   ;; classloader, which is how this namespace gets exercised from a REPL that
+   ;; added the dep with `add-lib`. Direct instantiation works in both.
+   (let [dir   (.getCanonicalPath (io/file dir))
+         props (java.util.Properties.)
+         _     (when-let [ext (extension-dir)]
+                 (.setProperty props "extension_directory" ext))
+         conn  (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" props)
+         lk    (->Lake conn dir)]
+     (try
+       (ensure-extension! lk)
+       (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"
+                   " (DATA_PATH '" dir "/files/', OVERRIDE_DATA_PATH true)"))
+       (x! lk "USE lake")
+       lk
+       (catch Throwable t (.close conn) (throw t))))))
+
+(defn close! [lk] (when-let [c (conn-of lk)] (.close c)))
+
+(defonce ^{:doc "The process's one lake at <data-dir>/lake.
+
+   A delay, so requiring this namespace still opens nothing — the rule the
+   whole codebase keeps, and the reason `loci.dlv/store` is shaped the same
+   way. Nothing rebinds this: the tests never touch it, because `open-lake!`
+   takes a directory and every test passes its own.
+
+   **DuckDB refuses a second attach of one catalog file, process-wide**, the
+   same way Datalevin refuses a second connection to one directory. Measured
+   2026-08-16 — a second `open-lake!` on a directory this JVM already holds
+   fails with
+
+     Binder Error: Failed to attach DuckLake MetaData
+     \"__ducklake_metadata_lake\" at path + \"…/catalog.duckdb\"Unique file handle
+     conflict: Cannot attach \"__ducklake_metadata_lake\" - the database file
+     \"…/catalog.duckdb\" is already attached by database
+     \"__ducklake_metadata_lake\"
+
+   which is why the laziness matters more here than it does for chunks or the
+   memory: forcing this delay in a process that already holds the lake is not
+   an unwanted file, it is a hard failure. So there is one handle and everyone
+   shares it — which loci can do because it is single-writer."}
+  lake
+  (delay (open-lake!)))
+
+(defn- table-name
+  "A loci object id → a lake table name that is a legal SQL identifier and
+   unique per call.
+
+   Two parts on purpose. The sanitised id keeps the name debuggable — you can
+   see which object `t_tbl_orders_1a2b3c4d` belongs to from a directory
+   listing. The suffix makes it unique, because sanitising is lossy
+   (`tbl:a-b` and `tbl:a_b` collide) and because writes never overwrite: the
+   same object id written twice must land in two tables."
+  [id n]
+  (let [safe (-> (str id)
+                 str/lower-case
+                 (str/replace #"[^a-z0-9]+" "_")
+                 (str/replace #"^_+|_+$" ""))
+        h    (-> (java.security.MessageDigest/getInstance "SHA-256")
+                 (.digest (.getBytes (str id "#" n) "UTF-8")))]
+    (str "t_" (if (str/blank? safe) "tbl" safe) "_"
+         (apply str (map #(format "%02x" %) (take 4 h))))))
+
+(defn- ident
+  "A column name as a quoted SQL identifier. Quoted, not interpolated bare:
+   column names arrive from CSV headers and from models, and `sub/col-kw` has
+   already made them safe for the LOG without making them safe for SQL."
+  [k]
+  (str "\"" (str/replace (name k) "\"" "\"\"") "\""))
+
+(defn- select-cols [cols] (str/join ", " (map ident cols)))
+
+(defn- current-snapshot
+  "The snapshot id the lake's write head is at.
+
+   Catalog-wide, not per-table: a DuckLake snapshot is one transaction against
+   the whole lake, so this is the max over every table, and two `put-rows!`
+   running concurrently can hand the first one a snapshot the second minted.
+
+   Measured 2026-08-16, and benign **only because writes never overwrite**: a
+   table read at a snapshot later than the one that created it returns exactly
+   the same rows, because nothing between the two touched it. Interleaved
+   `tbl:a`/`tbl:b` writes, then reading `a` at `b`'s snapshot, gave `[{:v 1}]`
+   either way.
+
+   That stops being true the day a table is mutated in place — a handle stamped
+   with a later snapshot would then read another transaction's edits as its own.
+   Whoever adds in-place mutation has to stamp the snapshot the write itself
+   produced rather than the catalog's high-water mark. See `restore-to!`, which
+   is the other half of that same day's work."
+  [lk]
+  (:snapshot_id (first (q lk "SELECT max(snapshot_id) AS snapshot_id FROM ducklake_snapshots('lake')"))))
+
+(defn restore-to!
+  "Move `table`'s write head back to `snapshot`.
+
+   Measured 2026-08-16, and this is the finding that most changed the design:
+   DuckLake's `AT (VERSION => n)` is a READ, and a read does not move the write
+   head. A substrate that merely re-points its handle after `undo!` diverges
+   from the lake silently — the next write builds on the state the undo was
+   supposed to remove, and the undone change comes back.
+
+   There is no `ducklake_rollback`; all 26 `ducklake_*` functions were checked.
+   A CREATE OR REPLACE from the old version is the native way to say it, and it
+   is also the fast way: 182 ms at 10M rows against 520 ms for inverting the
+   native change feed, and flat in the size of the edit (a 50% edit restored in
+   211/245/260 ms across three runs). The change-feed approach was measured,
+   was slower, had four change types to get right, and is not here.
+
+   **Unconditional — do not call it speculatively.** It rewrites the table
+   whether or not the version asked for is the one already current, and each
+   rewrite is a snapshot and a Parquet file. Measured: three restores to the
+   current version took the catalog from 2 snapshots and 1 file to 5 and 4, for
+   one 1000-row table. The files staying is correct — older versions still read
+   through them — so the caller is the one that has to know it needs this."
+  [lk table snapshot]
+  (x! lk (str "CREATE OR REPLACE TABLE " table
+              " AS SELECT * FROM " table " AT (VERSION => " (long snapshot) ")"))
+  :ok)
+
+(defn live-tables
+  "Every table the lake currently holds, with its file count and bytes.
+
+   One query for the whole catalog — a report over 31 tables must not be 31
+   round trips. A **dropped** table is absent from this, which is what makes
+   `dropped-at` a question worth asking separately. An **inlined** table has
+   `file_count` 0: DuckLake keeps small tables inside `catalog.duckdb` rather
+   than as Parquet, so there is no file to delete and nothing to reclaim.
+
+   **The bytes are every `table_id` that ever bore the name, not just the live
+   one** — which is why this counts `ducklake_data_file` itself instead of
+   asking `ducklake_table_info('lake')`. That function reports the live
+   `table_id` only, and `restore-to!` is a `CREATE OR REPLACE` that leaves a
+   tombstoned sibling's Parquet in the same directory. Measured 2026-08-17 on a
+   restored 100-row table: `ducklake_table_info` said `file_count` 1 and 906
+   bytes with **1812** bytes on disk.
+
+   The half of that which matters is that `loci.lakegc/reclaim!` deletes what
+   `table-files` finds, and `report` has to predict the same number, so both
+   have to be counting the same files. `table_id` stays in the shape and is the
+   live one; the whole point is that it is no longer the only one.
+
+   Restricted to names with a live catalog row, so a reclaimed table stays
+   absent even though its metadata rows survive the drop."
+  [lk]
+  (q lk (str "SELECT t.table_name AS table_name,"
+             "       max(t.table_id) AS table_id,"
+             "       count(df.data_file_id) AS file_count,"
+             "       coalesce(sum(df.file_size_bytes), 0) AS file_size_bytes"
+             "  FROM __ducklake_metadata_lake.main.ducklake_table t"
+             "  LEFT JOIN __ducklake_metadata_lake.main.ducklake_data_file df"
+             "    ON df.table_id = t.table_id"
+             " WHERE EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
+             "                WHERE live.table_name = t.table_name"
+             "                  AND live.end_snapshot IS NULL)"
+             " GROUP BY t.table_name")))
+
+(defn dropped-tables
+  "`{table-name when}` for every table this lake has dropped — `dropped-at`'s
+   answer for all of them at once, and the function `dropped-at` is now one
+   lookup into.
+
+   **One query, because the cost here is per query and not per table.** Measured
+   2026-08-17 over the migrated store (29 tables): this whole map costs 3.38 ms
+   and a single `dropped-at` costs 3.29 ms, so asking once per table is 29× the
+   work for the same answer. `list_tables` measured 0.10 ms before it asked about
+   reclamation and **100 ms** asking table by table — undoing the entire reason
+   that reader stopped hydrating — against 3.5 ms batched. `table-catalog` sits
+   on the same cliff, on every chat turn.
+
+   The `NOT EXISTS` is the load-bearing clause and it is `dropped-at`'s: a
+   tombstoned row does not mean a dead table, because `restore-to!` is a
+   `CREATE OR REPLACE` that stamps `end_snapshot` on the old row while minting a
+   live one under the same name. The question is not \"is there a tombstone\" but
+   \"is there no live row\". `arg_max` over `end_snapshot` picks the newest
+   tombstone, which is what `ORDER BY dt.end_snapshot DESC LIMIT 1` did per
+   table.
+
+   Note the metadata tables are invisible to `duckdb_tables()` and must be named
+   in full."
+  [lk]
+  (into {}
+        (map (fn [r] [(:table_name r) (java.util.Date/from (.toInstant (:t r)))]))
+        (q lk (str "SELECT dt.table_name AS table_name,"
+                   "       arg_max(s.snapshot_time, dt.end_snapshot) AS t"
+                   "  FROM __ducklake_metadata_lake.main.ducklake_table dt"
+                   "  JOIN ducklake_snapshots('lake') s"
+                   "    ON s.snapshot_id = dt.end_snapshot"
+                   " WHERE dt.end_snapshot IS NOT NULL"
+                   "   AND NOT EXISTS (SELECT 1 FROM __ducklake_metadata_lake.main.ducklake_table live"
+                   "                    WHERE live.table_name = dt.table_name"
+                   "                      AND live.end_snapshot IS NULL)"
+                   " GROUP BY dt.table_name"))))
+
+(defn dropped-at
+  "When `table` was dropped from this lake, or nil if it was never dropped.
+
+   The catalog is the record, so nothing here keeps a parallel one. DuckLake
+   sets `ducklake_table.end_snapshot` on a drop and `ducklake_snapshots` carries
+   that snapshot's time, so \"was this reclaimed, and when\" is a question the
+   store that did the reclaiming can already answer.
+
+   Returns nil for a name that was never a table at all — absent is not the same
+   as reclaimed, and a read that fails for any other reason must stay an error
+   rather than being reported to a user as a successful cleanup.
+
+   Note the metadata tables are invisible to `duckdb_tables()` and must be named
+   in full.
+
+   **A tombstoned row does not mean a dead table, and the `NOT EXISTS` is what
+   makes the answer true.** `restore-to!` is a `CREATE OR REPLACE`, which mints
+   a *new* `table_id` under the same table name and directory while stamping
+   `end_snapshot` on the old one — so one live table can own two catalog rows,
+   one of them tombstoned:
+
+     table_id 2  t_tbl_y_c41a2b1d  begin 2  end 3    ← replaced
+     table_id 3  t_tbl_y_c41a2b1d  begin 3  end nil  ← live
+
+   Filtering to non-null `end_snapshot` and taking the newest therefore finds
+   the tombstone and never sees the live sibling. Measured 2026-08-17 on two
+   tables given identical injury — every Parquet deleted, `DROP TABLE` never
+   issued — the plain one answered nil and `hydrate` rethrew, and the restored
+   one answered an instant and `hydrate` reported a reclamation for rows that
+   were never reclaimed. That is the one thing this function exists to prevent,
+   so the question it asks is not \"is there a tombstone\" but **\"is there no
+   live row\"**.
+
+   No longer latent: as of 2026-08-17 `list_tables` and `table-catalog` both
+   filter on this answer — through `dropped-tables`, but it is the same
+   question — so a restored table would vanish from the catalog the agent sees.
+
+   **One lookup into `dropped-tables` rather than its own query**, so the
+   `NOT EXISTS` above is written once. Measured the same 2026-08-17: a
+   table-filtered query costs 3.29 ms and the whole map costs 3.38 ms, because
+   the catalog is 29 tables and the cost is the round trip, not the scan. There
+   was no cheaper single-table query to keep."
+  [lk table]
+  (get (dropped-tables lk) table))
+
+(defn table-files
+  "The absolute paths of every Parquet file `table` owns, with their sizes.
+
+   Files, not the directory. `restore-to!` is a `CREATE OR REPLACE`, which mints
+   a new `table_id` under the **same** table name and directory — measured
+   2026-08-17, one directory held a dead and a live Parquet at once — so
+   removing a directory can destroy live data. The individual path is the only
+   safe unit.
+
+   **Every `table_id` that ever bore the name, which is why this reads
+   `ducklake_data_file` rather than `ducklake_list_files`.** That function
+   resolves through the live catalog and names the live `table_id`'s files only.
+   Measured 2026-08-17: reclaiming a restored table through it left the
+   pre-restore Parquet on disk, and `CREATE TABLE t AS SELECT * FROM t AT
+   (VERSION => 1)` then returned all 100 rows against a table that had just been
+   reclaimed — so the reclamation was not real, and a later undo would appear to
+   restore rows that are gone. The bytes were also uncollectable afterwards: the
+   name leaves `live-tables` on the drop, so nothing would ever offer them
+   again.
+
+   **The path is composed, not read.** DuckLake stores all three levels
+   relative — `ducklake_schema.path` is `main/`, `ducklake_table.path` is
+   `t_tbl_x_…/`, and `ducklake_data_file.path` is the bare
+   `ducklake-….parquet` — so this joins the two parents and prefixes the lake's
+   own root. Each level carries `path_is_relative`, and a level that says false
+   is already absolute and stops the composition there.
+
+   The root is `(:dir lk)`, never `ducklake_options`. That is the same authority
+   `open-lake!`'s `OVERRIDE_DATA_PATH` establishes: the catalog still reports
+   the path the lake was *created* at, which is the wrong answer for a lake that
+   has been moved, copied or mounted.
+
+   Unlike `ducklake_list_files`, this does not throw for a dropped table — the
+   metadata rows survive the tombstone (measured: still two rows after the
+   `DROP`). `loci.lakegc/reclaim!` still lists before it drops, because the
+   paths are what it is about to delete and there is no reason to hold them
+   across a mutation."
+  [lk table]
+  (let [under (fn [parent rel? p] (if rel? (str parent p) p))]
+    (mapv (fn [r]
+            {:data_file (-> (str (:dir lk) "/files/")
+                            (under (:s_rel r) (:s_path r))
+                            (under (:t_rel r) (:t_path r))
+                            (under (:f_rel r) (:f_path r)))
+             :data_file_size_bytes (:file_size_bytes r)})
+          (q lk (str "SELECT df.path AS f_path, df.path_is_relative AS f_rel,"
+                     "       df.file_size_bytes AS file_size_bytes,"
+                     "       t.path AS t_path, t.path_is_relative AS t_rel,"
+                     "       s.path AS s_path, s.path_is_relative AS s_rel"
+                     "  FROM __ducklake_metadata_lake.main.ducklake_data_file df"
+                     "  JOIN __ducklake_metadata_lake.main.ducklake_table t"
+                     "    ON t.table_id = df.table_id"
+                     "  JOIN __ducklake_metadata_lake.main.ducklake_schema s"
+                     "    ON s.schema_id = t.schema_id"
+                     " WHERE t.table_name = '" table "'")))))
+
+(defn drop-table!
+  "Drop `table` from the catalog. Frees no bytes on its own — a DuckLake drop is
+   a versioned tombstone, and the table still reads `AT` a version where it
+   existed. `loci.lakegc` deletes the files afterwards; that is what makes it
+   real.
+
+   It also **mints** a snapshot rather than removing one (measured 2026-08-17:
+   3 snapshots before a drop, 4 after), which is the whole reason reclamation
+   can be done this way — every other object's handle still finds the version it
+   reads at."
+  [lk table]
+  (x! lk (str "DROP TABLE " table)))
+
+(defn- load-rows!
+  "Bulk-load via newline-delimited JSON through a temp file. DuckDB infers the
+   types, which is the same inference `read_csv` already gives `import-csv!`,
+   and it is the path that stays reasonable at millions of rows — measured
+   2.9 s for a 10M-row create."
+  [lk table cols rs]
+  (let [f (java.io.File/createTempFile "loci-rows-" ".ndjson")]
+    (try
+      (with-open [w (io/writer f)]
+        (doseq [r rs] (json/write r w) (.write w "\n")))
+      (x! lk (str "CREATE TABLE " table " AS SELECT " (select-cols cols)
+                  " FROM read_json_auto('" (.getAbsolutePath f)
+                  "', format='newline_delimited')"))
+      (finally (.delete f)))))
+
+(def ^:private sample-cache
+  "Samples for a `[table snapshot]`, computed once.
+
+   `memoize` rather than a hand-rolled atom, and sound rather than merely
+   convenient: a handle is immutable, because `put-rows!` always creates a new
+   lake table and nothing overwrites one. So a hit is not a stale answer, it is
+   the only answer.
+
+   That is the same invariant `current-snapshot` above depends on, and it stops
+   holding on the same day: **whoever adds in-place mutation has to invalidate
+   this**. `restore-to!` is already a `CREATE OR REPLACE` and is the closest
+   thing to a counter-example, but it is not one — measured 2026-08-16, a
+   cached answer still matches a fresh one across an `UPDATE` and a
+   `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
+   snapshot and the rewrite only moves the write head.
+
+   Unbounded, and that is affordable *because the clip happens in SQL rather
+   than downstream*. An entry is at most `max-cols` × `per-col` values of
+   `tbl/sample-max-chars` code points — 24 × 3 × 41 ≈ 3 KB, or double that if
+   every code point is astral. Measured 2026-08-16 over the 31 live tables: a
+   median entry of 117 characters and a maximum of 879 (1,113 bytes of EDN). A
+   table with a 5,000-character text column, which without the clip would put
+   15 KB in one entry, produces 123 characters.
+
+   It retains more than the samples: the key holds the `Lake` it was asked
+   about, so an entry pins a JDBC connection. In the server there is one lake
+   and so one reference; a test run that opens many leaks one each until the
+   var is rebound. Measure before replacing this with an eviction policy."
+  (memoize
+   (fn [lk table snapshot cols per-col]
+     (into {} (for [c cols]
+                [c (mapv #(str (first (vals %)))
+                         ;; Clipped BEFORE the DISTINCT, matching
+                         ;; `tbl/clip-sample`: two values sharing a 40-point
+                         ;; prefix are one sample, not two that print alike.
+                         (q lk (str "SELECT DISTINCT CASE WHEN length(s) > " tbl/sample-max-chars
+                                    " THEN substr(s, 1, " tbl/sample-max-chars ") || '…'"
+                                    " ELSE s END AS v FROM ("
+                                    "SELECT CAST(" (ident c) " AS VARCHAR) AS s"
+                                    " FROM " table " AT (VERSION => " (long snapshot) ")"
+                                    " WHERE " (ident c) " IS NOT NULL)"
+                                    " ORDER BY v LIMIT " (long per-col))))])))))
+
+(extend-type Lake
+  tbl/TableStore
+  (put-rows! [lk id rs]
+    (let [rs    (tbl/normalize-rows (vec rs))
+          cols  (tbl/cols-of rs)
+          table (table-name id (System/nanoTime))]
+      (when (empty? rs)
+        (throw (ex-info "refusing to store a table with no rows" {:id id})))
+      (load-rows! lk table cols rs)
+      {:store :lake :table table :snapshot (current-snapshot lk)
+       :rows (count rs) :cols cols}))
+
+  (rows [lk h {:keys [offset limit]}]
+    (q-as lk (str "SELECT " (select-cols (:cols h))
+                  " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
+                  (when limit  (str " LIMIT "  (long limit)))
+                  (when offset (str " OFFSET " (long offset))))
+          (:cols h)))
+
+  (row-count [_ h] (:rows h))
+
+  (reclaimed-at [lk h] (dropped-at lk (:table h)))
+
+  (column-samples [lk h per-col max-cols]
+    (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
+
+(defn sweep!
+  "Automatic table GC. Disabled, deliberately, and it reports that rather than
+   returning a zero that reads like a completed sweep.
+
+   **It is snapshot expiry that is off, not reclamation.**
+   `loci.lakegc/report` and `loci.lakegc/reclaim!` are the manual per-table path
+   and they work — read the first for what every object's versions cost, call
+   the second to free one object's out-of-window ones. They work *precisely
+   because they never expire a snapshot*: `reclaim!` issues `DROP TABLE` and
+   deletes that table's own Parquet, and a drop MINTS a snapshot rather than
+   removing one, so every other handle in the log goes on reading. Everything
+   below is why the automatic path cannot borrow that safety — a caller who
+   reads only this function's `:why` and stops must not conclude that nothing in
+   loci can reclaim table space, because that has not been true since
+   `loci.lakegc` shipped.
+
+   Two reasons the automatic path stays off, and the second is the load-bearing
+   one.
+
+   **Today: DuckLake's expiry is not safe to run.** It cannot expire the latest
+   snapshot (duckdb/ducklake#261) — which is exactly the state an undo leaves —
+   and snapshot expiry has open data-loss bugs (#527, #529).
+
+   **After those are fixed: expiry is still incompatible with how loci reads a
+   table.** Every handle reads `AT (VERSION => n)`, so a handle is a *reference
+   to a snapshot*, and the log keeps handles forever — an undone `:put` still
+   names the table it wrote. Measured 2026-08-16 during Task 5's review:
+   `ducklake_expire_snapshots(older_than => now())` followed by
+   `ducklake_cleanup_old_files` makes an existing handle's read throw
+
+     Invalid Input Error: No snapshot found at version 1
+
+   So reclaiming disk invalidates stored handles *across the whole log*, and the
+   day someone enables GC to free space is the day every historical object stops
+   rendering. A working expiry is therefore not enough: loci would first have to
+   decide which snapshots are still referenced by live handles — walk the log,
+   collect every `{:store :lake}` value, keep those versions — and that
+   machinery does not exist. `live` is the argument it would take.
+
+   Blob GC has no such dependency and ships in its own plan. Automatic
+   retention here is: keep everything. Saying so is the whole point of this
+   function existing before it works — the same job `embedding-configured?`
+   does for semantic recall, and the failure it avoids is a sweep that
+   *implies* it was complete.
+
+   `live` is the argument the automatic path would take, and it is exactly the
+   question `loci.lakegc/classify` already answers per table. The gap is not
+   knowledge; it is that expiry is catalog-wide and reclamation has to be
+   per-table."
+  [_lk _live]
+  {:mode :disabled
+   :freed 0
+   :why (str "automatic table GC is off: DuckLake cannot expire the latest "
+             "snapshot (duckdb/ducklake#261) and snapshot expiry has open "
+             "data-loss bugs (#527, #529) — and even fixed, expiring a snapshot "
+             "invalidates every handle that reads AT (VERSION => it), which "
+             "loci does not yet track. Reclaiming table space is done by hand "
+             "instead: loci.lakegc/report says what each object's versions "
+             "cost and loci.lakegc/reclaim! frees one object's out-of-window "
+             "ones, by dropping those tables and deleting their Parquet — "
+             "never by expiring a snapshot, which is why it is safe. Automatic "
+             "retention is: keep everything.")})

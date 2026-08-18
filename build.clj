@@ -30,7 +30,9 @@
   "Paths to drop when building for linux-x86_64 alone.
 
    tools.build matches these with `re-matches`, so each must describe a whole
-   path. Three dependencies ship one native payload per platform:
+   path. Four dependencies ship one native payload per platform, and each
+   spells linux-x86_64 differently — copying a pattern between them is how you
+   get a slim jar that quietly kept all four platforms, or dropped all four:
 
    - Datalevin's LMDB binding, under `datalevin/dtlvnative/<platform>/` — four
      platforms. The sibling `DTLV*.class` files are not under a platform
@@ -39,6 +41,10 @@
    - JNA's `jnidispatch`, under `com/sun/jna/<platform>/` — 24. Restricted to
      the native file extensions on purpose: `com/sun/jna/win32/`, `internal/`
      and `ptr/` hold ordinary classes that must survive.
+   - DuckDB's JNI binding, as `libduckdb_java.so_<os>_<arch>` at the jar root —
+     four platforms, one file each, and no directory to key on. `linux_amd64`
+     is the one to keep; the sibling `org/duckdb/DuckDBNative.class` loads it
+     and must survive, which the `libduckdb_java` prefix already ensures.
 
    Measured on the 2026-08-07 dependency set: 51 files, 17.0 MB *compressed*,
    taking the jar from 80.7 MB to 63.9 MB. Compressed is the number that
@@ -46,12 +52,17 @@
    44.9 MB uncompressed, which is the larger figure `unzip -l` reports and it
    is not the saving.
 
+   DuckDB arrived 2026-08-16 and dwarfs all of that: its four natives are
+   81.3 MB compressed on their own, of which the three foreign ones are
+   61.4 MB. Slim is no longer a nicety on this dependency set.
+
    The trade is that the jar stops being portable. Nothing checks the platform
    at runtime: on arm64 or macOS a slim jar fails when Datalevin first tries to
    load libdtlv, not at startup. The manifest records which kind it is."
   ["datalevin/dtlvnative/(?!linux-x86_64/)[^/]+/.*"
    "(?!linux/amd64/)[^/]+/[^/]+/libzstd-jni-.*"
-   "com/sun/jna/(?!linux-x86-64/)[^/]+/.*\\.(so|dll|dylib|jnilib)"])
+   "com/sun/jna/(?!linux-x86-64/)[^/]+/.*\\.(so|dll|dylib|jnilib)"
+   "libduckdb_java\\.so_(?!linux_amd64).*"])
 
 (defn- basis [] (b/create-basis {:project "deps.edn"}))
 

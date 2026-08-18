@@ -60,6 +60,30 @@ than it saved: on 2026-08-15 it produced checksum verification in every single s
 prompt, a full rehearsal of an import against a copied store, and a refusal to write facts
 until a server was stopped — all to guard data the user regards as disposable.
 
+### And its *scale* is not evidence about anything
+
+`data/` is a small fixture. Measurements over it tell you whether code **works**. They never
+tell you whether a cost **matters**.
+
+On 2026-08-17 a per-table GC was measured against it and reported back as "viable, and
+pointless today": 0 reclaimable bytes, and Parquet only 1.8% of the lake against a 6.5 MB
+catalog. Both numbers were correct. Both were about a 117 KB toy corpus — and the feature
+exists for tables of millions of rows, which is the entire reason DuckLake was chosen. At the
+intended size the ratio inverts completely: one 10M-row table is ~107 MB *per version*, so ten
+refreshes retain a gigabyte and the catalog is a rounding error. The recommendation contradicted
+the intent by quoting the fixture back at it.
+
+So: take the scale from **the design's stated target**, never from `data/`. If a number is
+needed, generate data at the intended size and measure that — `put-rows!` of 10M rows costs
+~2.9 s, so there is no excuse for arguing from the fixture. And when reporting a measurement
+taken over `data/`, say which of the two things it establishes: that the mechanism works, or
+that the cost is real. It can only ever be the first.
+
+This is the mirror of tell 4 under "Don't build for a requirement nobody stated". That rule
+stops you inventing a constraint nobody has hit. This one stops you dismissing a real one
+because the fixture is too small to exhibit it. Both are the same failure — not asking what
+scale the question is about.
+
 ## Don't build for a requirement nobody stated
 
 Before treating something as a constraint and engineering around it: **check the docs and

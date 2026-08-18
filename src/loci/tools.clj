@@ -10,8 +10,10 @@
             [clojure.string :as str]
             [org.httpkit.client :as hc]
             [loci.config :as config]
+            [loci.lake :as lake]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.viewspec :as vs]))
 
 (defn- table-objs [st] (->> (sub/objects st) vals (filter #(= :table (:kind %)))))
@@ -102,22 +104,55 @@
                             :required ["title" "rows"]}}}])
 
 ;; ---- handlers ----
+;; A LIST of tables is metadata: ids, titles, columns, counts. It used to
+;; hydrate every table to read the columns off the first row and count the
+;; rest — 271 ms over the migrated store, for an answer every handle already
+;; carries. `table-shape` is the reader that fetches nothing.
+;;
+;; Reading the handle is also why this reader alone has to ASK about
+;; reclamation. Every other table reader goes through `hydrate`, which discovers
+;; a reclamation by failing to read the rows and then confirming with the
+;; catalog; this one never reads a row, so nothing fails and the handle goes on
+;; reporting the count it was written with long after the Parquet is gone.
+;; It is the read `lake/dropped-at`'s docstring anticipated.
+;;
+;; `lake/dropped-tables` and NOT `tbl/reclaimed-at` per table, because the cost
+;; is the round trip and not the scan: one call per table measured 100 ms over
+;; the 29-table store, against 0.10 ms before this reader asked at all and 3.5 ms
+;; asking once. Per-table would have handed back every millisecond the move to
+;; `table-shape` bought. The lake is forced only when some table is handle-backed
+;; — `table-shape`'s rule, for its reason.
 (defn- do-list [st _]
-  (mapv (fn [o] {:id (:id o) :title (:title o)
-                 :columns (mapv name (keys (first (:value o))))
-                 :rows (count (:value o))})
-        (table-objs st)))
+  (let [os      (table-objs st)
+        dropped (when (some #(tbl/handle? (:value %)) os)
+                  (lake/dropped-tables (force lake/lake)))]
+    (mapv (fn [o] (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)
+                        at (get dropped (:table (:value o)))]
+                    (cond-> {:id (:id o) :title (:title o)
+                             :columns (mapv name cols)
+                             :rows (or rows 0)}
+                      at (assoc :reclaimed at))))
+          os)))
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
-  (if-let [o (sub/object st table_id)]
-    (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
-          rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
-      (if save_as
-        (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-              obj {:id nid :kind :table :title save_as :value rendered}]
-          (sub/commit! st {:op :put :id nid :value obj})
-          {:saved_as nid :rows rendered})
-        {:rows rendered}))
+  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
+    ;; `hydrate` degrades a reclaimed table to `:value []` rather than throwing,
+    ;; so without this the tool answers `{:rows []}` — "your filter matched
+    ;; nothing" — and the model reports a real zero. Worse on the `save_as` path,
+    ;; where it would commit an empty derived table over the answer. An `:error`
+    ;; naming the date is something the model can act on and say out loud.
+    (if (:table/reclaimed o)
+      {:error (str "table " table_id " was reclaimed on "
+                   (tbl/reclaimed-str (:table/reclaimed o))
+                   " — its rows are no longer stored")}
+      (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
+            rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
+        (if save_as
+          (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
+                obj (tbl/table-object @lake/lake nid save_as rendered)]
+            (sub/commit! st {:op :put :id nid :value obj})
+            {:saved_as nid :rows rendered})
+          {:rows rendered})))
     {:error (str "no table " table_id)}))
 
 ;; Through `loci.config`, like every other configured value: `TAVILY_API_KEY` is
@@ -143,21 +178,34 @@
   "Land agent-gathered/extracted rows as a reversible, moldable :table object.
    With a space, also assoc it into that space's members (one :tx step)."
   [st title rows & [space]]
-  ;; the model names its own columns — "Key Proponent(s)" must not become a
-  ;; keyword the log cannot read back (the substrate would refuse the event)
-  (let [rows (mapv (fn [r] (if (map? r)
-                             (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)
-                             r))
-                   (vec rows))]
+  ;; The model names its own columns — "Key Proponent(s)" must not become a
+  ;; keyword the log cannot read back. `put-rows!` normalizes (and refuses a
+  ;; collision), so this no longer does it by hand; what it must do instead is
+  ;; report the columns the store actually holds. `(keys (first rows))` would
+  ;; name "Total Sales" while the stored column is :total_sales, and the model's
+  ;; next `query_table` would then ask for a column that does not exist.
+  ;;
+  ;; And normalizing can now REFUSE: a model that emits both "Total Sales" and
+  ;; "total_sales" names two columns that become one, and `normalize-rows`
+  ;; throws rather than silently keep one value. Nothing above catches it —
+  ;; `agent/chat-tools` does not wrap `tool-fn` (agent.clj:139) — so the throw
+  ;; runs to `draft-brief!`'s catch and blanks the whole brief with
+  ;; `_(agent unavailable: two column names would become one column…)_`. A tool
+  ;; handler answers with `{:error …}`; this one already does for no rows.
+  (let [rows (vec rows)]
     (if (empty? rows)
       {:error "no rows to save"}
       (let [nid (str "tbl:extract-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-            obj {:id nid :kind :table :title (or title "Extracted table") :value rows}]
-        (sub/commit! st (if (and space (sub/object st space))
-                          {:op :tx :events [{:op :put :id nid :value obj}
-                                            (nb/append-cell-event st space {:ref nid})]}
-                          {:op :put :id nid :value obj}))
-        {:saved_as nid :rows (count rows) :columns (mapv name (keys (first rows)))}))))
+            obj (try (tbl/table-object @lake/lake nid (or title "Extracted table") rows)
+                     (catch Exception e e))]
+        (if (instance? Exception obj)
+          {:error (.getMessage ^Exception obj)}                 ; and commit nothing
+          (let [h (:value obj)]
+            (sub/commit! st (if (and space (sub/object st space))
+                              {:op :tx :events [{:op :put :id nid :value obj}
+                                                (nb/append-cell-event st space {:ref nid})]}
+                              {:op :put :id nid :value obj}))
+            {:saved_as nid :rows (:rows h) :columns (mapv name (:cols h))}))))))
 
 (defn dispatch [st name args]
   (case name

@@ -17,10 +17,13 @@
             [loci.embed :as embed]
             [loci.entities :as ent]
             [loci.fnlib :as fnlib]
+            [loci.lake :as lake]
+            [loci.lakegc :as gc]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools]
             [loci.viewspec :as vs])
   (:import [java.util Locale])
@@ -390,8 +393,22 @@
    read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
    pass it."
   [st m id view]
-  (let [o (sub/object st id)]
+  (let [o (tbl/hydrate lake/lake (sub/object st id))]
     (cond
+      ;; RECLAIMED — first, and before the view branches, because a reclaimed
+      ;; table can still have a viewspec pointed at it and `vs/interpret` over
+      ;; `[]` would draw an empty chart rather than say anything.
+      ;;
+      ;; `hydrate` handed us `:value []`, and every branch below would render
+      ;; that as a table with no rows in it — indistinguishable from a table the
+      ;; user emptied themselves, which is the worst available shape for this
+      ;; answer. The cols and the true count come off the handle, so the page can
+      ;; still say what was there. `:rendered` and `:alternatives` are present
+      ;; and empty because the shell reads both on every payload.
+      (:table/reclaimed o)
+      {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
+       :table/total (:table/total o) :table/cols (:table/cols o)
+       :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
       ;; materialization, out of the same payload. A `mold/mold` viewer could not
       ;; be this page: a viewer's `:render` only ever receives `(:value o)`,
@@ -568,10 +585,45 @@
             ;; never built reports every chunk it implies rather than "0 awaiting"
             ;; over an empty group. ~170 on the live corpus before a first sweep.
             ;;
-            ;; It re-chunks and re-hashes the whole substrate to answer: measured
-            ;; 4.2 ms over 101 chunks / 82 events, which is affordable HERE and
-            ;; nowhere else. It is one of the reasons this function may only ever
-            ;; be reached by ?deep=1.
+            ;; It re-chunks and re-hashes the whole substrate to answer. A
+            ;; lake-backed table no longer costs a row read for that:
+            ;; `all-chunks` builds its synopsis from `tbl/column-samples`, which
+            ;; the lake answers with one `SELECT DISTINCT … LIMIT 3` per column
+            ;; and memoizes per `[table, snapshot]`. A handle is immutable, so
+            ;; each one is queried once in the life of the process.
+            ;;
+            ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
+            ;; chunks / 31 row-bearing tables. Interleaved after 30 warmup
+            ;; rounds, median of 15 — an un-warmed first call reads 150-250 ms
+            ;; and will mislead whoever measures this next:
+            ;;
+            ;;   14.8 ms  chunking and hashing alone, samples already in hand
+            ;;   15.2 ms  every table handle-backed, cache warm ← what a sweep pays
+            ;;   25.7 ms  the same tables inline
+            ;;   1061 ms  every table handle-backed, cache cold (fresh lake, median of 5)
+            ;;
+            ;; Warm is within a millisecond of pure chunking — the lake work
+            ;; disappears — and beats the inline path, which still walks 3,957
+            ;; rows in Clojure to sample them. Cold is 169 queries, one per
+            ;; column across the 31 tables, at 6.3 ms each; it is paid once per
+            ;; handle for the life of the process, where the hydrating version
+            ;; this replaced paid 297 ms on every 15-second sweep.
+            ;;
+            ;; The SHAPE of the cost changed with it, and that is the part worth
+            ;; knowing. Each query is a full column scan, NOT bounded by
+            ;; `tbl/mold-cap` the way hydrating was, so a cold miss scales with
+            ;; the table rather than being capped: measured on one 10M-row table,
+            ;; 20 ms for a 7-distinct-value column against 399-423 ms for
+            ;; high-cardinality ones. The trade is an unbounded one-time cost for
+            ;; a bounded recurring one, and a description that covers the whole
+            ;; column instead of its first 2,000 rows.
+            ;;
+            ;; So it is still affordable HERE and nowhere else, and now for a
+            ;; sharper reason: warm it is ~1× the pure-chunking cost, but the
+            ;; first ?deep=1 after a restart — or after any write that mints a
+            ;; new handle — is ~70×. It is one of the reasons this function may
+            ;; only ever be reached by ?deep=1, and the reason a cheaper answer
+            ;; is an open question.
             awaiting (count (ch/pending st cs model))]
         (cond-> hits
           (pos? awaiting)
@@ -1057,7 +1109,7 @@
 ;; reversible object; it then appears in the object's "view this as…" menu.
 (defn describe! [st id prompt]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "describe works on tables"}
         (let [spec (agent/describe-view (mapv name (keys (first rows))) (take 2 rows) prompt)
@@ -1080,7 +1132,7 @@
 ;; if this ever serves untrusted users.
 (defn make-view! [st id prompt]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "code views work on tables"}
         (let [code (agent/make-applet (mapv name (keys (first rows))) (take 3 rows) prompt)
@@ -1119,7 +1171,7 @@
 
 (defn compute-clj! [st id prompt space]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "compute works on tables"}
         (let [cols    (mapv name (keys (first rows)))
@@ -1157,7 +1209,7 @@
                   ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
                   fobj {:id fid :kind :fn :title (str "fn: " p)
                         :value {:source id :prompt p :lang "clojure" :code code}}
-                  tobj {:id nid :kind :table :title ttl :value out :from id :via fid}
+                  tobj (tbl/table-object @lake/lake nid ttl out {:from id :via fid})
                   evs (cond-> [{:op :put :id fid :value fobj}
                                {:op :put :id nid :value tobj}]
                         (and space (space? st space))
@@ -1184,7 +1236,7 @@
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
 (defn- table-rows [st id]
-  (let [rows (:value (sub/object st id))]
+  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
 
 (defn fns-payload [st id]
@@ -1238,8 +1290,8 @@
                   lbl (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
                           (:title (sub/object st fid)) fid)
                   nid (next-id st "tbl:derived-")
-                  tobj {:id nid :kind :table :title (str (:title src) " · " lbl)
-                        :value (:rows r) :from id :via fid :params (or params {})}
+                  tobj (tbl/table-object @lake/lake nid (str (:title src) " · " lbl)
+                                         (:rows r) {:from id :via fid :params (or params {})})
                   evs (cond-> [{:op :put :id nid :value tobj}]
                         (and space (space? st space))
                         (conj (nb/append-cell-event st space {:ref nid})))]
@@ -1254,9 +1306,30 @@
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
-        rows   (or (get working src-id) (:value (sub/object st src-id)))
+        ;; The hydrated OBJECT, not just its `:value` — a source whose rows were
+        ;; reclaimed hydrates to `:value []`, which is not nil, so the "is gone"
+        ;; branch below cannot see it and the chain recomputes over zero rows.
+        ;; Before tables could degrade, that case raised and the chain stopped.
+        ;;
+        ;; What that costs depends on the `via`, measured 2026-08-17: all six
+        ;; `lib:` builtins answer "no rows came out — nothing to keep", so they
+        ;; skip with a misleading reason and lose nothing. An agent-written fn
+        ;; that AGGREGATES is the one that destroys data — `(fn [rows] [{:n
+        ;; (count rows)}])` returns `[{:n 0}]` from no rows, nothing downstream
+        ;; refuses a non-empty result, and `rerun!` commits it over the good
+        ;; table and reports it as refreshed. Measured `[{:n 100}]` → `[{:n 0}]`.
+        ;; Still only hydrated when the ancestor was NOT already refreshed in
+        ;; this run: fresh rows supersede whatever the stored source says, and
+        ;; hydrating regardless would both cost a lake read per link in the
+        ;; chain and refuse a source that has just been recomputed.
+        known  (get working src-id)
+        src    (when-not known (tbl/hydrate lake/lake (sub/object st src-id)))
+        rows   (or known (:value src))
         via    (:via obj)]
     (cond
+      ;; Before `nil?`: `[]` passes that check.
+      (:table/reclaimed src) {:why (str "source " src-id "'s rows were reclaimed on "
+                                        (tbl/reclaimed-str (:table/reclaimed src)))}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]
@@ -1274,43 +1347,61 @@
 (defn rerun!
   "Refresh id (if derived) and everything derived from it, transitively.
    Children recompute against their parent's NEW rows. All updates land as
-   one :tx. Returns {:state :refreshed [ids] :skipped [{:id :why}]}."
+   one :tx. Returns {:state :refreshed [ids] :skipped [{:id :why}]}.
+
+   The `try` is the one every sibling has — `fn-apply!`, `compute-clj!`,
+   `import-csv!`, `describe!`, `make-view!`, `do!` — and this was the only writer
+   without it. `handler` has no top-level catch, so `/api/rerun` answered a
+   throw with a 500 and a stack trace. Reachable since `normalize-rows` began
+   refusing a column collision: `lib:pivot` names its columns from data VALUES
+   (`fnlib.clj:63`), so a source that grows a `\"a b\"` beside an `\"a_b\"`
+   makes a recompute collide where the original apply did not. And because the
+   commit is one `:tx` after the whole reduce, a throw meant NOTHING refreshed —
+   not even the levels that had already succeeded."
   [st id]
-  (let [o (sub/object st id)]
-    (if-not (and o (= :table (:kind o)))
-      {:error (str "not a table: " id)}
-      (let [objs     (vals (sub/objects st))
-            children (fn [pid] (->> objs (filter #(= pid (:from %))) (sort-by :id) (map :id)))
-            ;; breadth-first over the :from DAG, parents before children
-            order    (loop [q (vec (if (:from o) [id] (children id))) seen #{} out []]
-                       (if (empty? q)
-                         out
-                         (let [[x & xs] q]
-                           (if (seen x)
-                             (recur (vec xs) seen out)
-                             (recur (vec (concat xs (children x))) (conj seen x) (conj out x))))))
-            {:keys [working refreshed skipped]}
-            (reduce (fn [{:keys [working refreshed skipped]} cid]
-                      (let [r (recompute st working (sub/object st cid))]
-                        (if (:rows r)
-                          {:working (assoc working cid (:rows r))
-                           :refreshed (conj refreshed cid) :skipped skipped}
-                          {:working working :refreshed refreshed
-                           :skipped (conj skipped {:id cid :why (:why r)})})))
-                    {:working {} :refreshed [] :skipped []}
-                    order)]
-        (when (seq refreshed)
-          (sub/commit! st {:op :tx :events (mapv (fn [cid] {:op :assoc :id cid :path [:value]
-                                                            :value (get working cid)})
-                                                 refreshed)}))
-        {:state (state-payload st) :refreshed refreshed :skipped skipped}))))
+  (try
+    (let [o (sub/object st id)]
+      (if-not (and o (= :table (:kind o)))
+        {:error (str "not a table: " id)}
+        (let [objs     (vals (sub/objects st))
+              children (fn [pid] (->> objs (filter #(= pid (:from %))) (sort-by :id) (map :id)))
+              ;; breadth-first over the :from DAG, parents before children
+              order    (loop [q (vec (if (:from o) [id] (children id))) seen #{} out []]
+                         (if (empty? q)
+                           out
+                           (let [[x & xs] q]
+                             (if (seen x)
+                               (recur (vec xs) seen out)
+                               (recur (vec (concat xs (children x))) (conj seen x) (conj out x))))))
+              {:keys [working refreshed skipped]}
+              (reduce (fn [{:keys [working refreshed skipped]} cid]
+                        (let [r (recompute st working (sub/object st cid))]
+                          (if (:rows r)
+                            {:working (assoc working cid (:rows r))
+                             :refreshed (conj refreshed cid) :skipped skipped}
+                            {:working working :refreshed refreshed
+                             :skipped (conj skipped {:id cid :why (:why r)})})))
+                      {:working {} :refreshed [] :skipped []}
+                      order)]
+          ;; `working` holds ROWS, because that is what `recompute` threads from
+          ;; an ancestor to its descendants. What lands in the LOG is the handle
+          ;; those rows were written to — the seventh writer, and the one that
+          ;; builds no `:kind :table` literal for a grep to find.
+          (when (seq refreshed)
+            (sub/commit! st {:op :tx :events (mapv (fn [cid]
+                                                     {:op :assoc :id cid :path [:value]
+                                                      :value (tbl/table-value @lake/lake cid
+                                                                              (get working cid))})
+                                                   refreshed)}))
+          {:state (state-payload st) :refreshed refreshed :skipped skipped})))
+    (catch Exception e {:error (.getMessage e)})))
 
 ;; ONE verb over a table: the user says what they want, the agent picks the
 ;; simplest mechanism (declarative view-spec / browser applet / server-side
 ;; Clojure transform) and routes to it. No technique buttons — loci decides.
 (defn do! [st id prompt space]
   (try
-    (let [o (sub/object st id) rows (:value o)]
+    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
         {:error "this works on tables"}
         (let [technique (agent/choose-technique (mapv name (keys (first rows))) (take 3 rows) prompt)]
@@ -1414,6 +1505,75 @@
            (str/join ", " (map name (keys (first v)))) ")\n"
            (table-digest v) "\nsample rows: " (json/write-str (vec (take 3 v))))
       :else "")))
+
+(defn- dropped-lookup
+  "`{table-name when}` for the whole lake, or nil when nothing in `os` is
+   handle-backed — the reclamation question asked ONCE for a whole read.
+
+   Every reader that answers about a LIST of objects wants this rather than
+   `tbl/reclaimed-at` per table. Measured 2026-08-17 over the 29-table store: the
+   cost is the round trip and not the scan, so asking per table took
+   `list_tables` from 0.10 ms to 100 ms where one query costs 3.5 ms.
+
+   Nil when no candidate is handle-backed, so a workspace whose tables never left
+   the log does not open `<data-dir>/lake` to be told nothing was dropped —
+   `tbl/table-shape`'s rule, for its reason. `reclaimed-on` reads nil as
+   \"nothing was dropped\", which is the truth in that case."
+  [os]
+  (when (some #(tbl/handle? (:value %)) os)
+    (lake/dropped-tables (force lake/lake))))
+
+(defn- reclaimed-on
+  "When `o`'s rows were reclaimed, or nil — answered against a `dropped-lookup`
+   map rather than by asking the catalog again.
+
+   Reads `:table/reclaimed` first so a HYDRATED object answers without the map,
+   and falls back to the handle's table name so an UNHYDRATED one answers too.
+   Both shapes reach these readers: `tbl/hydrate` sets the key, and
+   `table-catalog` is handed unhydrated objects on purpose."
+  [dropped o]
+  (or (:table/reclaimed o) (get dropped (:table (:value o)))))
+
+(defn- table-catalog
+  "The `TABLES (query by id)` block the agent is given — one line per table,
+   naming its id, title, columns and row count.
+
+   **Reads the handle; fetches no rows.** Three call sites built this by hand
+   out of `(keys (first (:value o)))` and `(or (:table/total o) (count …))`,
+   which needed the object hydrated — and hydrating a whole workspace to write
+   three dozen characters per table cost 282 ms on every chat turn once the
+   rows moved to the lake. A catalog is metadata, and `tbl/table-shape` answers
+   it from the handle in microseconds. `obj-digest` is the reader that really
+   does need rows, and it still gets them.
+
+   Takes UNHYDRATED objects. Handing it hydrated ones still works — a legacy
+   inline vector is `table-shape`'s other branch — but it would pay the cost
+   this function exists to avoid.
+
+   **A table whose rows were reclaimed is left out entirely.** The handle still
+   says `100 rows`, so without the filter this block advertises a table by id and
+   row count and the agent's very next move is a `query_table` that cannot be
+   served. Omitting it is the honest answer for a catalog, whose whole job is to
+   say what can be queried; `list_tables` is the reader that says *reclaimed* out
+   loud, because a tool result has somewhere to put the word.
+
+   Reading `:table/reclaimed` off the object would be the cheap way and it does
+   not work here: only `hydrate` sets that key, and this function is fed
+   unhydrated objects on purpose. So it asks the catalog, in ONE query for the
+   whole workspace — `lake/dropped-tables` and never `reclaimed-at` per table.
+   Measured 2026-08-17: 3.4 ms either way, so per-table would have put 100 ms
+   back onto every chat turn over the 29-table store, which is the cost this
+   function was rewritten to remove."
+  [tbls]
+  (let [dropped (dropped-lookup tbls)]
+    (str/join "\n"
+              (keep (fn [o]
+                      (let [{:keys [cols rows]} (tbl/table-shape lake/lake o)]
+                        (when-not (reclaimed-on dropped o)
+                          (str "- " (:id o) " — " (:title o)
+                               " (cols: " (str/join ", " (map name cols))
+                               "; " (or rows 0) " rows)"))))
+                    tbls))))
 
 (defn- descendant-sources
   "DOWN. The notebook, the ids of its cells, and the same for everything it
@@ -1738,7 +1898,7 @@
       {:error (str "not a notebook: " space)}
       (try
         (let [digest (->> (nb/cells-of o) (keep #(sub/object st (:ref %)))
-                          (map obj-digest) (str/join "\n"))]
+                          (map #(obj-digest (tbl/hydrate lake/lake %))) (str/join "\n"))]
           {:tags (vec (take 3 (agent/propose-tags (:title o)
                                                   (get-in o [:value :intent]) digest)))})
         (catch Exception e {:error (.getMessage e)})))))
@@ -1757,14 +1917,19 @@
     (let [objs    (if-let [sp (and space (sub/object st space))]
                     (keep #(sub/object st (:ref %)) (nb/cells-of sp))  ; scoped to this space
                     (vals (sub/objects st)))                                  ; whole workspace
-          objs    (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs)
-          texty   (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
-                                (not (every? :block (:value %)))) objs) ; docs + reports (not tables)
-          tbls    (filter #(= :table (:kind %)) objs)
+          objs    (vec (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
+          tbls    (filterv #(= :table (:kind %)) objs)
+          ;; Tables go to the catalog, which reads their handles; only the DOCS
+          ;; are hydrated, because only `obj-digest` needs rows. The shape test
+          ;; that follows still stands: it is what keeps a non-`:table` object
+          ;; whose value happens to BE rows out of the prose digest.
+          texty   (->> objs
+                       (remove #(= :table (:kind %)))
+                       (mapv #(tbl/hydrate lake/lake %))
+                       (remove #(and (sequential? (:value %)) (seq (:value %)) (every? map? (:value %))
+                                     (not (every? :block (:value %)))))) ; docs + reports (not tables)
           allowed (when space (set (map :id tbls)))
-          catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                   " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                   "; " (count (:value o)) " rows)")) tbls))
+          catalog (table-catalog tbls)
           sys     (str "Answer the user's question about their workspace. Cite the object ids you used. "
                        "Do NOT guess any table figure — call query_table for exact numbers. "
                        "If the data doesn't say, say so plainly. Be concise, markdown.\n\n"
@@ -1785,7 +1950,7 @@
   (try
     (let [rows (tools/parse-csv csv)
           nid (str "tbl:csv-" (count (filter #(= :table (:kind %)) (vals (sub/objects st)))) "-" (inc (rand-int 9999)))
-          obj {:id nid :kind :table :title (or (not-empty title) "Imported CSV") :value rows}
+          obj (tbl/table-object @lake/lake nid (or (not-empty title) "Imported CSV") rows)
           base [{:op :put :id nid :value obj}]
           evs (if (and space (space? st space))
                 (conj base (nb/append-cell-event st space {:ref nid}))
@@ -2012,13 +2177,14 @@
 (defn delegate! [st space]
   (let [sp (sub/object st space)
         members (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
-                     (remove #(#{:space :viewspec :applet :fn} (:kind %))))
-        texty   (remove #(= :table (:kind %)) members)
-        tbls    (filter #(= :table (:kind %)) members)
+                     (remove #(#{:space :viewspec :applet :fn} (:kind %)))
+                     vec)
+        tbls    (filterv #(= :table (:kind %)) members)
+        ;; docs hydrate (obj-digest reads rows); tables do not (the catalog
+        ;; reads their handles) — see `table-catalog`
+        texty   (mapv #(tbl/hydrate lake/lake %) (remove #(= :table (:kind %)) members))
         allowed (set (map :id tbls))
-        catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                 " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (count (:value o)) " rows)")) tbls))
+        catalog (table-catalog tbls)
         sys (str "You are a concise analyst. Draft a short markdown brief (≤150 words, with a heading) "
                  "for this workspace space. Use query_table for any exact figure — never guess. Cite object ids.\n\n"
                  "Space: " (:title sp) ". Intent: " (get-in sp [:value :intent]) ".\n\n"
@@ -2043,13 +2209,15 @@
   (let [objs (if-let [sp (and space (sub/object st space))]
                (keep #(sub/object st (:ref %)) (nb/cells-of sp))
                (vals (sub/objects st)))
-        objs (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs)
-        texty (remove #(= :table (:kind %)) objs)
-        tbls  (filter #(= :table (:kind %)) objs)
+        objs (vec (remove #(#{:space :viewspec :applet :fn} (:kind %)) objs))
+        tbls  (filterv #(= :table (:kind %)) objs)
+        ;; `obj-digest` genuinely needs rows; the catalog does not. So hydrate
+        ;; the DOCS only. Hydrating everything cost 282 ms on every chat turn
+        ;; over the migrated store, scaling with the workspace's total rows
+        ;; rather than with the table anyone asked about.
+        texty (mapv #(tbl/hydrate lake/lake %) (remove #(= :table (:kind %)) objs))
         allowed (when space (set (map :id tbls)))
-        catalog (str/join "\n" (map (fn [o] (str "- " (:id o) " — " (:title o)
-                                                 " (cols: " (str/join ", " (map name (keys (first (:value o)))))
-                                                 "; " (count (:value o)) " rows)")) tbls))]
+        catalog (table-catalog tbls)]
     {:context (str "DOCS:\n" (str/join "\n\n" (map obj-digest texty))
                    "\n\nTABLES (query by id):\n" catalog)
      :tool-fn (fn [nm a]
@@ -2117,7 +2285,7 @@
       (if-not (= :space (:kind sp))
         {:error (str "not a notebook: " space)}
         (let [digest (str (->> (nb/cells-of sp) (keep #(sub/object st (:ref %)))
-                               (map obj-digest) (str/join "\n"))
+                               (map #(obj-digest (tbl/hydrate lake/lake %))) (str/join "\n"))
                           (remembered-context st (str (:title sp) " " (get-in sp [:value :intent])) space))]
           {:proposals (vec (take 3 (agent/propose-subtopics
                                     (:title sp) (get-in sp [:value :intent]) digest)))})))
@@ -2237,9 +2405,37 @@
       v)
     v))
 
-(defn- table-shaped? [st id]
-  (let [rows (:value (sub/object st id))]
-    (boolean (and (sequential? rows) (seq rows) (every? map? rows)))))
+(defn- table-shaped?
+  "Does `id` name something whose value is rows **that are still there**? A
+   handle counts — it IS a table, it just keeps its rows in the lake.
+
+   The failure that needs is a flow with a **non-table step before the table**:
+   with one step `resolve-ref` has already produced that step's own `:out` and
+   `resolve-table-ref`'s `or` falls back to it either way. With a doc in front,
+   a scan that reads a handle as 'not a table' skips past the lake-backed table
+   and the compute step runs on prose.
+
+   It used to hydrate to find that out — fetching every row of every candidate
+   to answer a boolean, on a scan that runs over earlier steps until one
+   matches. `tbl/table-shape` answers it from the handle.
+
+   **And a handle whose rows were reclaimed is not a table this caller can
+   use.** The handle survives the reclamation intact — same cols, same count —
+   so shape alone says yes forever, and the one caller asking is a scan looking
+   for a table it can COMPUTE on. Measured before this clause, on a flow whose
+   outputs were `[tbl:good doc:prose tbl:gone]`: `resolve-table-ref` returned
+   `tbl:gone`, `compute-clj!` answered `\"compute works on tables\"`, and
+   `run-flow!` marked that step and the whole flow `failed` — so one reclaimed
+   table stopped every remaining step of a flow that had a live table sitting
+   two outputs earlier. Per operation, where the requirement is per object.
+
+   The 3-arity takes a `dropped-lookup` map so a scan asks the catalog once for
+   the whole flow rather than once per candidate; the 2-arity asks for itself."
+  ([st id] (table-shaped? st id (dropped-lookup [(sub/object st id)])))
+  ([st id dropped]
+   (let [o (sub/object st id)]
+     (and (some? (tbl/table-shape lake/lake o))
+          (nil? (reclaimed-on dropped o))))))
 
 (defn- step-index->ref
   "A bare step index — `0`, `\"0\"` — as the `$`-ref the planner meant.
@@ -2279,14 +2475,28 @@
    one somebody named by hand is the worse error.
 
    No tabular output anywhere → the unresolved value, so the failure
-   downstream stays honest rather than becoming a confident wrong table."
+   downstream stays honest rather than becoming a confident wrong table.
+
+   **A reclaimed output is stepped OVER, not stopped on.** The reverse scan
+   exists to find a table this step can use, and a table whose rows are gone is
+   not one — `table-shaped?` answers false for it, so the `filter` walks past to
+   the next candidate. Measured on outputs `[tbl:good doc:prose tbl:gone]`: this
+   returned `tbl:gone` and failed the whole flow, where `tbl:good` was live and
+   two outputs earlier. Every candidate reclaimed still falls through to `r` and
+   the honest downstream failure, which is the same answer as no table at all.
+
+   One `dropped-lookup` for the whole scan rather than one catalog read per
+   candidate, and it covers `r` as well as the outputs — `r` can be a literal id
+   naming a table no step produced."
   [st flow v]
   (let [ref (step-index->ref v)]
     (if (and (string? ref) (str/starts-with? ref "$"))
-      (let [r (resolve-ref flow ref)]
-        (if (and (string? r) (table-shaped? st r))
+      (let [r       (resolve-ref flow ref)
+            outs    (vec (keep :out (:steps flow)))
+            dropped (dropped-lookup (keep #(sub/object st %) (cons r outs)))]
+        (if (and (string? r) (table-shaped? st r dropped))
           r
-          (or (->> (:steps flow) (keep :out) reverse (filter #(table-shaped? st %)) first)
+          (or (->> outs reverse (filter #(table-shaped? st % dropped)) first)
               r)))
       ;; the ORIGINAL value, not the normalized one: a literal id passes through
       ;; untouched exactly as it always did, and only a reference is resolved
@@ -2697,6 +2907,54 @@
                 (mem/append-line! log rec)
                 (dissoc rec :vec))))))))
 
+;; ---- storage: what the lake costs, and reclaiming one object's history ----
+
+(defn- storage-payload
+  "What every object's lake tables cost, for the storage panel.
+
+   `st` and not just the lake because the classification is a property of the
+   *log*, not of the catalog: `gc/classify` walks every event ever committed to
+   decide which lake table is current, which is still inside the window undo and
+   `?at=` can reach, and which no handle names at all. The catalog alone cannot
+   tell those apart — it sees thirty-one equally live tables.
+
+   `(force lake/lake)` rather than `@lake/lake` only to read the same way the
+   rest of this namespace does; the route is a read and forces the singleton the
+   first time a panel is opened, which is the intended moment."
+  [st]
+  (gc/report st (force lake/lake) gc/default-window))
+
+(defn- storage-reclaim!
+  "Reclaim one object's out-of-window versions. Irreversible, so it refuses a
+   request that named no object.
+
+   **`nil` is a meaningful argument to `gc/reclaim!` — it means *the orphans*.**
+   And `json/read-str` cannot distinguish a body that omitted `:id` from one
+   that sent an explicit null, so without this guard `POST /api/storage/reclaim`
+   with an empty body deletes every orphaned table in the lake and answers with
+   a completed sweep. Measured before the guard, against a lake holding one
+   orphan: `{:object nil :tables [\"t_tbl_orphan_3f55a4d0\"] :versions 1 :freed 2176}`.
+
+   That makes this the one route where the house habit — hand the body value
+   through raw and let the callee refuse it by name, as `/api/memory-durable`
+   does — is not available: the callee does not refuse it. An unknown or
+   non-table id needs no guard, because `gc/reclaim!` does refuse that one
+   (`{:error :unknown-object …}`), and the refusal travels as a 200 with an
+   `:error` key like every other refusal this server issues.
+
+   **The orphans are therefore not reachable over HTTP at all.** Deliberate: the
+   caller who wants them is a person reading `report`'s `:orphaned` count, and
+   giving them a spelling here would mean choosing one before a panel exists to
+   need it. `loci.lakegc/reclaim!` with `nil` is the path, from a REPL attached
+   to the server."
+  [st id window]
+  (if-not (and (string? id) (seq id))
+    {:error :no-object :versions 0 :freed 0
+     :why (str "no object named — refusing rather than reclaiming the orphans, "
+               "which is what a nil id means to lakegc/reclaim! and is not what "
+               "a request with no :id is asking for")}
+    (gc/reclaim! st (force lake/lake) id (or window gc/default-window))))
+
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
   (let [st (store)
@@ -2777,6 +3035,15 @@
                                (json-resp (suggest-start! st space)))
       (= uri "/api/suggest-run")(let [{:keys [space items destination]} (body-json req)]
                                   (json-resp (suggest-run-start! st space items destination)))
+      (= uri "/api/storage") (json-resp (storage-payload st))
+      ;; The only route here besides `/api/notebook` that tests the method, and
+      ;; the reason is that this one deletes Parquet: bodyless GETs happen — a
+      ;; prefetch, a pasted URL, a curl without `-X POST` — and this reaching
+      ;; `storage-reclaim!` with no `:id` is exactly the shape the guard inside
+      ;; it refuses. Two cheap answers to one irreversible call, and a GET here
+      ;; falls through to the 404 rather than to a reclaim.
+      (and (= :post (:request-method req)) (= uri "/api/storage/reclaim"))
+      (json-resp (storage-reclaim! st (:id (body-json req)) nil))
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
@@ -2848,6 +3115,59 @@
   (.join thread 2000)
   (not (.isAlive thread)))
 
+(defn- close-lake-at-exit!
+  "Register the shutdown hook that closes `lk`, and return the thread.
+
+   Returns it so the two things that matter here can be run by a test: the JVM
+   will not run a hook on demand, and both behaviours live in the hook's body.
+
+   Takes the delay rather than reading `lake/lake` for the same reason — a test
+   passing its own delay proves the guard without opening the user's lake, and
+   proving it is the only way to know the guard is a guard. `-main` registers
+   this BEFORE it forces the lake, which is what leaves the `realized?` check
+   with something to decide: registered and never forced, exit closes nothing.
+   Registered after the force it would always be true and read as a check that
+   is not one.
+
+   The catch is not defensive noise. `realized?` does not mean \"opened\" — a
+   delay whose body THREW is realized too, and every later deref rethrows the
+   cached exception. Same shape `start-chunk-sweep!` puts around its background
+   work.
+
+   **A failed boot has nothing to close, and says nothing.** Which is why the
+   deref is separated from the close and only the close is reported. With one
+   `try` around both, a lake that failed to open printed
+   `loci.server: closing the lake threw:` and a full stack trace of the *open*
+   failure on the way out — after `-main` had already printed the real error,
+   and therefore under it, burying the one line the user needed. The guard was
+   added to keep exit quiet about a lake nobody opened; a lake that could not
+   be opened is the same case and was getting the opposite treatment. A close
+   that genuinely fails still reports, because that is news.
+
+   What the close buys, measured 2026-08-16: DuckDB holds uncheckpointed
+   commits in `catalog.duckdb.wal` and checkpoints them into the catalog on
+   close, releasing the file lock. After a 100k-row write: `catalog.duckdb`
+   12,288 B beside a 12,281 B WAL while open, 3,944,448 B and no WAL after.
+   Replaying the WAL on open is DuckDB's own recovery path, so this is a
+   checkpoint and a released lock, not data loss avoided — the substrate's LMDB
+   env is left to process exit and loses nothing either."
+  [lk]
+  (let [t (Thread. ^Runnable
+                   #(when-let [opened (when (realized? lk)
+                                        ;; A delay whose body threw is realized
+                                        ;; and rethrows here; that is a boot
+                                        ;; failure already reported, not a
+                                        ;; close failure, and there is nothing
+                                        ;; open to close.
+                                        (try @lk (catch Throwable _ nil)))]
+                      (try (lake/close! opened)
+                           (catch Throwable e
+                             (binding [*out* *err*]
+                               (println "loci.server: closing the lake threw:" e)))))
+                   "loci-lake-close")]
+    (.addShutdownHook (Runtime/getRuntime) t)
+    t))
+
 (defn -main [& _]
   ;; FIRST, before the store is touched — `(store)` below opens LMDB, and once
   ;; Datalevin has failed the only thing the user sees is a stack trace that
@@ -2857,6 +3177,16 @@
   (when-let [problem (sub/data-dir-problem)]
     (binding [*out* *err*] (println problem))
     (System/exit 1))
+  ;; Before the force, not after — see `close-lake-at-exit!`, which is where
+  ;; the order is the difference between a guard and a line that always passes.
+  (close-lake-at-exit! lake/lake)
+  ;; Force the lake at boot rather than on first use. 75 ms, measured against
+  ;; a lake holding 10M rows — 0.5% of the dependency load already paid — and
+  ;; it turns "tables are broken" into a startup error naming the directory.
+  ;; After `data-dir-problem`, for the same reason `(store)` is: the lake lives
+  ;; under the data directory, and a permissions failure should be reported by
+  ;; the check that names the uid rather than by DuckDB.
+  @lake/lake
   ;; PORT because that is what every container runtime sets. Through
   ;; `loci.config` like everything else, so that a PORT in loci.env is honoured
   ;; rather than silently ignored by a local run while compose obeys it — the

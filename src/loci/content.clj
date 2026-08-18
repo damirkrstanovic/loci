@@ -13,9 +13,11 @@
   (:require [clojure.core.protocols :as p]
             [clojure.string :as str]
             [loci.dlv :as dlv]
+            [loci.lake :as lake]
             [loci.mold :as mold]
             [loci.notebook :as nb]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 ;; ============================================================================
 ;; deterministic generators
@@ -561,8 +563,43 @@
 ;; seeded store (layer 1)
 ;; ============================================================================
 
-(defn seed! [store]
-  (doseq [o objects] (sub/commit! store {:op :put :id (:id o) :value o}))
+(defn seed!
+  "Write the demo world into `store`, landing every row-bearing object's rows
+   in `ts`.
+
+   **This is a writer, and it was the eighth one found.** `objects` above builds
+   its table objects through `obj`, which takes `kind` as a *parameter* — so it
+   spells no `:kind :table` literal and the grep that found six writers, and
+   then the seventh, did not find this one either. Measured 2026-08-16 before
+   the conversion: 10 table objects, 1,810 rows, **230,300 characters** of `:put`
+   events, of which `tbl:orders` alone was 134,630 in a single event. Not test
+   data — `store` below seeds whenever the log is empty, so a fresh boot after a
+   migration re-created ten inline tables.
+
+   **`ts` is an argument rather than `@lake/lake`** because `objects` is a
+   top-level `def` and this namespace's property is that requiring it starts
+   nothing — no store opened, no lake attached. The rows stay plain data in
+   `objects`; landing them is something a caller asks for. `store` below is the
+   only caller, and it forces the lake only on the branch that actually seeds.
+
+   **`:metric` as well as `:table`**, because a metric's `:value` is rows too:
+   `metric:mrr` and `metric:headcount` are 48 rows and 1,882 characters between
+   them, `777000` among them. The first pass filtered on `:kind :table` and
+   converted 10 of 12 — and its test could not see the other two, because it
+   filtered the same way. Filtering by the property being fixed is the blind
+   spot this move keeps rediscovering; it is what hid `rerun!` one level up. It
+   also falsifies \"nothing writes a `:metric`\": something does, on every fresh
+   boot.
+
+   `table-value` rather than `table-object`, because these objects already exist
+   and only their `:value` moves — and because `table-object` would stamp
+   `:kind :table` on a `:metric`."
+  [store ts]
+  (doseq [o objects]
+    (sub/commit! store {:op :put :id (:id o)
+                        :value (if (#{:table :metric} (:kind o))
+                                 (assoc o :value (tbl/table-value ts (:id o) (:value o)))
+                                 o)}))
   store)
 
 (defonce store
@@ -571,8 +608,10 @@
   ;; and `loci.memory` now opens its facts dbi through the same handle. Seeding
   ;; stays here because seeding is this namespace's business, not `dlv`'s.
   (delay (let [s @dlv/store]
-           ;; a non-empty log on disk wins; otherwise seed (which writes the log)
-           (if (seq (sub/history s)) s (seed! s)))))
+           ;; a non-empty log on disk wins; otherwise seed (which writes the log).
+           ;; `@lake/lake` sits on the seeding branch alone, so a store that is
+           ;; already there never attaches a lake to find that out.
+           (if (seq (sub/history s)) s (seed! s @lake/lake)))))
 
 (defn members [store space-id]
   (->> (nb/cells-of (sub/object store space-id))

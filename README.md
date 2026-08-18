@@ -110,12 +110,44 @@ made while loci still ran as root keeps its root-owned files forever, and uid
 docker run --rm -v loci-data:/data alpine chown -R 10001:10001 /data
 ```
 
-Use `-R`: chowning `/data` alone leaves `/data/substrate` root-owned, which
-fails in the same place. loci checks both before it opens anything and refuses
-to start with a message naming the path, the uid and that command, rather than
-handing you an LMDB permission error. It will not chown for you — the same path
-may be a bind-mounted host directory, and quietly taking ownership of your own
-files is the worse surprise.
+Use `-R`, and note that since 2026-08-16 there are **two** stores under `/data`:
+chowning `/data` alone leaves `/data/substrate` root-owned, and chowning
+`/data/substrate` by hand leaves `/data/lake` root-owned. A reader who fixes
+only the substrate gets a working log and broken tables — the server boots and
+the shell draws, and the first write to a table fails when DuckDB cannot write
+its catalog. `-R` covers both.
+
+loci checks `/data`, `/data/substrate` and `/data/lake` before it opens anything
+and refuses to start with a message naming the path, the uid and that command,
+rather than handing you an LMDB or DuckDB permission error. It will not chown
+for you — the same path may be a bind-mounted host directory, and quietly taking
+ownership of your own files is the worse surprise.
+
+**DuckDB's ducklake extension ships in the image, so a first boot needs no
+network.** loci stores table rows in a DuckLake catalog, and DuckDB loads that
+catalog through an extension it will otherwise `INSTALL` — 36 MB over the
+internet — the first time a lake is opened. The Dockerfile installs it in the
+build stage into `/opt/duckdb-extensions` and points `LOCI_DUCKDB_EXTENSIONS`
+there, so an air-gapped container starts (verified with `--network none`), and
+the 36 MB lands in the image rather than in the directory you back up. It is
+root-owned and stays that way: `LOAD` only reads, and a writable extension
+directory would let a version mismatch quietly re-download at boot instead of
+failing where someone would notice.
+
+That variable exists because **DuckDB composes its extension directory from
+`$HOME`, and this container has no usable one.** Nothing in the image sets HOME,
+so `getenv("HOME")` was null, the path became `/.duckdb`, and the container died
+before the listener with `IO Error: Failed to create directory "/.duckdb":
+Permission denied`. Setting HOME in the image is not the fix — compose runs loci
+as `${LOCI_UID:-10001}`, which the bind-mount instructions above tell you to set
+to your own uid, and that uid has no `/etc/passwd` entry here and no claim on
+`/home/loci`. Naming the directory covers both ways this image is run.
+
+**Outside Docker this matters too.** A `clojure -M:serve` or a `java -jar` under
+your own account has a real HOME and needs nothing. A **systemd unit** may not:
+`User=` alone does not set HOME for a service, and loci will then try to install
+into `/.duckdb` and fail exactly as the container did. Set
+`LOCI_DUCKDB_EXTENSIONS` (or `Environment=HOME=…`) in the unit.
 
 **The jar in the image is not portable.** The Dockerfile builds it with
 `clojure -T:build uber :slim true`, which excludes the native libraries for
@@ -196,6 +228,7 @@ those files, because `.dockerignore` deliberately keeps them out of the build co
 | `LOCI_RERANK_API_KEY` | `LOCI_EMBED_API_KEY`, then `LOCI_LLM_API_KEY` | *unset — no header* |
 | `LOCI_LLM_TIMEOUT_MS` | — | `180000` — one model call's deadline; an idle timeout, so in practice the whole response |
 | `LOCI_DATA` | — | a **relative** `data/` |
+| `LOCI_DUCKDB_EXTENSIONS` | — | *unset — DuckDB's own `$HOME/.duckdb`, which a container has not got* |
 | `PORT` | — | `7777` |
 
 **One config file, Docker or not.** Every variable in that table is read from
@@ -213,13 +246,17 @@ line that is not `KEY=VALUE` is skipped with its line number on stderr rather
 than stopping the app over one typo. (The number, not the line: a malformed line
 is exactly where a mistyped key ends up.)
 
-`LOCI_DATA` and `PORT` are the two that `loci.env.example` deliberately does not
-set, though both are honoured if you do. They are deployment facts rather than
-configuration, and the image supplies them: `ENV LOCI_DATA=/data` and
-`ENV PORT=7777` in the `Dockerfile`. `/data` in a portable config file would add
-nothing in the container and would point a `clojure -M:serve` on your own machine
-at a directory it cannot create; `PORT` in it would move the container's listener
-without moving compose's published mapping.
+`LOCI_DATA`, `PORT` and `LOCI_DUCKDB_EXTENSIONS` are the three that
+`loci.env.example` deliberately does not set, though all are honoured if you do.
+They are deployment facts rather than configuration, and the image supplies them:
+`ENV LOCI_DATA=/data`, `ENV PORT=7777` and
+`ENV LOCI_DUCKDB_EXTENSIONS=/opt/duckdb-extensions` in the `Dockerfile`. `/data`
+in a portable config file would add nothing in the container and would point a
+`clojure -M:serve` on your own machine at a directory it cannot create; `PORT` in
+it would move the container's listener without moving compose's published
+mapping; and `/opt/duckdb-extensions` names a directory that exists only inside
+the image, so a local run pointed at it would find no extension and refuse to
+open its lake.
 
 **Any server that speaks OpenAI's `POST /v1/chat/completions` works** — llama.cpp,
 vLLM, Ollama, LM Studio, a gateway — so loci can run entirely on your own hardware:
@@ -340,11 +377,33 @@ that looks healthy and answers nothing, and `LOCI_DATA=/data` is the container's
 the image already sets and which a `clojure -M:serve` on your own machine would take
 literally and refuse to start over.
 
-`clojure -M:serve` persists its state under `data/` — everything lives in one
-Datalevin (LMDB) environment at `data/substrate`, in six dbis: `events` (the
+`clojure -M:serve` persists its state under `data/`, in **two stores**:
+
+```
+data/
+  substrate/   LMDB — the log. Truth: metadata, structure, and handles.
+  lake/        DuckLake catalog + Parquet — every table's rows.
+```
+
+`data/substrate` is one Datalevin (LMDB) environment in six dbis: `events` (the
 truth), `counts` and `touched` (derived indices), `meta`, `facts` (the agent's
-memory) and `chunks` (embedding vectors). Delete that directory to reset to a
-clean slate; one directory is the whole backup.
+memory) and `chunks` (embedding vectors). Since 2026-08-16 a `:kind :table`
+object's `:value` in that log is a **handle** — `{:store :lake :table … :snapshot
+… :rows … :cols …}` — and the rows themselves are Parquet under `data/lake`.
+Delete `data/` to reset to a clean slate.
+
+**Backing up means copying `data/`, with the app stopped.** It used to be one
+directory you could copy at any time; it is now two stores that are not written
+in one transaction — a `:put` lands in LMDB and the Parquet lands in the lake —
+so a copy taken between the two holds a handle pointing at a table the copy does
+not contain. Stopping the app first costs nothing and is route (3) below.
+
+**Table GC is off.** `data/lake` only grows: every write creates a new table and
+nothing is ever expired, because a handle reads `AT (VERSION => n)` and expiring
+a snapshot would invalidate every handle in the log that names it. See
+`loci.lake/sweep!`, which reports `:mode :disabled` and the reason rather than a
+zero that reads like a completed sweep. A growing `lake/` is the design, not a
+leak.
 
 Until 2026-08-15 the memory and the vectors were flat files beside it —
 `data/memory.edn` and `data/chunks.edn`, together twenty-five times the size of

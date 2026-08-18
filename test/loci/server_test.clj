@@ -2,20 +2,121 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is use-fixtures]]
             [loci.agent :as agent]
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.lake :as lake]
+            [loci.lake-fixture :as lf]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
-            [loci.substrate :as sub])
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
+            [loci.tools :as tools])
   (:import [java.util Locale]))
+
+(use-fixtures :once loci.lake-fixture/with-temp-lake)
 
 (defn- tmpfile []
   (str (System/getProperty "java.io.tmpdir") "/loci-test-" (System/nanoTime) "/memory.edn"))
+
+;; ---------------------------------------------------------------------------
+;; the boot path: what exit does about the lake
+;;
+;; `-main` cannot be called from a test — it binds a port and blocks on a
+;; promise — so the hook is registered by `close-lake-at-exit!`, which hands
+;; back the thread. `.run` on it is the hook's body on this thread, which is
+;; the only way to see a shutdown hook without shutting down. The hook is
+;; always removed again: it is registered against the real JVM, and a suite
+;; that left them behind would close a stranger's connection at exit.
+;; ---------------------------------------------------------------------------
+
+(defn- rm-rf [f]
+  (let [f (io/file f)]
+    (when (.isDirectory f) (run! rm-rf (.listFiles f)))
+    (.delete f)))
+
+(defn- rows-of
+  "A table object's rows, through the same seam the server reads them through.
+
+   Since every writer lands a handle, `(:value (sub/object st id))` is no longer
+   rows and asserting on it asserts on the handle's own keys. `hydrate` is what
+   the fifteen production call sites use, and it passes a literal vector through
+   untouched — so a test that writes rows into `:value` by hand still reads back
+   what it wrote.
+
+   **Which is exactly why a test that reads through here cannot tell a converted
+   writer from an unconverted one.** That blind spot is not hypothetical: it is
+   how `rerun!` — the seventh writer, which assocs over `:value` and so builds no
+   `:kind :table` literal for a grep to find — went on putting rows in the log
+   with every rerun test passing. Assertions that a writer *landed a handle* must
+   read `(:value (sub/object …))` raw; see `every-server-writer-lands-a-handle`
+   and `rerun-writes-a-handle-and-not-the-refreshed-rows`."
+  [st id]
+  (:value (tbl/hydrate lake/lake (sub/object st id))))
+
+(deftest exit-closes-a-lake-that-was-opened
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-hook-" (System/nanoTime))
+        lk  (delay (lake/open-lake! dir))
+        t   (#'srv/close-lake-at-exit! lk)]
+    (try
+      (is (= [{:answer 2}] (lake/q @lk "SELECT 1 + 1 AS answer")))
+      (.run t)
+      (is (thrown-with-msg? java.sql.SQLException #"Connection was closed"
+                            (lake/q @lk "SELECT 1 AS answer"))
+          "exit must close the connection, not just let the process drop it")
+      (finally
+        (.removeShutdownHook (Runtime/getRuntime) t)
+        (rm-rf dir)))))
+
+(deftest exit-opens-no-lake-that-was-never-opened
+  ;; The guard `close-lake-at-exit!` exists for. A bare `@lk` in the hook opens
+  ;; a lake on the way out of a process that never wanted one — and against a
+  ;; delay whose body threw, rethrows on the shutdown thread. This is the test
+  ;; that fails if the `realized?` check goes, and the reason the hook is
+  ;; registered before `-main` forces anything.
+  (let [forced (atom 0)
+        lk     (delay (swap! forced inc))
+        t      (#'srv/close-lake-at-exit! lk)]
+    (try
+      (.run t)
+      (is (zero? @forced) "a hook that runs before the boot force must open nothing")
+      (finally (.removeShutdownHook (Runtime/getRuntime) t)))))
+
+(deftest exit-says-nothing-about-a-lake-that-failed-to-open
+  ;; `realized?` is true for a delay whose body THREW, and every later deref
+  ;; rethrows the cached exception — so a boot that could not open the lake
+  ;; printed "closing the lake threw:" and the open failure's whole stack trace
+  ;; on the way out, UNDER the real error `-main` had just printed. The guard
+  ;; exists to keep exit quiet about a lake nobody opened; a lake that could
+  ;; not be opened is the same case and was getting the loudest treatment.
+  (let [lk  (delay (throw (ex-info "ATTACH failed" {})))
+        err (java.io.StringWriter.)]
+    (is (thrown? clojure.lang.ExceptionInfo @lk) "realize it by failing it")
+    (is (realized? lk) "which is exactly the trap: a thrown body still realizes")
+    (let [t (#'srv/close-lake-at-exit! lk)]
+      (try
+        (binding [*err* err] (.run t))
+        (is (= "" (str err)) "a failed boot has nothing to close and nothing to say")
+        (finally (.removeShutdownHook (Runtime/getRuntime) t))))))
+
+(deftest exit-still-reports-a-close-that-fails
+  ;; The other side of the same line, and the reason the `try` stays: a lake
+  ;; that opened and then would not close is news, and silence there would lose
+  ;; an uncheckpointed WAL without saying so.
+  (let [lk  (delay {:conn (reify java.io.Closeable
+                            (close [_] (throw (ex-info "connection is wedged" {}))))})
+        err (java.io.StringWriter.)]
+    @lk
+    (let [t (#'srv/close-lake-at-exit! lk)]
+      (try
+        (binding [*err* err] (.run t))
+        (is (str/includes? (str err) "closing the lake threw")
+            "a genuine close failure must still be reported")
+        (finally (.removeShutdownHook (Runtime/getRuntime) t))))))
 
 (def ^:private no-memory
   "The memory `mold-payload` must not open — a delay that throws if it is forced.
@@ -332,7 +433,7 @@
                      :value {:id "fn:t-1" :kind :fn :title "fn: double it"
                              :value {:lang "clojure" :code "(fn [rows] (mapv #(update % :revenue * 2) rows))"}}})
     (let [r (srv/fn-apply! st "tbl:t" "fn:t-1" {} nil)]
-      (is (= [200 500] (map :revenue (:value (sub/object st (:openId r)))))))))
+      (is (= [200 500] (map :revenue (rows-of st (:openId r))))))))
 
 (deftest fn-apply-rejects-non-space-target
   (let [st (store-with-table)
@@ -415,10 +516,12 @@
         r  (srv/rerun! st "tbl:t")]
     (is (= (inc before) (count (sub/history st))))                 ; ONE :tx for the whole chain
     (is (= #{b c} (set (:refreshed r))))
-    (is (= [{:region "EMEA" :revenue 900}] (:value (sub/object st b))))       ; top-1 follows the new data
-    (is (= [1800 500] (map :revenue (:value (sub/object st c)))))             ; doubled fresh rows
+    (is (= [{:region "EMEA" :revenue 900}] (rows-of st b)))                   ; top-1 follows the new data
+    (is (= [1800 500] (map :revenue (rows-of st c))))                         ; doubled fresh rows
     (sub/undo! st)                                                 ; one undo restores BOTH
-    (is (= [{:region "APAC" :revenue 250}] (:value (sub/object st b))))))
+    ;; undo puts back the handle `fn-apply!` landed — `rerun!` assoc'd rows over
+    ;; it, so this is the one assertion in the chain that reads through hydrate
+    (is (= [{:region "APAC" :revenue 250}] (rows-of st b)))))
 
 (deftest rerun-on-a-derived-table-refreshes-it-then-descendants
   (let [st (store-with-table)
@@ -431,7 +534,10 @@
                             :value [{:region "X" :revenue 7} {:region "Y" :revenue 3}]})
         r  (srv/rerun! st b)]                                      ; hit ↻ on the DERIVED table
     (is (= [b c] (:refreshed r)))                                  ; parent before child
-    (is (= [14 6] (map :revenue (:value (sub/object st c)))))))    ; child used b's NEW rows
+    ;; `recompute` threads ROWS between an ancestor and its descendants through
+    ;; `working`; only what lands in the log is a handle. This is the assertion
+    ;; that breaks first if those two ever get confused.
+    (is (= [14 6] (map :revenue (rows-of st c))))))                ; child used b's NEW rows
 
 (deftest rerun-skips-paramless-legacy-and-reports-why
   (let [st (store-with-table)]
@@ -444,6 +550,48 @@
       (is (= "tbl:old" (:id (first (:skipped r)))))
       (is (string? (:why (first (:skipped r)))))
       (is (= before (count (sub/history st)))))))                  ; nothing to refresh → no event
+
+(deftest rerun-refuses-a-reclaimed-source-rather-than-emptying-its-children
+  ;; `recompute` is a SEVENTH reader of a hydrated table, and the one with
+  ;; teeth. A reclaimed source hydrates to `:value []` — not nil — so the
+  ;; "source is gone" branch cannot fire and the chain recomputes over zero
+  ;; rows. Before `hydrate` learned to degrade, that case raised and the chain
+  ;; stopped; the marker check is what replaces that.
+  ;;
+  ;; **The `via` here has to be an aggregate, and that is the whole test.**
+  ;; Measured 2026-08-17: all six `lib:` builtins answer "no rows came out —
+  ;; nothing to keep" for an empty input, so with a `lib:` via the marker
+  ;; changes only the message a skip reports. An agent-written fn that counts
+  ;; returns `[{:n 0}]` from no rows — non-empty, so nothing downstream refuses
+  ;; it — and `rerun!` commits it over the good table and reports success.
+  ;; Sabotaged, this test goes from `[{:n 100}]` to `[{:n 0}]` and `:refreshed`.
+  (let [st  (sub/fresh-store)
+        lk  @lake/lake
+        ;; 100 rows so the write lands a Parquet there is something to delete —
+        ;; DuckLake inlines a small insert and the source would keep reading.
+        _   (sub/commit! st {:op :put :id "tbl:t"
+                             :value (tbl/table-object
+                                     lk "tbl:t" "T"
+                                     (mapv (fn [i] {:region (str "r" i) :revenue i}) (range 100)))})
+        _   (sub/commit! st {:op :put :id "fn:agg"
+                             :value {:id "fn:agg" :kind :fn :title "fn: count"
+                                     :value {:lang "clojure" :code "(fn [rows] [{:n (count rows)}])"}}})
+        b   (:openId (srv/fn-apply! st "tbl:t" "fn:agg" {} nil))
+        before (rows-of st b)
+        h   (:value (sub/object st "tbl:t"))            ; raw: the handle, not rows
+        files (mapv :data_file
+                    (lake/q lk (str "SELECT data_file FROM ducklake_list_files('lake', '"
+                                    (:table h) "')")))]
+    (is (= [{:n 100}] before) "the derived table starts with a real count")
+    (lake/x! lk (str "DROP TABLE " (:table h)))          ; reclaim the SOURCE for real
+    (doseq [f files] (io/delete-file f true))
+    (let [hist (count (sub/history st))
+          r    (srv/rerun! st "tbl:t")]
+      (is (= [] (:refreshed r)) "nothing could be refreshed")
+      (is (= b (:id (first (:skipped r)))) "the child is skipped, by name")
+      (is (re-find #"reclaimed" (str (:why (first (:skipped r))))) "and it says why")
+      (is (= before (rows-of st b)) "the child's rows are UNCHANGED, not recounted to zero")
+      (is (= hist (count (sub/history st))) "and nothing was committed"))))
 
 (deftest rerun-validates
   (let [st (store-with-table)]
@@ -587,7 +735,7 @@
           r  (srv/research! st "space:n" "extract a table of shares")]
       (is (clojure.string/starts-with? (str (:openId r)) "tbl:extract"))
       (is (= [{:name "A" :share_pct 30} {:name "B" :share_pct 20}]
-             (:value (sub/object st (:openId r))))))))
+             (rows-of st (:openId r)))))))
 
 (deftest compute-retries-once-with-error-feedback
   ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
@@ -603,7 +751,7 @@
         (is (= 2 (count @calls)))
         (is (nil? (first @calls)))                        ; first attempt: no error context
         (is (string? (second @calls)))                    ; retry got the eval error
-        (is (= 1 (:x (first (:value (sub/object st (:openId r)))))))))))
+        (is (= 1 (:x (first (rows-of st (:openId r))))))))))
 
 (deftest compute-fails-honestly-after-two-bad-attempts
   (with-redefs [agent/make-clj-transform (fn [& _] "(bad")]
@@ -4064,3 +4212,336 @@
       (srv/flow-gate! st newer false)
       (is (= 0 (:flows-need-you (srv/state-payload st)))
           "rejecting clears the badge — nothing is waiting any more"))))
+
+;; ---------------------------------------------------------------------------
+;; every reader hydrates, not just mold-payload
+;;
+;; A table's rows live in the lake; the log holds a handle. Twelve places pull
+;; an object out of the substrate and read `:value` as rows. Three of them are
+;; pinned here: the ƒ palette (which answered "functions work on tables" for a
+;; real table), the agent's own workspace digest (where a table vanished
+;; silently, because `obj-digest` returns "" for anything that is not rows),
+;; and `table-shaped?`, the scan a compute step uses to find the table an
+;; earlier step produced.
+;; ---------------------------------------------------------------------------
+
+(deftest the-fn-palette-sees-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (let [r (srv/fns-payload st "tbl:x")]
+      (is (nil? (:error r)) "a handle-backed table must not read as 'not a table'")
+      (is (seq (:fns r))))))
+
+(deftest a-compute-step-resolves-past-a-doc-to-the-handle-backed-table
+  ;; `table-shaped?` is the scan `resolve-table-ref` runs over earlier outputs.
+  ;; A handle is a MAP, so an unhydrated scan reads a lake-backed table as "not
+  ;; a table" and stops at whatever `resolve-ref` already returned — here the
+  ;; doc — and the compute step runs on prose. A single-step flow cannot show
+  ;; this: `resolve-ref` has already produced the step's own `:out` and the `or`
+  ;; falls back to it either way. It needs a non-table step in front.
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "doc:n" :value {:id "doc:n" :kind :doc :title "N" :value "text"}})
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (is (= "tbl:x"
+           (#'srv/resolve-table-ref st {:steps [{:out "doc:n"} {:out "tbl:x"}]} 0))
+        "the scan must skip the doc and find the table, wherever its rows live")))
+
+(deftest the-workspace-digest-still-describes-a-handle-backed-table
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1} {:a 2}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "Sales" :value h}})
+    (let [c (:context (#'srv/agent-ctx st nil))]
+      (is (re-find #"tbl:x" c) "the table must appear in the agent's context at all")
+      (is (re-find #"2 rows" c) "and with its true row count"))))
+
+(deftest the-workspace-digest-reads-no-rows
+  ;; …and it must name the table WITHOUT fetching a row. `agent-ctx` runs on
+  ;; every chat turn and scales with the total rows in the workspace, not with
+  ;; the table being asked about: measured 282 ms over the migrated store's
+  ;; 3,957 rows, against 14 ms once it reads the handle instead.
+  (let [st (sub/fresh-store)
+        h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "Sales" :value h}})
+    (with-redefs [tbl/rows (fn [& _] (throw (ex-info "agent-ctx fetched rows" {})))]
+      (let [c (:context (#'srv/agent-ctx st nil))]
+        (is (re-find #"tbl:x — Sales" c) "the table is still named")
+        (is (re-find #"cols: a, b" c) "with its columns")
+        (is (re-find #"2 rows" c) "and its true row count")))))
+
+;; ---------------------------------------------------------------------------
+;; the three server writers land handles — and a filter that matched nothing
+;; still lands a table
+;; ---------------------------------------------------------------------------
+
+(deftest every-server-writer-lands-a-handle
+  ;; `rows-of` hydrates, so it reads an unconverted writer's literal rows just
+  ;; as happily as a handle — which means no assertion above can tell whether
+  ;; these three were converted at all. This is the one that can.
+  (let [st (store-with-table)
+        landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
+    (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
+        "import-csv!")
+    (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                         {:by "revenue" :n "1" :order "desc"} nil)))
+        "the ƒ apply")
+    (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+      (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
+          "compute-clj!"))))
+
+(deftest a-csv-with-only-a-header-is-an-empty-table-not-an-error
+  ;; `Lake/put-rows!` refuses a table with no rows. Of the six writers this is
+  ;; one of only two that can hand it one — `compute-clj!` and the ƒ apply
+  ;; cannot, because `run-clj-rows` and `fnlib/run-fn` both already answer
+  ;; "the function did not return rows" for an empty result, measured
+  ;; 2026-08-16. Before tables moved this committed `:value []` and the shell
+  ;; drew an empty table; it still must.
+  (let [st (store-with-table)
+        r  (srv/import-csv! st "C" "region,revenue" nil)]
+    (is (nil? (:error r)) "a header-only CSV must not become an error")
+    (is (= [] (rows-of st (:openId r))))))
+
+(deftest a-transform-that-keeps-nothing-never-reaches-the-writer
+  ;; the other half of the same measurement: this path refuses upstream, so the
+  ;; empty branch of `tbl/table-object` is unreachable from here — do not "fix"
+  ;; compute by removing a guard it does not use.
+  (with-redefs [agent/make-clj-transform (fn [& _] "(filterv (fn [_] false) rows)")]
+    (let [st (store-with-table)
+          r  (srv/compute-clj! st "tbl:t" "keep nothing" nil)]
+      (is (= "compute failed: the function did not return rows" (:error r))))))
+
+(deftest rerun-writes-a-handle-and-not-the-refreshed-rows
+  ;; The seventh writer, and the one no grep for `:kind :table` finds: `rerun!`
+  ;; replaces an existing object's `:value` in place. It went unnoticed for the
+  ;; same reason `every-server-writer-lands-a-handle` exists — `rows-of` reads a
+  ;; literal vector exactly as happily as a handle, so nothing that hydrates can
+  ;; tell. Measured before the fix: one refresh of a 50-row derived table wrote a
+  ;; 1,599-character event with `:region "r99"` in it.
+  (let [trows (mapv (fn [i] {:region (str "r" i) :revenue (* 10 i)}) (range 100))
+        st    (sub/fresh-store)
+        _     (sub/commit! st {:op :put :id "tbl:t"
+                               :value (tbl/table-object @lake/lake "tbl:t" "T" trows)})
+        b     (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                      {:by "revenue" :n "50" :order "desc"} nil))
+        _     (srv/rerun! st "tbl:t")
+        ev    (last (sub/history st))]
+    (is (tbl/handle? (:value (sub/object st b)))
+        "a refresh must leave a handle where fn-apply! left one")
+    (is (not (re-find #":region \"r99\"" (pr-str ev)))
+        "and no row may appear anywhere in the :assoc event")
+    (is (= 50 (count (rows-of st b))) "the refreshed rows are still readable")))
+
+(deftest rerun-answers-a-refusal-instead-of-a-500
+  ;; `rerun!` was the only writer with no `try`, and `handler` has no top-level
+  ;; catch, so /api/rerun answered a throw with a stack trace. Reachable since
+  ;; `normalize-rows` began refusing a collision: `lib:pivot` names its columns
+  ;; from data VALUES, so a source that grows "a b" beside "a_b" collides on
+  ;; recompute where the original apply did not.
+  (let [st (sub/fresh-store)
+        _  (sub/commit! st {:op :put :id "tbl:t"
+                            :value (tbl/table-object @lake/lake "tbl:t" "T"
+                                                     [{:r "r1" :c "x" :m 1} {:r "r2" :c "y" :m 2}])})
+        b  (:openId (srv/fn-apply! st "tbl:t" "lib:pivot"
+                                   {:rows_col "r" :cols_col "c" :measure "m" :agg "sum"} nil))
+        _  (sub/commit! st {:op :assoc :id "tbl:t" :path [:value]
+                            :value [{:r "r1" :c "a b" :m 1} {:r "r2" :c "a_b" :m 2}]})
+        before (count (sub/history st))
+        r  (srv/rerun! st "tbl:t")]
+    (is (some? b))
+    (is (re-find #"two column names would become one column" (str (:error r))))
+    (is (= before (count (sub/history st))) "and nothing was committed")))
+
+(deftest the-seed-lands-handles-for-every-row-bearing-kind
+  ;; The EIGHTH writer, missed for the same reason as the seventh: `content/obj`
+  ;; takes `kind` as a parameter, so it spells no `:kind :table` literal for a
+  ;; grep to find. This is production code — `content/store` seeds whenever the
+  ;; log is empty, so a fresh boot after a migration re-created them inline.
+  ;;
+  ;; **Kind-agnostic on purpose.** The first version of this test filtered the
+  ;; seeded objects by `:kind :table` and asserted `(= 10 …)` — the same filter
+  ;; the fix used — so it was structurally blind to the two `:metric` objects
+  ;; the fix missed. Filtering by the property being fixed is the blind spot
+  ;; this whole move keeps rediscovering.
+  ;;
+  ;; Measured before: 10 tables at 230,300 characters (`tbl:orders` alone
+  ;; 134,630 in one event) and 2 metrics at 1,882, with `777000` in the log.
+  (let [st (sub/fresh-store)
+        _  (c/seed! st @lake/lake)
+        rb (->> (sub/objects st) vals (filter #(#{:table :metric} (:kind %))))]
+    (is (= 12 (count rb)) "10 tables and 2 metrics")
+    (is (every? #(tbl/handle? (:value %)) rb))
+    ;; Scoped to the row-bearing events, and NOT to the whole log, because
+    ;; `report:qbr` carries its own inline copy of the mrr rows inside a chart
+    ;; spec. A report's `:value` is a document, not a table — a different kind
+    ;; of duplication, and not one this constructor reaches.
+    (is (not (re-find #"777000"
+                      (pr-str (filter #(#{:table :metric} (:kind (:value %))) (sub/history st)))))
+        "a metric's rows must not be in its own event either")
+    ;; 3,032 with all twelve converted; 4,454 with the two metrics left inline,
+    ;; 232,144 with none of them. The bound has to sit below the middle number
+    ;; or it does not notice the case this test was rewritten for.
+    (is (< (reduce + (map (comp count pr-str)
+                          (filter #(#{:table :metric} (:kind (:value %))) (sub/history st))))
+           3500)
+        "the twelve :put events together")
+    (is (= 1000 (count (rows-of st "tbl:orders"))) "and the rows are still all there")
+    (is (= 24 (count (rows-of st "metric:mrr"))))
+    (is (= :metric (:kind (sub/object st "metric:mrr"))) "landing rows must not restamp the kind")))
+
+(deftest as-of-reads-the-table-that-existed-then
+  ;; Design decision 1 — every read names its version — is supposed to make
+  ;; time travel work over lake-backed tables without anything else being built.
+  ;; No implementation backs this test; it exists because the claim needs one.
+  ;;
+  ;; **What it does not prove.** Measured by sabotage 2026-08-17: dropping
+  ;; ` AT (VERSION => …)` from `lake/rows` leaves this test green, because each
+  ;; table here has exactly one snapshot and the current version IS the recorded
+  ;; one. `a-read-names-its-version` in `loci.lake-test` is the test that fails
+  ;; there. This one proves the substrate's `frozen-at` window and the lake agree
+  ;; on which tables existed — not that a handle reads its own version.
+  (let [st (sub/fresh-store)
+        a  (:saved_as (tools/save-table! st "A" [{:v 1}]))
+        n1 (count (sub/history st))
+        b  (:saved_as (tools/save-table! st "B" [{:v 2}]))
+        frozen (sub/frozen-at st n1)]
+    (is (some? (sub/object frozen a)) "the first table existed at n1")
+    (is (nil? (sub/object frozen b))  "the second did not")
+    (is (= [{:v 1}] (:value (tbl/hydrate lake/lake (sub/object frozen a))))
+        "and its rows still resolve, from a store that cannot commit")))
+
+;; ---------------------------------------------------------------------------
+;; a reclaimed table, on the two reader paths server.clj owns
+;;
+;; `hydrate` degrades rather than throwing, so both of these already answered
+;; *something* before the fix — an empty table, and a catalog line advertising
+;; 100 rows the store cannot serve. Saying "reclaimed" is the whole change.
+;; ---------------------------------------------------------------------------
+
+(deftest mold-payload-says-a-table-was-reclaimed
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [p (srv/mold-payload st no-memory "tbl:gone" nil)]
+        (is (:reclaimed p) "the payload says so rather than showing an empty table")
+        (is (= 100 (:table/total p)) "and still reports what was there")
+        (is (string? (json/write-str p)) "and the shell can render it")))))
+
+(deftest the-agent-catalog-skips-a-reclaimed-table
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [c (:context (#'srv/agent-ctx st nil))]
+        (is (re-find #"tbl:good" c) "the healthy table is still catalogued")
+        (is (not (re-find #"tbl:gone" c))
+            "and the reclaimed one is omitted rather than advertised with rows it cannot serve")))))
+
+(deftest as-of-answers-for-every-object-when-one-was-reclaimed
+  ;; Phase 1's governing requirement, and the only test that states it whole:
+  ;; failure is per object, never per operation. Each of the seven reader sites
+  ;; has its own test; this one is the claim they were all changed to support —
+  ;; that landing on a state containing one reclaimed table still lets every
+  ;; other object answer normally.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (sub/commit! st {:op :put :id "doc:d"
+                       :value {:id "doc:d" :kind :doc :title "D" :value "prose"}})
+      (let [frozen (sub/frozen-at st (count (sub/history st)))]
+        (is (= "prose" (:value (sub/object frozen "doc:d"))) "the doc answers")
+        (is (= [{:b 1}] (:value (tbl/hydrate lake/lake (sub/object frozen "tbl:good"))))
+            "the healthy table answers")
+        (is (:table/reclaimed (tbl/hydrate lake/lake (sub/object frozen "tbl:gone")))
+            "and the reclaimed one says so, without stopping the other two")))))
+
+;; ---------------------------------------------------------------------------
+;; the flow engine — the eighth reader, and the one where "per operation"
+;; failure was still reachable
+;; ---------------------------------------------------------------------------
+
+(deftest a-flow-steps-over-a-reclaimed-table-to-the-live-one
+  ;; `table-shaped?` answers from the handle, and a handle survives its rows:
+  ;; same cols, same count, forever. So `resolve-table-ref`'s reverse scan —
+  ;; whose entire job is to find a table the compute step can USE — stopped at
+  ;; the reclaimed one, `compute-clj!` answered "compute works on tables", and
+  ;; `run-flow!` marked that step AND the whole flow failed. One reclaimed table
+  ;; stopping every remaining step is failure per operation, where the
+  ;; requirement is per object — with a live table sitting two outputs earlier.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (sub/commit! st {:op :put :id "doc:prose"
+                       :value {:id "doc:prose" :kind :doc :title "P" :value "prose"}})
+      (sub/commit! st {:op :put :id "space:s"
+                       :value {:id "space:s" :kind :space :title "S" :value {:intent "i" :cells []}}})
+      (let [flow {:id "flow:f" :kind :flow :title "F"
+                  :value {:goal "g" :space "space:s" :status "running"
+                          :steps [{:verb "research" :status "done" :out "tbl:good"}
+                                  {:verb "research" :status "done" :out "doc:prose"}
+                                  {:verb "research" :status "done" :out "tbl:gone"}
+                                  {:verb "compute" :args {:id "$2" :prompt "keep it"}
+                                   :status "pending"}]}}]
+        (sub/commit! st {:op :put :id "flow:f" :value flow})
+        (is (false? (#'srv/table-shaped? st "tbl:gone"))
+            "a table whose rows are gone is not one this scan can use")
+        (is (true? (#'srv/table-shaped? st "tbl:good")))
+        (is (= "tbl:good" (srv/resolve-table-ref st (:value flow) "$2"))
+            "the scan walks PAST the reclaimed output to the live table behind it")
+        ;; and the flow runs to the end. The model is stubbed — what is being
+        ;; measured is which table the step was handed, not what it computed.
+        (with-redefs [agent/make-clj-transform (fn [& _] "(fn [rows] rows)")]
+          (let [r (srv/run-flow! st "flow:f")]
+            (is (= "done" (:status r))
+                "the flow completes rather than failing at a table it never needed")))))))
+
+;; ---------------------------------------------------------------------------
+;; /api/storage and /api/storage/reclaim
+;;
+;; A nested `with-temp-lake` inside the namespace's `:once` one: these ask what
+;; a WHOLE lake costs and how many versions a reclaim took, and both numbers are
+;; wrong the moment another test's tables share the directory.
+;; ---------------------------------------------------------------------------
+
+(deftest storage-endpoint-reports-and-serializes
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1}])]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "X" :value h}})
+        (let [r (#'srv/storage-payload st)]
+          (is (= 1 (count (:tables r))))
+          (is (get-in r [:lake :catalog]))
+          (is (string? (json/write-str r))
+              "no DuckDBArray may reach the payload — ducklake_snapshots' :changes holds one"))))))
+
+(deftest storage-reclaim-endpoint-frees-and-reports
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (dotimes [_ 5]
+          (let [h (tbl/put-rows! @lake/lake "tbl:x" (vec (for [n (range 300)] {:a n})))]
+            (sub/commit! st {:op :put :id "tbl:x"
+                             :value {:id "tbl:x" :kind :table :title "X" :value h}})))
+        (let [r (#'srv/storage-reclaim! st "tbl:x" {:versions 3 :days 0})]
+          (is (pos? (:freed r)))
+          (is (= 2 (:versions r))))))))
+
+(deftest storage-reclaim-refuses-a-request-that-named-no-object
+  ;; The route reads `:id` out of a JSON body, and `json/read-str` cannot tell a
+  ;; missing key from an explicit null. `gc/reclaim!` gives `nil` a meaning —
+  ;; **the orphans** — so without this guard `POST /api/storage/reclaim {}`, or a
+  ;; stray GET with no body at all, irreversibly deletes every orphaned table in
+  ;; the lake and answers as if that is what was asked for. Measured before the
+  ;; guard: `{:object nil :tables ["t_tbl_orphan_…"] :versions 1 :freed 2176}`.
+  ;;
+  ;; This is the one place the surrounding routes' habit — pass the body value
+  ;; through raw and let the callee refuse it by name — does not hold, because
+  ;; the callee does not refuse it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)]
+        (tbl/put-rows! @lake/lake "tbl:orphan" (vec (for [n (range 300)] {:a n})))
+        (let [r (#'srv/storage-reclaim! st nil nil)]
+          (is (= :no-object (:error r)) "a refusal, not a sweep of the orphans")
+          (is (= 0 (:freed r)))
+          (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))

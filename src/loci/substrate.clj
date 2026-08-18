@@ -171,15 +171,33 @@
 ;; predicate can be tested and a branch of `-main` cannot.
 ;; ----------------------------------------------------------------------------
 
-(defn- effective-user
+(defn effective-user
   "uid and name of the process, best effort. UnixSystem is in `jdk.security.auth`
    — present in the JREs we ship on, but a jlinked runtime could drop it, and a
    missing uid must degrade the message rather than replace it with a
-   ClassNotFoundException."
+   ClassNotFoundException.
+
+   Public because a test that would otherwise pass vacuously needs it: a
+   permission refusal cannot be provoked as root, so `loci.lake-test` asks the
+   uid and says out loud that it skipped."
   []
   {:name (System/getProperty "user.name")
    :uid  (try (.getUid (com.sun.security.auth.module.UnixSystem.))
               (catch Throwable _ nil))})
+
+(defn running-as
+  "\"uid 10001 (loci)\", degrading through whatever `effective-user` could find.
+
+   Shared rather than written twice: both messages that name a permission
+   problem — the data directory's and the extension directory's — have to say
+   who we are, and a container's whole difficulty is that the uid is not the one
+   the image expected."
+  []
+  (let [{:keys [uid name]} (effective-user)]
+    (cond (and uid name) (str "uid " uid " (" name ")")
+          uid            (str "uid " uid)
+          name           (str "user " name)
+          :else          "an unknown user")))
 
 (defn- write-probe
   "nil if we can actually create a file in `dir`, else the reason we could not.
@@ -215,11 +233,7 @@
                    (cond (nil? c)    nil
                          (.exists c) c
                          :else       (recur (.getParentFile c))))
-         {:keys [uid name]} (effective-user)
-         who    (cond (and uid name) (str "uid " uid " (" name ")")
-                      uid            (str "uid " uid)
-                      name           (str "user " name)
-                      :else          "an unknown user")
+         who    (running-as)
          header (fn [why]
                   (str "loci cannot use its data directory: " dir "\n"
                        "  " why "\n"
@@ -240,18 +254,24 @@
        (str (header (str nearest " is a file, not a directory")) refusal)
 
        :else
-       ;; the data dir AND, when it is already there, the store dir inside it —
-       ;; `chown` on /data alone leaves /data/substrate root-owned, and a check
-       ;; that passed there would hand the user back the Datalevin trace it
-       ;; exists to replace. Only when `nearest` IS the data directory: if we
-       ;; walked up to an ancestor then nothing below it exists yet, and
-       ;; <ancestor>/substrate would be some other directory entirely.
-       (let [store (io/file nearest "substrate")]
+       ;; the data dir AND, when they are already there, the two databases
+       ;; inside it — `chown` on /data alone leaves /data/substrate and
+       ;; /data/lake root-owned, and a check that passed there would hand the
+       ;; user back the Datalevin trace, or the DuckDB one, that it exists to
+       ;; replace. Only when `nearest` IS the data directory: if we walked up to
+       ;; an ancestor then nothing below it exists yet, and <ancestor>/substrate
+       ;; would be some other directory entirely.
+       (let [store (io/file nearest "substrate")
+             lake  (io/file nearest "lake")
+             here? (= nearest (.getAbsoluteFile asked))]
          (or (when-let [why (write-probe nearest)]
                (str (header (str "cannot write " nearest " — " why)) advice))
-             (when (and (= nearest (.getAbsoluteFile asked)) (.isDirectory store))
+             (when (and here? (.isDirectory store))
                (when-let [why (write-probe store)]
-                 (str (header (str "cannot write " store " — " why)) advice)))))))))
+                 (str (header (str "cannot write " store " — " why)) advice)))
+             (when (and here? (.isDirectory lake))
+               (when-let [why (write-probe lake)]
+                 (str (header (str "cannot write " lake " — " why)) advice)))))))))
 
 (defn- load-events
   "Replay the log line by line. A crash mid-append can truncate the LAST line —

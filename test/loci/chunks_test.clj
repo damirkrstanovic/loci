@@ -18,7 +18,10 @@
             [clojure.test :refer [deftest is]]
             [loci.chunks :as ch]
             [loci.embed :as embed]
+            [loci.lake :as lake]
+            [loci.lake-fixture :as lf]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [org.httpkit.server :as server])
   (:import [java.net ServerSocket]))
 
@@ -252,6 +255,112 @@
   (let [cs (ch/chunks-of (table-obj "tbl:empty" "Nothing here yet" []))]
     (is (= 1 (count cs)))
     (is (= "Nothing here yet" (:text (first cs))))))
+
+(deftest a-table-chunks-the-same-whether-its-rows-are-inline-or-in-the-lake
+  ;; The synopsis is what LEAP searches to answer "which table holds this?".
+  ;; A handle fails `rows?`, so before this fix a lake-backed table chunked to
+  ;; its bare title — columns and sample values gone, silently. And because
+  ;; :hash covers the chunk text, migrating a table would retire its synopsis
+  ;; chunk and re-embed a weaker one: a model round trip per table, for nothing.
+  (let [inline {:id "tbl:x" :kind :table :title "Sales"
+                :value [{:region "EMEA" :rev 10} {:region "APAC" :rev 20}]}]
+    (lf/with-temp-lake
+      (fn []
+        (let [h      (tbl/put-rows! @lake/lake "tbl:x" (:value inline))
+              handle (assoc inline :value h)
+              st     (sub/fresh-store)]
+          (sub/commit! st {:op :put :id "tbl:x" :value handle})
+          (is (= (map :text (ch/chunks-of inline))
+                 (map :text (ch/all-chunks st)))
+              "same text — so migrating a table re-embeds nothing")
+          (is (= (map :hash (ch/chunks-of inline))
+                 (map :hash (ch/all-chunks st)))
+              "and therefore the same hashes"))))))
+
+(deftest chunking-a-lake-table-reads-no-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [rs (into [] (for [i (range 500)] {:a i}))
+            h  (tbl/put-rows! @lake/lake "tbl:x" rs)
+            st (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "S" :value h}})
+        (with-redefs [tbl/rows (fn [& _] (throw (ex-info "the sweep fetched rows" {})))]
+          (is (seq (ch/all-chunks st))
+              "a synopsis must come from samples, not from a page of rows"))))))
+
+(deftest all-chunks-opens-no-lake-for-a-store-with-no-handle
+  (let [boom (delay (throw (ex-info "the sweep opened the lake for tables that never left the log" {})))
+        st   (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "tbl:x" :value {:id "tbl:x" :kind :table :title "S"
+                                                  :value [{:a 1} {:a 2}]}})
+    (with-redefs [lake/lake boom]
+      (is (seq (ch/all-chunks st)))
+      (is (not (realized? boom))
+          "the 15-second sweep must not open a lake to chunk inline tables"))))
+
+(deftest one-reclaimed-table-does-not-stop-the-sweep
+  ;; `all-chunks` is whole-substrate and `sweep!` runs it on a 15-second timer,
+  ;; so a single unreadable table used to cost every object its indexing — the
+  ;; doc below chunks or not depending on whether some unrelated table's Parquet
+  ;; still exists. The blast radius has to be one chunk.
+  (lf/with-temp-lake
+    (fn []
+      (let [lk   @lake/lake
+            good (tbl/put-rows! lk "tbl:good" [{:region "EMEA" :rev 10}])
+            ;; 100 rows, not 1: DuckLake INLINES a small insert into
+            ;; catalog.duckdb, so a tiny table has no Parquet to delete and the
+            ;; read would still succeed — the test would pass while proving
+            ;; nothing. `rows100` in lake_test.clj documents the threshold.
+            gone (tbl/put-rows! lk "tbl:gone" (vec (for [n (range 100)] {:a n})))
+            st   (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:good"
+                         :value {:id "tbl:good" :kind :table :title "Good" :value good}})
+        (sub/commit! st {:op :put :id "tbl:gone"
+                         :value {:id "tbl:gone" :kind :table :title "Gone" :value gone}})
+        (sub/commit! st {:op :put :id "doc:d"
+                         :value {:id "doc:d" :kind :doc :title "D" :value "some prose here"}})
+        ;; lists the files BEFORE the DROP, which is the only order that works
+        (is (= 1 (count (lf/reclaim! lk (:table gone))))
+            "the rows were in a file, so deleting it can actually break the read")
+        (let [by-object (group-by :object (ch/all-chunks st))]
+          (is (seq (get by-object "doc:d")) "the doc still chunks")
+          (is (re-find #"EMEA" (:text (first (get by-object "tbl:good"))))
+              "the healthy table still chunks with its samples")
+          (is (= ["Gone"] (map :text (get by-object "tbl:gone")))
+              "and the reclaimed one falls back to its title, which is all that is left"))))))
+
+(deftest a-broken-sweep-is-not-silently-a-quiet-one
+  ;; The catch has to ask the catalog. An unconditional one turns a failing disk
+  ;; into a substrate of bare titles, sweep after sweep, with nothing raised.
+  (lf/with-temp-lake
+    (fn []
+      (let [h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1}])
+            st (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:x"
+                         :value {:id "tbl:x" :kind :table :title "X" :value h}})
+        (with-redefs [tbl/column-samples (fn [& _] (throw (ex-info "disk on fire" {})))]
+          (is (thrown-with-msg? Exception #"disk on fire" (ch/all-chunks st))
+              "a table that is not reclaimed must not be silently skipped"))))))
+
+(deftest a-broken-catalog-does-not-replace-the-read-error
+  ;; The mirror of `hydrate-keeps-the-read-error-when-the-catalog-is-broken-too`
+  ;; in `loci.tablestore-test`: asking "was this reclaimed" is itself a read, and
+  ;; a store damaged enough to fail the first can fail the second. What reaches
+  ;; the sweep's caller has to be why the table would not read, not why the
+  ;; bookkeeping would not.
+  ;;
+  ;; No lake: both protocol calls are stubbed, so forcing the delay would only
+  ;; open one to be ignored.
+  (let [st (sub/fresh-store)
+        h  {:store :lake :table "t_x" :snapshot 1 :rows 2 :cols [:a]}]
+    (sub/commit! st {:op :put :id "tbl:x"
+                     :value {:id "tbl:x" :kind :table :title "X" :value h}})
+    (with-redefs [lake/lake          (delay ::no-store)
+                  tbl/column-samples (fn [& _] (throw (ex-info "disk on fire" {})))
+                  tbl/reclaimed-at   (fn [& _] (throw (ex-info "catalog unreadable" {})))]
+      (is (thrown-with-msg? Exception #"disk on fire" (ch/all-chunks st))
+          "the original read error survives, not the one from asking about it"))))
 
 ;; ---- reports ----
 

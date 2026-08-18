@@ -71,10 +71,12 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [loci.lake :as lake]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as server]
             [loci.substrate :as sub]
+            [loci.tablestore :as tbl]
             [loci.tools :as tools]))
 
 (def hubs
@@ -460,12 +462,19 @@
    yet. That is `research!`'s order and `loci.repair`'s reason.
 
    Returns `[objm' entry]`, the entry carrying both the printable plan and the
-   `:tx` that realises it."
-  [objm dir m {:keys [file title about prose]}]
+   `:tx` that realises it.
+
+   `ts` is the table store the rows are landed in, and a **dry run passes an
+   `InlineTable`** — see `import-corpus!`. Minting is how the plan is computed,
+   so a dry run runs this function in full; landing its rows in the real lake
+   would leave five orphan tables and six snapshots behind every preview
+   (measured 2026-08-16), for a plan that is then discarded. An inline handle
+   carries the rows in the `:tx` nobody applies and writes nothing anywhere."
+  [ts objm dir m {:keys [file title about prose]}]
   (let [tentry (get (by-file m) file)
         rows   (tools/parse-csv (slurp (io/file dir file)))
         tid    (server/next-id (view objm) "tbl:corpus-")
-        tobj   {:id tid :kind :table :title (:title tentry) :value rows}
+        tobj   (tbl/table-object ts tid (:title tentry) rows)
         objm   (assoc objm tid tobj)
         [objm docs]
         (reduce (fn [[objm acc] nm]
@@ -492,9 +501,9 @@
       :events (count events)
       :tx events}]))
 
-(defn- mint [st dir m todo]
+(defn- mint [ts st dir m todo]
   (second (reduce (fn [[objm out] hub]
-                    (let [[objm entry] (mint-hub objm dir m hub)]
+                    (let [[objm entry] (mint-hub ts objm dir m hub)]
                       [objm (conj out entry)]))
                   [(sub/objects st) []]
                   todo)))
@@ -524,6 +533,14 @@
    by the same code and carrying the same ids — which is what makes Task 4's
    \"dry-run the copy, then compare the plans strictly\" a real check rather than
    a look.
+
+   Computed by the same code but **not into the same table store**: a dry run
+   mints into an `InlineTable` and a live run into the lake. Minting is how the
+   plan is computed, so a dry run has to run `mint-hub` in full, and once tables
+   moved to DuckLake that meant every preview left five orphan tables and six
+   snapshots behind for a plan nobody applied — measured 2026-08-16, and a leak
+   that compounds, because the lake's table GC is off. \"Without applying any of
+   it\" has to cover the lake as well as the log.
 
    **One `sub/commit!` of one `:tx` per notebook.** `sub/undo!` therefore takes
    back the last notebook and only the last, while it is still the last commit —
@@ -560,7 +577,12 @@
              {:ok? true :dry-run? dry-run? :already-done? true
               :plan {:notebooks [] :already already
                      :tables 0 :documents 0 :events 0 :commits 0}}
-             (let [entries (mint st dir manifest todo)
+             ;; A dry run mints into an `InlineTable`, so it opens no lake and
+             ;; leaves nothing behind — the `if` also means `@lake/lake` is never
+             ;; forced by a preview. The plan is the same value either way: the
+             ;; handle lives in `:tx`, which `plan` dissocs.
+             (let [entries (mint (if dry-run? (tbl/inline-table) @lake/lake)
+                                 st dir manifest todo)
                    ids     (mapcat (fn [e] (map :id (:tx e))) entries)
                    taken   (filterv #(sub/object st %) ids)
                    plan    {:notebooks (mapv #(dissoc % :tx) entries)
