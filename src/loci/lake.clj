@@ -174,10 +174,14 @@
    ATTACH that follows then succeeds.
 
    So this is a guard after all, and the thing it guards is first run. The
-   INSTALL is the one line here that can reach the network; a packaged build
-   should hoist it to image-build time so a user's first boot does not, and
-   until it does, an air-gapped first run cannot work no matter what this
-   function says."
+   INSTALL is the one line here that can reach the network — and **the image no
+   longer reaches it**: since 2026-08-18 the Dockerfile installs the extension in
+   the build stage into `/opt/duckdb-extensions` and sets
+   `LOCI_DUCKDB_EXTENSIONS`, so in a container LOAD succeeds on the first try and
+   this fallback never fires. Verified with `docker run --network none`. It stays
+   for the machine that is not a container: a `clojure -M:serve` on a laptop that
+   has never opened a lake still needs it, and there this branch is the whole
+   reason that works."
   [lk]
   (try (x! lk "LOAD ducklake")
        (catch Exception _

@@ -130,6 +130,28 @@ COPY resources ./resources
 # baked in. With it, both steps read and write one store.
 RUN --mount=type=cache,target=/root/.m2,sharing=locked \
     clojure -T:build uber :slim true
+# DuckDB's ducklake extension, fetched HERE rather than on the user's first boot.
+#
+# `loci.lake/ensure-extension!` installs it when LOAD fails, and INSTALL is the
+# one line in loci that reaches the network at runtime. Leaving it there meant a
+# first boot needed the internet, and an air-gapped one could not open a lake at
+# all — ATTACH fails outright against an extension directory that has never seen
+# it. This stage still has the network and the toolchain, so it is where the
+# download belongs.
+#
+# Raw JDBC and no alias: `:deps` already carries org.duckdb/duckdb_jdbc, so this
+# resolves the SAME dependency set the uberjar above was built from and the
+# extension version therefore matches the driver that will load it. Reaching
+# through `loci.lake` instead would load Datalevin and all of src/ for one
+# statement, and would create a lake directory it does not need.
+#
+# The `test -f` is not ceremony. A silently empty /duckdb-ext produces an image
+# that builds green and fails at first boot — which is exactly where the failure
+# is today.
+RUN --mount=type=cache,target=/root/.m2,sharing=locked \
+    clojure -M -e '(let [p (java.util.Properties.)] (.setProperty p "extension_directory" "/duckdb-ext") (with-open [c (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" p) s (.createStatement c)] (.execute s "INSTALL ducklake")))' \
+ && test -f /duckdb-ext/v*/linux_amd64/ducklake.duckdb_extension \
+ && du -sh /duckdb-ext
 
 # …and run it on that runtime, on the same distribution the runtime was linked on.
 # Debian 12 is not incidental: clojure:temurin-26-tools-deps *is* bookworm, and a
@@ -150,6 +172,32 @@ ENV PATH="/opt/java/bin:${PATH}"
 # the seed again. Mount a named volume to outlive the container.
 ENV LOCI_DATA=/data
 ENV PORT=7777
+# The ducklake extension, and the one thing that has to be said out loud about
+# where it lives. DuckDB composes its extension directory from $HOME, and this
+# image sets no HOME — `USER` below does not set one and debian:bookworm-slim
+# does not either — so getenv("HOME") was null, the path became "/.duckdb", and
+# the container died with EACCES before the listener:
+#
+#   IO Error: Failed to create directory "/.duckdb": Permission denied
+#
+# `ENV HOME=/home/loci` looks like the fix and covers half the cases. compose.yaml
+# sets `user: "${LOCI_UID:-10001}:…"` and *tells you to put your own uid there*,
+# because ./data is a bind mount of a directory you own — so loci commonly runs
+# as a uid with no /etc/passwd entry here and no claim on /home/loci. Naming the
+# directory is right for both ways this image is run; HOME is right for one.
+#
+# Root-owned and NOT chowned to loci, deliberately: LOAD only reads, and a
+# writable extension directory would let a version mismatch quietly re-download
+# 36 MB at boot instead of failing where someone would notice.
+#
+# Cost, measured 2026-08-18 with `docker images`: 213 MB → 249 MB. All of it is
+# the extension itself — 36,436,086 bytes of ducklake.duckdb_extension — which is
+# the price of a first boot that needs no network. It is the largest single item
+# this image spends after the JDK runtime and the jar, so: if it ever needs to
+# come back out, the alternative is a writable extension directory under /data
+# and a first boot that downloads.
+COPY --from=build /duckdb-ext /opt/duckdb-extensions
+ENV LOCI_DUCKDB_EXTENSIONS=/opt/duckdb-extensions
 # Unprivileged. The chown must precede VOLUME: once /data is a declared volume,
 # later RUN changes to it are discarded, and Docker seeds a fresh volume from
 # the image's directory — ownership included. Without this the container starts
