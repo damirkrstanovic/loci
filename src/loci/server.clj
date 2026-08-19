@@ -2090,12 +2090,36 @@
    `res.state` and `res.openId`, and those three keys are added there."
   [st title csv space]
   (let [written
-        (try (let [nm  (str (or (not-empty title) "imported") "-" (System/currentTimeMillis) ".csv")
-                   nm  (str/replace (str/lower-case nm) #"[^a-z0-9._-]+" "-")
-                   dir (io/file (sub/data-dir) "files")]
+        (try (let [stem (-> (str (or (not-empty title) "imported"))
+                            str/lower-case
+                            (str/replace #"[^a-z0-9._-]+" "-")
+                            (str/replace #"^[.-]+|[.-]+$" ""))
+                   stem (if (str/blank? stem) "imported" stem)
+                   stem (subs stem 0 (min (count stem) 64))
+                   ;; `createTempFile` refuses a prefix under three characters,
+                   ;; and a one-letter title is ordinary — `"C"` in this file's
+                   ;; own tests. Pad rather than truncate the caller's word.
+                   stem (if (< (count stem) 3) (str "csv-" stem) stem)
+                   dir  (io/file (sub/data-dir) "files")]
                (.mkdirs dir)
-               (spit (io/file dir nm) csv)
-               nm)
+               ;; `createTempFile` rather than a name built from the clock, and
+               ;; this is a data-loss fix rather than tidiness. A
+               ;; `title-<millis>.csv` collides at millisecond resolution:
+               ;; measured 2026-08-19 with 20 concurrent posts of one title,
+               ;; `mint-id` correctly minted 20 distinct table objects while the
+               ;; 20 `spit`s landed on ONE file, and all 20 tables afterwards
+               ;; held whichever body was written last — not the rows their own
+               ;; request carried. The OS mints a name that is unique by
+               ;; construction, which is the same reason `table-name` hashes
+               ;; rather than counts.
+               ;;
+               ;; The stem is stripped of leading dots (no accidental dotfile),
+               ;; bounded at 64 (a 500-character title threw `File name too
+               ;; long` and leaked the absolute data path in the error), and
+               ;; kept only so a human can tell the files apart in a listing.
+               (let [f (java.io.File/createTempFile (str stem "-") ".csv" dir)]
+                 (spit f csv)
+                 (.getName f)))
              ;; Its own catch: an unwritable data directory fails HERE, before
              ;; `source-connect!` — whose catch would otherwise never see it —
              ;; and `handler` has no top-level catch to turn a throw into

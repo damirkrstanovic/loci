@@ -4781,3 +4781,32 @@
         (is (= :materialise (:mode c)) "the facade's default, reported as a keyword")
         (is (= :lake (:store (:value (sub/object st (:openId c)))))
             "and it really materialised")))))
+
+(deftest concurrent-imports-of-one-title-keep-their-own-rows
+  ;; Measured 2026-08-19 with a clock-derived filename: 20 concurrent posts of
+  ;; one title minted 20 distinct table objects — `mint-id` and `connect-lock`
+  ;; did their job — but the 20 writes landed on ONE file at millisecond
+  ;; resolution, and every table afterwards held whichever body was written
+  ;; last. Distinct ids pointing at one file is worse than a collision that
+  ;; errors, because it looks like success.
+  (lf/with-temp-lake
+    (fn []
+      (let [st  (sub/fresh-store)
+            n   12
+            rs  (mapv deref
+                      (mapv (fn [i]
+                              (future (srv/import-csv! st "Race"
+                                                       (str "a\n" i "\n") nil)))
+                            (range n)))
+            ids (mapv :openId rs)]
+        (is (every? nil? (map :error rs)) "every import succeeds")
+        (is (= n (count (distinct ids))) "and each gets its own id")
+        (let [vals (->> ids
+                        (map #(sub/object st %))
+                        (map #(tbl/hydrate @lake/lake %))
+                        (mapcat :value)
+                        (map :a)
+                        set)]
+          (is (= n (count vals))
+              (str "each table must hold the rows its OWN request carried; got "
+                   (count vals) " distinct values across " n " tables")))))))
