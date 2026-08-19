@@ -53,9 +53,31 @@
    **Two spellings of \"no value\", one result.** A SQL NULL never reaches here
    at all: JDBC returns Java `null` for it, JsonNode or not. A JSON `null`
    literal parses to `nil`. Both land on `nil`, which is what every other column
-   type already gives."
+   type already gives.
+
+   **Temporal types render through `java.time`, never through `java.sql`.**
+   `read_csv` types a date column DATE, and JDBC hands it back as
+   `java.time.LocalDate` — a class `clojure.data.json` refuses outright, exactly
+   as it refuses `JsonNode`:
+
+     Don't know how to write JSON of class java.time.LocalDate
+
+   `java.sql.Timestamp` is the worse case because it does NOT throw. It
+   serializes through the JVM default zone, so `2026-01-02` comes back
+   `\"2026-01-01T23:00:00Z\"` — measured 2026-08-19, wrong by a day and silent.
+   `.toLocalDateTime` / `.toLocalDate` take the wall-clock value the file
+   actually contains and `str` renders it ISO-8601 with no zone applied, which
+   is what a CSV cell meant."
   [v]
-  (if (instance? org.duckdb.JsonNode v) (json/read-str (str v)) v))
+  (condp instance? v
+    org.duckdb.JsonNode      (json/read-str (str v))
+    java.time.LocalDate      (str v)
+    java.time.LocalDateTime  (str v)
+    java.time.LocalTime      (str v)
+    java.sql.Timestamp       (str (.toLocalDateTime ^java.sql.Timestamp v))
+    java.sql.Date            (str (.toLocalDate ^java.sql.Date v))
+    java.sql.Time            (str (.toLocalTime ^java.sql.Time v))
+    v))
 
 (defn- rs->maps
   "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)` and
