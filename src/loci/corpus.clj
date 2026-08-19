@@ -68,49 +68,70 @@
    are recorded in `MANIFEST.edn`'s `:findings` and are predicates several
    viewers hang off. Task 1 guarded against the first *in the extract*. Nothing
    here works around any of them."
-  (:require [clojure.data.csv :as csv]
-            [clojure.edn :as edn]
+  (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [loci.lake :as lake]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as server]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
-(defn- ->val
-  "Three regexes over a CSV cell: `-?\\d+` → Long, `-?\\d+\\.\\d+` → Double,
-   anything else → the string it already was.
+(defn- read-rows
+  "A corpus CSV → rows, through the same reader every other source uses.
 
-   **On its way out.** This and `parse-csv` below moved here from `loci.tools`
-   when `read_csv` became the only way a CSV becomes rows: every path a user
-   reaches — the `/api/import-csv` route, `/api/source/connect`, the agent's
-   table tools — now types a CSV through DuckDB's sniffer, which is per-column,
-   sampled, and gives real DATE/TIMESTAMP/BOOLEAN types where these three give
-   Long, Double or nothing. Two inferences meant the same CSV yielded different
-   types depending on how it arrived.
+   `src/describe` sniffs the file per COLUMN and `lake/relation-rows` reads it
+   under the projection a materialised import would store — so the fixture's
+   types ARE the types `/api/import-csv` gives a user's file, rather than a
+   third inference belonging to this namespace alone. Until 2026-08-20 that
+   third inference was here: `->val`, three regexes over a CELL, Long / Double /
+   the string it already was.
 
-   The corpus is the last caller, and it keeps this one until it imports through
-   the file connector like everything else — which is a change with a re-seed and
-   a set of broken derivations in it (`=` against a literal is type-strict, and a
-   `:month` that was a string becomes a DATE), not a rename. Deleting it here and
-   now would have broken `loci.corpus` to make one namespace tidy."
-  [s]
-  (let [s (str/trim (str s))]
-    (cond (re-matches #"-?\d+" s)        (Long/parseLong s)
-          (re-matches #"-?\d+\.\d+" s)   (Double/parseDouble s)
-          :else s)))
+   **What that changed, measured over all five files on 2026-08-20.** 1,311 rows
+   in, 1,311 rows out, and every column of `elections-turnout.csv`,
+   `lead-phaseout.csv`, `mineral-production.csv` and `interest-rates-monthly.csv`
+   came back holding the same values it always had — `:year` and `:ban_year`
+   Long, `:turnout_pct`, `:rate_pct` and `:production_tonnes` Double, and
+   `:month` still the String `\"2021-01\"`, because DuckDB does not read a
+   year-month as a DATE. The whole difference is three columns of
+   `art-objects.csv` — `:artist_display_name` (210 cells), `:country` (282) and
+   `:culture` (66) — where a blank was `\"\"` and is now `nil`: `read_csv`
+   sniffs a COLUMN and makes an empty field a SQL NULL, where `->val` typed each
+   CELL on its own and had nothing but the empty string to hand back. Every
+   derivation over that file goes through `str` or `commonest`, both of which
+   already treated `\"\"` as no value, so all 70 facts came out identical —
+   sentence, entities and order.
 
-(defn- parse-csv
-  "A corpus CSV's text → rows, keyed by `sub/col-kw` and typed by `->val`.
+   **Read here, re-inferred on the way in**, and the claim above is about this
+   function rather than about the lake. `mint-hub` hands these rows to
+   `tbl/table-object`, which is `put-rows!` — NDJSON through `read_json_auto` —
+   so the type the lake finally stores comes from the JSON reader looking at the
+   VALUES, not from `read_csv` looking at the file. Measured 2026-08-20 over
+   both the old corpus tables and the re-seeded ones: the stored types are
+   identical either way, and `art-objects.year` is HUGEINT — a Clojure
+   `BigInteger` — because its BCE years widen there, where
+   `mineral-production.year` is BIGINT. A user's `/api/import-csv` takes no such
+   step; `create-from-relation!` materialises the relation and keeps `read_csv`'s
+   own types. Whoever wants the two to agree exactly has to land the corpus
+   through the relation as well, which is a different change from this one.
 
-   Private, and the only remaining `->val` caller in loci. See `->val` for why
-   it is still here and what replaces it."
-  [text]
-  (let [[hdr & rows] (csv/read-csv (java.io.StringReader. (str/trim text)))
-        ks (mapv sub/col-kw hdr)]                          ; "Total Revenue ($)" → :total_revenue
-    (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
+   **It reads and does not land**, which is what keeps `import-corpus!`'s dry
+   run honest: this runs on a preview too — `table-complaint` checks every file
+   before anything is written — and `create-from-relation!` here would leave a
+   table and a snapshot per file behind every plan nobody applied. See
+   `lake/relation-rows`.
+
+   Private, and `loci.corpus-test` spells the same two calls out for itself
+   rather than borrowing this. `describe` and `relation-rows` are public API and
+   the derivations are what is under test, so a test reading its rows through
+   here would be asking `loci.corpus` for the numbers it checks `loci.corpus`
+   against — which is exactly what `#'corpus/parse-csv` let it do."
+  [lk dir file]
+  (let [uri (str "file://" (.getAbsolutePath (io/file dir file)))
+        d   (src/describe lk {:uri uri :format :csv})]
+    (lake/relation-rows lk (:cols d) (:relation d))))
 
 (def hubs
   "The five notebooks: which corpus table each is built on, what it is for, and
@@ -280,12 +301,12 @@
    one artifact committed together, so a hash of one recorded in the other
    catches an accidental edit and nothing else; the checks below catch the edits
    that would actually change what loci does with the file."
-  [dir m {:keys [file]}]
+  [lk dir m {:keys [file]}]
   (let [f     (io/file dir file)
         entry (get (by-file m) file)]
     (if-not (.isFile f)
       (str "the corpus has no " file " — " (.getPath f) " is not there")
-      (let [rows (try (parse-csv (slurp f)) (catch Exception e {:error (.getMessage e)}))]
+      (let [rows (try (read-rows lk dir file) (catch Exception e {:error (.getMessage e)}))]
         (cond
           (map? rows)
           (str file " could not be parsed as CSV: " (:error rows))
@@ -351,8 +372,8 @@
 (defn- material-complaint
   "The first reason the material on disk is not the corpus the manifest
    describes, or nil. Every hub is checked before any of them is written."
-  [dir m]
-  (or (some #(table-complaint dir m %) hubs)
+  [lk dir m]
+  (or (some #(table-complaint lk dir m %) hubs)
       (some #(prose-complaint dir m %) (mapcat :prose hubs))))
 
 ;; ----------------------------------------------------------------------------
@@ -502,10 +523,15 @@
    so a dry run runs this function in full; landing its rows in the real lake
    would leave five orphan tables and six snapshots behind every preview
    (measured 2026-08-16), for a plan that is then discarded. An inline handle
-   carries the rows in the `:tx` nobody applies and writes nothing anywhere."
-  [ts objm dir m {:keys [file title about prose]}]
+   carries the rows in the `:tx` nobody applies and writes nothing anywhere.
+
+   `lk` is the lake the rows are READ through, which is a different question and
+   is why it is a second argument rather than `ts` again: `read-rows` reads a
+   `read_csv` recipe and creates nothing, so a dry run passes the real lake here
+   and an `InlineTable` there without either being a write."
+  [lk ts objm dir m {:keys [file title about prose]}]
   (let [tentry (get (by-file m) file)
-        rows   (parse-csv (slurp (io/file dir file)))
+        rows   (read-rows lk dir file)
         tid    (server/next-id (view objm) "tbl:corpus-")
         tobj   (tbl/table-object ts tid (:title tentry) rows)
         objm   (assoc objm tid tobj)
@@ -534,9 +560,9 @@
       :events (count events)
       :tx events}]))
 
-(defn- mint [ts st dir m todo]
+(defn- mint [lk ts st dir m todo]
   (second (reduce (fn [[objm out] hub]
-                    (let [[objm entry] (mint-hub ts objm dir m hub)]
+                    (let [[objm entry] (mint-hub lk ts objm dir m hub)]
                       [objm (conj out entry)]))
                   [(sub/objects st) []]
                   todo)))
@@ -575,6 +601,15 @@
    that compounds, because the lake's table GC is off. \"Without applying any of
    it\" has to cover the lake as well as the log.
 
+   A dry run **opens the lake and still writes nothing to it**, and those are two
+   claims rather than one. Since 2026-08-20 the corpus's files are read through
+   `read-rows`, so `@lake/lake` is forced by a preview — it has to be, because
+   `table-complaint` checks every file and the derivations are functions over
+   rows. What survives is the property that matters: `read-rows` reads a
+   `read_csv` recipe and creates nothing. Measured 2026-08-20 against a fresh
+   lake — 1 snapshot and 0 tables before a dry `import-corpus!`, 1 snapshot and
+   0 tables after; the live run that followed took it to 6 and 5.
+
    **One `sub/commit!` of one `:tx` per notebook.** `sub/undo!` therefore takes
    back the last notebook and only the last, while it is still the last commit —
    the honest limit of this half's reversibility, and the same one the repair
@@ -595,48 +630,51 @@
   ([st {:keys [dir dry-run?] :or {dir "corpus" dry-run? true}}]
    (let [{:keys [manifest error]} (read-manifest dir)]
      (if error
+       ;; Before the lake is forced, so `:dir` naming no corpus at all is still
+       ;; answered without opening anything.
        {:ok? false :dry-run? dry-run? :error error}
-       (if-let [why (or (coverage-complaint manifest)
-                        (material-complaint dir manifest)
-                        (claim-complaint st))]
-         {:ok? false :dry-run? dry-run? :error why}
-         (let [done    (imported st)
-               already (vec (for [{:keys [file]} hubs
-                                  :let [o (get done file)]
-                                  :when o]
-                              {:from file :id (:id o) :title (:title o)}))
-               todo    (remove #(get done (:file %)) hubs)]
-           (if (empty? todo)
-             {:ok? true :dry-run? dry-run? :already-done? true
-              :plan {:notebooks [] :already already
-                     :tables 0 :documents 0 :events 0 :commits 0}}
-             ;; A dry run mints into an `InlineTable`, so it opens no lake and
-             ;; leaves nothing behind — the `if` also means `@lake/lake` is never
-             ;; forced by a preview. The plan is the same value either way: the
-             ;; handle lives in `:tx`, which `plan` dissocs.
-             (let [entries (mint (if dry-run? (tbl/inline-table) @lake/lake)
-                                 st dir manifest todo)
-                   ids     (mapcat (fn [e] (map :id (:tx e))) entries)
-                   taken   (filterv #(sub/object st %) ids)
-                   plan    {:notebooks (mapv #(dissoc % :tx) entries)
-                            :already   already
-                            :tables    (count entries)
-                            :documents (reduce + (map (comp count :documents) entries))
-                            :events    (reduce + (map :events entries))
-                            :commits   (count entries)}]
-               (cond
-                 (seq taken)
-                 {:ok? false :dry-run? dry-run?
-                  :error (str "the ids this import minted are occupied: " (str/join ", " taken)
-                              " — minting onto a live object is the 2026-07-23 bug")}
+       (let [lk @lake/lake]
+         (if-let [why (or (coverage-complaint manifest)
+                          (material-complaint lk dir manifest)
+                          (claim-complaint st))]
+           {:ok? false :dry-run? dry-run? :error why}
+           (let [done    (imported st)
+                 already (vec (for [{:keys [file]} hubs
+                                    :let [o (get done file)]
+                                    :when o]
+                                {:from file :id (:id o) :title (:title o)}))
+                 todo    (remove #(get done (:file %)) hubs)]
+             (if (empty? todo)
+               {:ok? true :dry-run? dry-run? :already-done? true
+                :plan {:notebooks [] :already already
+                       :tables 0 :documents 0 :events 0 :commits 0}}
+               ;; A dry run mints into an `InlineTable`, so it lands nothing —
+               ;; while READING every file through `lk`, which creates nothing.
+               ;; The plan is the same value either way: the handle lives in
+               ;; `:tx`, which `plan` dissocs.
+               (let [entries (mint lk (if dry-run? (tbl/inline-table) lk)
+                                   st dir manifest todo)
+                     ids     (mapcat (fn [e] (map :id (:tx e))) entries)
+                     taken   (filterv #(sub/object st %) ids)
+                     plan    {:notebooks (mapv #(dissoc % :tx) entries)
+                              :already   already
+                              :tables    (count entries)
+                              :documents (reduce + (map (comp count :documents) entries))
+                              :events    (reduce + (map :events entries))
+                              :commits   (count entries)}]
+                 (cond
+                   (seq taken)
+                   {:ok? false :dry-run? dry-run?
+                    :error (str "the ids this import minted are occupied: " (str/join ", " taken)
+                                " — minting onto a live object is the 2026-07-23 bug")}
 
-                 dry-run?
-                 {:ok? true :dry-run? true :plan plan}
+                   dry-run?
+                   {:ok? true :dry-run? true :plan plan}
 
-                 :else
-                 (do (doseq [e entries] (sub/commit! st {:op :tx :events (:tx e)}))
-                     {:ok? true :dry-run? false :plan plan
-                      :committed (count (sub/history st))}))))))))))
+                   :else
+                   (do (doseq [e entries] (sub/commit! st {:op :tx :events (:tx e)}))
+                       {:ok? true :dry-run? false :plan plan
+                        :committed (count (sub/history st))})))))))))))
 
 ;; ============================================================================
 ;; the facts — the half the substrate cannot take back
@@ -677,10 +715,17 @@
 (defn- printed
   "A cell as a sentence prints it: `230000.0` → `\"230000\"`, `78.3` → `\"78.3\"`.
 
-   `parse-csv` reads every unquoted decimal as a Double, so a whole-number
-   tonnage arrives as `2600000.0` and a sentence that printed it that way would
-   read like a machine talking. Only the trailing `.0` is dropped and only when
-   the value really is integral — `-0.582` and `78.3` print as they parsed."
+   `read_csv` types a column DOUBLE the moment any cell in it carries a decimal
+   point, and `fetch/build_minerals.py` writes every tonnage with one — so a
+   whole-number tonnage arrives as `2600000.0` and a sentence that printed it
+   that way would read like a machine talking. Only the trailing `.0` is dropped
+   and only when the value really is integral: `-0.582` and `78.3` print as they
+   parsed.
+
+   Written for `->val`, which typed the same cells the same way one at a time,
+   and kept unchanged when the corpus moved to `read_csv` on 2026-08-20 —
+   `:production_tonnes`, `:rate_pct` and `:turnout_pct` came back Double either
+   way, measured over all five files."
   [x]
   (if (and (number? x) (== (double x) (Math/rint (double x))) (< (Math/abs (double x)) 1e15))
     (str (long x))
@@ -910,10 +955,17 @@
                      "zero at some point: " (oxford neg) ".")
           :entities (mapv str/lower-case neg)})))
 
-   ;; `:month` is a string — "2024-03", left as it parsed, because `->val` reads
-   ;; it as one and `timeseries?` keys on the column's NAME rather than its type.
-   ;; So the latest month is the last of a lexical sort and never `max`, which
-   ;; is only correct at all because the manifest committed ISO months.
+   ;; `:month` is a string — "2024-03" — so the latest month is the last of a
+   ;; LEXICAL sort and never `max`, which is only correct at all because the
+   ;; manifest committed ISO months.
+   ;;
+   ;; It was going to stop being a string, and it did not. Measured 2026-08-20,
+   ;; through `source/describe` on `interest-rates-monthly.csv`: `read_csv` sniffs
+   ;; the column VARCHAR, because a year-month is not a date DuckDB recognises —
+   ;; where a full `2026-01-02` in the same position would come back DATE, and
+   ;; `unwrap` would then hand this function the string `"2026-01-02"` anyway.
+   ;; Either way `timeseries?` keys on the column's NAME rather than its type,
+   ;; so nothing here depends on the answer.
    :coverage
    (fn [rows _]
      (let [by    (group-by :country rows)
@@ -1222,12 +1274,12 @@
    not a small defect — `entity-payload` finds facts BY name, so it is a fact
    that is written, counted, reported as imported, and reachable from no entity
    page at all."
-  [dir m srcs]
+  [lk dir m srcs]
   (let [out (reduce
              (fn [acc {:keys [file prose]}]
                (if (:error acc)
                  acc
-                 (let [rows (parse-csv (slurp (io/file dir file)))]
+                 (let [rows (read-rows lk dir file)]
                    (reduce (fn [acc r]
                              (if (:error r)
                                (reduced r)
@@ -1348,17 +1400,18 @@
    (let [{:keys [manifest error]} (read-manifest dir)]
      (if error
        {:ok? false :dry-run? dry-run? :error error}
-       (let [srcs (fact-sources st manifest)
+       (let [lk   @lake/lake
+             srcs (fact-sources st manifest)
              gap  (first (concat (remove srcs (map :table derived))
                                  (remove srcs (map :doc quoted))))]
          (if-let [why (or (facts-coverage-complaint manifest)
-                          (material-complaint dir manifest)
+                          (material-complaint lk dir manifest)
                           (when gap
                             (str "nothing in the store was imported from " gap
                                  " — run import-corpus! first, or these facts have nothing "
                                  "to cite")))]
            {:ok? false :dry-run? dry-run? :error why}
-           (let [{:keys [facts error]} (plan-facts dir manifest srcs)]
+           (let [{:keys [facts error]} (plan-facts lk dir manifest srcs)]
              (if error
                {:ok? false :dry-run? dry-run? :error error}
                (let [by-nb (reduce (fn [acc f]

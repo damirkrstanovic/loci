@@ -648,6 +648,32 @@
      :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
      :cols  (mapv :col cols)}))
 
+(defn relation-rows
+  "Every row of `rel` — any SQL relation expression — read into this process
+   under `describe`'s column names, **creating nothing**.
+
+   `create-from-relation!`'s sibling, one `CREATE TABLE … AS` short of it: same
+   `projection`, so the raw header becomes the same normalized column, and the
+   same `q-as`, so `unwrap` renders a DATE the same way. Measured 2026-08-20
+   over the five `corpus/` CSVs — 1,311 rows — the two paths are `=` row for
+   row and value for value, which is what lets a caller read a file the way a
+   materialised import will store it without storing it.
+
+   Wanted for exactly one thing, and it is the thing `create-from-relation!`
+   cannot do: `loci.corpus` reads each of its files to CHECK it and to derive
+   facts from it, on dry runs as well as live ones, and a preview that landed a
+   table per file would leave the orphans and snapshots `import-corpus!`'s
+   `InlineTable` exists to avoid. Measured the same day: five
+   `create-from-relation!` calls take a fresh lake from 1 snapshot to 6 and
+   leave five tables; five `relation-rows` calls leave 1 and none.
+
+   **Not a way to read a table.** A `:lake` handle names a table and a version
+   and `tbl/rows` pages it; this reads a *recipe* and holds all of it, so the
+   caller has to know the relation is small. The corpus's largest file is 445
+   rows."
+  [lk cols rel]
+  (q-as lk (str "SELECT " (projection cols) " FROM " rel) (mapv :col cols)))
+
 (defn- from-of
   "The FROM text for a handle: a versioned table, or a source's reader call.
 

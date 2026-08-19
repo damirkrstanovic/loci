@@ -164,8 +164,10 @@
 ;; the values that exist rather than casting a hole to a number. The hole has
 ;; two spellings and `number?` refuses both: `nil`, which is what `read_csv`
 ;; makes of a blank cell (measured 2026-08-20, through `source/describe` and a
-;; materialised read), and `""`, which is what a model's `save_table` rows and
-;; `loci.corpus`'s own parser still hand over.
+;; materialised read), and `""`, which is what a model's `save_table` rows hand
+;; over and what every table imported before 2026-08-20 still holds — including
+;; the corpus's own art-objects table, whose three text columns carried 558
+;; empty strings until it was re-seeded through the file connector.
 (defn- col-vals [rows c] (map #(get % c) rows))
 (defn- nums     [xs]     (filter number? xs))
 

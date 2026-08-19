@@ -28,6 +28,7 @@
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl])
   (:import [java.nio.file Files]
@@ -251,7 +252,33 @@
                           :when (some #{:table/line}
                                       (map :id (mold/viewers-for (:value (tbl/hydrate lake/lake t)))))]
                       f)]
-        (is (= ["interest-rates-monthly.csv"] (vec monthly)))))))
+        (is (= ["interest-rates-monthly.csv"] (vec monthly)))))
+
+    (testing "the cells are DuckDB's, which is what importing through the connector means"
+      ;; The one thing that changed when `loci.corpus` stopped carrying its own
+      ;; parser (2026-08-20), and the only place in the suite it is visible: a
+      ;; blank CSV cell is a SQL NULL now, because `read_csv` sniffs a COLUMN,
+      ;; where `->val` typed each CELL and had nothing but `""` to hand back.
+      ;; 558 cells across three columns of art-objects.csv. Asserted here rather
+      ;; than trusted, because every derivation over that file launders a blank
+      ;; through `str` or `commonest` — so all 70 facts read the same either way
+      ;; and nothing else in this suite can tell the two readers apart.
+      (let [art (:value (tbl/hydrate lake/lake (by-file "art-objects.csv")))]
+        (is (= {:artist_display_name 210 :country 282 :culture 66}
+               (into {} (for [c [:artist_display_name :country :culture]]
+                          [c (count (filter #(nil? (get % c)) art))])))
+            "a blank is nil…")
+        ;; counted rather than listed: the sabotage that reintroduces `""`
+        ;; produces 558 of them, and `is` prints the whole failing collection.
+        (is (= {} (frequencies (for [r art, [k v] r :when (= "" v)] k)))
+            "…and never the empty string")
+        (is (every? #(integer? (:year %)) art) "year is a whole number")
+        (is (every? #(instance? Double (:turnout_pct %))
+                    (:value (tbl/hydrate lake/lake (by-file "elections-turnout.csv"))))
+            "a percentage is DOUBLE")
+        (is (every? #(string? (:month %))
+                    (:value (tbl/hydrate lake/lake (by-file "interest-rates-monthly.csv"))))
+            "and a year-month stays text — DuckDB does not read 2021-01 as a DATE")))))
 
 ;; ---------------------------------------------------------------------------
 ;; the documents land verbatim
@@ -638,9 +665,16 @@
         ;; whichever one came last.
         one    (fn [via args] (:fact (first (filter #(and (= via (:via %)) (= args (:args %)))
                                                     (:facts (:plan r))))))
-        ;; `parse-csv` moved into `loci.corpus` when `read_csv` became the only
-        ;; way a CSV becomes rows everywhere else; the corpus is its last caller.
-        rows   #(#'corpus/parse-csv (slurp (io/file dir %)))]
+        ;; The rows, read the way `loci.corpus` reads them but NOT through it:
+        ;; `describe` + `relation-rows` are the public reader every source in
+        ;; loci goes through, and `corpus/read-rows` is two lines of private
+        ;; glue over them. Calling that glue would make the numbers below the
+        ;; importer's own answer to the question they are checking.
+        rows   (fn [f]
+                 (let [lk  @lake/lake
+                       uri (str "file://" (.getAbsolutePath (io/file dir f)))
+                       d   (src/describe lk {:uri uri :format :csv})]
+                   (lake/relation-rows lk (:cols d) (:relation d))))]
 
     (testing "the cobalt leader is the largest 2025 producer in the file"
       (let [g (sort-by :production_tonnes >
