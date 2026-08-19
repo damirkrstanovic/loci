@@ -103,7 +103,7 @@
   [rows]
   (into [] (distinct) (map sub/col-kw (mapcat keys rows))))
 
-(defn name-collisions
+(defn- name-collisions
   "The source names `col-kw` would collapse onto one column, as
    `{normalized [source …]}` — empty whenever the normalization is injective,
    which it is for all 31 tables in the corpus (measured 2026-08-16).
@@ -118,7 +118,11 @@
    no single row loses a value there, and yet the table still ends with one
    column fed by two different names. `:cols` is a table-level fact, so the
    invariant that produces it is one too — and the table-level check is a strict
-   superset, since a row is a table of one."
+   superset, since a row is a table of one.
+
+   Private: `check-names!` is the only caller and the only thing anyone should
+   need. A reader that wants to LIST collisions rather than refuse them can have
+   this made public on the day it exists."
   [names]
   (into (sorted-map)
         (keep (fn [[k ks]] (when (next ks) [k (vec (sort-by pr-str ks))])))

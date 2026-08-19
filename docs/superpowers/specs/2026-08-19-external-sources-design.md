@@ -76,8 +76,14 @@ materialise and passthrough cannot disagree about what the columns are:
    existing `sub/col-kw`. Both modes build their projection from this.
 3. **The schema a preview shows**, so the shell can display it before anything is committed.
 
-`tablestore/collisions` applies unchanged to a header: two CSV columns normalizing onto one
-column name is caught at connect rather than silently dropping a column.
+`tablestore/check-names!` applies unchanged to a header: two CSV columns normalizing onto one
+column name is caught at connect rather than silently dropping a column. (It was extracted from
+`normalize-rows`' private `collisions` for exactly this, so rows and headers run one check.)
+
+**Two literally identical headers are not loci's problem** — measured 2026-08-19, DuckDB dedupes
+them before `DESCRIBE` returns: `Region,Region,Total` describes as `Region`, `Region_1`, `Total`,
+which normalize apart. So `describe` never sees a duplicate name, and `check-names!` is only ever
+asked the normalization question it was written for.
 
 ### A source lives on the table object
 
