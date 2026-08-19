@@ -103,23 +103,43 @@
   [rows]
   (into [] (distinct) (map sub/col-kw (mapcat keys rows))))
 
-(defn- collisions
-  "The source keys `col-kw` would collapse onto one column, as
+(defn name-collisions
+  "The source names `col-kw` would collapse onto one column, as
    `{normalized [source …]}` — empty whenever the normalization is injective,
    which it is for all 31 tables in the corpus (measured 2026-08-16).
+
+   Takes NAMES rather than rows, so a CSV header and a vector of row maps run
+   the same check: `loci.source/describe` calls `check-names!` on the header
+   before anything is created, and `normalize-rows` calls it on every key any
+   row has.
 
    Across the whole table rather than per row, deliberately. A per-row check
    passes a ragged table whose row 1 says `\"a b\"` and whose row 2 says `:a_b`:
    no single row loses a value there, and yet the table still ends with one
    column fed by two different names. `:cols` is a table-level fact, so the
    invariant that produces it is one too — and the table-level check is a strict
-   superset, since a row is a table of one.
-
-   One extra pass over every key, on top of the one `cols-of` already makes."
-  [rows]
+   superset, since a row is a table of one."
+  [names]
   (into (sorted-map)
         (keep (fn [[k ks]] (when (next ks) [k (vec (sort-by pr-str ks))])))
-        (group-by sub/col-kw (into #{} (mapcat keys) rows))))
+        (group-by sub/col-kw (set names))))
+
+(defn check-names!
+  "Throw if two of `names` would become one column. Returns nil otherwise.
+
+   Refusing rather than merging is the register this codebase already keeps:
+   `put-rows!` throws on a table with no rows, and `safe-event` throws rather
+   than write a line it could not read back. `{\"a b\" 1, :a_b 2}` loses a whole
+   column — both keys become `:a_b`, one value wins, and nothing downstream can
+   tell, because `:cols` and the rows still agree with each other perfectly."
+  [names]
+  (let [cs (name-collisions names)]
+    (when (seq cs)
+      (let [[k ks] (first cs)]
+        (throw (ex-info (str "two column names would become one column: "
+                             (str/join " and " (map pr-str ks))
+                             " both normalize to " k " — refusing to merge them")
+                        {:column k :from ks :collisions cs}))))))
 
 (defn- nested-value
   "The first `[column value]` whose value is a vector, map or set — or nil.
@@ -181,13 +201,7 @@
    divergence is the failure this move has spent four tasks closing, and a check
    that lived in one store would be one more."
   [rows]
-  (let [cs (collisions rows)]
-    (when (seq cs)
-      (let [[k ks] (first cs)]
-        (throw (ex-info (str "two column names would become one column: "
-                             (str/join " and " (map pr-str ks))
-                             " both normalize to " k " — refusing to merge them")
-                        {:column k :from ks :collisions cs})))))
+  (check-names! (into #{} (mapcat keys) rows))
   (when-let [[k v] (nested-value rows)]
     (throw (ex-info (str "column " k " holds a " (.getSimpleName (class v))
                          " — a loci table column holds scalars, not a vector or a map."
