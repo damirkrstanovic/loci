@@ -2027,7 +2027,7 @@ git commit -m "measure: a 10M-row CSV through the file connector"
 - [ ] `refresh!` commits a new handle; `undo!` walks back to one whose rows still read
 - [ ] A passthrough table renders live, and degrades to `:table/unavailable` / `:table/source-drift` with `:value []`
 - [ ] `tbl/unusable` is the single answer, and all four readers go through it
-- [ ] `tools/parse-csv` and `tools/->val` do not exist; `grep -rn "parse-csv\|->val" src/ test/` is clean
+- [ ] `tools/parse-csv` and `tools/->val` do not exist **as code**. The grep is NOT clean and cannot be: about a dozen hits remain, all prose — docstrings in `lake.clj`, `chunks.clj`, `server.clj` and `tools.clj` explaining why three live tables carry `JSON` columns, plus two false positives on the literal `column->value`. Deleting the names would make those paragraphs unintelligible. Check `grep -rn "(defn-? (parse-csv|->val)" src/` instead.
 - [ ] The corpus imports through the connector, and the type changes are written down
 - [ ] `clojure -M:test` and `npm run test:browser` both green
 - [ ] Every regression test above proved to fail when its fix is reverted
