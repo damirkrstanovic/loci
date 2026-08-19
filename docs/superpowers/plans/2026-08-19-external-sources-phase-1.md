@@ -33,6 +33,11 @@
 - **Prove every test bites.** After a test passes, break the implementation it covers, re-run, confirm FAIL, restore. A test that passes either way is worse than none, because it certifies.
 - **End every commit message with** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. This
   branch's earlier commits predate the rule and are not being rewritten for it.
+- **The shell is `resources/public/index.html`, and plain `grep` lies about it.** The repo root
+  holds a different, unserved `index.html`; `server.clj:2991` slurps the one under `resources`.
+  And grep treats the served file as binary because of its long lines, so it reports zero matches
+  silently — always `grep -a`. A conclusion of "nothing in the shell calls this" drawn any other
+  way is worthless; one was drawn that way on 2026-08-19 and was wrong.
 - **`data/` is disposable.** Do not checksum it, do not rehearse on copies. Prefer a throwaway `LOCI_DATA` where a test does not need the real store.
 
 ## File structure
@@ -1766,7 +1771,7 @@ In `src/loci/server.clj`, replace `import-csv!` (line ~1949) with:
     (catch Exception e {:error (.getMessage e)})))
 ```
 
-The last line must be `(source-connect! st {…} space)`, not `src/connect!` — the route's callers want `{:state … :openId …}` and Task 10's handler is what adds them. Two existing tests in `test/loci/server_test.clj` hold that shape and must stay green:
+The last line must be `(source-connect! st {…} space)`, not `src/connect!` — the route's callers want `{:state … :openId …}` and Task 10's handler is what adds them. **This is a live shell contract, not just a test's:** `resources/public/index.html:1102` reads `res.error`, then `applyState(res.state)` and `openObject(res.openId)`. Break the shape and the paste-CSV flow breaks with it. Two existing tests in `test/loci/server_test.clj` hold that shape and must stay green:
 
 - `every-server-writer-lands-a-handle` (line ~4280) asserts `(tbl/handle? (:value (sub/object st (:openId …))))`. `create-from-relation!` returns `{:store :lake …}`, so this passes unchanged.
 - `a-csv-with-only-a-header-is-an-empty-table-not-an-error` (line ~4295) asserts a header-only CSV gives no `:error` and `(= [] (rows-of st (:openId r)))`.

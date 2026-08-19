@@ -28,11 +28,22 @@ The CSV path is not that machinery, and is the thing being replaced:
 | parse | `tools/parse-csv` → `clojure.data.csv` → a vector of Clojure maps, all in RAM |
 | types | `tools/->val` — three regexes: `-?\d+`, `-?\d+\.\d+`, else string |
 | then | those maps re-serialized to NDJSON and read back by DuckDB |
-| callers in the shell | **none** — `grep` finds no caller of `/api/import-csv` in `index.html` |
+| callers in the shell | **one** — `startImport`, a paste-CSV-into-a-textarea flow (`resources/public/index.html:1102`) |
 
-Three full in-memory copies before a byte reaches DuckDB, and no user-reachable path. The only
-CSV ingest anyone actually runs is `loci.corpus`, which reads files off disk and builds events
-directly.
+Three full in-memory copies before a byte reaches DuckDB — and the copies are the whole story,
+because there **is** a user-reachable path and it is the one that makes them unavoidable.
+`startImport` gives you a textarea to paste a CSV into, so the file arrives as a JSON string in a
+request body and is already in RAM before loci sees it. That is fine for the paste it was built
+for and cannot be made to work for a 500 MB file, which is why phase 2 adds a streaming upload
+rather than widening this one.
+
+**Corrected 2026-08-19.** An earlier draft of this table said the shell had no caller at all. That
+came from grepping `index.html` at the repo root — a different, unserved file. The shell is
+`resources/public/index.html` (2952 lines), which is what `server.clj:2991` slurps, and a plain
+`grep` on it silently reports zero matches because its long lines make grep treat it as binary.
+Use `grep -a`, and grep the served file.
+
+The other CSV ingest is `loci.corpus`, which reads files off disk and builds events directly.
 
 `loci.tools` already declares the seam this design takes up: *"This is where MCP servers would
 register too: same shape — a JSON spec + a handler — so the model reaches every connected source
