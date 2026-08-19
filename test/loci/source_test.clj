@@ -257,3 +257,117 @@
             "and it names who could not read it, because that is the repair")))
     (.setReadable f true false)
     (.delete f)))
+
+(deftest connect-materialise-lands-rows-in-the-lake
+  (let [lk @lake/lake]
+    (let [st (sub/fresh-store)
+          r  (src/connect! st {:uri (csv! "Total Revenue ($)\n5\n7\n")
+                               :format :csv :mode :materialise :title "Revenue"})
+          o  (sub/object st (:id r))]
+      (is (= "tbl:revenue" (:id r)) "the id is a readable slug of the title")
+      (is (= :lake (:store (:value o))) "materialise yields today's handle")
+      (is (= [:total_revenue] (:cols (:value o))))
+      (is (= "Revenue" (:title o)))
+      (is (= :materialise (:mode (:source o))))
+      (is (string? (:at (:source o))))
+      (is (= [{:total_revenue 5} {:total_revenue 7}] (:value (tbl/hydrate lk o)))))))
+
+(deftest connect-passthrough-stores-the-recipe-and-creates-no-table
+  (let [lk @lake/lake]
+    (let [st     (sub/fresh-store)
+          before (count (lake/q lk "SELECT table_name FROM duckdb_tables()"))
+          r      (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                                   :mode :passthrough :title "Live"})
+          h      (:value (sub/object st (:id r)))]
+      (is (= :source (:store h)))
+      ;; DEVIATION from the plan's draft of this test, which read
+      ;; `(is (= "tbl:live" (:id h)) "the handle carries its own id, for the
+      ;; sample key")`. It is stale: `lake/samples-version` keys a source's
+      ;; samples on the PATH plus `:at`, and its docstring says an object id is
+      ;; deliberately not in that key — "a component no test could distinguish,
+      ;; which is worse than absent, because it reads as a guarantee".
+      ;; `two-source-handles-at-one-path-share-samples-on-purpose` above pins it.
+      ;; So the handle must NOT carry one; nothing reads it, and a key put there
+      ;; for a reason that no longer exists is the guarantee that paragraph warns
+      ;; about.
+      (is (nil? (:id h)) "the handle carries no object id — the sample key is path + :at")
+      (is (string? (:at h)) "it carries its :at, which is that key's only version component")
+      (is (= before (count (lake/q lk "SELECT table_name FROM duckdb_tables()")))
+          "passthrough must create no catalog object at all"))))
+
+(deftest connect-mints-a-second-id-rather-than-overwriting
+  (let [_ @lake/lake]
+    (let [st (sub/fresh-store)
+          a  (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                               :mode :materialise :title "Sales"})
+          b  (src/connect! st {:uri (csv! "a\n2\n") :format :csv
+                               :mode :materialise :title "Sales"})]
+      (is (= "tbl:sales" (:id a)))
+      (is (= "tbl:sales-2" (:id b)) "a taken id is suffixed, never reused"))))
+
+(deftest a-connected-source-keeps-its-reader-options-on-the-handle
+  ;; `:options` are load-bearing on the handle, not decoration. Every read
+  ;; rebuilds the relation from the handle ALONE, so a handle that forgets them
+  ;; reads right once — `describe` was given the real options — and then falls
+  ;; back to DuckDB's sniffer forever after. The symptom is not an error: it is a
+  ;; spurious `:table/source-drift` on a file nobody touched.
+  ;;
+  ;; `#` deliberately, and not `;`: DuckDB's sniffer finds `,`, `|`, `;` and tab
+  ;; on its own, so a test written with one of those PASSES with `:options`
+  ;; dropped and certifies nothing. Measured 2026-08-19 — `a#b\n1#x\n` describes
+  ;; as two columns with `delim='#'`, and as one `a#b` without it.
+  (let [lk  @lake/lake
+        st  (sub/fresh-store)
+        uri (csv! "a#b\n1#x\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough
+                              :title "Hash" :options {:delim "#"}})
+        o   (sub/object st (:id r))
+        h   (:value o)]
+    (is (= [:a :b] (:cols h)) "describe saw two columns, because it was given the option")
+    (is (= {:delim "#"} (:options h)) "so the handle must carry it, or no later read can repeat that")
+    (is (= {:delim "#"} (:options (:source o)))
+        "and the recipe carries it, so refresh! re-describes the same way")
+    (let [hy (tbl/hydrate lk o)]
+      (is (= [{:a 1 :b "x"}] (:value hy)))
+      (is (nil? (:table/source-drift hy))
+          "a handle that forgot the option drifts against a file that never changed"))))
+
+(deftest refresh-commits-a-new-handle-and-undo-restores-the-old-one
+  (let [lk @lake/lake]
+    (let [st  (sub/fresh-store)
+          uri (csv! "a\n1\n")
+          r   (src/connect! st {:uri uri :format :csv :mode :materialise :title "R"})
+          h1  (:value (sub/object st (:id r)))]
+      (spit (subs uri 7) "a\n1\n2\n")
+      (src/refresh! st (:id r))
+      (let [h2 (:value (sub/object st (:id r)))]
+        (is (not= (:table h1) (:table h2)) "refresh materialises a NEW table")
+        (is (= 2 (:rows h2)))
+        (is (= 2 (count (tbl/rows lk h2 {})))))
+      (sub/undo! st)
+      (is (= h1 (:value (sub/object st (:id r))))
+          "the old handle is still in the log, so undo walks back to it")
+      (is (= 1 (count (tbl/rows lk (:value (sub/object st (:id r))) {})))
+          "and its rows are still there, because writes never overwrite"))))
+
+(deftest refresh-of-a-passthrough-moves-at-and-cols-and-writes-no-bytes
+  (let [_ @lake/lake]
+    (let [st  (sub/fresh-store)
+          uri (csv! "a\n1\n")
+          r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "P"})
+          h1  (:value (sub/object st (:id r)))]
+      (spit (subs uri 7) "a,b\n1,x\n2,y\n")
+      (src/refresh! st (:id r))
+      (let [h2 (:value (sub/object st (:id r)))]
+        (is (= :source (:store h2)))
+        (is (= [:a :b] (:cols h2)) "refresh re-describes")
+        (is (= 2 (:rows h2)))
+        (is (not= (:at h1) (:at h2)) "at moves, which is what invalidates the synopsis")))))
+
+(deftest refresh-refuses-an-object-with-no-source
+  (let [lk @lake/lake]
+    (let [st (sub/fresh-store)]
+      (sub/commit! st {:op :put :id "tbl:hand"
+                       :value (tbl/table-object lk "tbl:hand" "Hand" [{:a 1}])})
+      (is (thrown? clojure.lang.ExceptionInfo (src/refresh! st "tbl:hand"))
+          "a table nobody connected has no recipe to re-run"))))
