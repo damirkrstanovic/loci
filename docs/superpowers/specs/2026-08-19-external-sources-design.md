@@ -112,11 +112,10 @@ to build the abstraction that connector will want.
 | mode | handle | reads |
 |---|---|---|
 | `:materialise` | `{:store :lake :table … :snapshot … :rows … :cols …}` — **unchanged** | `… FROM t AT (VERSION => n)` |
-| `:passthrough` | `{:store :source :id … :uri … :format … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
+| `:passthrough` | `{:store :source :uri … :format … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
 
-The passthrough handle carries its object `:id` and its `:at` because `column-samples` receives
-**only the handle** — see "The synopsis cache needs a key that can change" for what those two
-are for.
+The passthrough handle carries its `:at` because `column-samples` receives **only the handle** —
+see "The synopsis cache needs a key that can change" for what it is for.
 
 Passthrough creates **no catalog object**: no DuckLake view, no snapshot to fake, nothing for GC
 to track. `Lake` executes both — a `:source` handle inlines the relation expression where a
@@ -222,16 +221,24 @@ answer it the key has to do two jobs: **separate** different tables from one ano
 does both in a single token, because every write mints a new name. That is why the existing key
 carries no object id and has never needed one.
 
-Passthrough splits the two jobs apart, and an object id only does the first. An id is fixed for
-the life of the object while the file underneath it can be overwritten any number of times. Key
-on the id alone and the samples are computed once, on the first read, and never again — replace
-the CSV, refresh, and the table goes on describing the file you deleted, with nothing able to
-invalidate it.
+Passthrough splits the two jobs apart — but not the way it first appears, and the difference is
+worth stating because the obvious answer produces a key no test can check.
 
-So: **a passthrough handle keys the sample cache on `[id at]`** — the object id for job one, the
-source's `:source :at` for job two, since `at` is the only thing that moves when the operator
-says the bytes changed. It must not reuse `(:table h)` and `(:snapshot h)`, which are `nil` for
-this handle shape.
+The **separating** job is already done. The cached SQL is keyed on its own FROM text, and a
+passthrough handle's FROM text names the file's path, so two sources at two paths can never
+collide. Two sources at *one* path are a different matter, and they must share: one file is one
+set of bytes, so one answer is the right answer. An object id in this key would therefore be
+inert — it would distinguish only cases that must not be distinguished, and read as a guarantee
+it is not making.
+
+What is genuinely missing is the **version**. A `:lake` handle's FROM text carries one already:
+it names the table and the snapshot, and a write never overwrites — measured 2026-08-19, two
+`put-rows!` under a single object id land in `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. A
+path carries none.
+
+So: **a passthrough handle keys the sample cache on its `:at`**, the instant of the connect or
+refresh that last looked, and a `:lake` handle adds nothing. `:at` is the only thing in a source
+that moves when the operator says the bytes changed.
 
 **The known limit, stated rather than hidden.** For a materialised table the version in the key
 is a fact DuckLake guarantees. For a passthrough table `at` is a claim loci makes on the

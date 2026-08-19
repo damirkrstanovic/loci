@@ -55,3 +55,34 @@
                                                        :format :parquet})))))
     (is (= [:a :b] (mapv :col (:cols (src/describe lk {:uri (str "file://" (.getAbsolutePath js))
                                                        :format :json})))))))
+
+(deftest describe-says-which-source-it-could-not-read
+  ;; The commonest real failure — a typo, a moved file, a loci:// name never
+  ;; uploaded — and the only one DuckDB notices rather than loci. Raw it is four
+  ;; lines: a JDBC driver describing its own state, then the real error, then a
+  ;; dump of the SQL loci generated. Callers put .getMessage into a JSON body.
+  (let [e (try (src/describe @lake/lake {:uri "file:///no/such/file.csv" :format :csv}) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e) "must be an ex-info, not a bare SQLException")
+    (is (= "file:///no/such/file.csv" (:uri (ex-data e))))
+    (is (re-find #"loci cannot read file:///no/such/file\.csv" (.getMessage e)))
+    (is (re-find #"No files found" (.getMessage e)) "and it keeps what DuckDB actually said")
+    (is (not (re-find #"pending query result" (.getMessage e)))
+        "without the JDBC driver's account of its own state")
+    (is (not (re-find #"LINE 1" (.getMessage e)))
+        "and without a dump of SQL the caller never wrote")))
+
+(deftest describe-succeeds-on-an-empty-source-with-a-fabricated-column
+  ;; Pins what the empty-columns guard does NOT do. DuckDB's auto-detection
+  ;; never returns zero columns, so an empty file connects as a one-column,
+  ;; zero-row table. Recorded as a comment first; a comment is not a guarantee.
+  (let [lk @lake/lake
+        f  (fn [suffix text] (str "file://" (.getAbsolutePath
+                                             (doto (java.io.File/createTempFile "empty-" suffix)
+                                               (spit text)))))]
+    (is (= [{:raw "column0" :col :column0 :type "VARCHAR"}]
+           (:cols (src/describe lk {:uri (f ".csv" "") :format :csv}))))
+    (is (= [{:raw "column0" :col :column0 :type "VARCHAR"}]
+           (:cols (src/describe lk {:uri (f ".csv" "\n") :format :csv}))))
+    (is (= [{:raw "json" :col :json :type "JSON"}]
+           (:cols (src/describe lk {:uri (f ".json" "[]") :format :json}))))))

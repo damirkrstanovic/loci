@@ -7,10 +7,38 @@
    which is why nothing here takes a `:dry-run?` flag.
 
    `loci.sourcespec` holds the pure half: URI → location, source → SQL."
-  (:require [loci.lake :as lake]
+  (:require [clojure.string :as str]
+            [loci.lake :as lake]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
+
+(defn- duckdb-said
+  "The one line of a DuckDB JDBC failure that says what actually went wrong.
+
+   A missing file is the commonest way a source fails — a typo, a moved file, a
+   `loci://` name that was never uploaded — and it is the only failure in this
+   namespace that arrives as a `SQLException` rather than an `ex-info`, because
+   it is DuckDB that notices rather than loci. Raw, that message is four lines:
+
+     Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result
+     Error: IO Error: No files found that match the pattern \"/no/such/file.csv\"
+
+     LINE 1: DESCRIBE SELECT * FROM read_csv('/no/such/file.csv')
+                                    ^
+
+   The first line is the JDBC driver describing its own state and says nothing
+   about the source; the last two are a SQL dump of text loci generated. Only
+   the `Error:` line is about what the caller did. `describe`'s callers put
+   `.getMessage` straight into a JSON body — `server.clj` does this at every
+   route — so this is what the shell shows."
+  [^Throwable e]
+  (let [ls (->> (str/split-lines (str (.getMessage e)))
+                (map str/trim)
+                (remove str/blank?))]
+    (or (some->> ls (filter #(str/starts-with? % "Error: ")) first (drop 7) (apply str))
+        (first ls)
+        (str e))))
 
 (defn describe
   "The columns `src` has, and the relation expression that reads them:
@@ -29,7 +57,10 @@
    column — the same refusal `normalize-rows` makes for rows."
   [lk src]
   (let [rel  (ssp/relation src (ssp/locate (:uri src)))
-        rows (lake/q lk (str "DESCRIBE SELECT * FROM " rel))
+        rows (try (lake/q lk (str "DESCRIBE SELECT * FROM " rel))
+                  (catch java.sql.SQLException e
+                    (throw (ex-info (str "loci cannot read " (:uri src) " — " (duckdb-said e))
+                                    {:uri (:uri src) :relation rel} e))))
         cols (mapv (fn [r] {:raw  (:column_name r)
                             :col  (sub/col-kw (:column_name r))
                             :type (:column_type r)})

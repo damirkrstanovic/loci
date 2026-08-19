@@ -22,6 +22,14 @@
   ```
   `clojure -M:test` is for the single full-suite run in Task 14.
 - **The nREPL on port 7888 is shared.** If more than one agent is working at once, another agent's mid-edit definitions live in the same JVM as yours, and a namespace you did not touch can fail — or, worse, *pass* — for reasons that are not on disk. Observed 2026-08-19: `loci.tablestore-test` reported 8 failures against a `tablestore.clj` that `git diff` showed clean. Always `(require '[the.ns] :reload)` from disk before trusting any cross-namespace result, and treat a surprising result as possible contamination before treating it as a finding. The controller runs agents serially for this reason; if you see evidence of a second writer, stop and report it.
+- **A sabotage that did not take effect is a false green — check that it landed.** Two ways to get
+  this wrong were hit on 2026-08-19. `(in-ns 'loci.x)` nested inside a `do`/vector does NOT change
+  the namespace the enclosing form is *compiled* in, so the `defn` beside it defines `user/foo`
+  and sabotages nothing — send `in-ns` as its own top-level form, or edit the file. And
+  `with-redefs` on a widely-used helper can break more than the target (`sub/col-kw` also breaks
+  `check-names!`, giving 3 failures where 1 was wanted) — when the signal is muddy, edit the
+  source instead. Either way: if the sabotage run reports 0 failures, that is a finding about your
+  sabotage, not about the code.
 - **Prove every test bites.** After a test passes, break the implementation it covers, re-run, confirm FAIL, restore. A test that passes either way is worse than none, because it certifies.
 - **`data/` is disposable.** Do not checksum it, do not rehearse on copies. Prefer a throwaway `LOCI_DATA` where a test does not need the real store.
 
@@ -787,7 +795,7 @@ Append to `test/loci/source_test.clj`:
 (deftest a-source-handle-reads-the-file-on-every-query
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n2,y\n")
-          h   {:store :source :id "tbl:live" :uri uri :format :csv
+          h   {:store :source :uri uri :format :csv
                :cols [:a :b] :rows 2 :at "2026-08-19T10:00:00Z"}]
       (is (true? (tbl/handle? h)) "a :source map is a handle")
       (is (= [{:a 1 :b "x"} {:a 2 :b "y"}] (tbl/rows lk h {})))
@@ -801,7 +809,7 @@ Append to `test/loci/source_test.clj`:
 (deftest a-source-handle-keys-its-samples-on-id-and-at
   (let [lk @lake/lake]
     (let [uri (csv! "a\nfirst\n")
-          h   {:store :source :id "tbl:s" :uri uri :format :csv
+          h   {:store :source :uri uri :format :csv
                :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}]
       (is (= {:a ["first"]} (tbl/column-samples lk h 3 8)))
       (spit (subs uri 7) "a\nsecond\n")
@@ -819,28 +827,28 @@ Append to `test/loci/source_test.clj`:
         feb (csv! "a\nfebruary\n")
         at  "2026-08-19T10:00:00Z"]
     (is (= {:a ["january"]}
-           (tbl/column-samples lk {:store :source :id "tbl:jan" :uri jan :format :csv
+           (tbl/column-samples lk {:store :source :uri jan :format :csv
                                    :cols [:a] :rows 1 :at at} 3 8)))
     (is (= {:a ["february"]}
-           (tbl/column-samples lk {:store :source :id "tbl:feb" :uri feb :format :csv
+           (tbl/column-samples lk {:store :source :uri feb :format :csv
                                    :cols [:a] :rows 1 :at at} 3 8)))))
 
 (deftest two-source-handles-at-one-path-share-samples-on-purpose
-  ;; The other half, and the reason the object id is NOT in the key: one file is
-  ;; one set of bytes, so two handles reading it must agree. A test that only
-  ;; ever compares different files cannot tell an id-keyed cache from a
-  ;; path-keyed one, and would pass with the key wrong.
+  ;; The other half, and the reason no object id is in the key: one file is one
+  ;; set of bytes, so two handles reading it must agree. A test that only ever
+  ;; compares different files cannot tell an id-keyed cache from a path-keyed
+  ;; one, and would pass with the key wrong.
   (let [lk  @lake/lake
         uri (csv! "a\nshared\n")
         at  "2026-08-19T10:00:00Z"]
     (is (= {:a ["shared"]}
-           (tbl/column-samples lk {:store :source :id "tbl:one" :uri uri :format :csv
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
                                    :cols [:a] :rows 1 :at at} 3 8)))
     (spit (subs uri 7) "a\nrewritten\n")
     (is (= {:a ["shared"]}
-           (tbl/column-samples lk {:store :source :id "tbl:two" :uri uri :format :csv
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
                                    :cols [:a] :rows 1 :at at} 3 8))
-        "a different id at the same path and the same :at is the same cache entry")))
+        "the same path and the same :at is the same cache entry")))
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1006,7 +1014,7 @@ Append to `test/loci/source_test.clj`:
 (deftest hydrate-marks-a-passthrough-table-as-live
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n")
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:live" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [{:a 1 :b "x"}] (:value o)))
       (is (true? (:table/passthrough o)) "a reader has to be able to tell")
@@ -1018,7 +1026,7 @@ Append to `test/loci/source_test.clj`:
   (let [lk @lake/lake]
     (let [uri (csv! "a\n1\n")
           _   (.delete (java.io.File. (subs uri 7)))
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:gone" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [] (:value o)) "the same shape every downstream guard already handles")
       (is (= 1 (:table/total o)) "the count survives on the handle")
@@ -1030,7 +1038,7 @@ Append to `test/loci/source_test.clj`:
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n")
           _   (spit (subs uri 7) "c,d\n1,x\n")            ; same file, new header
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:drift" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [] (:value o)))
       (is (string? (:table/source-drift o))
@@ -1281,7 +1289,7 @@ Append to `src/loci/source.clj`:
    nothing and keeps the recipe."
   [lk id src d at]
   (if (= :passthrough (:mode src))
-    {:store :source :id id :uri (:uri src) :format (:format src)
+    {:store :source :uri (:uri src) :format (:format src)
      :options (:options src)
      :cols (mapv :col (:cols d))
      :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
