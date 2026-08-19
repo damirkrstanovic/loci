@@ -297,6 +297,100 @@
       (is (= before (count (lake/q lk "SELECT table_name FROM duckdb_tables()")))
           "passthrough must create no catalog object at all"))))
 
+(deftest passthrough-reads-a-file-whose-headers-are-not-identifiers
+  ;; **The fixture is the test.** Every other passthrough fixture in this
+  ;; namespace uses `a`, `b`, `share` — headers that are ALREADY loci
+  ;; identifiers, so raw and normalized coincide and a read that names the wrong
+  ;; half still binds. `Total Revenue ($)` is what a real CSV looks like, and
+  ;; against it the handle's `:cols` are the one set of names the file does NOT
+  ;; expose. Measured 2026-08-20, with the handle carrying only `:cols`:
+  ;;
+  ;;   Binder Error: Referenced column "total_revenue" not found in FROM clause!
+  ;;   Candidate bindings: "Total Revenue ($)"
+  ;;
+  ;; from `tbl/rows` AND from `tbl/column-samples`, and `hydrate` classified that
+  ;; throw as `:table/source-drift` on a file that had never changed — telling
+  ;; the reader to reconnect a source that could never have read.
+  (let [lk  @lake/lake
+        st  (sub/fresh-store)
+        uri (csv! "Total Revenue ($),Region\n5,north\n7,south\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "Revenue"})
+        o   (sub/object st (:id r))
+        h   (:value o)]
+    (is (= :source (:store h)) "nothing was copied")
+    (is (= [:total_revenue :region] (:cols h)))
+    (is (= ["Total Revenue ($)" "Region"] (:raw h))
+        "the handle carries the file's own header too, or no later read can build the projection")
+    (is (= [{:total_revenue 5 :region "north"}
+            {:total_revenue 7 :region "south"}]
+           (tbl/rows lk h {}))
+        "rows come back under loci's names — the same ones materialise would have stored")
+    (is (= [{:total_revenue 7 :region "south"}] (tbl/rows lk h {:offset 1 :limit 1}))
+        "and a page goes through the same projection, not a second one")
+    (is (= {:total_revenue ["5" "7"] :region ["north" "south"]}
+           (tbl/column-samples lk h 3 8))
+        "the synopsis reads too — a table's chunk and its recall vector are these samples")
+    (let [hy (tbl/hydrate lk o)]
+      (is (true? (:table/passthrough hy)))
+      (is (= 2 (:table/total hy)))
+      (is (= [{:total_revenue 5 :region "north"}
+              {:total_revenue 7 :region "south"}]
+             (:value hy)))
+      (is (nil? (:table/source-drift hy))
+          "a file that has never changed must never be reported as drift")
+      (is (nil? (:table/unavailable hy)))
+      (is (nil? (tbl/unusable hy))
+          "and it reads as usable through the one predicate every reader calls"))))
+
+(deftest a-real-header-that-actually-changes-is-still-drift
+  ;; The other half, and the reason the fix keeps a NAMED projection. Verified by
+  ;; sabotage 2026-08-20: renaming POSITIONALLY instead — `SELECT #1 AS
+  ;; "total_revenue", #2 AS "region"` — makes the test above pass and this one
+  ;; fail, because any file of the same arity reads and nothing ever looks like
+  ;; drift. Neither test can stand without the other: one says the read must
+  ;; work, this one says it must still refuse.
+  (let [lk  @lake/lake
+        st  (sub/fresh-store)
+        uri (csv! "Total Revenue ($),Region\n5,north\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "Drift"})
+        o   (sub/object st (:id r))]
+    (spit (subs uri 7) "Gross Revenue,Area\n5,north\n")   ; same file, new header
+    (let [hy (tbl/hydrate lk o)]
+      (is (= [] (:value hy)) "the shape every downstream guard already handles")
+      (is (true? (:table/passthrough hy)))
+      (is (nil? (:table/unavailable hy)) "the file is right there — this is drift, not absence")
+      (is (string? (:table/source-drift hy)))
+      (is (re-find #"connected as total_revenue, region" (:table/source-drift hy))
+          "loci's own half, true whatever the driver says")
+      (is (re-find #"Gross Revenue" (:table/source-drift hy))
+          "and DuckDB's half names what the file holds NOW"))))
+
+(deftest a-source-handle-with-no-raw-still-reads-and-refresh-repairs-it
+  ;; `:raw` is new. This branch has already committed `:source` handles without
+  ;; it — the corpus re-seed, every test store — so a handle that lacks it falls
+  ;; back to using `:cols` as the file's own header. That is correct exactly when
+  ;; the headers were already identifiers, which is the only case such a handle
+  ;; could ever have read in, and it is bit-for-bit what the read did before.
+  ;;
+  ;; It cannot be made right for an old handle over `Total Revenue ($)`: the raw
+  ;; name was never recorded, so there is nothing to fall back TO. `refresh!` is
+  ;; the repair, and it is a repair because it re-describes and writes `:raw`.
+  (let [lk  @lake/lake
+        uri (csv! "a,b\n1,x\n")
+        old {:store :source :uri uri :format :csv
+             :cols [:a :b] :rows 1 :at "2026-08-20T10:00:00Z"}]
+    (is (nil? (:raw old)))
+    (is (= [{:a 1 :b "x"}] (tbl/rows lk old {})) "an identifier-headed file reads as it always did")
+    (is (= {:a ["1"] :b ["x"]} (tbl/column-samples lk old 3 8)))
+    (let [st (sub/fresh-store)]
+      (sub/commit! st {:op :put :id "tbl:old"
+                       :value {:id "tbl:old" :kind :table :title "Old" :value old
+                               :source {:uri uri :format :csv :mode :passthrough
+                                        :at "2026-08-20T10:00:00Z"}}})
+      (src/refresh! st "tbl:old")
+      (is (= ["a" "b"] (:raw (:value (sub/object st "tbl:old"))))
+          "refresh re-describes, so it records the raw header a pre-:raw handle never had"))))
+
 (deftest connect-mints-a-second-id-rather-than-overwriting
   (let [_ @lake/lake]
     (let [st (sub/fresh-store)

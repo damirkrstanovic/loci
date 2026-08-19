@@ -628,9 +628,30 @@
    Named rather than `SELECT *` on purpose, and the reason is passthrough: a
    named projection THROWS when the file's header changes, where `SELECT *`
    would quietly return a differently-shaped table. That throw is what
-   `hydrate` turns into `:table/source-drift`."
+   `hydrate` turns into `:table/source-drift`.
+
+   **A header that is already loci's column name is emitted bare, with no `AS`**,
+   and that is about the message rather than the SQL — the two forms select the
+   same thing. `\"a\" AS \"a\"` puts DuckDB on its lateral-column-alias path, so
+   when the file no longer has an `a` it answers about the SELECT list instead of
+   about the file. Measured 2026-08-20, same relation, header now `c,d`:
+
+     \"a\" AS \"a\" → Column \"a\" referenced that exists in the SELECT clause -
+                  but this column cannot be referenced before it is defined
+     \"a\"        → Referenced column \"a\" not found in FROM clause!
+                  Candidate bindings: \"c\"
+
+   `Candidate bindings` is the half that names what the file holds NOW, which is
+   the one thing a reader needs in order to reconnect — see `duckdb-said`, whose
+   whole paragraph rule exists to keep it. The redundant alias would drop it for
+   exactly the CSVs whose headers were already clean."
   [cols]
-  (str/join ", " (map (fn [{:keys [raw col]}] (str (ident raw) " AS " (ident col))) cols)))
+  (str/join ", "
+            (map (fn [{:keys [raw col]}]
+                   (if (= (name raw) (name col))
+                     (ident col)
+                     (str (ident raw) " AS " (ident col))))
+                 cols)))
 
 (defn create-from-relation!
   "Materialise `rel` — any SQL relation expression — into a new lake table, and
@@ -675,13 +696,39 @@
   (q-as lk (str "SELECT " (projection cols) " FROM " rel) (mapv :col cols)))
 
 (defn- from-of
-  "The FROM text for a handle: a versioned table, or a source's reader call.
+  "The FROM text for a handle: a versioned table, or a source's reader call
+   **already renamed to loci's columns**.
 
    Both modes go through one function so a read cannot resolve differently from
-   the projection built beside it."
+   the projection built beside it — and for a `:source` handle the projection is
+   INSIDE here rather than beside it, because there are two callers and they
+   build different SELECTs. `rows` projects the columns; `column-samples` CASTs
+   one at a time. Measured 2026-08-20, with the rename left to each of them, a
+   passthrough source over `Total Revenue ($),Region` failed BOTH ways with
+
+     Binder Error: Referenced column \"total_revenue\" not found in FROM clause!
+     Candidate bindings: \"Total Revenue ($)\"
+
+   — because a handle's `:cols` are loci's names and `read_csv` exposes the
+   file's. Renaming in the FROM is what `create-from-relation!` gets for free by
+   writing a table whose columns already carry them, and it means neither caller
+   has to know the difference. Anything reading through this sees loci's names.
+
+   `:raw` is the file's own header, recorded at connect beside `:cols`. A
+   `:source` handle committed before `:raw` existed falls back to `:cols` —
+   correct exactly when the headers were already identifiers, which is the only
+   case such a handle could ever have read in. `refresh!` re-describes and
+   writes `:raw`, so it repairs one.
+
+   Still a NAMED projection and not `SELECT *`: a positional read would quietly
+   return a differently-shaped table where this throws, and that throw is what
+   `hydrate` turns into `:table/source-drift`."
   [h]
   (if (= :source (:store h))
-    (ssp/relation h (ssp/locate (:uri h)))
+    (str "(SELECT " (projection (map (fn [raw col] {:raw raw :col col})
+                                     (or (:raw h) (:cols h))
+                                     (:cols h)))
+         " FROM " (ssp/relation h (ssp/locate (:uri h))) ")")
     (str (:table h) " AT (VERSION => " (long (:snapshot h)) ")")))
 
 (defn- samples-version

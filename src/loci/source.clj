@@ -156,9 +156,12 @@
 (defn- land!
   "`src` + `describe`'s answer → the handle to record, for either mode.
 
-   The whole difference between the two modes is these four lines, which is the
+   The whole difference between the two modes is the branch below, which is the
    point of the framework: materialise runs one CREATE, passthrough runs
-   nothing and keeps the recipe.
+   nothing and keeps the recipe. Both build from the SAME `describe` output, and
+   both keep both halves of it — the raw header and loci's column — because both
+   have to emit the same `\"raw\" AS \"col\"` projection. Materialise emits it
+   once, into a table; passthrough emits it on every read.
 
    `(:mode src)` is trusted to be one of `modes`, because `connect!` normalized
    and validated it and `refresh!` reads back what `connect!` recorded. The `=`
@@ -168,6 +171,16 @@
   (if (= :passthrough (:mode src))
     (cond-> {:store :source :uri (:uri src) :format (:format src)
              :cols (mapv :col (:cols d))
+             ;; `:raw` beside `:cols`, because a passthrough read has to build
+             ;; the projection `create-from-relation!` writes into a table:
+             ;; `"Total Revenue ($)" AS "total_revenue"`. The handle IS the
+             ;; recipe, and half a recipe reads nothing — measured 2026-08-20, a
+             ;; handle carrying only `:cols` failed every read of that file with
+             ;; `Binder Error: Referenced column "total_revenue" not found`,
+             ;; which `hydrate` then reported as drift on a file nobody had
+             ;; touched. Only the raw half is new; `describe` has always
+             ;; returned it and materialise has always used it.
+             :raw  (mapv :raw (:cols d))
              :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
              :at at}
       ;; `:options` are load-bearing on the handle, not decoration: every read

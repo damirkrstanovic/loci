@@ -81,9 +81,10 @@
    from being wrong.
 
    `:source` is the passthrough handle, and it is the odd one: it carries no
-   rows and names no storage, because it IS the recipe — a location, a format
-   and the columns observed when it was connected. Reading it runs the reader
-   function against the file every time."
+   rows and names no storage, because it IS the recipe — a location, a format,
+   and the columns observed when it was connected under BOTH names: `:raw`, the
+   file's own header, and `:cols`, loci's. Reading it runs the reader function
+   against the file every time, projecting the first onto the second."
   [v]
   (and (map? v) (contains? #{:inline :lake :source} (:store v))))
 
