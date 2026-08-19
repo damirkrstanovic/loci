@@ -239,7 +239,14 @@ Expected: PASS, 6 assertions. Now re-run Task 1's test too; it should pass.
 
 - [ ] **Step 5: Prove the test bites**
 
-Change `projection` to return `"*"`, `:reload`, re-run. Expected: FAIL on `(:cols h)` — the columns come back as the raw header names. Restore.
+Change `projection` to return `"*"`, `:reload`, re-run. Expected: FAIL on the `(tbl/rows lk h {})` assertion, with
+
+```
+Binder Error: Referenced column "total_revenue" not found in FROM clause!
+Candidate bindings: "Total Revenue ($)"
+```
+
+**Not** on `(:cols h)`, which passes under the sabotage: the handle's `:cols` is echoed from the caller's argument rather than read back from the table, so it reports what `describe` claimed and not what the CREATE actually built. That is correct — `describe` read the real file — but it means the handle cannot self-check, and the read is what catches a projection that did not do its job. Restore afterwards.
 
 - [ ] **Step 6: Commit**
 
