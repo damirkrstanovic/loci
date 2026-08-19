@@ -112,10 +112,17 @@ to build the abstraction that connector will want.
 | mode | handle | reads |
 |---|---|---|
 | `:materialise` | `{:store :lake :table … :snapshot … :rows … :cols …}` — **unchanged** | `… FROM t AT (VERSION => n)` |
-| `:passthrough` | `{:store :source :uri … :format … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
+| `:passthrough` | `{:store :source :uri … :format … :options … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
 
 The passthrough handle carries its `:at` because `column-samples` receives **only the handle** —
 see "The synopsis cache needs a key that can change" for what it is for.
+
+**It carries its `:options` for the same reason, and this is the easier one to lose.** A read
+rebuilds the relation from the handle alone, so a source connected with `{:delim ";"}` that does
+not record it would read correctly once — `describe` saw the real options — and then fall back to
+DuckDB's sniffer on every read afterwards. The likely symptom is not an error but a spurious
+`:table/source-drift` on a file that never changed, because the sniffer guessed differently
+without the option it was not given.
 
 Passthrough creates **no catalog object**: no DuckLake view, no snapshot to fake, nothing for GC
 to track. `Lake` executes both — a `:source` handle inlines the relation expression where a

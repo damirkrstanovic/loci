@@ -1290,11 +1290,16 @@ Append to `src/loci/source.clj`:
    nothing and keeps the recipe."
   [lk id src d at]
   (if (= :passthrough (:mode src))
-    {:store :source :uri (:uri src) :format (:format src)
-     :options (:options src)
-     :cols (mapv :col (:cols d))
-     :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
-     :at at}
+    (cond-> {:store :source :uri (:uri src) :format (:format src)
+             :cols (mapv :col (:cols d))
+             :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
+             :at at}
+      ;; `:options` are load-bearing on the handle, not decoration: every read
+      ;; rebuilds the relation from the handle alone, so a source connected with
+      ;; `{:delim ";"}` that did not record it would read right once and then
+      ;; fall back to the sniffer forever after. `cond->` rather than an
+      ;; unconditional key so a source with no options gets no `:options nil`.
+      (seq (:options src)) (assoc :options (:options src)))
     (lake/create-from-relation! lk id (:cols d) (:relation d))))
 
 (defn- source-of

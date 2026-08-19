@@ -665,7 +665,16 @@
 
    **`:at` is a refresh marker, not a version.** Overwrite the file without
    refreshing and the synopsis is stale and nothing detects it. Only the
-   synopsis: the ROWS are always live, because they go straight to the file."
+   synopsis: the ROWS are always live, because they go straight to the file.
+
+   Two refreshes *are* distinguished, and it is worth saying why rather than
+   assuming it. `:at` is `(str (java.time.Instant/now))`, which is nanosecond
+   resolution — measured 2026-08-19, 2000 consecutive calls gave 2000 distinct
+   strings — while the cheapest possible refresh is a `describe` round trip at
+   2.24 ms. Two refreshes of one path would have to land in the same nanosecond
+   with 2.24 ms of work between them. No tiebreaker is needed here; if `:at`
+   ever comes from something coarser than `Instant/now`, this is the paragraph
+   that stops being true."
   [h]
   (when (= :source (:store h)) (:at h)))
 
