@@ -810,19 +810,37 @@ Append to `test/loci/source_test.clj`:
       (is (= {:a ["second"]} (tbl/column-samples lk (assoc h :at "2026-08-19T11:00:00Z") 3 8))
           "a new :at is a new key, so refresh is what moves a synopsis"))))
 
-(deftest two-source-handles-with-the-same-columns-do-not-share-samples
-  ;; N tables with identical headers is ordinary. The id is what separates them,
-  ;; and it must be in the key.
-  (let [lk @lake/lake]
-    (let [jan (csv! "a\njanuary\n")
-          feb (csv! "a\nfebruary\n")
-          at  "2026-08-19T10:00:00Z"]
-      (is (= {:a ["january"]}
-             (tbl/column-samples lk {:store :source :id "tbl:jan" :uri jan :format :csv
-                                     :cols [:a] :rows 1 :at at} 3 8)))
-      (is (= {:a ["february"]}
-             (tbl/column-samples lk {:store :source :id "tbl:feb" :uri feb :format :csv
-                                     :cols [:a] :rows 1 :at at} 3 8))))))
+(deftest two-source-handles-at-different-paths-do-not-share-samples
+  ;; N tables with identical headers is ordinary, and what separates them is the
+  ;; PATH, which is already in the FROM text — not the object id. Same `:at`
+  ;; deliberately, so the only thing that can be doing the separating is `from`.
+  (let [lk @lake/lake
+        jan (csv! "a\njanuary\n")
+        feb (csv! "a\nfebruary\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["january"]}
+           (tbl/column-samples lk {:store :source :id "tbl:jan" :uri jan :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (is (= {:a ["february"]}
+           (tbl/column-samples lk {:store :source :id "tbl:feb" :uri feb :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))))
+
+(deftest two-source-handles-at-one-path-share-samples-on-purpose
+  ;; The other half, and the reason the object id is NOT in the key: one file is
+  ;; one set of bytes, so two handles reading it must agree. A test that only
+  ;; ever compares different files cannot tell an id-keyed cache from a
+  ;; path-keyed one, and would pass with the key wrong.
+  (let [lk  @lake/lake
+        uri (csv! "a\nshared\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :id "tbl:one" :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (spit (subs uri 7) "a\nrewritten\n")
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :id "tbl:two" :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8))
+        "a different id at the same path and the same :at is the same cache entry")))
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -864,27 +882,33 @@ In `src/loci/lake.clj`, add `[loci.sourcespec :as ssp]` to the ns `:require`, th
     (ssp/relation h (ssp/locate (:uri h)))
     (str (:table h) " AT (VERSION => " (long (:snapshot h)) ")")))
 
-(defn- samples-key
-  "What identifies the bytes a handle's samples came from.
+(defn- samples-version
+  "What `from-of` cannot say: **which bytes**. nil when the FROM text already
+   settles it.
 
-   A cache key here does two jobs — **separate** different tables, and **change**
-   when one table's bytes change. For a lake handle the table name does both in
-   one token, because every write mints a new name; that is why the key has
-   never carried an object id.
+   A cache key here does two jobs — separate different tables, and change when
+   one table's bytes change — and for a `:lake` handle the FROM text does both
+   on its own, because it names the table *and* the snapshot and a write never
+   overwrites. Measured 2026-08-19: two `put-rows!` under one object id land in
+   `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. So there is nothing to add,
+   and nil is the whole answer.
 
-   A `:source` handle splits them. Its id separates it from every other source
-   and never moves, while the file underneath can be overwritten any number of
-   times — so keying on the id alone would compute the samples once, on the
-   first read, and never again. It takes the id AND the `:at` of the connect or
-   refresh that last looked.
+   A `:source` handle's FROM text names a path, and the file at that path can be
+   rewritten with no event anywhere. Its `:at` — the instant of the connect or
+   refresh that last looked — is the only thing that moves when the bytes do.
+
+   **The object id is deliberately NOT here.** It looks like it belongs, because
+   an id is what separates two tables; but two source handles sharing a path
+   share bytes, so sharing their samples is correct rather than a collision, and
+   the path is already in the FROM text. An id in this key would be a component
+   no test could distinguish — which is worse than absent, because it reads as a
+   guarantee.
 
    **`:at` is a refresh marker, not a version.** Overwrite the file without
    refreshing and the synopsis is stale and nothing detects it. Only the
    synopsis: the ROWS are always live, because they go straight to the file."
   [h]
-  (if (= :source (:store h))
-    [:source (:id h) (:at h)]
-    [:lake (:table h) (:snapshot h)]))
+  (when (= :source (:store h)) (:at h)))
 ```
 
 Change `sample-cache`'s memoized function to take the key and the FROM text — replace its argument vector and the `FROM` fragment inside the SQL:
@@ -932,7 +956,7 @@ Then replace the four `extend-type Lake` methods that touch a handle:
     (when-not (= :source (:store h)) (dropped-at lk (:table h))))
 
   (column-samples [lk h per-col max-cols]
-    (sample-cache lk (samples-key h) (from-of h)
+    (sample-cache lk (samples-version h) (from-of h)
                   (vec (take max-cols (:cols h))) per-col)))
 ```
 
@@ -950,7 +974,9 @@ Expected: PASS on both namespaces, 0 failures. `loci.lake-test` matters here —
 
 - [ ] **Step 6: Prove the tests bite**
 
-Change `samples-key`'s `:source` branch to `[:source (:id h)]` (drop `at`), `:reload`, re-run. Expected: FAIL on `a-source-handle-keys-its-samples-on-id-and-at` — the third assertion, the one that says a refresh moves the synopsis. Then change it to `[:source (:at h)]` (drop the id). Expected: FAIL on `two-source-handles-with-the-same-columns-do-not-share-samples`. Restore.
+Make `samples-version` return `nil` unconditionally, `:reload`, re-run. Expected: FAIL on `a-source-handle-keys-its-samples-on-id-and-at`, third assertion — a new `:at` no longer moves the synopsis, so a refreshed source keeps describing the file it saw first.
+
+Then check the other direction, which is the one that matters for whether the key is honest: **add** `(:id h)` back into `samples-version`'s `:source` branch and re-run. Expected: **everything still passes.** That is the finding, not a failure — it is why the id is not in the key. A component no test can distinguish reads as a guarantee and is not one. Restore.
 
 - [ ] **Step 7: Commit**
 
