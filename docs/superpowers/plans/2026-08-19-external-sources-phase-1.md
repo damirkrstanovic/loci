@@ -510,7 +510,16 @@ Create `src/loci/sourcespec.clj`:
         (str (sub/data-dir) "/" rel))
 
       (str/starts-with? uri "file://")
-      (let [p (.getPath (java.net.URI. uri))]
+      ;; `java.net.URI.` throws its own `URISyntaxException` before the blank
+      ;; check can run — a bare `file://` gives "Expected authority at index 7",
+      ;; which names neither loci nor the thing the caller typed. Every other
+      ;; branch here answers with an `ex-info` carrying `:uri`, and `describe`'s
+      ;; catch turns the message into what the shell shows, so this one does too.
+      (let [p (try (.getPath (java.net.URI. uri))
+                   (catch java.net.URISyntaxException e
+                     (throw (ex-info (str "not a usable file:// location: " uri
+                                          " — " (.getMessage e))
+                                     {:uri uri} e))))]
         (when (str/blank? p)
           (throw (ex-info (str "file:// location has no path: " uri) {:uri uri})))
         p)
@@ -554,7 +563,14 @@ Create `src/loci/sourcespec.clj`:
   "A source → the SQL relation expression that reads it at `location`.
 
    Options are emitted in key order so the text is deterministic and the whole
-   function is testable with `=`. DuckDB does not care about the order."
+   function is testable with `=`. DuckDB does not care about the order.
+
+   Ordered by the key's NAME rather than the key, because `sort-by key` is a
+   partial comparator: two options whose keys are a string and a keyword —
+   reachable by hand from the REPL facade, if not from a JSON body — throw a
+   `ClassCastException` out of the sort before `opt-sql` can refuse them with a
+   sentence. Same order for a keyword-only map, one word longer, and the
+   friendly error always wins."
   [{:keys [format options]} location]
   (let [f (get readers format)]
     (when-not f
@@ -575,7 +591,7 @@ Create `src/loci/sourcespec.clj`:
 (clojure.test/run-tests 'loci.sourcespec-test)
 ```
 
-Expected: PASS, 8 tests, 0 failures.
+Expected: PASS, 12 tests, 0 failures.
 
 - [ ] **Step 5: Prove the tests bite**
 

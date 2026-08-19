@@ -48,7 +48,16 @@
         (str (sub/data-dir) "/" rel))
 
       (str/starts-with? uri "file://")
-      (let [p (.getPath (java.net.URI. uri))]
+      ;; `java.net.URI.` throws its own `URISyntaxException` before the blank
+      ;; check can run — a bare `file://` gives "Expected authority at index 7",
+      ;; which names neither loci nor the thing the caller typed. Every other
+      ;; branch here answers with an `ex-info` carrying `:uri`, and `describe`'s
+      ;; catch turns the message into what the shell shows, so this one does too.
+      (let [p (try (.getPath (java.net.URI. uri))
+                   (catch java.net.URISyntaxException e
+                     (throw (ex-info (str "not a usable file:// location: " uri
+                                          " — " (.getMessage e))
+                                     {:uri uri} e))))]
         (when (str/blank? p)
           (throw (ex-info (str "file:// location has no path: " uri) {:uri uri})))
         p)

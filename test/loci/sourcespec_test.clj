@@ -68,3 +68,13 @@
                nil (catch clojure.lang.ExceptionInfo e e))]
     (is (some? e) "the option-name guard must win, not the comparator")
     (is (= "1=1" (:option (ex-data e))))))
+
+(deftest locate-answers-a-malformed-file-uri-in-locis-own-voice
+  ;; `java.net.URI.` throws first, and its own message — "Expected authority at
+  ;; index 7: file://" — names neither loci nor what the caller typed. Every
+  ;; other refusal here is an ex-info carrying :uri, and this one must be too,
+  ;; because `describe`'s catch turns the message into what the shell shows.
+  (doseq [bad ["file://" "file://a b/c"]]
+    (let [e (try (ssp/locate bad) nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str "must be an ex-info, not a raw URISyntaxException: " bad))
+      (is (= bad (:uri (ex-data e)))))))
