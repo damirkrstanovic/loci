@@ -56,13 +56,36 @@
     (tbl/check-names! (map :raw cols))
     {:cols cols :relation rel}))
 
+(def ^:private slug-max
+  "How long the readable half of a minted id may be.
+
+   A bound, not a preference. `connect!` is the first path in loci from
+   **user-supplied text** to a lake table name, and `lake/table-name` renders
+   that id as a *filesystem path component* — DuckLake writes one directory per
+   table. ext4 caps a name component at 255 bytes, and `table-name` spends 11 of
+   them on its `t_` prefix and `_<8 hex>` suffix, leaving 244.
+
+   Measured 2026-08-19: a 500-character title took `connect!` in `:materialise`
+   mode to
+
+     IO Error: Failed to create directory …/t_tbl_aaa…aaa_6f4ec946:
+     File name too long
+
+   which names neither loci nor the title that caused it. 64 is well inside the
+   headroom and still long enough that a slug reads as its title; the id stays
+   unique regardless, because uniqueness lives in the `-2`/`-3` suffix here and
+   in a content hash in `table-name`."
+  64)
+
 (defn- slug
   "A title → the readable half of an object id: `\"Q3 Revenue ($)\"` → `revenue`
    is wrong, `q3_revenue` is right. Letters, digits and underscores only."
   [title]
   (let [s (-> (str title) str/lower-case
               (str/replace #"[^a-z0-9]+" "_")
-              (str/replace #"^_+|_+$" ""))]
+              (str/replace #"^_+|_+$" ""))
+        s (cond-> s (> (count s) slug-max) (subs 0 slug-max))
+        s (str/replace s #"_+$" "")]
     (if (str/blank? s) "table" s)))
 
 (defn- mint-id
@@ -70,7 +93,18 @@
 
    Readable rather than `tbl:csv-<count>-<rand>`, which is one of the
    count-plus-random minters `loci.corpus` already refuses to go through: a
-   count falls when an object is removed and then mints an id that is taken."
+   count falls when an object is removed and then mints an id that is taken.
+
+   **It recycles a deleted id, and that is accepted rather than overlooked.**
+   The check is `contains?` against the objects that exist *now*, so deleting
+   `tbl:dup-2` and connecting again mints `tbl:dup-2` — measured 2026-08-19.
+   Nothing live ever collides, which is the property that matters, and the two
+   things that could care do not: the log is append-only, so an `as-of` before
+   the delete still resolves the old object and one after resolves the new; and
+   `loci.chunks` is derived and staleness there is by content hash, so the next
+   sweep rebuilds. Never recycling would mean walking the whole log for every
+   id the store has ever named, which is a cost against a failure nobody has
+   had."
   [st title]
   (let [objs (sub/objects st)
         base (str "tbl:" (slug title))]

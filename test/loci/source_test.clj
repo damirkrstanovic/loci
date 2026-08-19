@@ -371,3 +371,31 @@
                        :value (tbl/table-object lk "tbl:hand" "Hand" [{:a 1}])})
       (is (thrown? clojure.lang.ExceptionInfo (src/refresh! st "tbl:hand"))
           "a table nobody connected has no recipe to re-run"))))
+
+(deftest a-very-long-title-still-connects
+  ;; `connect!` is the first path in loci from user-supplied text to a lake
+  ;; table name, and `lake/table-name` renders an id as a filesystem path
+  ;; component. Measured 2026-08-19, before `slug-max`: a 500-character title
+  ;; took materialise mode to `IO Error: Failed to create directory
+  ;; "…/t_tbl_aaa…aaa_6f4ec946": File name too long`.
+  (let [uri (csv! "a\n1\n")
+        r   (src/connect! (sub/fresh-store)
+                          {:uri uri :format :csv :mode :materialise
+                           :title (apply str (repeat 500 "a"))})]
+    (is (nil? (:error r)))
+    (is (< (count (:id r)) 80) "the readable half is bounded, not the whole title")
+    (is (= 1 (:rows r)) "and it really landed"))
+  ;; passthrough never touches the filesystem, so it must survive it too
+  (let [uri (csv! "a\n1\n")
+        r   (src/connect! (sub/fresh-store)
+                          {:uri uri :format :csv :mode :passthrough
+                           :title (apply str (repeat 500 "b"))})]
+    (is (nil? (:error r)))
+    (is (< (count (:id r)) 80))))
+
+(deftest a-title-with-no-usable-characters-still-mints-an-id
+  (doseq [t ["!!! *** ???" "" "   " nil]]
+    (let [r (src/connect! (sub/fresh-store)
+                          {:uri (csv! "a\n1\n") :format :csv
+                           :mode :passthrough :title t})]
+      (is (re-matches #"tbl:[a-z0-9_]+" (:id r)) (str "unusable id for title " (pr-str t))))))
