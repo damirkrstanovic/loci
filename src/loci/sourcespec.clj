@@ -120,16 +120,89 @@
            (str ", " (str/join ", " (map opt-sql (sort-by (comp name key) options)))))
          ")")))
 
-(defn readable?
-  "True when `uri` names a file this process can read right now.
+(defn duckdb-said
+  "The one line of a DuckDB JDBC failure that says what actually went wrong.
 
-   The one thing that tells `:table/unavailable` from `:table/source-drift`: a
-   query can fail because the bytes are gone, or because they are there and no
-   longer match the columns recorded at connect. The first is a missing source,
-   the second is a changed one, and a reader does different things about them.
+   A missing file is the commonest way a source fails — a typo, a moved file, a
+   `loci://` name that was never uploaded — and it is the only failure in
+   `loci.source` that arrives as a `SQLException` rather than an `ex-info`,
+   because it is DuckDB that notices rather than loci. Raw, that message is four
+   lines:
 
-   False rather than a throw for a location `locate` refuses, because this is
-   asked on the failure path and must not raise a second error over the first."
+     Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result
+     Error: IO Error: No files found that match the pattern \"/no/such/file.csv\"
+
+     LINE 1: DESCRIBE SELECT * FROM read_csv('/no/such/file.csv')
+                                    ^
+
+   The first line is the JDBC driver describing its own state and says nothing
+   about the source; the last two are a SQL dump of text loci generated. Only
+   the `Error:` line is about what the caller did. `describe`'s callers put
+   `.getMessage` straight into a JSON body — `server.clj` does this at every
+   route — so this is what the shell shows.
+
+   Lives here rather than in `loci.source` because `tablestore/hydrate` needs it
+   too, for the message it carries under `:table/source-drift`, and `tablestore`
+   cannot require `loci.source` without closing a cycle.
+
+   **The whole `Error:` paragraph, not just its first line.** A missing file is
+   one line, but a drifted one is two, and the second is the actionable half.
+   Measured 2026-08-19, for a source recorded with columns `a,b` whose file now
+   holds `c,d`:
+
+     Error: Binder Error: Referenced column \"a\" not found in FROM clause!
+     Candidate bindings: \"c\"
+
+   `Candidate bindings` is what names the columns the file has NOW — the one
+   thing a reader needs in order to reconnect it — and a first-line-only rule
+   drops it. The paragraph ends at the blank line before the `LINE 1:` dump, so
+   nothing about the missing-file message changes: its `Error:` line is followed
+   by that blank immediately."
+  [^Throwable e]
+  (let [ls   (map str/trim (str/split-lines (str (.getMessage e))))
+        para (->> ls
+                  (drop-while #(not (str/starts-with? % "Error: ")))
+                  (take-while (complement str/blank?)))]
+    (or (when (seq para)
+          (str/join " " (cons (subs (first para) 7) (rest para))))
+        (first (remove str/blank? ls))
+        (str e))))
+
+(defn unreadable-because
+  "Why `uri` cannot be read as a file right now, as a phrase — or nil when it
+   can.
+
+   This is what tells `:table/unavailable` from `:table/source-drift`: a
+   passthrough read can fail because the bytes are not there, or because they
+   are and no longer match the columns recorded at connect. Those want different
+   repairs — find the file, versus reconnect it — so guessing between them
+   badly is worse than not classifying at all.
+
+   **A phrase rather than a boolean, and it is the phrase that gets shown.**
+   DuckDB's own message for an unreadable file is not usable: for a `chmod 000`
+   file its JDBC driver reports four lines, three of which are the driver
+   describing its own state and a dump of SQL loci generated, and for some it
+   throws a bare `NullPointerException` — `Cannot invoke
+   \"java.lang.Number.doubleValue()\" because \"x\" is null` — which names
+   nothing at all. loci has already looked at the filesystem by this point and
+   knows the real answer, so it says it rather than forwarding that.
+
+   **A directory is unreadable here, and `.canRead` disagrees.** Java calls a
+   directory readable when its listing can be enumerated, so a boolean built on
+   `.canRead` alone reports a source pointed at a directory as *drift* — telling
+   the reader to reconnect a file that does not exist and never will. Measured
+   2026-08-19.
+
+   nil rather than a throw for a location `locate` refuses: this is asked on the
+   failure path and must not raise a second error over the first."
   [uri]
-  (try (.canRead (java.io.File. ^String (locate uri)))
-       (catch Exception _ false)))
+  (try
+    (let [f (java.io.File. ^String (locate uri))]
+      (cond
+        (not (.exists f))  (str "there is no file at " (.getPath f))
+        (.isDirectory f)   (str (.getPath f) " is a directory, not a file")
+        (not (.isFile f))  (str (.getPath f) " is not a regular file")
+        (not (.canRead f)) (str (.getPath f) " is not readable by " (sub/running-as))
+        :else nil))
+    (catch Exception e
+      (str "loci cannot resolve " uri " — " (.getMessage e)))))

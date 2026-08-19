@@ -3,6 +3,7 @@
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.source :as src]
+            [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -170,7 +171,7 @@
     (is (= 1 (:table/total o)) "the count survives on the handle")
     (is (= [:a] (:table/cols o)))
     (is (true? (:table/passthrough o)) "still a live source, just an unreachable one")
-    (is (string? (:table/unavailable o)) "carrying what the store actually said")
+    (is (string? (:table/unavailable o)) "carrying loci's own account of why")
     (is (nil? (:table/source-drift o)))))
 
 (deftest hydrate-degrades-when-the-columns-changed
@@ -191,3 +192,44 @@
                              :value {:store :lake :table "t_does_not_exist"
                                      :snapshot 1 :rows 1 :cols [:a]}}))
       "a broken lake stays a broken lake — only a deliberate loss is swallowed"))
+
+(deftest a-directory-is-unavailable-not-drift
+  ;; File.canRead says a directory is readable, so a boolean built on it alone
+  ;; tells the reader to reconnect a file that does not exist and never will.
+  (let [d (java.io.File. (str (System/getProperty "java.io.tmpdir")
+                              "/src-dir-" (System/nanoTime)))]
+    (.mkdirs d)
+    (let [uri (str "file://" (.getAbsolutePath d))
+          o   (tbl/hydrate @lake/lake
+                           (src-obj {:store :source :uri uri :format :csv
+                                     :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+      (is (nil? (:table/source-drift o)) "a directory is not a changed file")
+      (is (string? (:table/unavailable o)))
+      (is (re-find #"is a directory, not a file" (:table/unavailable o))))))
+
+(deftest an-unavailable-message-is-locis-own-words
+  (let [uri (csv! "a\n1\n")
+        _   (.delete (java.io.File. ^String (subs uri 7)))
+        o   (tbl/hydrate @lake/lake
+                         (src-obj {:store :source :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+    (is (re-find #"there is no file at " (:table/unavailable o)))
+    (is (not (re-find #"pending query result" (:table/unavailable o)))
+        "not the driver's account of its own state")
+    (is (not (re-find #"LINE 1" (:table/unavailable o)))
+        "and not a dump of SQL the caller never wrote")))
+
+(deftest a-drift-message-names-the-columns-the-file-has-now
+  (let [uri (csv! "a,b\n1,x\n")
+        _   (spit (subs uri 7) "c,d\n1,x\n")
+        o   (tbl/hydrate @lake/lake
+                         (src-obj {:store :source :uri uri :format :csv
+                                   :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+    (is (nil? (:table/unavailable o)))
+    (is (re-find #"Candidate bindings" (:table/source-drift o))
+        "DuckDB's message is the actionable half here — it names what IS there")
+    (is (not (re-find #"pending query result" (:table/source-drift o)))
+        "but still without the driver's preamble")))
+
+(deftest unreadable-because-answers-nil-for-a-good-file
+  (is (nil? (ssp/unreadable-because (csv! "a\n1\n")))))

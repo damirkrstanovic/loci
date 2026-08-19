@@ -391,11 +391,17 @@
    carries `:table/passthrough true` beside its rows, so a reader can tell that
    its `:table/total` is the count recorded at connect rather than a fact about
    the file right now. A failing one degrades exactly as a reclaimed one does —
-   `:value []`, the count and cols off the handle — and carries the store's own
-   message under `:table/unavailable` when the file cannot be read, or
-   `:table/source-drift` when it can be read but no longer matches the columns
-   recorded at connect. Those are different repairs: find the file, versus
-   reconnect it."
+   `:value []`, the count and cols off the handle — and carries a marker saying
+   which repair it needs: `:table/unavailable` when there is no readable file
+   there, or `:table/source-drift` when there is one and it no longer matches
+   the columns recorded at connect. Find the file, versus reconnect it.
+
+   **The two markers carry messages from different places, deliberately.**
+   `:table/unavailable` carries loci's own phrase, because loci looked at the
+   filesystem to choose this branch and knows the real answer — where DuckDB's
+   driver, for an unreadable file, reports either a four-line dump or a bare
+   `NullPointerException`. `:table/source-drift` carries DuckDB's, because there
+   the message is the actionable part: it names the columns the file has now."
   [ts o]
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
@@ -413,11 +419,10 @@
           ;; count survive because they live on the handle, not in the rows.
           (let [gone (assoc o :value [] :table/total (:rows h) :table/cols (:cols h))]
             (if pt
-              (assoc gone :table/passthrough true
-                          (if (ssp/readable? (:uri h))
-                            :table/source-drift
-                            :table/unavailable)
-                          (str (.getMessage e)))
+              (if-let [why (ssp/unreadable-because (:uri h))]
+                (assoc gone :table/passthrough true :table/unavailable why)
+                (assoc gone :table/passthrough true
+                            :table/source-drift (ssp/duckdb-said e)))
               (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
                 (assoc gone :table/reclaimed at)
                 (throw e)))))))
