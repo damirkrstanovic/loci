@@ -3,9 +3,14 @@
    DuckDB can address, and a source becomes the SQL relation expression that
    reads it.
 
-   No lake, no file, no network, no clock — so every test here is an `=`, and
-   the connector-specific part of the framework is the part you can be sure of
-   without a fixture.
+   No lake, no network, no clock — so `locate`, `relation` and `duckdb-said` are
+   testable with `=`, and the connector-specific part of the framework is the
+   part you can be sure of without a fixture.
+
+   **`unreadable-because` is the exception, and deliberately so**: it asks the
+   filesystem, because telling a missing source from a changed one is a question
+   only the filesystem can answer, and answering it by matching on DuckDB's
+   error text would be the fragile alternative. Its tests use temp files.
 
    It is also what breaks the cycle. `loci.lake` needs `relation` to read a
    `:source` handle; `loci.source` needs `loci.lake` to run anything. Both
@@ -193,8 +198,10 @@
    the reader to reconnect a file that does not exist and never will. Measured
    2026-08-19.
 
-   nil rather than a throw for a location `locate` refuses: this is asked on the
-   failure path and must not raise a second error over the first."
+   A phrase rather than a throw for a location `locate` refuses, too — this is
+   asked on the failure path, while an error is already being handled, and must
+   never raise a second one over the first. So every branch answers, including
+   the one where the uri itself is the problem."
   [uri]
   (try
     (let [f (java.io.File. ^String (locate uri))]

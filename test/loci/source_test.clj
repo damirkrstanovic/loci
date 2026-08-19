@@ -233,3 +233,27 @@
 
 (deftest unreadable-because-answers-nil-for-a-good-file
   (is (nil? (ssp/unreadable-because (csv! "a\n1\n")))))
+
+(deftest an-unreadable-file-is-unavailable-and-says-who-cannot-read-it
+  ;; The fourth branch of `unreadable-because`, and the only one no other test
+  ;; reaches. Written with the skip rather than omitted, which is the pattern
+  ;; `loci.lake-test/an-unusable-extension-directory-says-so` already keeps and
+  ;; the reason `sub/effective-user` is public: root can read a 0000 file, so
+  ;; there is no refusal to provoke and every assertion below would pass while
+  ;; exercising nothing. Say so rather than reporting a green.
+  (let [f (java.io.File/createTempFile "noperm-" ".csv")]
+    (spit f "a\n1\n")
+    (.setReadable f false false)
+    (if (or (= 0 (:uid (sub/effective-user))) (.canRead f))
+      (println "SKIPPED an-unreadable-file-is-unavailable-and-says-who-cannot-read-it:"
+               "this process can read a file it just made unreadable")
+      (let [uri (str "file://" (.getAbsolutePath f))
+            o   (tbl/hydrate @lake/lake
+                             (src-obj {:store :source :uri uri :format :csv
+                                       :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+        (is (nil? (:table/source-drift o)) "unreadable is not changed")
+        (is (re-find #"is not readable by " (:table/unavailable o)))
+        (is (re-find (re-pattern (str (:uid (sub/effective-user)))) (:table/unavailable o))
+            "and it names who could not read it, because that is the repair")))
+    (.setReadable f true false)
+    (.delete f)))

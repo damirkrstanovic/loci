@@ -396,6 +396,11 @@
    there, or `:table/source-drift` when there is one and it no longer matches
    the columns recorded at connect. Find the file, versus reconnect it.
 
+   **`:table/passthrough` says how a table is stored, never whether it is well.**
+   It is `true` on all three shapes, the two failures included, so a reader must
+   not take it for a liveness signal — ask the specific marker. `loci.tablestore/unusable`
+   is the one answer to that question and the thing readers should call.
+
    **The two markers carry messages from different places, deliberately.**
    `:table/unavailable` carries loci's own phrase, because loci looked at the
    filesystem to choose this branch and knows the real answer — where DuckDB's
