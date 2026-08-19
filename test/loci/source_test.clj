@@ -86,3 +86,61 @@
            (:cols (src/describe lk {:uri (f ".csv" "\n") :format :csv}))))
     (is (= [{:raw "json" :col :json :type "JSON"}]
            (:cols (src/describe lk {:uri (f ".json" "[]") :format :json}))))))
+
+(deftest a-source-handle-reads-the-file-on-every-query
+  (let [lk  @lake/lake
+        uri (csv! "a,b\n1,x\n2,y\n")
+        h   {:store :source :uri uri :format :csv
+             :cols [:a :b] :rows 2 :at "2026-08-19T10:00:00Z"}]
+    (is (true? (tbl/handle? h)) "a :source map is a handle")
+    (is (= [{:a 1 :b "x"} {:a 2 :b "y"}] (tbl/rows lk h {})))
+    (is (= 2 (tbl/row-count lk h)) "the count is the one recorded at connect")
+    (is (nil? (tbl/reclaimed-at lk h)) "nothing can reclaim a file loci does not own")
+    ;; the file changes underneath, with no event anywhere
+    (spit (subs uri 7) "a,b\n1,x\n2,y\n3,z\n")
+    (is (= 3 (count (tbl/rows lk h {}))) "reads go to the file, so they see the new row")
+    (is (= 1 (count (tbl/rows lk h {:limit 1}))) "and a page is still a page")))
+
+(deftest a-source-handle-keys-its-samples-on-at
+  (let [lk  @lake/lake
+        uri (csv! "a\nfirst\n")
+        h   {:store :source :uri uri :format :csv
+             :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}]
+    (is (= {:a ["first"]} (tbl/column-samples lk h 3 8)))
+    (spit (subs uri 7) "a\nsecond\n")
+    (is (= {:a ["first"]} (tbl/column-samples lk h 3 8))
+        "same :at, same answer — the synopsis is as of the last connect or refresh")
+    (is (= {:a ["second"]} (tbl/column-samples lk (assoc h :at "2026-08-19T11:00:00Z") 3 8))
+        "a new :at is a new key, so refresh is what moves a synopsis")))
+
+(deftest two-source-handles-at-different-paths-do-not-share-samples
+  ;; N tables with identical headers is ordinary, and what separates them is the
+  ;; PATH, which is already in the FROM text — not any object id. Same `:at`
+  ;; deliberately, so the only thing that can be doing the separating is `from`.
+  (let [lk  @lake/lake
+        jan (csv! "a\njanuary\n")
+        feb (csv! "a\nfebruary\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["january"]}
+           (tbl/column-samples lk {:store :source :uri jan :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (is (= {:a ["february"]}
+           (tbl/column-samples lk {:store :source :uri feb :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))))
+
+(deftest two-source-handles-at-one-path-share-samples-on-purpose
+  ;; The other half, and the reason no object id is in the key: one file is one
+  ;; set of bytes, so two handles reading it must agree. A test that only ever
+  ;; compares different files cannot tell an id-keyed cache from a path-keyed
+  ;; one, and would pass with the key wrong.
+  (let [lk  @lake/lake
+        uri (csv! "a\nshared\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (spit (subs uri 7) "a\nrewritten\n")
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8))
+        "the same path and the same :at is the same cache entry")))

@@ -10,6 +10,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [loci.config :as config]
+            [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -630,6 +631,44 @@
      :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
      :cols  (mapv :col cols)}))
 
+(defn- from-of
+  "The FROM text for a handle: a versioned table, or a source's reader call.
+
+   Both modes go through one function so a read cannot resolve differently from
+   the projection built beside it."
+  [h]
+  (if (= :source (:store h))
+    (ssp/relation h (ssp/locate (:uri h)))
+    (str (:table h) " AT (VERSION => " (long (:snapshot h)) ")")))
+
+(defn- samples-version
+  "What `from-of` cannot say: **which bytes**. nil when the FROM text already
+   settles it.
+
+   A cache key here does two jobs — separate different tables, and change when
+   one table's bytes change — and for a `:lake` handle the FROM text does both
+   on its own, because it names the table *and* the snapshot and a write never
+   overwrites. Measured 2026-08-19: two `put-rows!` under one object id land in
+   `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. So there is nothing to add,
+   and nil is the whole answer.
+
+   A `:source` handle's FROM text names a path, and the file at that path can be
+   rewritten with no event anywhere. Its `:at` — the instant of the connect or
+   refresh that last looked — is the only thing that moves when the bytes do.
+
+   **An object id is deliberately NOT here.** It looks like it belongs, because
+   an id is what separates two tables; but two source handles sharing a path
+   share bytes, so sharing their samples is correct rather than a collision, and
+   the path is already in the FROM text. An id in this key would be a component
+   no test could distinguish — which is worse than absent, because it reads as a
+   guarantee.
+
+   **`:at` is a refresh marker, not a version.** Overwrite the file without
+   refreshing and the synopsis is stale and nothing detects it. Only the
+   synopsis: the ROWS are always live, because they go straight to the file."
+  [h]
+  (when (= :source (:store h)) (:at h)))
+
 (def ^:private sample-cache
   "Samples for a `[table snapshot]`, computed once.
 
@@ -657,9 +696,16 @@
    It retains more than the samples: the key holds the `Lake` it was asked
    about, so an entry pins a JDBC connection. In the server there is one lake
    and so one reference; a test run that opens many leaks one each until the
-   var is rebound. Measure before replacing this with an eviction policy."
+   var is rebound. Measure before replacing this with an eviction policy.
+
+   **`_version` is in the argument list only to be part of the memo key**, and it
+   is what keeps the soundness argument true now that a passthrough handle
+   exists. See `samples-version`: a `:lake` handle contributes nil, because its
+   FROM text already names a table and a snapshot that never change; a `:source`
+   handle contributes its `:at`, because its FROM text names only a path and the
+   file there can be rewritten with no event anywhere."
   (memoize
-   (fn [lk table snapshot cols per-col]
+   (fn [lk _version from cols per-col]
      (into {} (for [c cols]
                 [c (mapv #(str (first (vals %)))
                          ;; Clipped BEFORE the DISTINCT, matching
@@ -669,7 +715,7 @@
                                     " THEN substr(s, 1, " tbl/sample-max-chars ") || '…'"
                                     " ELSE s END AS v FROM ("
                                     "SELECT CAST(" (ident c) " AS VARCHAR) AS s"
-                                    " FROM " table " AT (VERSION => " (long snapshot) ")"
+                                    " FROM " from
                                     " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
@@ -687,17 +733,22 @@
 
   (rows [lk h {:keys [offset limit]}]
     (q-as lk (str "SELECT " (select-cols (:cols h))
-                  " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
+                  " FROM " (from-of h)
                   (when limit  (str " LIMIT "  (long limit)))
                   (when offset (str " OFFSET " (long offset))))
           (:cols h)))
 
   (row-count [_ h] (:rows h))
 
-  (reclaimed-at [lk h] (dropped-at lk (:table h)))
+  (reclaimed-at [lk h]
+    ;; Nothing can reclaim a file loci does not own, so a source handle is never
+    ;; reclaimed — its failure modes are unavailable and drift, which `hydrate`
+    ;; classifies in the next task.
+    (when-not (= :source (:store h)) (dropped-at lk (:table h))))
 
   (column-samples [lk h per-col max-cols]
-    (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
+    (sample-cache lk (samples-version h) (from-of h)
+                  (vec (take max-cols (:cols h))) per-col)))
 
 (defn sweep!
   "Automatic table GC. Disabled, deliberately, and it reports that rather than

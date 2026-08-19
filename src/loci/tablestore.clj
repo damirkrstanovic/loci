@@ -77,9 +77,14 @@
   "True for a handle this namespace produced. The `:store` key is explicit
    rather than inferred from shape, because a table's rows are a vector of maps
    and a handle is a map — close enough that a shape test would be one refactor
-   from being wrong."
+   from being wrong.
+
+   `:source` is the passthrough handle, and it is the odd one: it carries no
+   rows and names no storage, because it IS the recipe — a location, a format
+   and the columns observed when it was connected. Reading it runs the reader
+   function against the file every time."
   [v]
-  (and (map? v) (contains? #{:inline :lake} (:store v))))
+  (and (map? v) (contains? #{:inline :lake :source} (:store v))))
 
 (defn cols-of
   "The column order to preserve: every key any row has, in the order first seen.
