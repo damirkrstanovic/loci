@@ -106,7 +106,11 @@ to build the abstraction that connector will want.
 | mode | handle | reads |
 |---|---|---|
 | `:materialise` | `{:store :lake :table … :snapshot … :rows … :cols …}` — **unchanged** | `… FROM t AT (VERSION => n)` |
-| `:passthrough` | `{:store :source :uri … :format … :cols … :rows …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
+| `:passthrough` | `{:store :source :id … :uri … :format … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
+
+The passthrough handle carries its object `:id` and its `:at` because `column-samples` receives
+**only the handle** — see "The synopsis cache needs a key that can change" for what those two
+are for.
 
 Passthrough creates **no catalog object**: no DuckLake view, no snapshot to fake, nothing for GC
 to track. `Lake` executes both — a `:source` handle inlines the relation expression where a
@@ -120,7 +124,8 @@ the log, so `undo!` walks back to it and `as-of` still resolves it. Refresh is w
 versions come from, and `loci.lakegc` — which already classifies every version of a table by
 object and reclaims the out-of-window ones — bounds them with no change whatever.
 
-For a passthrough source, refresh re-runs `describe`, updates `:cols` and `:at`, and commits.
+For a passthrough source, refresh re-runs `describe` and commits a handle with fresh `:cols`,
+`:rows` and `:at`.
 It moves no bytes because there are none to move.
 
 ## Locations
@@ -200,25 +205,34 @@ modes.
 recomputing a derived table from zero rows and committing the empty result over good data. Every
 marker above gets the same treatment in the same readers.
 
-### The sample cache stops being sound, and this is the day its docstring warned about
+### The synopsis cache needs a key that can change
 
-`lake.clj`'s `sample-cache` memoizes `column-samples` on `[lake table snapshot cols per-col]`
-and argues it is sound rather than merely convenient: *"a handle is immutable, because
-`put-rows!` always creates a new lake table and nothing overwrites one. So a hit is not a stale
-answer, it is the only answer."* It then names its own expiry date — **"whoever adds in-place
-mutation has to invalidate this"**.
+`lake.clj`'s `sample-cache` memoizes `column-samples`, and its docstring names its own expiry
+date: **"whoever adds in-place mutation has to invalidate this."** Passthrough is that day.
 
-A passthrough handle has no `table` and no `snapshot`, and its bytes change without an event. It
-is that mutation. The rule:
+A cache key here answers one question — *which bytes did these samples come from?* — and to
+answer it the key has to do two jobs: **separate** different tables from one another, and
+**change** when the bytes behind one table change. For a materialised table the lake table name
+does both in a single token, because every write mints a new name. That is why the existing key
+carries no object id and has never needed one.
 
-- **Passthrough samples are cached on `[uri format at]`**, where `at` is the source's own
-  `:source :at`. So the cache is still sound by construction — a different `at` is a different
-  key — and the synopsis is explicitly **as of the last connect or refresh**, which is the same
-  thing `:table/total` already is for a passthrough table.
-- **`refresh!` is therefore what moves a passthrough table's synopsis**, and the chunk re-embeds
-  then and only then. Without this, a file rewritten every minute would move its synopsis hash on
-  every sweep and re-embed forever — the failure `tablestore/column-samples` gives ordered
-  sampling to avoid.
+Passthrough splits the two jobs apart, and an object id only does the first. An id is fixed for
+the life of the object while the file underneath it can be overwritten any number of times. Key
+on the id alone and the samples are computed once, on the first read, and never again — replace
+the CSV, refresh, and the table goes on describing the file you deleted, with nothing able to
+invalidate it.
+
+So: **a passthrough handle keys the sample cache on `[id at]`** — the object id for job one, the
+source's `:source :at` for job two, since `at` is the only thing that moves when the operator
+says the bytes changed. It must not reuse `(:table h)` and `(:snapshot h)`, which are `nil` for
+this handle shape.
+
+**The known limit, stated rather than hidden.** For a materialised table the version in the key
+is a fact DuckLake guarantees. For a passthrough table `at` is a claim loci makes on the
+operator's behalf: overwrite the file without refreshing and the synopsis is stale, and nothing
+detects it. Only the synopsis — **the rows are always live and correct**, because reads go
+straight to the file. `at` is a refresh marker, not a version, and the spec does not pretend
+otherwise.
 
 Materialised handles keep the existing key and the existing argument, untouched.
 
