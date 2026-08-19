@@ -1387,7 +1387,17 @@ git commit -m "feat: connect a source, and refresh it as a put rather than a mut
 
 ### Task 9: the four marker readers refuse on an unavailable or drifted source
 
-`server/recompute` already refuses on `:table/reclaimed` rather than recomputing a derived table from zero rows and committing the empty result over good data. Three other readers report it. All four must treat the new markers the same way, or the first missing file silently overwrites good data.
+`server/recompute` already refuses on `:table/reclaimed` rather than recomputing a derived table from zero rows and committing the empty result over good data. Two other readers report it. All three must treat the new markers the same way, or the first missing file silently overwrites good data.
+
+**There is a fifth reader and it is deliberately not routed.** `server/reclaimed-on` feeds
+`table-catalog` and `table-shaped?`, which take **unhydrated** objects on purpose — hydrating a
+whole workspace to write a catalog is the cost `table-shape` exists to avoid — so `unusable`,
+which reads keys only `hydrate` sets, would be a no-op there. Measured 2026-08-19: a passthrough
+source whose file is gone is still listed to the agent by `table-catalog` and still passes
+`table-shaped?`. Nothing acts on its rows — `query_table` and `recompute` both refuse through
+`unusable` — so no data is at risk; the cost is one wasted agent step and a misleading message
+from `compute-clj!`. Closing it needs a filesystem stat per candidate on a path that runs every
+agent turn, for a failure nobody has had, so **phase 1 records it rather than closing it**.
 
 **Files:**
 - Modify: `src/loci/tools.clj:144` (the `query_table` reader)
