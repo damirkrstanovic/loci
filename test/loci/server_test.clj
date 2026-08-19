@@ -4374,7 +4374,8 @@
         (is (= :table (:kind (sub/object st (:openId r))))
             "openObject must find a table there, not a missing id")
         (is (= [{:region "EMEA" :revenue 1}] (rows-of st (:openId r))))
-        (is (= "loci://files/sales-" (subs (:uri (:source (sub/object st (:openId r)))) 0 19))
+        (is (re-matches #"loci://files/[0-9a-f]{16}\.csv"
+                      (:uri (:source (sub/object st (:openId r)))))
             "and the CSV is on disk as a source, so refresh! has something to re-run")))))
 
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
@@ -4791,7 +4792,9 @@
   ;; errors, because it looks like success.
   (lf/with-temp-lake
     (fn []
-      (let [st  (sub/fresh-store)
+      (with-temp-data-dir
+       (fn []
+        (let [st  (sub/fresh-store)
             n   12
             rs  (mapv deref
                       (mapv (fn [i]
@@ -4809,4 +4812,40 @@
                         set)]
           (is (= n (count vals))
               (str "each table must hold the rows its OWN request carried; got "
-                   (count vals) " distinct values across " n " tables")))))))
+                   (count vals) " distinct values across " n " tables")))))))))
+
+(deftest importing-one-file-twice-writes-it-once-and-says-so
+  ;; Content addressing, arriving early from the big-content design's rule for
+  ;; blobs. Nothing deletes <LOCI_DATA>/files, so a unique-per-call name would
+  ;; keep a copy per import forever; a name that IS the content keeps one. And
+  ;; because the name cannot be rewritten with different bytes, a loci://
+  ;; passthrough source re-reading it on every query is safe.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                csv "region,revenue\nEMEA,1\n"
+                a   (srv/import-csv! st "Sales" csv nil)
+                b   (srv/import-csv! st "Sales again" csv nil)
+                c   (srv/import-csv! st "Different" "region,revenue\nAPAC,2\n" nil)
+                dir (io/file (sub/data-dir) "files")]
+            (is (every? nil? (map :error [a b c])))
+            (is (nil? (:duplicateOf a)) "the first import is not a duplicate")
+            (is (= (:openId a) (:duplicateOf b))
+                "the second names the table the first made, rather than refusing")
+            (is (nil? (:duplicateOf c)) "different bytes are not a duplicate")
+            (is (not= (:openId a) (:openId b)) "but it still makes its own table")
+            (is (= 2 (count (.listFiles dir)))
+                "two distinct bodies, two files — the repeat wrote nothing")))))))
+
+(deftest a-hashed-name-survives-a-one-letter-title
+  ;; The bug the previous naming scheme had: File/createTempFile refuses a
+  ;; prefix under three characters, and "C" is a title this file already uses.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [r (srv/import-csv! (sub/fresh-store) "C" "region,revenue\nEMEA,1\n" nil)]
+            (is (nil? (:error r)))
+            (is (some? (:openId r)))))))))

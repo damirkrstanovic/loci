@@ -2059,6 +2059,22 @@
   (try (assoc (src/refresh! st id) :state (state-payload st))
        (catch Exception e {:error (.getMessage e)})))
 
+(defn- content-hash
+  "The first 16 hex characters of `text`'s SHA-256 — the whole name of the file
+   holding that text.
+
+   Sixteen because this IS the filename rather than a suffix on one: 64 bits,
+   so two different CSVs collide at around four billion files, and `data/files`
+   holds one entry per distinct import. The same digest `lake/table-name`
+   truncates for the same reason, kept longer here because there is no other
+   component to fall back on."
+  [text]
+  (->> (.getBytes (str text) "UTF-8")
+       (.digest (java.security.MessageDigest/getInstance "SHA-256"))
+       (take 8)
+       (map #(format "%02x" %))
+       (apply str)))
+
 (defn import-csv!
   "Posted CSV **text** → a table, through the same reader as every other source.
 
@@ -2090,47 +2106,64 @@
    `res.state` and `res.openId`, and those three keys are added there."
   [st title csv space]
   (let [written
-        (try (let [stem (-> (str (or (not-empty title) "imported"))
-                            str/lower-case
-                            (str/replace #"[^a-z0-9._-]+" "-")
-                            (str/replace #"^[.-]+|[.-]+$" ""))
-                   stem (if (str/blank? stem) "imported" stem)
-                   stem (subs stem 0 (min (count stem) 64))
-                   ;; `createTempFile` refuses a prefix under three characters,
-                   ;; and a one-letter title is ordinary — `"C"` in this file's
-                   ;; own tests. Pad rather than truncate the caller's word.
-                   stem (if (< (count stem) 3) (str "csv-" stem) stem)
-                   dir  (io/file (sub/data-dir) "files")]
+        (try (let [dir (io/file (sub/data-dir) "files")
+                   nm  (str (content-hash csv) ".csv")
+                   f   (io/file dir nm)]
                (.mkdirs dir)
-               ;; `createTempFile` rather than a name built from the clock, and
-               ;; this is a data-loss fix rather than tidiness. A
-               ;; `title-<millis>.csv` collides at millisecond resolution:
-               ;; measured 2026-08-19 with 20 concurrent posts of one title,
-               ;; `mint-id` correctly minted 20 distinct table objects while the
-               ;; 20 `spit`s landed on ONE file, and all 20 tables afterwards
-               ;; held whichever body was written last — not the rows their own
-               ;; request carried. The OS mints a name that is unique by
-               ;; construction, which is the same reason `table-name` hashes
-               ;; rather than counts.
+               ;; **The name IS the content, and nothing else is in it.**
                ;;
-               ;; The stem is stripped of leading dots (no accidental dotfile),
-               ;; bounded at 64 (a 500-character title threw `File name too
-               ;; long` and leaked the absolute data path in the error), and
-               ;; kept only so a human can tell the files apart in a listing.
-               (let [f (java.io.File/createTempFile (str stem "-") ".csv" dir)]
-                 (spit f csv)
-                 (.getName f)))
+               ;; A `title-<millis>.csv` name lost data: measured 2026-08-19,
+               ;; 20 concurrent posts of one title minted 20 correct, distinct
+               ;; table objects while the 20 `spit`s landed on ONE file, and
+               ;; every table afterwards held whichever body was written last.
+               ;;
+               ;; A unique-per-call name fixes that but accumulates, and
+               ;; **nothing deletes this directory** — the design says so
+               ;; outright. Content addressing fixes both: the same bytes are
+               ;; one file however many times they arrive, and a file whose
+               ;; name is its content can never be rewritten with different
+               ;; bytes, which is what makes it safe for a `loci://`
+               ;; passthrough source to re-read on every query. It is the rule
+               ;; the big-content design already chose for blobs, arriving
+               ;; early: *a changed image is different bytes, so a different
+               ;; hash, so a different handle*.
+               ;;
+               ;; **No title in the name**, and that is the whole point rather
+               ;; than an omission. A stem would read nicely in a directory
+               ;; listing and would defeat the dedup the moment the same CSV
+               ;; arrived under two titles — measured, `"Sales"` and `"Sales
+               ;; again"` wrote two copies of identical bytes. What a person
+               ;; browses is the table's `:title`; the file is addressed, not
+               ;; named. It also retires a title-shaped class of bug outright:
+               ;; no path separators to strip, no leading dot to hide the file,
+               ;; no 255-byte filename limit to bound, no three-character
+               ;; minimum to pad.
+               ;;
+               ;; Written only when absent — re-writing identical bytes is
+               ;; harmless but not free, and skipping it is what lets the
+               ;; caller be told the file was already here.
+               (when-not (.exists f) (spit f csv))
+               nm)
              ;; Its own catch: an unwritable data directory fails HERE, before
              ;; `source-connect!` — whose catch would otherwise never see it —
              ;; and `handler` has no top-level catch to turn a throw into
-             ;; anything but a stack trace the shell parses as JSON.
+             ;; `{:error …}`.
              (catch Exception e {:error (.getMessage e)}))]
     (if (map? written)
       written
-      (source-connect! st {:uri (str "loci://files/" written)
-                           :format :csv :mode :materialise
-                           :title (or (not-empty title) "Imported CSV")}
-                       space))))
+      (let [uri  (str "loci://files/" written)
+            ;; The table this exact file already made, if any. One pass over
+            ;; the objects, which `mint-id` inside `connect!` is about to make
+            ;; anyway. Reported rather than refused: two tables from one file
+            ;; is a thing someone may well want, and loci's answer to a mistake
+            ;; is `undo!`, not a veto.
+            seen (->> (sub/objects st) vals
+                      (filter #(= uri (:uri (:source %))))
+                      (map :id) sort first)
+            r    (source-connect! st {:uri uri :format :csv :mode :materialise
+                                      :title (or (not-empty title) "Imported CSV")}
+                                  space)]
+        (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.

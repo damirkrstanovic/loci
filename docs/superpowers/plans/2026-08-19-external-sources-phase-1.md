@@ -48,7 +48,7 @@
 | `src/loci/source.clj` | **new.** The facade: `describe`, `connect!`, `refresh!`. Commits events. |
 | `src/loci/lake.clj` | `unwrap` grows temporal types; `create-from-relation!`; `:source` handle reads; the sample-cache key. |
 | `src/loci/tablestore.clj` | `handle?` learns `:source`; `check-names!` extracted; `hydrate` grows three markers. |
-| `src/loci/tools.clj` | `parse-csv` and `->val` deleted; `md-cell-val` returns a string. |
+| `src/loci/tools.clj` | `parse-csv` and `->val` deleted; `md-cell-val` keeps returning a number. |
 | `src/loci/server.clj` | `import-csv!` rewritten as a wrapper; `/api/source/*` routes; four marker readers taught the new keys. |
 | `src/loci/corpus.clj` | imports its five CSVs through `source/describe` instead of `parse-csv`. |
 | `test/loci/sourcespec_test.clj` | **new.** Pure-function tests, no fixture. |

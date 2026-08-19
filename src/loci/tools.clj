@@ -47,9 +47,10 @@
 
    Measured 2026-08-19, handing it a string instead: the lake column comes back
    `VARCHAR`, and `fnlib/numeric-cols` answers `[]` where it answered
-   `[:share]`. The ƒ palette still *offers* Group, Top N, Change and Share —
-   `fnlib/catalog` does not gate on numeric columns — so the loss surfaces only
-   when one is applied, which is the worst place to find it.
+   `[:share]`. `fnlib/catalog` still LISTS Group, Top N, Change and Share, each
+   greyed with `{:ok false :why needs-a-numeric-column}` — `needs-numeric`
+   is wired into all five. So the table is not broken, it is inert: the palette
+   says why, and the user is left reading `~30%` as text nobody can total.
 
    So: extracting a number out of a model's sentence is loci's job, because
    nothing else will ever do it; deciding what that number IS remains DuckDB's."

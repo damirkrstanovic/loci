@@ -232,9 +232,10 @@
             (str "two spellings of one instant: " (pr-str (:reclaimed wire)) " vs " (pr-str err)))))))
 
 (deftest a-salvaged-number-column-is-numeric-to-the-palette
-  ;; The property that actually degrades if `md-cell-val` returns a string. The
-  ;; ƒ catalog does NOT gate on this — it offers Group, Top N, Change and Share
-  ;; either way — so a string column loses them at apply time, not at offer
-  ;; time, which is why this pins `numeric-cols` rather than `catalog`.
+  ;; The property that actually degrades if `md-cell-val` returns a string.
+  ;; Pinned on `numeric-cols` rather than on `catalog` because `catalog` still
+  ;; LISTS Group, Top N, Change and Share — greyed, with a :why naming a numeric
+  ;; column"` — so its shape does not change and an assertion on it would not
+  ;; bite. What changes is whether the column counts as a number at all.
   (let [rows (tools/md-table->rows "| region | share |\n|---|---|\n| EMEA | ~30% |\n| APAC | ~25% |\n")]
     (is (= [:share] (fnlib/numeric-cols rows)))))
