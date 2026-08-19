@@ -390,6 +390,141 @@ fixture can establish that a mechanism works and never that a cost is real.
 5. **Every regression test proved to fail when its fix is reverted.** A test that passes either
    way is worse than none, because it certifies.
 
+## Measured
+
+Measured **2026-08-20**, on the machine this was written on: 6 cores, 15 GiB RAM, JDK default max
+heap **3,976 MB** — no `-Xmx` given, because the default is what `clojure -M:serve` runs with and
+item 4 below only means anything against it. DuckDB 1.5.5.1, `memory_limit` 12.4 GiB, `threads` 6.
+
+Method, because the numbers are only as good as it. Each figure is its own fresh JVM, so nothing
+carries over between sizes. Memory is **sampled on a 20 ms daemon thread for the length of every
+call** and the maximum reported — heap as `.totalMemory - .freeMemory`, process RSS as field 2 of
+`/proc/self/statm` — because a before/after delta misses the peak entirely; a triple `System/gc`
+brackets each call for the live-heap figures beside it. The fixture lives on real disk under
+`/var/tmp`, deliberately **not** on this machine's `/tmp`, which is a tmpfs and would have made
+the file's own bytes count against RAM.
+
+Item 3 of the list above — the corpus re-import — belongs to its own plan task and is not in this
+run.
+
+### The file
+
+`id,region,amount,day`, from which DuckDB infers `BIGINT, VARCHAR, DOUBLE, DATE`; `region` carries
+six distinct values.
+
+| rows | bytes | generated in |
+|---|---|---|
+| 10,000,000 | 417,658,901 (398 MiB) | 2,457 ms |
+| 1,000,000 | 40,765,900 (39 MiB) | 296 ms |
+
+398 MiB rather than the ~500 MB asked for above. The row count is the target and it is exact; the
+byte count falls out of the column shape.
+
+### 1. Materialise — memory does not scale with the file
+
+| | 1M rows / 39 MiB | 10M rows / 398 MiB |
+|---|---|---|
+| `source/connect!` wall | 238 ms | **893 ms** |
+| peak JVM heap | 57 MB | **57 MB** |
+| live heap, before → after | 55 → 55 MB | 55 → 55 MB |
+| peak process RSS | 744 MB | 953 MB |
+| RSS across the call | 620 → 712 MB | 585 → 914 MB |
+| Parquet written | 9.3 MB | 89 MB |
+
+Repeated three times in one JVM at 10M, because 893 ms was surprising enough to want measuring
+twice: 751 / 747 / 792 ms, peak heap 56 / 56 / 57 MB, RSS 609 → 725 → 766 → 873 MB, and DuckDB's
+own `duckdb_memory()` reporting 4.0 / 6.4 / 6.4 MB throughout. Each of the three tables verified
+independently — `count(*)` 10,000,000, `min(id)` 1, `max(id)` 10,000,000, six distinct regions,
+identical `sum(amount)`.
+
+**This is the claim the design rests on, and it holds — with one correction.** The JVM heap is
+flat to the megabyte: 57 MB at 1M and 57 MB at 10M, live heap 55 MB either side, because the rows
+never enter this process. Process **RSS is not flat**, and pretending otherwise would be the easy
+lie here: a file 10× larger cost 3.6× the RSS delta, +92 MB against +329 MB. That is DuckDB's
+native buffer manager, bounded by its own `memory_limit` rather than by the file — three
+successive passes over the same 398 MiB added ~90 MB each, not 398 MB each.
+
+The 893 ms also settles the note above about `put-rows!`. DuckDB reading the CSV directly is
+**three times faster** than the 2.9 s NDJSON path, from a starting state — a file on disk — that
+the NDJSON path cannot reach at all.
+
+### 2. Passthrough at 10M rows
+
+| | |
+|---|---|
+| `DESCRIBE SELECT *` — the sniff `describe` runs | 42 ms |
+| `SELECT count(*)` over the whole 398 MiB file | 244 ms (246 ms on a repeat) |
+| `connect!` with `:mode :passthrough`, total | **294 ms** |
+| bytes written to the lake | **21,543** — catalog only, no Parquet |
+| `tbl/hydrate` — the `LIMIT 2000` render plus `row-count` | 124 ms cold, 94 ms warm |
+| peak heap during hydrate | 139 MB |
+
+`hydrate` returned 2,000 rows, `:table/total 10000000`, `:table/passthrough true`, and
+`tablestore/unusable` nil. `row-count` costs no query at all — it is `(:rows h)` off the handle.
+
+**The `count(*)` is 244 of the 294 ms — 83% of a passthrough connect.** That is the one thing that
+makes passthrough not free at connect time, and it deserves saying plainly: connecting live is
+3× cheaper than materialising and writes nothing, but it is not O(1). It reads the file once, to
+learn how many rows are in it.
+
+### 3. What the JSON-string import path actually does
+
+**It does not fail.** The prediction above — *expected to fail outright; that failure is the
+number that justifies this work* — is wrong at 10M rows, and the justification has to change with
+it.
+
+**Over HTTP the file never reaches loci at all.** `server.clj` calls
+`(http/run-server #'handler {:port port})` with no `:max-body`, and http-kit 2.8.0 defaults that
+to 8,388,608 bytes. Posted at a live loci:
+
+| POST to `/api/import-csv` | answer |
+|---|---|
+| 116-byte body | 200, `tbl:tiny`, 2 rows, 85 ms |
+| 9,688,511-byte body | **413** `request body 9688511; max request body 8388608` — **0 bytes uploaded**, 0.6 ms |
+| 427,658,912-byte body, the 10M CSV | **413**, same message, **0 bytes uploaded**, 0.7 ms |
+| 8,388,588-byte body — the largest that fits | 200, **203,163 rows**, 2.15 s |
+
+So today's ceiling on this route is ~8 MiB of JSON body ≈ **203,163 rows of this shape**, two
+percent of the target, refused on the `Content-Length` header before a byte is read. That is a
+hard ceiling rather than a memory pressure, and lifting it is phase 2's first job.
+
+**In process, with the cap out of the way, the whole chain succeeds on the default heap.**
+
+| step | wall | peak heap | peak RSS |
+|---|---|---|---|
+| `slurp` the 418 MB CSV into one String | 420–475 ms | 1,480 MB | 1,968 MB |
+| `json/write-str {:csv …}` → a 427,658,912-char body | 7,712 ms | 2,439 MB | 2,890 MB |
+| `json/read-str` it back — what `body-json` does | 2,529 ms | 2,616 MB | 3,524 MB |
+| `body-json` over the 408 MiB body read off disk | 2,922 ms | **2,476 MB** | 3,028 MB |
+| `server/import-csv!` on the parsed String | 2,387 ms | 865 MB | 2,304 MB |
+
+The table lands — `tbl:sales_http`, 10,000,000 rows, `:materialise` — with no `OutOfMemoryError`
+anywhere, and the round trip is exact at 417,658,901 characters back.
+
+So the number that justifies the streaming route is not a crash. It is **2,476 MB of peak heap,
+62% of the default 3,976 MB and roughly six times the file**, to move bytes that DuckDB reads in
+893 ms holding 57 MB. `import-csv!` also writes a **second full copy** of the CSV into
+`<LOCI_DATA>/files/` — 417,658,901 bytes — on top of the 89 MB of Parquet, which the streaming
+route removes as well. Constant memory, not feasibility.
+
+### 4. Both suites
+
+- `clojure -M:test` — **769 tests, 4,279 assertions, 0 failures, 0 errors**, 59.5 s.
+- `npm run test:browser` — **135 pass, 0 fail**, 309.9 s.
+
+### Which of the two things each number establishes
+
+CLAUDE.md's rule: a measurement tells you a mechanism works, **or** that a cost is real, never
+both. Sorted, so nobody has to guess:
+
+- **That the cost is real.** Every figure at 10M rows, all taken at the design's stated target and
+  none over `data/`: the 57 MB heap flat against a 398 MiB file, the 244 ms `count(*)` that is
+  83% of a passthrough connect, the 2,476 MB peak of the JSON path, and the 8 MiB HTTP cap with
+  its 203,163-row ceiling.
+- **That the mechanism works.** The inferred `BIGINT, VARCHAR, DOUBLE, DATE`; the
+  `:table/passthrough` shape and its nil `unusable`; the byte-exact JSON round trip; both suites.
+  These say the code is correct. They say nothing about whether anything costs too much.
+
 ## Deliberately not in this spec
 
 - **Object storage, SQL databases, REST APIs.** Named above only where they constrain the
