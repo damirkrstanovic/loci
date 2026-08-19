@@ -743,7 +743,13 @@
   (reclaimed-at [lk h]
     ;; Nothing can reclaim a file loci does not own, so a source handle is never
     ;; reclaimed — its failure modes are unavailable and drift, which `hydrate`
-    ;; classifies in the next task.
+    ;; classifies.
+    ;;
+    ;; The guard saves a scan, not a crash. Measured 2026-08-19: `dropped-at`
+    ;; with a nil table answers nil quite happily, because `dropped-tables`
+    ;; queries the whole catalog and no real table is ever named nil. So this is
+    ;; here to say that the question is meaningless for a source — and to stop a
+    ;; catalog-wide query being run to answer it.
     (when-not (= :source (:store h)) (dropped-at lk (:table h))))
 
   (column-samples [lk h per-col max-cols]

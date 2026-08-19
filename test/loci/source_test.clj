@@ -99,7 +99,9 @@
     ;; the file changes underneath, with no event anywhere
     (spit (subs uri 7) "a,b\n1,x\n2,y\n3,z\n")
     (is (= 3 (count (tbl/rows lk h {}))) "reads go to the file, so they see the new row")
-    (is (= 1 (count (tbl/rows lk h {:limit 1}))) "and a page is still a page")))
+    (is (= 1 (count (tbl/rows lk h {:limit 1}))) "and a page is still a page")
+    (is (= [{:a 2 :b "y"}] (tbl/rows lk h {:offset 1 :limit 1}))
+        "a source handle pages like any other — OFFSET reaches the second row")))
 
 (deftest a-source-handle-keys-its-samples-on-at
   (let [lk  @lake/lake

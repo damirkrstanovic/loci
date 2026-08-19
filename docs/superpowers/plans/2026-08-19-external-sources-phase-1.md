@@ -938,11 +938,12 @@ Change `sample-cache`'s memoized function to take the key and the FROM text — 
 Append to `sample-cache`'s docstring:
 
 ```
-   **`_key` is in the argument list only to be part of the memo key**, and it is
-   what keeps the soundness argument true now that a passthrough handle exists.
-   See `samples-key`: a `:lake` handle keys on its table and snapshot, a
-   `:source` handle on its object id and its `:at`, because a source's location
-   separates nothing and its bytes can change under a fixed id.
+   **`_version` is in the argument list only to be part of the memo key**, and it
+   is what keeps the soundness argument true now that a passthrough handle
+   exists. See `samples-version`: a `:lake` handle contributes nil, because its
+   FROM text already names a table and a snapshot that never change; a `:source`
+   handle contributes its `:at`, because its FROM text names only a path and the
+   file there can be rewritten with no event anywhere.
 ```
 
 Then replace the four `extend-type Lake` methods that touch a handle:
@@ -984,7 +985,7 @@ Expected: PASS on both namespaces, 0 failures. `loci.lake-test` matters here —
 
 Make `samples-version` return `nil` unconditionally, `:reload`, re-run. Expected: FAIL on `a-source-handle-keys-its-samples-on-id-and-at`, third assertion — a new `:at` no longer moves the synopsis, so a refreshed source keeps describing the file it saw first.
 
-Then check the other direction, which is the one that matters for whether the key is honest: **add** `(:id h)` back into `samples-version`'s `:source` branch and re-run. Expected: **everything still passes.** That is the finding, not a failure — it is why the id is not in the key. A component no test can distinguish reads as a guarantee and is not one. Restore.
+Then check the other direction, which is the one that matters for whether the key is honest: **add** `(:uri h)` into `samples-version`'s `:source` branch — so it returns `[(:uri h) (:at h)]` — and re-run. Use `:uri`, a field every handle really carries; adding `(:id h)` proves nothing, because no source handle has an `:id` and the component is always nil whatever the key design. Expected: **everything still passes.** That is the finding, not a failure — it is why the id is not in the key. A component no test can distinguish reads as a guarantee and is not one. Restore.
 
 - [ ] **Step 7: Commit**
 
