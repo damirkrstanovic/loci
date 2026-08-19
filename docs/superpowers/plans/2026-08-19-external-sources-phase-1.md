@@ -729,6 +729,18 @@ Create `src/loci/source.clj`:
                             :col  (sub/col-kw (:column_name r))
                             :type (:column_type r)})
                    rows)]
+    ;; Kept, and **not** the guard against an empty file, which was what it was
+    ;; written for. Measured 2026-08-19: DuckDB's auto-detection never returns
+    ;; zero columns for one. A zero-byte CSV and a newline-only CSV both describe
+    ;; as a single fabricated `column0 VARCHAR`; an empty JSON file and `[]` both
+    ;; describe as a single `json JSON`. So connecting an empty source SUCCEEDS,
+    ;; with one garbage column and no rows — undoable like any other `:put`, and
+    ;; nobody has asked for it to be refused.
+    ;;
+    ;; It stays because it costs one line and `readers` will grow: a format whose
+    ;; reader is less inventive than `read_csv` can return nothing, and the
+    ;; alternative to this line is `create-from-relation!` emitting `SELECT  FROM`
+    ;; and DuckDB answering with a bare parser error.
     (when (empty? cols)
       (throw (ex-info (str "the source has no columns: " (:uri src)) {:uri (:uri src)})))
     (tbl/check-names! (map :raw cols))
