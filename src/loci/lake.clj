@@ -43,9 +43,16 @@
    them.** They were imported by `tools/parse-csv`, which typed one CELL at a
    time, so a blank cell arrived beside numbers as `\"\"` and `read_json_auto`
    had to widen the column to hold both. `read_csv` sniffs per COLUMN and makes
-   that same blank a SQL NULL inside a `DOUBLE` — measured 2026-08-20 — so this
-   function is reached only through `put-rows!` now, which is still every row
-   loci writes out of RAM. Their Parquet was re-read the same day and all four
+   that same blank a SQL NULL inside a `DOUBLE` — measured 2026-08-20.
+
+   So the **`JsonNode` branch** below is now reachable only through `put-rows!`,
+   which is still every row loci writes out of RAM: `save_table`, `seed!`,
+   `tablemigrate`. It is not that this whole function is — `unwrap` runs on
+   every value of every row read, `:lake` and `:source` handles alike, and its
+   temporal branches exist precisely for a source-connected CSV with a date
+   column. `create-from-relation!` issues `CREATE TABLE … AS SELECT … FROM
+   read_csv(…)` and never goes near `read_json_auto`, so a CSV connected today
+   cannot produce a `JsonNode` at all. Their Parquet was re-read the same day and all four
    columns are still `JSON`; `tbl:extract-20-8413` is inlined in the catalog
    with no Parquet to read, so it is the one not re-measured.
 
