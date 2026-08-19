@@ -366,6 +366,16 @@ Three plans, each its own `writing-plans` pass.
 2. **Upload + shell.** Streamed raw-body route into `<LOCI_DATA>/files/`; the Connect data
    affordance, the preview, the mode toggle, the refresh button, the live badge and the scrubbed
    wording; `/api/storage` reports `data/files`.
+
+   **It must raise http-kit's `:max-body`, and that is a live defect today, not a new
+   requirement.** Measured 2026-08-20: `server.clj`'s `run-server` passes only `{:port port}`, so
+   the default 8,388,608-byte limit applies. Against a running loci, a 9.7 MB body is refused
+   with **413 and 0 bytes uploaded in 0.6 ms** — the request never reaches `import-csv!`, and the
+   shell's paste-CSV flow shows whatever a 413 renders as. The largest CSV that fits is 8,388,588
+   bytes, **203,163 rows** — 2% of this design's stated target. So the shell has silently had a
+   ~200k-row ceiling all along, unrelated to anything phase 1 changed, and a streaming route
+   inherits it unless the option is set. Phase 1 does not set it: choosing a byte limit is a
+   deployment judgement that belongs with the route that streams.
 3. **Remote locations.** httpfs, `s3://`/`gs://`/`https://`, and DuckDB `SECRET`s — which is also
    the spec that unblocks SQL databases, since credentials are the thing they share.
 
