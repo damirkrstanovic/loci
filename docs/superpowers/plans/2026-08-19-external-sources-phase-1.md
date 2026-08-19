@@ -1681,7 +1681,11 @@ git commit -m "feat: describe, connect and refresh a source over the API"
 
 ### Task 11: delete `parse-csv` and `->val`
 
-`read_csv` becomes the only way a CSV becomes rows. The markdown salvage keeps its regex — extracting `30` from `"~30% (estimated)"` is prose salvage, not type inference, and DuckDB will never do it — but it now returns the extracted **string** and lets DuckDB type it.
+`read_csv` becomes the only way a **CSV file** becomes rows. The markdown salvage keeps its regex *and keeps returning a number* — extracting `30` from `"~30% (estimated)"` is prose salvage, not type inference, and DuckDB will never do it.
+
+**An earlier draft of this task had the salvage return a string, and the premise was wrong.** These rows never reach `read_csv`: `md-table->rows`' only caller is `server/research!`, which hands them to `save-table!` → `put-rows!` → `load-rows!`, and that writes NDJSON and reads it back with `read_json_auto`. **DuckDB types them either way** — the only choice here is whether it is handed a JSON number or a JSON string. Measured 2026-08-19 with a string: the lake column comes back `VARCHAR` and `fnlib/numeric-cols` answers `[]` where it answered `[:share]`, and `fnlib/catalog` does *not* gate on that — so Group, Top N, Change and Share stay on the palette and fail only when applied.
+
+"One inference" survives, because the inference was always DuckDB's: `read_csv` for a file, `read_json_auto` for rows already in hand. What dies is loci having a second one of its own, which is `->val`.
 
 **Files:**
 - Modify: `src/loci/tools.clj` — delete `->val` and `parse-csv`, change `md-cell-val`
@@ -1709,7 +1713,7 @@ And change `md-cell-val`'s expectations in `test/loci/tools_test.clj` (line ~35)
 (deftest md-cell-val-extracts-the-number-as-text-for-duckdb-to-type
   (let [rows (tools/md-table->rows "a | b | c | d\n---|---|---|---\n$1,234 | 2025-06-01 | ~30% | -5")]
     (is (= [{:a "$1,234" :b "2025-06-01" :c "30" :d "-5"}] rows)
-        "prose salvage pulls the number OUT as text; DuckDB decides what it is")))
+        "a number out of prose is loci's job; deciding what it IS stays DuckDB's")))
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1731,7 +1735,7 @@ Delete `->val` and `parse-csv` entirely. Replace `md-cell-val`:
    they are, and so does anything with MORE digits after the number
    (\"$1,234\", \"2025-06-01\") — half-parsing those would be silently wrong.
 
-   **Returns a string, always.** This is prose salvage, not type inference:
+   **Returns a number.** This is prose salvage, not type inference:
    pulling a number out of a model's sentence is something DuckDB will never do,
    and deciding what that number IS is something only DuckDB should do. The
    salvaged rows go on to `read_csv` like every other table, so there is one
