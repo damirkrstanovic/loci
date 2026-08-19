@@ -1511,12 +1511,13 @@ git commit -m "feat: one answer for why a table's rows must not be acted on"
 
 1. **`connect!` and `refresh!` throw; routes must not.** Every other mutating route in `server.clj`
    returns `{:error …}` rather than a 500. The handlers below already wrap in `try`/`catch`; keep it.
-2. **`mint-id` reads `sub/objects` and `connect!` takes no monitor.** On the EDN stores that is a
-   full log fold, and two concurrent HTTP connects can mint the same id and have the second `:put`
-   erase the first with no error anywhere — the exact failure `loci.repair`'s forensics is about.
-   loci is single-writer, but "one writer" means one *process*, not one request at a time.
-   `server/materialize-entity!` already takes a global monitor for precisely this; take the same
-   one here, around the mint-and-commit.
+2. **The mint-and-commit monitor is already taken, and it lives in `loci.source`.** Do NOT add a
+   second one here. It went into the facade rather than the route because `loci.source` is
+   callable from a REPL attached to the live server — a lock in `server.clj` would leave a REPL
+   call racing an in-flight request, which is the one case the route cannot see. That is where the
+   analogy to `server/materialize-lock` stops: its lock and its facade are the same function.
+   Measured before the fix: 8 concurrent `connect!`s minted one id and 7 callers got a success
+   response for data unreachable by the id they were handed.
 3. **A passthrough `connect!`/`refresh!` runs `SELECT count(*)` over the whole file.** That is a
    full parse of a 500 MB CSV on an explicit user action, which is the right place to pay it —
    but Task 14 must report the number, not assume it.
@@ -1622,7 +1623,7 @@ Then in the route `cond`, beside `/api/import-csv`:
                                       (json-resp (source-refresh! st id)))
 ```
 
-The coercion of `:format` and `:mode` from JSON strings to keywords is already in both handlers above. This test is what holds it there:
+`:format` is coerced in the handlers above. **`:mode` is not, and must not be** — `loci.source/connect!` validates and normalises it itself, refusing anything that is not `:materialise` or `:passthrough` with a named error, precisely because a silently-defaulted mode materialises a file the user asked not to copy. Coercing here as well would put the decision in two places. This test is what holds the `:format` coercion:
 
 ```clojure
 (deftest source-connect-accepts-a-format-as-a-json-string
