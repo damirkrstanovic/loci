@@ -611,3 +611,29 @@
     (let [e (:error (tools/dispatch st "query_table" {:table_id (:id r)}))]
       (is e "the model gets something it can act on, not an empty result")
       (is (re-find #"unreachable" e)))))
+
+(deftest a-drifted-source-refuses-through-every-reader-not-just-the-fragment
+  ;; Drift was pinned at `tbl/unusable`'s fragment and at `hydrate`, but never
+  ;; through a reader's composed output — and the composed string is what a
+  ;; person and the model actually see. The unavailable marker has that cover;
+  ;; this is the other half.
+  (let [st  (sub/fresh-store)
+        uri (csv! "a,b\n1,x\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "Drifter"})
+        id  (:id r)]
+    (spit (subs uri 7) "c,d\n1,x\n")                     ; same file, new header
+    ;; query_table, the reader the model sees
+    (let [out (tools/dispatch st "query_table" {:table_id id})]
+      (is (:error out) "a drifted source must refuse, not answer with zero rows")
+      (is (nil? (:rows out)))
+      (is (re-find #"columns changed" (:error out)))
+      (is (re-find #"connected as a, b" (:error out))
+          "and it names the columns loci recorded, which is true whatever the driver says"))
+    ;; recompute, the reader that can destroy data
+    (sub/commit! st {:op :put :id "tbl:derived-drift"
+                     :value {:id "tbl:derived-drift" :kind :table :title "D"
+                             :value [] :from id :via "lib:top"
+                             :params {:by "a" :n "1" :order "desc"}}})
+    (let [out (#'server/recompute st {} (sub/object st "tbl:derived-drift"))]
+      (is (:why out) "and it must refuse before lib:top answers 'no rows came out'")
+      (is (re-find #"columns changed" (:why out))))))

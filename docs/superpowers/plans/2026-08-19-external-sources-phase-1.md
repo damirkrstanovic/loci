@@ -1491,7 +1491,7 @@ In `src/loci/server.clj` at line ~1331, replace the `(:table/reclaimed src)` cla
       (tbl/unusable src) {:why (str "source " src-id " cannot be read: " (tbl/unusable src))}
 ```
 
-`(tbl/unusable src)` is called twice here. That is deliberate — it is a `cond` test whose truthiness IS the message, and binding it would need a `cond`-to-`let` rewrite of a function this task is otherwise not touching.
+Bind it as `why` in `recompute`'s **existing** `let` and use it in both places. An earlier draft of this plan justified calling `(tbl/unusable src)` twice by claiming a binding would need a `cond`-to-`let` rewrite; that was simply wrong — `recompute` already opens with a `let` binding `src-id`, `known`, `src`, `rows` and `via`. `unusable` is nil-safe and cheap, so eager evaluation costs nothing even when `src` is nil.
 
 - [ ] **Step 5: Run tests to verify they pass**
 

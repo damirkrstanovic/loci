@@ -1331,10 +1331,20 @@
         known  (get working src-id)
         src    (when-not known (tbl/hydrate lake/lake (sub/object st src-id)))
         rows   (or known (:value src))
-        via    (:via obj)]
+        via    (:via obj)
+        ;; Bound rather than called twice in the `cond` below. `unusable` is
+        ;; nil-safe and cheap, so evaluating it eagerly costs nothing even when
+        ;; `src` is nil because the ancestor was already refreshed in this run.
+        why    (tbl/unusable src)]
     (cond
-      ;; Before `nil?`: `[]` passes that check.
-      (tbl/unusable src) {:why (str "source " src-id " cannot be read: " (tbl/unusable src))}
+      ;; **Before the `via` branches**, which is the ordering that matters — not
+      ;; its position relative to `nil?`. A `lib:` builtin fires on `[]` rows and
+      ;; answers "no rows came out — nothing to keep", so a refusal placed after
+      ;; them never runs and the chain reports a misleading reason instead of the
+      ;; real one. Measured 2026-08-19: moved below `via`, the file-is-gone test
+      ;; gets `lib:top`'s answer. Moving it below `nil?` changes nothing, because
+      ;; `hydrate` degrades to `[]` and `(nil? [])` is false.
+      why {:why (str "source " src-id "'s rows are unusable: " why)}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]

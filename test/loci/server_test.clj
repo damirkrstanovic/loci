@@ -4545,3 +4545,14 @@
           (is (= :no-object (:error r)) "a refusal, not a sweep of the orphans")
           (is (= 0 (:freed r)))
           (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))
+
+(deftest mold-payload-says-why-a-table-cannot-be-read
+  ;; `:unusable` is the sentence every reader shares; `:reclaimed` stays beside
+  ;; it because the shell formats that instant itself (`toLocaleString`) and a
+  ;; baked ISO string in prose cannot be localised. Phase 2 decides which wins.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [p (srv/mold-payload st no-memory "tbl:gone" nil)]
+        (is (:reclaimed p) "the raw instant survives, for the shell to format")
+        (is (re-find #"reclaimed on " (:unusable p)) "and the sentence is there too")
+        (is (string? (json/write-str p)) "and the whole payload still serialises")))))

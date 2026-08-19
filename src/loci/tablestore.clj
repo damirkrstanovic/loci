@@ -447,7 +447,19 @@
               (if-let [why (ssp/unreadable-because (:uri h))]
                 (assoc gone :table/passthrough true :table/unavailable why)
                 (assoc gone :table/passthrough true
-                            :table/source-drift (ssp/duckdb-said e)))
+                            :table/source-drift
+                            ;; The columns it was connected as come first,
+                            ;; because they are true whatever the driver says.
+                            ;; DuckDB's own text is usually the better half — it
+                            ;; names what the file holds NOW — but it is not
+                            ;; reliable: on a long-lived connection its JDBC
+                            ;; driver sometimes reports an unrelated
+                            ;; `NullPointerException` instead of the binder
+                            ;; error, observed twice on 2026-08-19. So the half
+                            ;; loci can always vouch for leads.
+                            (str "it was connected as "
+                                 (str/join ", " (map name (:cols h)))
+                                 " — " (ssp/duckdb-said e))))
               (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
                 (assoc gone :table/reclaimed at)
                 (throw e)))))))
