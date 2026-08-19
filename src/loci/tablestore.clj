@@ -353,6 +353,26 @@
   [^java.util.Date d]
   (when d (str (.toInstant d))))
 
+(defn unusable
+  "Why a hydrated table's rows must not be acted on, as one sentence — or nil
+   when they may be.
+
+   One function rather than a marker check per reader, because there are now
+   four markers and four readers, and the failure this prevents is arithmetic:
+   sixteen places to be right, and `recompute` has already been wrong once by
+   being ready to rebuild a derived table from zero rows and commit the empty
+   result over good data.
+
+   `:table/passthrough` is deliberately NOT here. It is a badge, not a refusal —
+   a live table's rows are as real as any other's."
+  [o]
+  (cond
+    (:table/reclaimed o)    (str "its rows were reclaimed on " (reclaimed-str (:table/reclaimed o)))
+    (:table/unavailable o)  (str "its source is unreachable — " (:table/unavailable o))
+    (:table/source-drift o) (str "its source's columns changed — " (:table/source-drift o)
+                                 " — reconnect or refresh it")
+    :else nil))
+
 (defn hydrate
   "An object whose `:value` is a table handle → the same object with rows in
    its place, capped, plus `:table/total`.

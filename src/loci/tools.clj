@@ -136,15 +136,15 @@
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
   (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
-    ;; `hydrate` degrades a reclaimed table to `:value []` rather than throwing,
+    ;; `hydrate` degrades an unusable table to `:value []` rather than throwing,
     ;; so without this the tool answers `{:rows []}` — "your filter matched
     ;; nothing" — and the model reports a real zero. Worse on the `save_as` path,
     ;; where it would commit an empty derived table over the answer. An `:error`
-    ;; naming the date is something the model can act on and say out loud.
-    (if (:table/reclaimed o)
-      {:error (str "table " table_id " was reclaimed on "
-                   (tbl/reclaimed-str (:table/reclaimed o))
-                   " — its rows are no longer stored")}
+    ;; naming the reason is something the model can act on and say out loud, and
+    ;; `tbl/unusable` is where every reader gets that sentence — a reclamation,
+    ;; a source file that is gone, a source whose columns moved.
+    (if-let [why (tbl/unusable o)]
+      {:error (str "table " table_id " cannot be read: " why)}
       (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
             rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
         (if save_as

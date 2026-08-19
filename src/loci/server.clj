@@ -395,9 +395,9 @@
   [st m id view]
   (let [o (tbl/hydrate lake/lake (sub/object st id))]
     (cond
-      ;; RECLAIMED — first, and before the view branches, because a reclaimed
-      ;; table can still have a viewspec pointed at it and `vs/interpret` over
-      ;; `[]` would draw an empty chart rather than say anything.
+      ;; UNUSABLE — first, and before the view branches, because such a table
+      ;; can still have a viewspec pointed at it and `vs/interpret` over `[]`
+      ;; would draw an empty chart rather than say anything.
       ;;
       ;; `hydrate` handed us `:value []`, and every branch below would render
       ;; that as a table with no rows in it — indistinguishable from a table the
@@ -405,8 +405,13 @@
       ;; answer. The cols and the true count come off the handle, so the page can
       ;; still say what was there. `:rendered` and `:alternatives` are present
       ;; and empty because the shell reads both on every payload.
-      (:table/reclaimed o)
+      ;;
+      ;; `:unusable` is the sentence — reclaimed, source gone, source drifted —
+      ;; and `:reclaimed` stays beside it, unchanged, because the shell renders
+      ;; that key today and teaching it the other three is Phase 2.
+      (tbl/unusable o)
       {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
+       :unusable (tbl/unusable o)
        :table/total (:table/total o) :table/cols (:table/cols o)
        :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
@@ -1306,8 +1311,9 @@
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
-        ;; The hydrated OBJECT, not just its `:value` — a source whose rows were
-        ;; reclaimed hydrates to `:value []`, which is not nil, so the "is gone"
+        ;; The hydrated OBJECT, not just its `:value` — a source that cannot be
+        ;; read (reclaimed, or a live source whose file is gone or whose columns
+        ;; moved) hydrates to `:value []`, which is not nil, so the "is gone"
         ;; branch below cannot see it and the chain recomputes over zero rows.
         ;; Before tables could degrade, that case raised and the chain stopped.
         ;;
@@ -1328,8 +1334,7 @@
         via    (:via obj)]
     (cond
       ;; Before `nil?`: `[]` passes that check.
-      (:table/reclaimed src) {:why (str "source " src-id "'s rows were reclaimed on "
-                                        (tbl/reclaimed-str (:table/reclaimed src)))}
+      (tbl/unusable src) {:why (str "source " src-id " cannot be read: " (tbl/unusable src))}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]
@@ -1530,7 +1535,29 @@
    Reads `:table/reclaimed` first so a HYDRATED object answers without the map,
    and falls back to the handle's table name so an UNHYDRATED one answers too.
    Both shapes reach these readers: `tbl/hydrate` sets the key, and
-   `table-catalog` is handed unhydrated objects on purpose."
+   `table-catalog` is handed unhydrated objects on purpose.
+
+   **Not routed through `tbl/unusable`, and that is a decision, not an
+   oversight.** `unusable` answers about a HYDRATED object, and both callers
+   here are fed unhydrated ones — the whole reason the `dropped` map exists. So
+   it would be a no-op on the shape that actually arrives, and making it
+   meaningful would mean hydrating every candidate: the 282 ms per chat turn
+   `table-catalog` was rewritten to remove.
+
+   The consequence, stated rather than left to be discovered. A PASSTHROUGH
+   source whose file is gone is not caught here — measured 2026-08-19 against a
+   connected source whose CSV was then deleted: `table-shaped?` answers `true`,
+   `agent-ctx` still catalogues it, and `compute-clj!` answers
+   `\"compute works on tables\"`. Both readers therefore behave as they did for a
+   reclaimed table BEFORE this function grew its clause. What softens it is that
+   the refusals downstream all hold: `query_table` and `mold-payload` now answer
+   with `unusable`'s sentence and name the repair, and `compute-clj!` refuses on
+   `(seq rows)` over `:value []` — misleadingly, but it refuses. Nothing
+   overwrites good data.
+
+   Closing it needs a filesystem check per candidate rather than a catalog
+   lookup — `ssp/unreadable-because`, not `lake/dropped-tables` — which is a
+   different mechanism from the one this function is, and not phase 1's."
   [dropped o]
   (or (:table/reclaimed o) (get dropped (:table (:value o)))))
 

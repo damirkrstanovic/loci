@@ -2,10 +2,12 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
+            [loci.server :as server]
             [loci.source :as src]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
-            [loci.tablestore :as tbl]))
+            [loci.tablestore :as tbl]
+            [loci.tools :as tools]))
 
 ;; `with-temp-lake` rather than `with-lake`, from the first test: it REBINDS
 ;; `lake/lake`, and a later task's `source/connect!` reads that var. A local
@@ -541,3 +543,71 @@
       (is (= "Renamed while refreshing" (:title o))
           "a refresh must not roll back a write it never read")
       (is (= 2 (:rows (:value o))) "and it must still have refreshed"))))
+
+;; ---------------------------------------------------------------------------
+;; one answer for why a table's rows must not be acted on
+;;
+;; Four markers and four readers is sixteen places to be right, and `recompute`
+;; has already been wrong once here in a way that destroyed data. `tbl/unusable`
+;; is the single answer; these tests pin both halves of it — what it refuses,
+;; and what it must NOT refuse.
+;; ---------------------------------------------------------------------------
+
+(deftest unusable-names-every-marker-a-reader-must-refuse-on
+  (is (nil? (tbl/unusable {:value [{:a 1}]})))
+  (is (re-find #"reclaimed" (tbl/unusable {:table/reclaimed (java.util.Date.)})))
+  (is (re-find #"unreachable" (tbl/unusable {:table/unavailable "no such file"})))
+  (is (re-find #"columns" (tbl/unusable {:table/source-drift "Binder Error"})))
+  (is (nil? (tbl/unusable {:table/passthrough true :value [{:a 1}]}))
+      "a healthy live table is usable — the badge is not a refusal"))
+
+(deftest recompute-refuses-a-source-whose-file-is-gone
+  ;; `recompute` is private and takes [st working obj]; a derived table names
+  ;; its source under `:from` and its transform under `:via`. This is the
+  ;; failure it already guards for a RECLAIMED source: an agent-written fn that
+  ;; aggregates turns zero rows into `[{:n 0}]`, nothing downstream refuses a
+  ;; non-empty result, and `rerun!` commits it over the good table and reports
+  ;; it as refreshed. Measured 2026-08-17 as [{:n 100}] -> [{:n 0}].
+  (let [st  (sub/fresh-store)
+        uri (csv! "a\n1\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "Src"})]
+    (.delete (java.io.File. ^String (subs uri 7)))
+    (sub/commit! st {:op :put :id "tbl:derived-1"
+                     :value {:id "tbl:derived-1" :kind :table :title "D"
+                             :value [] :from (:id r) :via "lib:top"
+                             :params {:by "a" :n "1" :order "desc"}}})
+    (let [out (#'server/recompute st {} (sub/object st "tbl:derived-1"))]
+      (is (:why out) "recompute must refuse, not rebuild from zero rows")
+      (is (re-find #"unreachable" (:why out))))))
+
+(deftest recompute-rebuilds-from-a-healthy-live-source
+  ;; The other half, and the one that catches `:table/passthrough` being read as
+  ;; a refusal. It is `true` on a healthy live table and on both failing ones,
+  ;; so a reader that takes it for a liveness signal refuses every passthrough
+  ;; source there is — and every derived table downstream of one stops
+  ;; refreshing, silently, with a plausible reason attached.
+  (let [st  (sub/fresh-store)
+        uri (csv! "a\n1\n2\n3\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough
+                              :title "Live src"})]
+    (sub/commit! st {:op :put :id "tbl:derived-2"
+                     :value {:id "tbl:derived-2" :kind :table :title "D2"
+                             :value [] :from (:id r) :via "lib:top"
+                             :params {:by "a" :n "1" :order "desc"}}})
+    (let [out (#'server/recompute st {} (sub/object st "tbl:derived-2"))]
+      (is (nil? (:why out)) "a live source's rows are as real as any other's")
+      (is (= [{:a 3}] (:rows out))))))
+
+(deftest query-table-answers-a-live-source-and-refuses-an-unreachable-one
+  ;; The `query_table` reader, over the two shapes a passthrough table has.
+  ;; Without the refusal the tool answers `{:rows []}` — "your filter matched
+  ;; nothing" — and the model reports a real zero over a missing file.
+  (let [st  (sub/fresh-store)
+        uri (csv! "a\n1\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :passthrough :title "Q"})]
+    (is (= [{:a 1}] (:rows (tools/dispatch st "query_table" {:table_id (:id r)})))
+        "a live source answers with its rows")
+    (.delete (java.io.File. ^String (subs uri 7)))
+    (let [e (:error (tools/dispatch st "query_table" {:table_id (:id r)}))]
+      (is e "the model gets something it can act on, not an empty result")
+      (is (re-find #"unreachable" e)))))
