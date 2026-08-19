@@ -5,7 +5,7 @@
             [clojure.test :refer [deftest is]]
             [loci.config :as config]
             [loci.lake :as lake]
-            [loci.lake-fixture :refer [rm-rf with-lake]]
+            [loci.lake-fixture :as lf :refer [rm-rf with-lake]]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -417,6 +417,25 @@
         (when-let [h (:handle r)]
           (is (string? (json/write-str (tbl/rows lk h {})))
               "stored, the rows would be unserializable"))))))
+
+(deftest create-from-relation-projects-raw-headers-onto-loci-columns
+  (lf/with-lake [lk]
+    (let [f (java.io.File/createTempFile "rel-" ".csv")]
+      (try
+        (spit f "Total Revenue ($),Region\n5,north\n7,south\n")
+        (let [h (lake/create-from-relation!
+                 lk "tbl:rev"
+                 [{:raw "Total Revenue ($)" :col :total_revenue} {:raw "Region" :col :region}]
+                 (str "read_csv('" (.getAbsolutePath f) "')"))]
+          (is (= :lake (:store h)) "materialise yields today's handle, unchanged")
+          (is (= [:total_revenue :region] (:cols h)))
+          (is (= 2 (:rows h)) "the row count comes from the table, not from a caller")
+          (is (number? (:snapshot h)))
+          (is (= [{:total_revenue 5 :region "north"}
+                  {:total_revenue 7 :region "south"}]
+                 (tbl/rows lk h {})))
+          (is (= 2 (tbl/row-count lk h))))
+        (finally (.delete f))))))
 
 (deftest table-gc-is-off-and-says-so
   (with-lake [lk]

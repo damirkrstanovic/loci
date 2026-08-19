@@ -582,6 +582,32 @@
                   "', format='newline_delimited')"))
       (finally (.delete f)))))
 
+(defn- projection
+  "`\"Total Revenue ($)\" AS \"total_revenue\", …` from `describe`'s column list.
+
+   Named rather than `SELECT *` on purpose, and the reason is passthrough: a
+   named projection THROWS when the file's header changes, where `SELECT *`
+   would quietly return a differently-shaped table. That throw is what
+   `hydrate` turns into `:table/source-drift`."
+  [cols]
+  (str/join ", " (map (fn [{:keys [raw col]}] (str (ident raw) " AS " (ident col))) cols)))
+
+(defn create-from-relation!
+  "Materialise `rel` — any SQL relation expression — into a new lake table, and
+   return the handle. The rows never enter this process: DuckDB reads the file
+   and writes Parquet, and loci sees a count.
+
+   The counterpart to `load-rows!`, which is the path for rows ALREADY in RAM.
+   Both mint a table name per call, because writes never overwrite.
+
+   `cols` is `loci.source/describe`'s output: `[{:raw \"…\" :col :…} …]`."
+  [lk id cols rel]
+  (let [table (table-name id (System/nanoTime))]
+    (x! lk (str "CREATE TABLE " table " AS SELECT " (projection cols) " FROM " rel))
+    {:store :lake :table table :snapshot (current-snapshot lk)
+     :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
+     :cols  (mapv :col cols)}))
+
 (def ^:private sample-cache
   "Samples for a `[table snapshot]`, computed once.
 
