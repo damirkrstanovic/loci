@@ -399,3 +399,118 @@
                           {:uri (csv! "a\n1\n") :format :csv
                            :mode :passthrough :title t})]
       (is (re-matches #"tbl:[a-z0-9_]+" (:id r)) (str "unusable id for title " (pr-str t))))))
+
+(deftest a-mode-that-is-a-string-still-means-what-it-says
+  ;; body-json keywordises a JSON object's KEYS, not its VALUES, so this is
+  ;; exactly the shape an HTTP request produces.
+  (let [st (sub/fresh-store)
+        r  (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                             :mode "passthrough" :title "StrMode"})
+        h  (:value (sub/object st (:id r)))]
+    (is (= :source (:store h)) "a string mode must not silently materialise")
+    (is (= :passthrough (:mode r)) "and the answer must come from what was built")
+    (is (= :passthrough (:mode (:source (sub/object st (:id r)))))
+        "and the log must record the keyword, not the string")))
+
+(deftest an-unknown-mode-is-refused-rather-than-defaulted
+  ;; `5` is in the list on purpose: the normalisation has to survive a value
+  ;; that is neither a string nor a keyword — `(keyword 5)` is a
+  ;; ClassCastException, which names neither loci nor the mode.
+  (doseq [bad [:materialize "copy" :cached "" 5]]
+    (let [e (try (src/connect! (sub/fresh-store)
+                               {:uri (csv! "a\n1\n") :format :csv
+                                :mode bad :title "Bad"})
+                 nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str "must refuse mode " (pr-str bad)))
+      (is (re-find #"unknown source mode" (str (.getMessage ^Exception e)))
+          (str "…and say so, for mode " (pr-str bad))))))
+
+(deftest concurrent-connects-do-not-mint-one-id-twice
+  ;; `mint-id` reads the objects and `connect!` commits under what it read, so
+  ;; two connects that both read before either commits both mint `tbl:race` —
+  ;; and the second `:put` REPLACES the first. Every caller still gets a success
+  ;; response, for an object only one of them can reach.
+  ;;
+  ;; Threads on a latch rather than `future`s, which is the shape
+  ;; `server-test/concurrent-materializations-mint-distinct-ids` already keeps:
+  ;; a thread pool can serialise the calls by itself and certify a lock that is
+  ;; not there.
+  (let [st      (sub/fresh-store)
+        uri     (csv! "a\n1\n")
+        latch   (java.util.concurrent.CountDownLatch. 1)
+        results (atom [])
+        ts      (mapv (fn [_]
+                        (doto (Thread.
+                               #(do (.await latch)
+                                    (swap! results conj
+                                           (src/connect! st {:uri uri :format :csv
+                                                             :mode :passthrough
+                                                             :title "Race"}))))
+                          (.start)))
+                      (range 8))]
+    (.countDown latch)
+    (doseq [t ts] (.join t))
+    (let [ids (map :id @results)]
+      (is (= 8 (count @results)) "every thread answered")
+      (is (= 8 (count (distinct ids))) "every caller gets its own id")
+      ;; DEVIATION from the review's draft, which asserted
+      ;; `(= 8 (count (filter #(sub/object st %) ids)))`. Measured 2026-08-19
+      ;; without the lock: it PASSES. All eight ids are the same `tbl:race`,
+      ;; that one object exists, and filtering a seq of eight duplicates for
+      ;; existence counts eight. It certifies. Counting the TABLES the store
+      ;; actually holds is the assertion that falls over — 1, not 8.
+      (is (= 8 (count (filter #(= :table (:kind %)) (vals (sub/objects st)))))
+          "and the store really holds eight — a lost update is a success response for data nobody can reach")
+      (is (= (set ids) (set (map :id (filter #(= :table (:kind %)) (vals (sub/objects st))))))
+          "…the eight the callers were handed, and not eight others"))))
+
+(deftest connect-appends-a-cell-to-a-space-and-skips-anything-else
+  ;; The 3-arity `space` argument, both branches. The guard is load-bearing:
+  ;; `:append` lands on `[:value :cells]` of whatever id it is given, so a table
+  ;; id here would rewrite that table's handle map into one carrying a `:cells`
+  ;; key — the poisoning `server/space?`'s comment names.
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "space:n"
+                     :value {:id "space:n" :kind :space :title "N"
+                             :value {:intent "i" :cells []}}})
+    (let [r (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                              :mode :passthrough :title "Celled"} "space:n")]
+      (is (= [{:ref (:id r)}] (get-in (sub/object st "space:n") [:value :cells]))
+          "a real space gets a cell referencing the new table"))
+    (let [t (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                              :mode :passthrough :title "Victim"})
+          r (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                              :mode :passthrough :title "Second"} (:id t))
+          v (:value (sub/object st (:id t)))]
+      (is (some? (sub/object st (:id r))) "the connect itself still succeeds")
+      (is (nil? (:cells v)) "a table id named as the space must not receive a cell")
+      (is (= :source (:store v)) "its handle is untouched"))
+    (let [r (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                              :mode :passthrough :title "Third"} "space:nope")]
+      (is (some? (sub/object st (:id r)))
+          "an id naming nothing is skipped too, and does not fail the connect")
+      (is (nil? (sub/object st "space:nope"))
+          "…and certainly does not conjure a notebook"))))
+
+(deftest a-materialise-refresh-adopts-the-columns-the-file-has-now
+  ;; The materialise half of `refresh-of-a-passthrough-moves-at-and-cols`.
+  ;; Refresh means re-run the recipe, NOT verify the schema is unchanged — a
+  ;; later "helpful" stability check would break this silently, and only the
+  ;; passthrough case was pinned.
+  (let [lk  @lake/lake
+        st  (sub/fresh-store)
+        uri (csv! "a,b\n1,x\n")
+        r   (src/connect! st {:uri uri :format :csv :mode :materialise :title "Adopt"})
+        h1  (:value (sub/object st (:id r)))]
+    (is (= [:a :b] (:cols h1)))
+    (spit (subs uri 7) "c,d,e\n1,x,2\n2,y,3\n")
+    (src/refresh! st (:id r))
+    (let [h2 (:value (sub/object st (:id r)))]
+      (is (= :lake (:store h2)))
+      (is (= [:c :d :e] (:cols h2))
+          "refresh adopts the columns the file has now, rather than refusing them")
+      (is (not= (:table h1) (:table h2)) "…into a NEW lake table")
+      (is (= 2 (:rows h2)))
+      (is (= [{:c 1 :d "x" :e 2} {:c 2 :d "y" :e 3}] (tbl/rows lk h2 {})))
+      (is (= 1 (count (tbl/rows lk h1 {})))
+          "and the old table is still readable, so undo still walks back to it"))))
