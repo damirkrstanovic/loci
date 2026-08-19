@@ -92,7 +92,14 @@
   "A source → the SQL relation expression that reads it at `location`.
 
    Options are emitted in key order so the text is deterministic and the whole
-   function is testable with `=`. DuckDB does not care about the order."
+   function is testable with `=`. DuckDB does not care about the order.
+
+   Ordered by the key's NAME rather than the key, because `sort-by key` is a
+   partial comparator: two options whose keys are a string and a keyword —
+   reachable by hand from the REPL facade, if not from a JSON body — throw a
+   `ClassCastException` out of the sort before `opt-sql` can refuse them with a
+   sentence. Same order for a keyword-only map, one word longer, and the
+   friendly error always wins."
   [{:keys [format options]} location]
   (let [f (get readers format)]
     (when-not f
@@ -101,5 +108,5 @@
                       {:format format})))
     (str f "(" (sql-str location)
          (when (seq options)
-           (str ", " (str/join ", " (map opt-sql (sort-by key options)))))
+           (str ", " (str/join ", " (map opt-sql (sort-by (comp name key) options)))))
          ")")))

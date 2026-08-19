@@ -58,3 +58,13 @@
                (catch clojure.lang.ExceptionInfo e e))]
     (is (some? e))
     (is (re-find #"csv" (.getMessage e)) "the error must list the formats it knows")))
+
+(deftest relation-refuses-a-bad-option-name-even-beside-a-good-one
+  ;; `sort-by key` is a partial comparator: a string key and a keyword key in
+  ;; one map throw a ClassCastException out of the SORT, before `opt-sql` can
+  ;; refuse the bad name with a sentence. Ordering by the key's name is total,
+  ;; so the guard is what the caller hears.
+  (let [e (try (ssp/relation {:format :csv :options {"1=1" true :header true}} "/tmp/a.csv")
+               nil (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e) "the option-name guard must win, not the comparator")
+    (is (= "1=1" (:option (ex-data e))))))

@@ -563,7 +563,7 @@ Create `src/loci/sourcespec.clj`:
                       {:format format})))
     (str f "(" (sql-str location)
          (when (seq options)
-           (str ", " (str/join ", " (map opt-sql (sort-by key options)))))
+           (str ", " (str/join ", " (map opt-sql (sort-by (comp name key) options)))))
          ")")))
 ```
 
@@ -579,7 +579,9 @@ Expected: PASS, 8 tests, 0 failures.
 
 - [ ] **Step 5: Prove the tests bite**
 
-Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then delete the `re-matches option-name` guard, `:reload`, re-run. Expected: FAIL on `relation-refuses-an-option-name-that-is-not-an-identifier`, and read the SQL it produces — `read_csv('/tmp/a.csv', 1=1=true)` is the shape the guard exists to stop. Restore. Then change `sort-by key` to `identity` in `relation`, re-run, expect FAIL on the options test (it may pass by luck of map ordering — if it does, that is itself the finding: replace the assertion with three options that expose it). Restore.
+Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then delete the `re-matches option-name` guard, `:reload`, re-run. Expected: FAIL on `relation-refuses-an-option-name-that-is-not-an-identifier`, and read the SQL it produces — `read_csv('/tmp/a.csv', 1=1=true)` is the shape the guard exists to stop. Restore. Then **delete the sort entirely** — `(map opt-sql options)` — `:reload`, re-run. Expect FAIL on `relation-orders-options-so-the-text-is-deterministic` with the options in hash order.
+
+Do **not** try `sort-by identity` as the sabotage: it is not a distinguishing mutation, and measuring why is worth more than the sabotage was. A `MapEntry` is a `clojure.lang.APersistentVector`, so `identity` compares `[k v]` element-wise — key first, value only on a tie — and map keys are unique, so the value is never consulted. `sort-by identity` and `sort-by key` are provably the same for any map with mutually-comparable keys. Removing the sort is the only mutation that changes the output.
 
 - [ ] **Step 6: Commit**
 
