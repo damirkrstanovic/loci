@@ -4692,3 +4692,20 @@
           (is (:state r)))
         (is (:error (post! "/api/source/connect" {:uri "file:///no/such.csv" :format "csv"}))
             "and a bad location comes back as a message, never a 500")))))
+
+(deftest source-connect-with-no-mode-defaults-in-one-place-only
+  ;; The default lives in `loci.source/connect!`. This pins that the route does
+  ;; not quietly grow a second one — which would interact badly with the route
+  ;; deliberately NOT coercing `:mode`, since a route-side default would be a
+  ;; keyword the caller never sent sitting beside a validator built to name what
+  ;; they did send.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            f  (doto (java.io.File/createTempFile "nomode-" ".csv") (spit "a\n1\n"))
+            c  (srv/source-connect! st {:uri (str "file://" (.getAbsolutePath f))
+                                        :format "csv" :title "NoMode"})]
+        (is (nil? (:error c)))
+        (is (= :materialise (:mode c)) "the facade's default, reported as a keyword")
+        (is (= :lake (:store (:value (sub/object st (:openId c)))))
+            "and it really materialised")))))

@@ -2052,6 +2052,12 @@
   ([st src space]
    (try (let [r (src/connect! st (update src :format keyword)
                               (when (and space (space? st space)) space))]
+          ;; `:openId` as well as `:id`, and the duplication is deliberate.
+          ;; `:openId` is the shell's word — `import-csv!` returns it and
+          ;; `startImport` reads it — while `:id` is what the facade returns and
+          ;; what a REPL or a non-shell API caller wants to name the table by.
+          ;; Dropping either would make one of those two callers reach into a
+          ;; key that is not about them.
           (assoc r :state (state-payload st) :openId (:id r)))
         (catch Exception e {:error (.getMessage e)}))))
 
@@ -3101,13 +3107,21 @@
       (= uri "/api/import-csv")(let [{:keys [title csv space]} (body-json req)] (json-resp (import-csv! st title csv space)))
       ;; Not method-gated, and that is the file's own rule rather than an
       ;; oversight. `/api/storage/reclaim` above tests `:request-method` because
-      ;; it deletes Parquet — "two cheap answers to one irreversible call". These
-      ;; three are the other side of that line: `describe` commits nothing at
-      ;; all, and `connect!`/`refresh!` commit ordinary `:put`s that `undo!`
-      ;; pops. Measured 2026-08-19: a GET carrying a JSON body does land a table
-      ;; here, exactly as a POST would, which is true of nearly every mutating
-      ;; route in this `cond` and is what makes gating these three — and not the
-      ;; other eighteen — a new inconsistency rather than a fix.
+      ;; it DELETES Parquet — "two cheap answers to one irreversible call".
+      ;;
+      ;; The line it draws is destroying existing data against making new data,
+      ;; **not** free against costly, and these three are on the making side. A
+      ;; materialise `connect!` is not free: it reads the whole file and writes
+      ;; Parquet, and `undo!` pops the event without deleting those bytes —
+      ;; `loci.lakegc` reclaims them later, as it does for any superseded
+      ;; version. What it cannot do is overwrite something that was already
+      ;; there. `describe` does not even commit.
+      ;;
+      ;; Measured 2026-08-19: a GET carrying a JSON body does land a table here,
+      ;; exactly as a POST would — and `/api/import-csv`, which these are
+      ;; modelled on, has the identical exposure. Of 42 routes in this `cond`,
+      ;; two test the method. Gating these three and not the other eighteen
+      ;; mutating ones would be a new inconsistency rather than a fix.
       (= uri "/api/source/describe")(let [b (body-json req)] (json-resp (source-describe st b)))
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
