@@ -21,6 +21,7 @@
   (clojure.test/test-vars [#'loci.source-test/the-one-test])
   ```
   `clojure -M:test` is for the single full-suite run in Task 14.
+- **The nREPL on port 7888 is shared.** If more than one agent is working at once, another agent's mid-edit definitions live in the same JVM as yours, and a namespace you did not touch can fail — or, worse, *pass* — for reasons that are not on disk. Observed 2026-08-19: `loci.tablestore-test` reported 8 failures against a `tablestore.clj` that `git diff` showed clean. Always `(require '[the.ns] :reload)` from disk before trusting any cross-namespace result, and treat a surprising result as possible contamination before treating it as a finding. The controller runs agents serially for this reason; if you see evidence of a second writer, stop and report it.
 - **Prove every test bites.** After a test passes, break the implementation it covers, re-run, confirm FAIL, restore. A test that passes either way is worse than none, because it certifies.
 - **`data/` is disposable.** Do not checksum it, do not rehearse on copies. Prefer a throwaway `LOCI_DATA` where a test does not need the real store.
 
