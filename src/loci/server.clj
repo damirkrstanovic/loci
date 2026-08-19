@@ -3099,6 +3099,15 @@
       (= uri "/api/ask")     (let [{:keys [prompt space]} (body-json req)] (json-resp (ask! st prompt space)))
       (= uri "/api/keep-note")(let [{:keys [space title text]} (body-json req)] (json-resp (keep-note! st space title text)))
       (= uri "/api/import-csv")(let [{:keys [title csv space]} (body-json req)] (json-resp (import-csv! st title csv space)))
+      ;; Not method-gated, and that is the file's own rule rather than an
+      ;; oversight. `/api/storage/reclaim` above tests `:request-method` because
+      ;; it deletes Parquet — "two cheap answers to one irreversible call". These
+      ;; three are the other side of that line: `describe` commits nothing at
+      ;; all, and `connect!`/`refresh!` commit ordinary `:put`s that `undo!`
+      ;; pops. Measured 2026-08-19: a GET carrying a JSON body does land a table
+      ;; here, exactly as a POST would, which is true of nearly every mutating
+      ;; route in this `cond` and is what makes gating these three — and not the
+      ;; other eighteen — a new inconsistency rather than a fix.
       (= uri "/api/source/describe")(let [b (body-json req)] (json-resp (source-describe st b)))
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))

@@ -1605,9 +1605,12 @@ In `src/loci/server.clj`, next to `import-csv!`, add:
    Commits nothing, which is why `loci.source` has no `:dry-run?` flag — this
    is the dry run, and the shell shows its answer before anything lands.
 
-   `:format` and `:mode` arrive from JSON as strings — `body-json` gives
-   `{:format \"csv\"}` — and `loci.sourcespec` keys on keywords, so both are
-   coerced at this boundary and nowhere deeper."
+   `:format` arrives from JSON as a string — `body-json` gives `{:format
+   \"csv\"}`, keywordising a map's keys and not its values — and
+   `loci.sourcespec` keys on a keyword, so it is coerced here and nowhere
+   deeper. **`:mode` is not coerced here**: `loci.source/connect!` validates it
+   itself and refuses an unknown one by name, and a second coercion would mean
+   the refusal named a keyword the caller never typed."
   [_st src]
   (try (src/describe @lake/lake (update src :format keyword))
        (catch Exception e {:error (.getMessage e)})))
