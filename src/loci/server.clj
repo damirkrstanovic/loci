@@ -22,6 +22,7 @@
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools]
@@ -1996,6 +1997,73 @@
       {:state (state-payload st) :openId nid})
     (catch Exception e {:error (.getMessage e)})))
 
+;; ---- the three /api/source routes ----
+;;
+;; `loci.source` throws where these return; that is the whole of what these
+;; three add, and it is not optional. `handler` has no top-level catch, so an
+;; uncaught `ex-info` from a missing file leaves the shell parsing a stack
+;; trace as JSON. Every other mutating route in this namespace answers
+;; `{:error …}`, and `startImport` — the live caller these are shaped after —
+;; reads `res.error`, then `applyState(res.state)` and `openObject(res.openId)`.
+;; So `connect!` gets the same `{:state … :openId …}` idiom, and the shell has
+;; one thing to learn rather than two.
+;;
+;; **No monitor here.** `loci.source/connect!` already takes one, around its own
+;; mint-and-commit, and it lives there rather than in the route because
+;; `loci.source` is a facade meant to be called from a REPL attached to the live
+;; server — a lock in `server.clj` would leave a REPL caller racing an in-flight
+;; request, which is the one case the route cannot see. A second monitor would
+;; be a second thing to be wrong, and would serialise nothing the first does not.
+
+(defn source-describe
+  "Preview a source: its columns, their types, and the SQL that reads them.
+
+   Commits nothing, which is why `loci.source` has no `:dry-run?` flag — this
+   IS the dry run, and it is what the shell shows before anything lands.
+
+   Takes `st` and ignores it, so the three routes read alike and a later
+   preview that wants the store does not change the route."
+  [_st src]
+  (try (src/describe @lake/lake (update src :format keyword))
+       (catch Exception e {:error (.getMessage e)})))
+
+(defn source-connect!
+  "Land `src` as a `:kind :table` object and answer the shell's three keys.
+
+   `:format` is coerced to a keyword HERE and nowhere deeper, because
+   `body-json` keywordises a map's keys and leaves its values alone, so the
+   shell sends `{:format \"csv\"}`; `sourcespec/relation` looks the format up in
+   `readers`, which is keyed by keyword, and a string misses every entry — the
+   refusal is *loci does not know the format \"csv\"*, about the one format it
+   certainly does know. Nothing downstream validates it, so this is the only
+   place it can be fixed.
+
+   **`:mode` is NOT coerced, deliberately.** `loci.source/connect!` normalizes a
+   string and refuses anything that is neither `:materialise` nor
+   `:passthrough` by name — it is the one place that decides, and everything
+   downstream trusts the answer. Coercing here too would put the decision in two
+   places, and would report an unknown mode as `:nonsense` rather than as the
+   `\"nonsense\"` the caller actually typed.
+
+   The `space?` guard is `import-csv!`'s, kept for `import-csv!`'s reason: an
+   existence check alone lets a table id through, and appending a cell to its
+   vector `:value` poisons the log."
+  ([st src] (source-connect! st src nil))
+  ([st src space]
+   (try (let [r (src/connect! st (update src :format keyword)
+                              (when (and space (space? st space)) space))]
+          (assoc r :state (state-payload st) :openId (:id r)))
+        (catch Exception e {:error (.getMessage e)}))))
+
+(defn source-refresh!
+  "Re-run `id`'s recorded recipe and answer with the state the write produced.
+
+   No `:openId`: the object the shell is looking at is the one it asked to
+   refresh, so there is nothing new to open."
+  [st id]
+  (try (assoc (src/refresh! st id) :state (state-payload st))
+       (catch Exception e {:error (.getMessage e)})))
+
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
 
@@ -3031,6 +3099,10 @@
       (= uri "/api/ask")     (let [{:keys [prompt space]} (body-json req)] (json-resp (ask! st prompt space)))
       (= uri "/api/keep-note")(let [{:keys [space title text]} (body-json req)] (json-resp (keep-note! st space title text)))
       (= uri "/api/import-csv")(let [{:keys [title csv space]} (body-json req)] (json-resp (import-csv! st title csv space)))
+      (= uri "/api/source/describe")(let [b (body-json req)] (json-resp (source-describe st b)))
+      (= uri "/api/source/connect")(let [b (body-json req)]
+                                     (json-resp (source-connect! st (dissoc b :space) (:space b))))
+      (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))

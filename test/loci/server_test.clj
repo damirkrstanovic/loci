@@ -4556,3 +4556,139 @@
         (is (:reclaimed p) "the raw instant survives, for the shell to format")
         (is (re-find #"reclaimed on " (:unusable p)) "and the sentence is there too")
         (is (string? (json/write-str p)) "and the whole payload still serialises")))))
+
+;; ---------------------------------------------------------------------------
+;; /api/source/describe, /api/source/connect and /api/source/refresh
+;;
+;; A nested `with-temp-lake` inside the namespace's `:once` one, for the reason
+;; the storage tests above give: these materialise real lake tables under ids
+;; another test in this file could also mint, and `lake/create-from-relation!`
+;; names a directory after the id — a shared lake makes two suites' `tbl:a`
+;; the same table.
+;; ---------------------------------------------------------------------------
+
+(defn- source-csv
+  "A `file://` URI naming a fresh temp CSV holding `text`.
+
+   The path is `(subs uri 7)`, which is how `loci.source-test` rewrites a file
+   under a connected source to make a `refresh!` see something new."
+  [text]
+  (let [f (java.io.File/createTempFile "api-src-" ".csv")]
+    (spit f text)
+    (str "file://" (.getAbsolutePath f))))
+
+(deftest source-describe-previews-without-committing
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            d  (srv/source-describe st {:uri (source-csv "Total Revenue ($)\n5\n") :format :csv})]
+        (is (= [:total_revenue] (mapv :col (:cols d))))
+        (is (empty? (sub/objects st)) "describe commits nothing — it IS the dry run")))))
+
+(deftest source-connect-then-refresh-over-the-api
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            u  (source-csv "a\n1\n")
+            c  (srv/source-connect! st {:uri u :format :csv :mode :materialise :title "A"})]
+        (is (nil? (:error c)))
+        (is (= "tbl:a" (:openId c)))
+        (is (:state c) "connect returns the state payload, like every other mutating route")
+        (spit (subs u 7) "a\n1\n2\n")
+        (let [r (srv/source-refresh! st "tbl:a")]
+          (is (= 2 (:rows r)))
+          (is (:state r)))))))
+
+(deftest source-connect-returns-an-error-map-rather-than-throwing
+  ;; `loci.source`'s three entry points all throw — a bad location, an unknown
+  ;; format, two headers that collapse to one column — and `handler` has no
+  ;; top-level catch, so without the `try` here /api/source/connect answers a
+  ;; missing file with a stack trace. Every other mutating route in this file
+  ;; answers `{:error …}`; all three of these must too.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri "file:///no/such.csv" :format :csv})]
+        (is (:error c) "a bad location is an error map, not a 500")
+        (is (empty? (sub/objects st)) "and nothing was committed on the way to it")
+        (is (:error (srv/source-describe st {:uri "file:///no/such.csv" :format :csv}))
+            "describe answers the same way")
+        (is (:error (srv/source-refresh! st "tbl:never-connected"))
+            "and so does a refresh of an id no source ever landed")))))
+
+(deftest source-connect-accepts-a-format-as-a-json-string
+  ;; `body-json` keywordises a map's KEYS and leaves its VALUES alone, so a
+  ;; shell POST carries `{:format "csv"}`. `sourcespec/relation` looks `format`
+  ;; up in `readers`, which is keyed by keyword, and a string misses every key —
+  ;; the refusal is *loci does not know the format "csv"*, about the one format
+  ;; it certainly does know.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri (source-csv "a\n1\n")
+                                        :format "csv" :mode "materialise" :title "S"})]
+        (is (nil? (:error c)))
+        (is (= "tbl:s" (:openId c)))))))
+
+(deftest the-mode-is-the-facades-decision-and-the-route-does-not-repeat-it
+  ;; `:mode` arrives from JSON as a string exactly as `:format` does, and is
+  ;; deliberately NOT coerced here: `loci.source/connect!` normalizes it and
+  ;; refuses an unknown one by name, precisely because a silently-defaulted mode
+  ;; materialises a file the user asked not to copy. Both halves are asserted,
+  ;; because only the second can tell the difference — a route-level
+  ;; `(update :mode keyword)` still lands the passthrough below, and only the
+  ;; refusal shows the decision having moved: it would name `:nonsense`, a
+  ;; keyword the caller never typed and cannot find in their own request.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri (source-csv "a\n1\n2\n")
+                                        :format "csv" :mode "passthrough" :title "P"})]
+        (is (nil? (:error c)))
+        (is (= :passthrough (:mode c)) "the facade normalized the string it was handed")
+        (is (= :source (:store (:value (sub/object st "tbl:p"))))
+            "and a passthrough handle landed — no bytes were copied")
+        (let [bad (srv/source-connect! st {:uri (source-csv "a\n1\n") :format "csv"
+                                           :mode "nonsense" :title "N"})]
+          (is (str/includes? (str (:error bad)) "\"nonsense\"")
+              "the refusal names what the caller typed, not a keyword the route made")
+          (is (nil? (sub/object st "tbl:n")) "and refused before committing anything"))))))
+
+(deftest the-source-routes-answer-through-the-URL
+  ;; Handler tests cannot see a route typo, and these three are otherwise only
+  ;; ever called as functions. `c/store` is a delay behind an ordinary var, so
+  ;; rebinding it means the user's Datalevin store is never opened — the trick
+  ;; `the-materialize-route-answers-through-the-URL` uses.
+  ;;
+  ;; It also asserts the JSON round-trip, which the function tests cannot: a
+  ;; `:col` is a keyword in Clojure and `"total_revenue"` by the time the shell
+  ;; reads it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st    (sub/fresh-store)
+            post! (fn [uri body]
+                    (with-redefs [c/store (delay st)]
+                      (json/read-str (:body (srv/handler
+                                             {:uri uri :request-method :post
+                                              :body (java.io.StringReader. (json/write-str body))}))
+                                     :key-fn keyword)))
+            _     (sub/commit! st {:op :put :id "space:n"
+                                   :value {:id "space:n" :kind :space :title "N"
+                                           :value {:intent "i" :cells []}}})
+            u     (source-csv "Total Revenue ($)\n1\n")
+            d     (post! "/api/source/describe" {:uri u :format "csv"})]
+        (is (= ["total_revenue"] (mapv :col (:cols d))) "describe round-trips as JSON")
+        (is (nil? (sub/object st "tbl:sales")) "and committed nothing")
+        (let [c (post! "/api/source/connect" {:uri u :format "csv" :mode "materialise"
+                                              :title "Sales" :space "space:n"})]
+          (is (nil? (:error c)))
+          (is (= "tbl:sales" (:openId c)) "the shell's openObject id")
+          (is (:state c) "and the state payload it applies")
+          (is (= [{:ref "tbl:sales"}] (nb/cells-of (sub/object st "space:n")))
+              "`:space` still appends a cell — `import-csv!`'s shape, kept"))
+        (spit (subs u 7) "Total Revenue ($)\n1\n2\n")
+        (let [r (post! "/api/source/refresh" {:id "tbl:sales"})]
+          (is (= 2 (:rows r)))
+          (is (:state r)))
+        (is (:error (post! "/api/source/connect" {:uri "file:///no/such.csv" :format "csv"}))
+            "and a bad location comes back as a message, never a 500")))))
