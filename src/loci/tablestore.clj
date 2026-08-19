@@ -251,14 +251,19 @@
    rows.
 
    **The empty case is not a handle** because `Lake/put-rows!` refuses an empty
-   table and two writers can honestly produce one: `query_table :save_as` over a
-   filter that matched nothing, and `import-csv!` on a header-only file. Both
-   committed `:value []` before tables moved and the shell drew an empty table;
-   letting the throw through would turn \"nothing matched\" into an error string,
-   and on the `save_as` path into an uncaught exception inside the agent's tool
-   loop. `[]` is not a handle, so `hydrate` passes it through and everything
-   downstream sees what it saw before — and `[]` in the log is not rows in the
-   log, so the guard costs the move nothing.
+   table and a writer can honestly produce one: `query_table :save_as` over a
+   filter that matched nothing. `import-csv!` on a header-only file was the
+   second such writer and is not one any longer — it lands through
+   `source/connect!`, which materialises a real, empty lake table out of
+   `read_csv` rather than handing rows here; see
+   `a-header-only-csv-lands-an-empty-lake-table-not-a-literal` in
+   `loci.server-test`. Both committed `:value []` before tables moved and the
+   shell drew an empty table; letting the throw through would turn
+   \"nothing matched\" into an error string, and on the `save_as` path into an
+   uncaught exception inside the agent's tool loop. `[]` is not a handle, so
+   `hydrate` passes it through and everything downstream sees what it saw
+   before — and `[]` in the log is not rows in the log, so the guard costs the
+   move nothing.
 
    The other five writers cannot reach the empty case, measured 2026-08-16, and
    this is worth knowing before anyone \"simplifies\" one of them: `save-table!`

@@ -410,6 +410,30 @@
      reorders: `10, 50, ~13% (1 of 8 countries)` against
      `\"~13% (1 of 8 countries)\", 10, 50`.
 
+   **Both bullets are about ROWS, and the `tbl:csv-*` examples are history.**
+   `read_json_auto` is what `put-rows!` reads its NDJSON back with, so the
+   widening is live wherever loci hands the lake Clojure values — `save_table`,
+   `content/seed!`, `tablemigrate`. It is not what a CSV meets any more. Those
+   two tables were imported by `tools/parse-csv`, which typed one CELL at a
+   time, so a single column could hold a Long, a Double and a `\"\"` at once and
+   the lake had to reconcile them; every import now goes through `read_csv`,
+   which sniffs per COLUMN. Measured 2026-08-20 over a CSV of that exact shape
+   — `100` beside `87.6` in one column, a blank cell in the next — `describe`
+   answers `DOUBLE` and `DOUBLE`, the samples are `100.0, 23.0, 87.6` and
+   `13.1, 25.4, 347.8`, and the blank is a SQL NULL that `column-samples` drops.
+   The same four rows through `put-rows!` still give `DOUBLE` and `JSON`,
+   sampling `\"\", 13.1, 25.4, 347.8`. So the first bullet's *rendering* outlives
+   the change and only its *cause* is gone; the second cannot happen to a CSV
+   at all.
+
+   The examples were re-read from their own Parquet on 2026-08-20 and all still
+   hold: `urban_pct` DOUBLE sampling `100.0` first, `density_per_km2` JSON
+   sampling `\"\"` first, `tbl:csv-18-1542`'s three JSON, and `tbl:corpus-2`'s
+   `production_tonnes` DOUBLE sampling `100.0, 1000.0, 10000.0`.
+   `tbl:extract-20-8413` holds too few rows for DuckLake to write it a Parquet
+   at all — it is inlined in the catalog — so its line above is the one thing
+   here not re-measured.
+
    The fourth is this function's own, and is the price of asking SQL rather
    than Clojure to render. `tbl:corpus-2`'s `production_tonnes` samples
    `1.24E7, 1.4E7, 100.0` inline and `100.0, 1000.0, 10000.0` from the lake —

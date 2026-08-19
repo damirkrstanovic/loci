@@ -39,6 +39,16 @@
    `:growth_pct`, `:unemployment_pct`), `tbl:csv-19-7071` (`:density_per_km2`)
    and `tbl:extract-20-8413` (`:approx_low_income_share`).
 
+   **The two `tbl:csv-*` are historical, and no CSV connected today can join
+   them.** They were imported by `tools/parse-csv`, which typed one CELL at a
+   time, so a blank cell arrived beside numbers as `\"\"` and `read_json_auto`
+   had to widen the column to hold both. `read_csv` sniffs per COLUMN and makes
+   that same blank a SQL NULL inside a `DOUBLE` — measured 2026-08-20 — so this
+   function is reached only through `put-rows!` now, which is still every row
+   loci writes out of RAM. Their Parquet was re-read the same day and all four
+   columns are still `JSON`; `tbl:extract-20-8413` is inlined in the catalog
+   with no Parquet to read, so it is the one not re-measured.
+
    A `JsonNode`'s `toString` is the JSON text of the value it holds, so parsing
    it back is lossless and none of the three needs refusing: `50` returns as
    `50` and `\"~13% (1 of 8 countries)\"` as that string. Refusing them was the

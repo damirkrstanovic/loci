@@ -161,7 +161,11 @@
 ;; Real tables have holes — not every country reports unemployment, and a CSV
 ;; says so with an empty cell. So a column's kind is decided by ALL its values,
 ;; not by whichever row happens to be first, and every aggregate below measures
-;; the values that exist rather than casting a "" to a number.
+;; the values that exist rather than casting a hole to a number. The hole has
+;; two spellings and `number?` refuses both: `nil`, which is what `read_csv`
+;; makes of a blank cell (measured 2026-08-20, through `source/describe` and a
+;; materialised read), and `""`, which is what a model's `save_table` rows and
+;; `loci.corpus`'s own parser still hand over.
 (defn- col-vals [rows c] (map #(get % c) rows))
 (defn- nums     [xs]     (filter number? xs))
 

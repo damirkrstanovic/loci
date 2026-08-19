@@ -36,10 +36,10 @@
    **This is prose salvage, and it returns a number.** An earlier draft of the
    external-sources plan had it return the extracted *string*, on the theory
    that DuckDB should do all the typing and loci none — the same rule that
-   deleted `->val` and made `read_csv` the only way a CSV file becomes rows.
-   That rule does not reach here, and the reason is worth writing down: these
-   rows never touch `read_csv`. `md-table->rows`' only caller is
-   `server/research!`, which hands them to `save-table!` → `put-rows!` →
+   took `->val` out of `loci.tools` and made `read_csv` the only way a CSV a
+   user imports becomes rows. That rule does not reach here, and the reason is
+   worth writing down: these rows never touch `read_csv`. `md-table->rows`' only
+   caller is `server/research!`, which hands them to `save-table!` → `put-rows!` →
    `load-rows!`, and that path writes NDJSON and reads it back with
    `read_json_auto`. **DuckDB types these cells either way.** The only thing
    decided here is whether it is handed a JSON number or a JSON string, and a
