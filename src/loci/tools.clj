@@ -29,30 +29,34 @@
 (defn- md-sep? [line] (boolean (re-matches #"[\s|:\-]+" line)))
 
 (defn- md-cell-val
-  "\"~30% (estimated)\" → \"30\"; \"1.5\" → \"1.5\". Letters-first cells stay as
-   they are, and so does anything with MORE digits after the number
-   (\"$1,234\", \"2025-06-01\") — half-parsing those would be silently wrong.
+  "\"~30% (estimated)\" → 30; \"1.5\" → 1.5. Letters-first cells stay strings,
+   and so does anything with MORE digits after the number (\"$1,234\",
+   \"2025-06-01\") — half-parsing those would be silently wrong.
 
-   **Returns a string, always.** This is prose salvage, not type inference:
-   pulling a number out of a model's sentence is something DuckDB will never do,
-   and deciding what that number IS is something only DuckDB should do. `->val`,
-   which used to do the deciding here, is gone — `read_csv` is the one inference
-   in loci and this is not it.
+   **This is prose salvage, and it returns a number.** An earlier draft of the
+   external-sources plan had it return the extracted *string*, on the theory
+   that DuckDB should do all the typing and loci none — the same rule that
+   deleted `->val` and made `read_csv` the only way a CSV file becomes rows.
+   That rule does not reach here, and the reason is worth writing down: these
+   rows never touch `read_csv`. `md-table->rows`' only caller is
+   `server/research!`, which hands them to `save-table!` → `put-rows!` →
+   `load-rows!`, and that path writes NDJSON and reads it back with
+   `read_json_auto`. **DuckDB types these cells either way.** The only thing
+   decided here is whether it is handed a JSON number or a JSON string, and a
+   cell that says `~30%` holds a number.
 
-   **The cost, measured 2026-08-19, because it is not paid where it is made.**
-   `md-table->rows`'s only caller is `server/research!`, which hands the rows to
-   `save-table!` — and that path lands rows in the lake through `put-rows!`,
-   which types a column from the Clojure values it is given. So a salvaged
-   `share_pct` is now a VARCHAR of `\"30\"` where it was a BIGINT of `30`, and
-   `fnlib/catalog` on such a table drops from five available builtins to one:
-   Group, Top N, Pivot, Change and Share all answer *needs a numeric column*.
-   The salvage does NOT go through `read_csv`; nothing routes it there yet.
-   Making it one inference in fact rather than in intent means giving
-   `research!` the same file-and-connect path `import-csv!` now takes, which is
-   a change to `research!` and not to this function."
+   Measured 2026-08-19, handing it a string instead: the lake column comes back
+   `VARCHAR`, and `fnlib/numeric-cols` answers `[]` where it answered
+   `[:share]`. The ƒ palette still *offers* Group, Top N, Change and Share —
+   `fnlib/catalog` does not gate on numeric columns — so the loss surfaces only
+   when one is applied, which is the worst place to find it.
+
+   So: extracting a number out of a model's sentence is loci's job, because
+   nothing else will ever do it; deciding what that number IS remains DuckDB's."
   [s]
   (if-let [m (re-matches #"[^A-Za-z0-9]*?(-?\d+(?:\.\d+)?)[^0-9]*" s)]
-    (second m)
+    (let [n (second m)]
+      (if (str/includes? n ".") (Double/parseDouble n) (Long/parseLong n)))
     s))
 
 (defn md-table->rows

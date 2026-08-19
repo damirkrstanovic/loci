@@ -742,7 +742,11 @@
       (is (= before (count (sub/history st)))))))          ; nothing committed
 
 (deftest research-salvages-prose-tables
-  ;; The salvaged cells are TEXT since `md-cell-val` stopped typing them —
+  ;; The salvaged cells are NUMBERS: `md-cell-val` pulls a figure out of the
+  ;; model's sentence, which nothing else will do, and `put-rows!` hands it to
+  ;; `read_json_auto` — so DuckDB still decides the type. Handing it a string
+  ;; instead makes the column VARCHAR and `fnlib/numeric-cols` answer [], which
+  ;; costs Group, Top N, Change and Share at apply time. Measured 2026-08-19 —
   ;; `->val` was loci's second CSV inference and `read_csv` is the only one
   ;; left. **This path does not reach `read_csv`**: `research!` hands the rows
   ;; to `save-table!`, which types a lake column from the Clojure values it is
@@ -758,7 +762,7 @@
     (let [st (store-with-table)
           r  (srv/research! st "space:n" "extract a table of shares")]
       (is (clojure.string/starts-with? (str (:openId r)) "tbl:extract"))
-      (is (= [{:name "A" :share_pct "30"} {:name "B" :share_pct "20"}]
+      (is (= [{:name "A" :share_pct 30} {:name "B" :share_pct 20}]
              (rows-of st (:openId r)))))))
 
 (deftest compute-retries-once-with-error-feedback

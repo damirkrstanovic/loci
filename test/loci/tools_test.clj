@@ -3,6 +3,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
+            [loci.fnlib :as fnlib]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.server :as server]
@@ -37,23 +38,20 @@
         rows (tools/md-table->rows text)]
     (is (= 2 (count rows)))
     (is (= "JSR Corporation (Japan)" (:supplier (first rows))))
-    (is (= "30" (:market_share_pct (first rows))))        ; "~30% (estimated)" → "30"
-    (is (= "25" (:market_share_pct (second rows))))))
+    (is (= 30 (:market_share_pct (first rows))))         ; "~30% (estimated)" → 30
+    (is (= 25 (:market_share_pct (second rows))))))
 
-(deftest md-table-salvage-piped-cells-are-all-text
+(deftest md-table-salvage-piped-and-typed
   (let [rows (tools/md-table->rows "| name | q | when |\n|---|---|---|\n| A | 1.5 | Q3 2025 |")]
-    ;; every cell is a string, salvaged or not — the salvage decides what text
-    ;; a cell contributes, and `read_csv` decides what that text IS.
-    (is (= [{:name "A" :q "1.5" :when "Q3 2025"}] rows))))
+    (is (= [{:name "A" :q 1.5 :when "Q3 2025"}] rows))))  ; letters-first cells stay strings
 
-(deftest md-cell-val-extracts-the-number-as-text-for-duckdb-to-type
-  ;; final-review finding, kept: thousands separators and dates must NOT
-  ;; half-parse. What changed is the other half — the salvaged cell comes back
-  ;; as TEXT now, because pulling a number out of a model's sentence is prose
-  ;; salvage and deciding what that number is belongs to `read_csv`.
+(deftest md-table-salvage-never-mangles-numbers
+  ;; final-review finding: thousands separators and dates must NOT half-parse
   (let [rows (tools/md-table->rows "a | b | c | d\n---|---|---|---\n$1,234 | 2025-06-01 | ~30% | -5")]
-    (is (= [{:a "$1,234" :b "2025-06-01" :c "30" :d "-5"}] rows)
-        "prose salvage pulls the number OUT as text; DuckDB decides what it is")))
+    (is (= "$1,234" (:a (first rows))))                   ; not 1
+    (is (= "2025-06-01" (:b (first rows))))               ; not 2025
+    (is (= 30 (:c (first rows))))
+    (is (= -5 (:d (first rows))))))
 
 (deftest md-table-salvage-honest-nil
   (is (nil? (tools/md-table->rows "no table here at all")))
@@ -232,3 +230,11 @@
             "list_tables no longer reaches the model as ISO-UTC")
         (is (str/includes? err (:reclaimed wire))
             (str "two spellings of one instant: " (pr-str (:reclaimed wire)) " vs " (pr-str err)))))))
+
+(deftest a-salvaged-number-column-is-numeric-to-the-palette
+  ;; The property that actually degrades if `md-cell-val` returns a string. The
+  ;; ƒ catalog does NOT gate on this — it offers Group, Top N, Change and Share
+  ;; either way — so a string column loses them at apply time, not at offer
+  ;; time, which is why this pins `numeric-cols` rather than `catalog`.
+  (let [rows (tools/md-table->rows "| region | share |\n|---|---|\n| EMEA | ~30% |\n| APAC | ~25% |\n")]
+    (is (= [:share] (fnlib/numeric-cols rows)))))
