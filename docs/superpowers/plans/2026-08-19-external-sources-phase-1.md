@@ -422,6 +422,19 @@ Create `test/loci/sourcespec_test.clj`:
   (is (= "read_csv('/tmp/o''brien.csv')"
          (ssp/relation {:format :csv} "/tmp/o'brien.csv"))))
 
+(deftest relation-refuses-an-option-name-that-is-not-an-identifier
+  ;; :options reach here from a JSON body, and an option NAME cannot be quoted
+  ;; the way a value can — DuckDB wants a bare identifier. So it is checked.
+  (doseq [bad ["header, x" "1=1" "" "a b" "he'ader"]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ssp/relation {:format :csv :options {bad true}} "/tmp/a.csv"))
+        (str "must refuse option name " (pr-str bad)))))
+
+(deftest relation-refuses-an-option-value-it-cannot-render
+  (is (thrown? clojure.lang.ExceptionInfo
+               (ssp/relation {:format :csv :options {:columns {"a" "INT"}}} "/tmp/a.csv"))
+      "a map is not a reader option value, and must not be interpolated raw"))
+
 (deftest relation-refuses-an-unknown-format
   (let [e (try (ssp/relation {:format :xlsx} "/tmp/a.xlsx") nil
                (catch clojure.lang.ExceptionInfo e e))]
@@ -508,11 +521,29 @@ Create `src/loci/sourcespec.clj`:
   [s]
   (str "'" (str/replace (str s) "'" "''") "'"))
 
+(def ^:private option-name
+  "What may appear to the left of the `=` in a reader option: a SQL identifier,
+   and nothing else.
+
+   `:options` arrive from a JSON body on `/api/source/connect`, which makes this
+   the one place in the framework where a caller chooses SQL *text* rather than a
+   value. `sql-str` quotes a value; there is no equivalent for an option NAME,
+   because DuckDB wants a bare identifier there and a quoted one is a syntax
+   error. So the name is CHECKED rather than escaped, and anything that is not an
+   identifier is refused."
+  #"[A-Za-z_][A-Za-z0-9_]*")
+
 (defn- opt-sql [[k v]]
-  (str (name k) "="
-       (cond (string? v)  (sql-str v)
-             (boolean? v) (if v "true" "false")
-             :else        v)))
+  (let [k (name k)]
+    (when-not (re-matches option-name k)
+      (throw (ex-info (str "not a reader option name: " (pr-str k)) {:option k})))
+    (str k "="
+         (cond (string? v)  (sql-str v)
+               (boolean? v) (if v "true" "false")
+               (number? v)  v
+               :else (throw (ex-info (str "a reader option takes a string, a number or a boolean — "
+                                          (pr-str k) " got " (pr-str v))
+                                     {:option k :value v}))))))
 
 (defn relation
   "A source → the SQL relation expression that reads it at `location`.
@@ -543,7 +574,7 @@ Expected: PASS, 8 tests, 0 failures.
 
 - [ ] **Step 5: Prove the tests bite**
 
-Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then change `sort-by key` to `identity` in `relation`, re-run, expect FAIL on the options test (it may pass by luck of map ordering — if it does, that is itself the finding: replace the assertion with three options that expose it). Restore.
+Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then delete the `re-matches option-name` guard, `:reload`, re-run. Expected: FAIL on `relation-refuses-an-option-name-that-is-not-an-identifier`, and read the SQL it produces — `read_csv('/tmp/a.csv', 1=1=true)` is the shape the guard exists to stop. Restore. Then change `sort-by key` to `identity` in `relation`, re-run, expect FAIL on the options test (it may pass by luck of map ordering — if it does, that is itself the finding: replace the assertion with three options that expose it). Restore.
 
 - [ ] **Step 6: Commit**
 
