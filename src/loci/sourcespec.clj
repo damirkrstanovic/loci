@@ -119,3 +119,17 @@
          (when (seq options)
            (str ", " (str/join ", " (map opt-sql (sort-by (comp name key) options)))))
          ")")))
+
+(defn readable?
+  "True when `uri` names a file this process can read right now.
+
+   The one thing that tells `:table/unavailable` from `:table/source-drift`: a
+   query can fail because the bytes are gone, or because they are there and no
+   longer match the columns recorded at connect. The first is a missing source,
+   the second is a changed one, and a reader does different things about them.
+
+   False rather than a throw for a location `locate` refuses, because this is
+   asked on the failure path and must not raise a second error over the first."
+  [uri]
+  (try (.canRead (java.io.File. ^String (locate uri)))
+       (catch Exception _ false)))

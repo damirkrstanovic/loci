@@ -146,3 +146,48 @@
            (tbl/column-samples lk {:store :source :uri uri :format :csv
                                    :cols [:a] :rows 1 :at at} 3 8))
         "the same path and the same :at is the same cache entry")))
+
+(defn- src-obj [h] {:id "tbl:x" :kind :table :title "Live" :value h})
+
+(deftest hydrate-marks-a-passthrough-table-as-live
+  (let [lk  @lake/lake
+        uri (csv! "a,b\n1,x\n")
+        o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
+                                      :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+    (is (= [{:a 1 :b "x"}] (:value o)))
+    (is (true? (:table/passthrough o)) "a reader has to be able to tell")
+    (is (= 1 (:table/total o)))
+    (is (nil? (:table/unavailable o)))
+    (is (nil? (:table/source-drift o)))))
+
+(deftest hydrate-degrades-when-the-file-is-gone
+  (let [lk  @lake/lake
+        uri (csv! "a\n1\n")
+        _   (.delete (java.io.File. ^String (subs uri 7)))
+        o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
+                                      :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+    (is (= [] (:value o)) "the same shape every downstream guard already handles")
+    (is (= 1 (:table/total o)) "the count survives on the handle")
+    (is (= [:a] (:table/cols o)))
+    (is (true? (:table/passthrough o)) "still a live source, just an unreachable one")
+    (is (string? (:table/unavailable o)) "carrying what the store actually said")
+    (is (nil? (:table/source-drift o)))))
+
+(deftest hydrate-degrades-when-the-columns-changed
+  (let [lk  @lake/lake
+        uri (csv! "a,b\n1,x\n")
+        _   (spit (subs uri 7) "c,d\n1,x\n")            ; same file, new header
+        o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
+                                      :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
+    (is (= [] (:value o)))
+    (is (string? (:table/source-drift o))
+        "readable but unqueryable is drift, not unavailability")
+    (is (nil? (:table/unavailable o)))))
+
+(deftest hydrate-still-rethrows-a-real-failure-for-a-lake-handle
+  (is (thrown? Exception
+               (tbl/hydrate @lake/lake
+                            {:id "tbl:x" :kind :table :title "X"
+                             :value {:store :lake :table "t_does_not_exist"
+                                     :snapshot 1 :rows 1 :cols [:a]}}))
+      "a broken lake stays a broken lake — only a deliberate loss is swallowed"))

@@ -7,6 +7,7 @@
    store a test uses when it has nothing to say about DuckLake, the same role
    `substrate/PersistentStore` plays next to `dlv/DatalevinStore`."
   (:require [clojure.string :as str]
+            [loci.sourcespec :as ssp]
             [loci.substrate :as sub]))
 
 (defprotocol TableStore
@@ -384,22 +385,40 @@
    Only a store that says the rows were reclaimed may be swallowed. Any other
    failure is rethrown untouched, so a broken disk stays a broken disk — and
    asking the store is itself wrapped, because a catalog too damaged to answer
-   must not replace the error the caller actually needs to see."
+   must not replace the error the caller actually needs to see.
+
+   **A passthrough table adds three more shapes on the same rule.** A healthy one
+   carries `:table/passthrough true` beside its rows, so a reader can tell that
+   its `:table/total` is the count recorded at connect rather than a fact about
+   the file right now. A failing one degrades exactly as a reclaimed one does —
+   `:value []`, the count and cols off the handle — and carries the store's own
+   message under `:table/unavailable` when the file cannot be read, or
+   `:table/source-drift` when it can be read but no longer matches the columns
+   recorded at connect. Those are different repairs: find the file, versus
+   reconnect it."
   [ts o]
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
-          h  (:value o)]
+          h  (:value o)
+          pt (= :source (:store h))]
       (try
-        (assoc o :value       (rows ts h {:limit mold-cap})
-                 :table/total (row-count ts h))
+        (cond-> (assoc o :value       (rows ts h {:limit mold-cap})
+                         :table/total (row-count ts h))
+          pt (assoc :table/passthrough true))
         (catch Exception e
-          (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
-            ;; `:value []` rather than the handle, so every downstream shape
-            ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
-            ;; in a dozen readers — behaves as it does for an empty table, which
-            ;; is a state they all already handle. The cols and the true row
-            ;; count survive because they live on the handle, not in the rows.
-            (assoc o :value [] :table/total (:rows h)
-                     :table/cols (:cols h) :table/reclaimed at)
-            (throw e)))))
+          ;; `:value []` rather than the handle, so every downstream shape
+          ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
+          ;; in a dozen readers — behaves as it does for an empty table, which
+          ;; is a state they all already handle. The cols and the true row
+          ;; count survive because they live on the handle, not in the rows.
+          (let [gone (assoc o :value [] :table/total (:rows h) :table/cols (:cols h))]
+            (if pt
+              (assoc gone :table/passthrough true
+                          (if (ssp/readable? (:uri h))
+                            :table/source-drift
+                            :table/unavailable)
+                          (str (.getMessage e)))
+              (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
+                (assoc gone :table/reclaimed at)
+                (throw e)))))))
     o))
