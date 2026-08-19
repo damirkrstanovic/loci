@@ -31,6 +31,8 @@
   source instead. Either way: if the sabotage run reports 0 failures, that is a finding about your
   sabotage, not about the code.
 - **Prove every test bites.** After a test passes, break the implementation it covers, re-run, confirm FAIL, restore. A test that passes either way is worse than none, because it certifies.
+- **End every commit message with** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. This
+  branch's earlier commits predate the rule and are not being rewritten for it.
 - **`data/` is disposable.** Do not checksum it, do not rehearse on copies. Prefer a throwaway `LOCI_DATA` where a test does not need the real store.
 
 ## File structure
