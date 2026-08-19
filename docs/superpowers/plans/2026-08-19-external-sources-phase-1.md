@@ -1615,8 +1615,7 @@ In `src/loci/server.clj`, next to `import-csv!`, add:
 (defn source-connect!
   ([st src] (source-connect! st src nil))
   ([st src space]
-   (try (let [src (cond-> (update src :format keyword)
-                    (:mode src) (update :mode keyword))
+   (try (let [src (update src :format keyword)   ; :format only — never :mode
               r   (src/connect! st src (when (and space (space? st space)) space))]
           (assoc r :state (state-payload st) :openId (:id r)))
         (catch Exception e {:error (.getMessage e)}))))
@@ -1665,6 +1664,8 @@ Expected: PASS, 0 failures.
 - [ ] **Step 5: Prove the tests bite**
 
 Delete the `(update src :format keyword)` coercion, `:reload`, re-run. Expected: FAIL on `source-connect-accepts-a-format-as-a-json-string` with *loci does not know the format "csv"*. Restore.
+
+Then **add** a `:mode` coercion — `(cond-> src (:mode src) (update :mode keyword))` — and re-run. Expected: FAIL on the unknown-mode test. Note what does **not** work as a check here: passing `"passthrough"` through the route and watching a passthrough handle land proves nothing, because `(keyword "passthrough")` gives the same answer whether the route coerced it or the facade did. The discriminating case is an *unknown* mode, where a route-level coercion turns the refusal from `"nonsense"` into `:nonsense` and names something the caller never typed. Restore.
 
 - [ ] **Step 6: Commit**
 
