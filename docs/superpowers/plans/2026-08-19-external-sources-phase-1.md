@@ -1507,6 +1507,22 @@ git commit -m "feat: one answer for why a table's rows must not be acted on"
 
 ### Task 10: the `/api/source/*` routes
 
+**Three things Task 8 handed forward — deal with them here, they are not optional:**
+
+1. **`connect!` and `refresh!` throw; routes must not.** Every other mutating route in `server.clj`
+   returns `{:error …}` rather than a 500. The handlers below already wrap in `try`/`catch`; keep it.
+2. **`mint-id` reads `sub/objects` and `connect!` takes no monitor.** On the EDN stores that is a
+   full log fold, and two concurrent HTTP connects can mint the same id and have the second `:put`
+   erase the first with no error anywhere — the exact failure `loci.repair`'s forensics is about.
+   loci is single-writer, but "one writer" means one *process*, not one request at a time.
+   `server/materialize-entity!` already takes a global monitor for precisely this; take the same
+   one here, around the mint-and-commit.
+3. **A passthrough `connect!`/`refresh!` runs `SELECT count(*)` over the whole file.** That is a
+   full parse of a 500 MB CSV on an explicit user action, which is the right place to pay it —
+   but Task 14 must report the number, not assume it.
+
+
+
 **Files:**
 - Modify: `src/loci/server.clj` — the route `cond` (search for `(= uri "/api/import-csv")`)
 - Test: `test/loci/server_test.clj`
