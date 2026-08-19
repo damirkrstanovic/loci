@@ -514,3 +514,30 @@
       (is (= [{:c 1 :d "x" :e 2} {:c 2 :d "y" :e 3}] (tbl/rows lk h2 {})))
       (is (= 1 (count (tbl/rows lk h1 {})))
           "and the old table is still readable, so undo still walks back to it"))))
+
+(deftest refresh-does-not-discard-a-write-that-lands-while-it-runs
+  ;; `apply-event :put` is a whole-object replace, so a commit built from an
+  ;; earlier read drops whatever landed in between — no error, no trace.
+  ;; `server/rerun!` already avoids this by assoc-ing the one path it means.
+  ;;
+  ;; **The write has to land INSIDE refresh!'s window** — after it reads the
+  ;; object and before it commits. A first draft of this test committed the edit
+  ;; before calling `refresh!`, so `refresh!` simply read the edited object and
+  ;; the test passed against the whole-object `:put` it was written to catch.
+  ;; Hooking `land!`, which runs between the read and the commit, is what makes
+  ;; the window real.
+  (let [st   (sub/fresh-store)
+        uri  (csv! "a\n1\n")
+        r    (src/connect! st {:uri uri :format :csv :mode :materialise :title "Keep"})
+        id   (:id r)
+        orig @#'src/land!]
+    (spit (subs uri 7) "a\n1\n2\n")
+    (with-redefs [src/land! (fn [& args]
+                              (sub/commit! st {:op :assoc :id id :path [:title]
+                                               :value "Renamed while refreshing"})
+                              (apply orig args))]
+      (src/refresh! st id))
+    (let [o (sub/object st id)]
+      (is (= "Renamed while refreshing" (:title o))
+          "a refresh must not roll back a write it never read")
+      (is (= 2 (:rows (:value o))) "and it must still have refreshed"))))

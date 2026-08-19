@@ -294,6 +294,17 @@
           d   (describe lk src)
           at  (now-iso)
           h   (land! lk id src d at)]
-      (sub/commit! st {:op :put :id id
-                       :value (assoc o :value h :source (source-of src at))})
+      ;; Two `:assoc`s in one `:tx`, never a `:put` of the object read above.
+      ;; `apply-event :put` is `assoc-in [:objects id]` — a whole-object replace
+      ;; — so committing a map built from an earlier read silently discards
+      ;; anything else that landed on the object in between. Demonstrated
+      ;; 2026-08-19, deterministically and with no error anywhere: an
+      ;; `/api/edit` on a table between this function's read and its commit was
+      ;; gone afterwards. `server/rerun!` already avoids exactly this by
+      ;; assoc-ing `[:value]` rather than re-putting the object, and this is the
+      ;; same hazard with the same remedy — one refresh touches the two paths a
+      ;; refresh means, and nothing else.
+      (sub/commit! st {:op :tx
+                       :events [{:op :assoc :id id :path [:value]  :value h}
+                                {:op :assoc :id id :path [:source] :value (source-of src at)}]})
       {:id id :cols (:cols h) :rows (:rows h) :mode (:mode src)})))
