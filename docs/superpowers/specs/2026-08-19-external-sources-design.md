@@ -183,7 +183,12 @@ A passthrough table's bytes can change with no event. That breaks a promise the 
 everywhere else. The design makes it **visible and bounded**; it does not paper over it.
 
 Reads are bounded exactly as everything else is: `SELECT <projection> FROM read_csv('…')
-LIMIT 2000`, the same `mold-cap`. So a 10M-row passthrough file renders like a 10M-row
+LIMIT 2000`, the same `mold-cap`. **Which** 2000 is not promised, and that is not new: a
+`LIMIT` without an `ORDER BY` has no guaranteed row order over Parquet either, which is
+why `tablestore/column-samples` already sorts in SQL — *"the lake has no row order to
+appeal to without an `ORDER BY`, and a synopsis whose values vary between runs would move
+its hash on every sweep and re-embed forever."* A molded table has always been a page of an
+unordered relation; passthrough inherits that rather than introducing it. So a 10M-row passthrough file renders like a 10M-row
 materialised one. `row-count` would be a full scan, so the handle carries the count observed at
 connect and `hydrate` reports it as `:table/total` **with the passthrough marker attached** — a
 stale count that announces itself is safe; one that does not, is not.
