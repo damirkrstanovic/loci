@@ -68,7 +68,8 @@
    are recorded in `MANIFEST.edn`'s `:findings` and are predicates several
    viewers hang off. Task 1 guarded against the first *in the extract*. Nothing
    here works around any of them."
-  (:require [clojure.edn :as edn]
+  (:require [clojure.data.csv :as csv]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [loci.lake :as lake]
@@ -76,8 +77,40 @@
             [loci.notebook :as nb]
             [loci.server :as server]
             [loci.substrate :as sub]
-            [loci.tablestore :as tbl]
-            [loci.tools :as tools]))
+            [loci.tablestore :as tbl]))
+
+(defn- ->val
+  "Three regexes over a CSV cell: `-?\\d+` → Long, `-?\\d+\\.\\d+` → Double,
+   anything else → the string it already was.
+
+   **On its way out.** This and `parse-csv` below moved here from `loci.tools`
+   when `read_csv` became the only way a CSV becomes rows: every path a user
+   reaches — the `/api/import-csv` route, `/api/source/connect`, the agent's
+   table tools — now types a CSV through DuckDB's sniffer, which is per-column,
+   sampled, and gives real DATE/TIMESTAMP/BOOLEAN types where these three give
+   Long, Double or nothing. Two inferences meant the same CSV yielded different
+   types depending on how it arrived.
+
+   The corpus is the last caller, and it keeps this one until it imports through
+   the file connector like everything else — which is a change with a re-seed and
+   a set of broken derivations in it (`=` against a literal is type-strict, and a
+   `:month` that was a string becomes a DATE), not a rename. Deleting it here and
+   now would have broken `loci.corpus` to make one namespace tidy."
+  [s]
+  (let [s (str/trim (str s))]
+    (cond (re-matches #"-?\d+" s)        (Long/parseLong s)
+          (re-matches #"-?\d+\.\d+" s)   (Double/parseDouble s)
+          :else s)))
+
+(defn- parse-csv
+  "A corpus CSV's text → rows, keyed by `sub/col-kw` and typed by `->val`.
+
+   Private, and the only remaining `->val` caller in loci. See `->val` for why
+   it is still here and what replaces it."
+  [text]
+  (let [[hdr & rows] (csv/read-csv (java.io.StringReader. (str/trim text)))
+        ks (mapv sub/col-kw hdr)]                          ; "Total Revenue ($)" → :total_revenue
+    (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
 
 (def hubs
   "The five notebooks: which corpus table each is built on, what it is for, and
@@ -252,7 +285,7 @@
         entry (get (by-file m) file)]
     (if-not (.isFile f)
       (str "the corpus has no " file " — " (.getPath f) " is not there")
-      (let [rows (try (tools/parse-csv (slurp f)) (catch Exception e {:error (.getMessage e)}))]
+      (let [rows (try (parse-csv (slurp f)) (catch Exception e {:error (.getMessage e)}))]
         (cond
           (map? rows)
           (str file " could not be parsed as CSV: " (:error rows))
@@ -472,7 +505,7 @@
    carries the rows in the `:tx` nobody applies and writes nothing anywhere."
   [ts objm dir m {:keys [file title about prose]}]
   (let [tentry (get (by-file m) file)
-        rows   (tools/parse-csv (slurp (io/file dir file)))
+        rows   (parse-csv (slurp (io/file dir file)))
         tid    (server/next-id (view objm) "tbl:corpus-")
         tobj   (tbl/table-object ts tid (:title tentry) rows)
         objm   (assoc objm tid tobj)
@@ -1194,7 +1227,7 @@
              (fn [acc {:keys [file prose]}]
                (if (:error acc)
                  acc
-                 (let [rows (tools/parse-csv (slurp (io/file dir file)))]
+                 (let [rows (parse-csv (slurp (io/file dir file)))]
                    (reduce (fn [acc r]
                              (if (:error r)
                                (reduced r)

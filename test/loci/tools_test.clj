@@ -5,11 +5,25 @@
             [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
+            [loci.server :as server]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools]))
 
 (use-fixtures :once loci.lake-fixture/with-temp-lake)
+
+(defn- with-temp-data-dir
+  "Run `f` with `sub/data-dir` answering a fresh temp directory, removed after.
+
+   `import-csv!` writes the posted text under `<LOCI_DATA>/files/` before it
+   connects, so without this the suite drops a CSV into the real `data/` on
+   every run. Redefining the ONE function is what keeps the round trip whole:
+   `sourcespec/locate` resolves `loci://` through the same var, so the write
+   and the read cannot end up in different directories."
+  [f]
+  (let [d (str (System/getProperty "java.io.tmpdir") "/loci-tools-data-" (System/nanoTime))]
+    (try (with-redefs [sub/data-dir (constantly d)] (f))
+         (finally (lf/rm-rf d)))))
 
 (deftest md-table-salvage-parses-prose-tables
   ;; live-fire finding #3: the model wrote the table INTO the note instead of
@@ -23,20 +37,23 @@
         rows (tools/md-table->rows text)]
     (is (= 2 (count rows)))
     (is (= "JSR Corporation (Japan)" (:supplier (first rows))))
-    (is (= 30 (:market_share_pct (first rows))))          ; "~30% (estimated)" → 30
-    (is (= 25 (:market_share_pct (second rows))))))
+    (is (= "30" (:market_share_pct (first rows))))        ; "~30% (estimated)" → "30"
+    (is (= "25" (:market_share_pct (second rows))))))
 
-(deftest md-table-salvage-piped-and-typed
+(deftest md-table-salvage-piped-cells-are-all-text
   (let [rows (tools/md-table->rows "| name | q | when |\n|---|---|---|\n| A | 1.5 | Q3 2025 |")]
-    (is (= [{:name "A" :q 1.5 :when "Q3 2025"}] rows))))  ; letters-first cells stay strings
+    ;; every cell is a string, salvaged or not — the salvage decides what text
+    ;; a cell contributes, and `read_csv` decides what that text IS.
+    (is (= [{:name "A" :q "1.5" :when "Q3 2025"}] rows))))
 
-(deftest md-table-salvage-never-mangles-numbers
-  ;; final-review finding: thousands separators and dates must NOT half-parse
+(deftest md-cell-val-extracts-the-number-as-text-for-duckdb-to-type
+  ;; final-review finding, kept: thousands separators and dates must NOT
+  ;; half-parse. What changed is the other half — the salvaged cell comes back
+  ;; as TEXT now, because pulling a number out of a model's sentence is prose
+  ;; salvage and deciding what that number is belongs to `read_csv`.
   (let [rows (tools/md-table->rows "a | b | c | d\n---|---|---|---\n$1,234 | 2025-06-01 | ~30% | -5")]
-    (is (= "$1,234" (:a (first rows))))                   ; not 1
-    (is (= "2025-06-01" (:b (first rows))))               ; not 2025
-    (is (= 30 (:c (first rows))))
-    (is (= -5 (:d (first rows))))))
+    (is (= [{:a "$1,234" :b "2025-06-01" :c "30" :d "-5"}] rows)
+        "prose salvage pulls the number OUT as text; DuckDB decides what it is")))
 
 (deftest md-table-salvage-honest-nil
   (is (nil? (tools/md-table->rows "no table here at all")))
@@ -59,9 +76,18 @@
     ;; and `:cols` is where the column keywords travel through it as a *value*
     (is (= h (edn/read-string (pr-str h))))))
 
-(deftest parse-csv-sanitizes-headers
-  (let [rows (tools/parse-csv "Key Proponent(s),Total Revenue ($)\nCanon,5")]
-    (is (= {:key_proponent_s "Canon" :total_revenue 5} (first rows)))))
+(deftest import-csv-sanitizes-headers-through-read-csv
+  ;; What `parse-csv` used to prove, proved where the work now happens. The
+  ;; header normalization is still `sub/col-kw`; the inference underneath it is
+  ;; DuckDB's sniffer and nothing else in loci.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (server/import-csv! st "T" "Key Proponent(s),Total Revenue ($)\nCanon,5\n" nil)
+            o  (tbl/hydrate @lake/lake (sub/object st (:openId r)))]
+        (is (nil? (:error r)))
+        (is (= [{:key_proponent_s "Canon" :total_revenue 5}] (:value o))
+            "the header normalization is the same; the inference is DuckDB's")))))
 
 ;; ---- the agent's two table tools read through the handle, not around it ----
 ;; A table's rows live in the lake and the log holds a handle. Both tools used

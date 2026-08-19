@@ -1101,8 +1101,9 @@
 ;; Forward-declared because the minting below starts ~500 lines before these are
 ;; defined, down beside the entity work `next-id-in` was split out for. Both are
 ;; 1 + the highest existing suffix. Every unguarded count-based minter in this
-;; file now goes through one of them; `import-csv!` is the one holdout, and it
-;; still carries the `(rand-int 9999)` suffix the forensics addendum argues about.
+;; file goes through one of them. `import-csv!` was the last holdout, with its
+;; `(rand-int 9999)` suffix; it mints nothing now — `loci.source/mint-id` names
+;; the table, as it does for every other connected source.
 (declare next-id next-id-in)
 
 (defn edit! [st id value]
@@ -1984,18 +1985,6 @@
         {:answer answer}))
     (catch Exception e {:error (.getMessage e)})))
 
-(defn import-csv! [st title csv space]
-  (try
-    (let [rows (tools/parse-csv csv)
-          nid (str "tbl:csv-" (count (filter #(= :table (:kind %)) (vals (sub/objects st)))) "-" (inc (rand-int 9999)))
-          obj (tbl/table-object @lake/lake nid (or (not-empty title) "Imported CSV") rows)
-          base [{:op :put :id nid :value obj}]
-          evs (if (and space (space? st space))
-                (conj base (nb/append-cell-event st space {:ref nid}))
-                base)]
-      (sub/commit! st {:op :tx :events evs})
-      {:state (state-payload st) :openId nid})
-    (catch Exception e {:error (.getMessage e)})))
 
 ;; ---- the three /api/source routes ----
 ;;
@@ -2069,6 +2058,55 @@
   [st id]
   (try (assoc (src/refresh! st id) :state (state-payload st))
        (catch Exception e {:error (.getMessage e)})))
+
+(defn import-csv!
+  "Posted CSV **text** → a table, through the same reader as every other source.
+
+   The text is written under `<LOCI_DATA>/files/` and connected as a `loci://`
+   source, so this route and a phase-2 upload land identically: one inference,
+   one refresh path, and a file that stays reproducible. `tools/parse-csv` typed
+   a CSV with three regexes — Long, Double, String — where `read_csv` sniffs per
+   column and gives real DATE, TIMESTAMP and BOOLEAN types. Two inferences meant
+   the same CSV became different rows depending on which door it came through;
+   this is the door that closed.
+
+   Two consequences worth stating, because both are visible from the shell:
+
+   · **The id is a slug now**, `tbl:sales` rather than `tbl:csv-19-7071` —
+     `loci.source/mint-id` names every connected table the same way, and that
+     retires the `(rand-int 9999)` suffix this was the last holder of.
+   · **A header-only CSV lands a real, empty lake table** instead of the
+     `:value []` `tbl/table-value` used to commit for it. It hydrates to `[]`
+     either way, so the shell still draws an empty table; the difference is that
+     an empty table carries a recipe and `[]` cannot be refreshed.
+
+   It keeps the in-RAM copy of the posted body, because a JSON string body is
+   already the whole file in memory. That is the limit this route has always
+   had and the reason the streaming upload route exists in phase 2 — not a
+   regression introduced here.
+
+   `source-connect!` rather than `src/connect!` is what makes this a wrapper
+   rather than a second route: `startImport` reads `res.error`, then
+   `res.state` and `res.openId`, and those three keys are added there."
+  [st title csv space]
+  (let [written
+        (try (let [nm  (str (or (not-empty title) "imported") "-" (System/currentTimeMillis) ".csv")
+                   nm  (str/replace (str/lower-case nm) #"[^a-z0-9._-]+" "-")
+                   dir (io/file (sub/data-dir) "files")]
+               (.mkdirs dir)
+               (spit (io/file dir nm) csv)
+               nm)
+             ;; Its own catch: an unwritable data directory fails HERE, before
+             ;; `source-connect!` — whose catch would otherwise never see it —
+             ;; and `handler` has no top-level catch to turn a throw into
+             ;; anything but a stack trace the shell parses as JSON.
+             (catch Exception e {:error (.getMessage e)}))]
+    (if (map? written)
+      written
+      (source-connect! st {:uri (str "loci://files/" written)
+                           :format :csv :mode :materialise
+                           :title (or (not-empty title) "Imported CSV")}
+                       space))))
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.

@@ -5,8 +5,7 @@
 
    This is where MCP servers would register too: same shape — a JSON spec + a
    handler — so the model reaches every connected source through one mechanism."
-  (:require [clojure.data.csv :as csv]
-            [clojure.data.json :as json]
+  (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as hc]
             [loci.config :as config]
@@ -17,18 +16,6 @@
             [loci.viewspec :as vs]))
 
 (defn- table-objs [st] (->> (sub/objects st) vals (filter #(= :table (:kind %)))))
-
-;; ---- CSV ----
-(defn- ->val [s]
-  (let [s (str/trim (str s))]
-    (cond (re-matches #"-?\d+" s)        (Long/parseLong s)
-          (re-matches #"-?\d+\.\d+" s)   (Double/parseDouble s)
-          :else s)))
-
-(defn parse-csv [text]
-  (let [[hdr & rows] (csv/read-csv (java.io.StringReader. (str/trim text)))
-        ks (mapv sub/col-kw hdr)]                          ; "Total Revenue ($)" → :total_revenue
-    (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
 
 ;; ---- markdown-table salvage: models sometimes write the table INTO prose
 ;; instead of calling save_table. Deterministic extraction from the agent's
@@ -42,12 +29,30 @@
 (defn- md-sep? [line] (boolean (re-matches #"[\s|:\-]+" line)))
 
 (defn- md-cell-val
-  "\"~30% (estimated)\" → 30; \"1.5\" → 1.5. Letters-first cells stay strings,
-   and so does anything with MORE digits after the number (\"$1,234\",
-   \"2025-06-01\") — half-parsing those would be silently wrong."
+  "\"~30% (estimated)\" → \"30\"; \"1.5\" → \"1.5\". Letters-first cells stay as
+   they are, and so does anything with MORE digits after the number
+   (\"$1,234\", \"2025-06-01\") — half-parsing those would be silently wrong.
+
+   **Returns a string, always.** This is prose salvage, not type inference:
+   pulling a number out of a model's sentence is something DuckDB will never do,
+   and deciding what that number IS is something only DuckDB should do. `->val`,
+   which used to do the deciding here, is gone — `read_csv` is the one inference
+   in loci and this is not it.
+
+   **The cost, measured 2026-08-19, because it is not paid where it is made.**
+   `md-table->rows`'s only caller is `server/research!`, which hands the rows to
+   `save-table!` — and that path lands rows in the lake through `put-rows!`,
+   which types a column from the Clojure values it is given. So a salvaged
+   `share_pct` is now a VARCHAR of `\"30\"` where it was a BIGINT of `30`, and
+   `fnlib/catalog` on such a table drops from five available builtins to one:
+   Group, Top N, Pivot, Change and Share all answer *needs a numeric column*.
+   The salvage does NOT go through `read_csv`; nothing routes it there yet.
+   Making it one inference in fact rather than in intent means giving
+   `research!` the same file-and-connect path `import-csv!` now takes, which is
+   a change to `research!` and not to this function."
   [s]
   (if-let [m (re-matches #"[^A-Za-z0-9]*?(-?\d+(?:\.\d+)?)[^0-9]*" s)]
-    (->val (second m))
+    (second m)
     s))
 
 (defn md-table->rows

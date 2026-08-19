@@ -29,8 +29,7 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
-            [loci.tablestore :as tbl]
-            [loci.tools :as tools])
+            [loci.tablestore :as tbl])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
@@ -639,7 +638,9 @@
         ;; whichever one came last.
         one    (fn [via args] (:fact (first (filter #(and (= via (:via %)) (= args (:args %)))
                                                     (:facts (:plan r))))))
-        rows   #(tools/parse-csv (slurp (io/file dir %)))]
+        ;; `parse-csv` moved into `loci.corpus` when `read_csv` became the only
+        ;; way a CSV becomes rows everywhere else; the corpus is its last caller.
+        rows   #(#'corpus/parse-csv (slurp (io/file dir %)))]
 
     (testing "the cobalt leader is the largest 2025 producer in the file"
       (let [g (sort-by :production_tonnes >

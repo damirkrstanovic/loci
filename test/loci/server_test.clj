@@ -39,6 +39,19 @@
     (when (.isDirectory f) (run! rm-rf (.listFiles f)))
     (.delete f)))
 
+(defn- with-temp-data-dir
+  "Run `f` with `sub/data-dir` answering a fresh temp directory, removed after.
+
+   `import-csv!` writes the posted text under `<LOCI_DATA>/files/` before it
+   connects, so without this the suite drops a CSV into the real `data/` on
+   every run. Redefining the ONE function is what keeps the round trip whole:
+   `sourcespec/locate` resolves `loci://` through the same var, so the write and
+   the read cannot end up in different directories."
+  [f]
+  (let [d (str (System/getProperty "java.io.tmpdir") "/loci-server-data-" (System/nanoTime))]
+    (try (with-redefs [sub/data-dir (constantly d)] (f))
+         (finally (rm-rf d)))))
+
 (defn- rows-of
   "A table object's rows, through the same seam the server reads them through.
 
@@ -729,12 +742,23 @@
       (is (= before (count (sub/history st)))))))          ; nothing committed
 
 (deftest research-salvages-prose-tables
+  ;; The salvaged cells are TEXT since `md-cell-val` stopped typing them —
+  ;; `->val` was loci's second CSV inference and `read_csv` is the only one
+  ;; left. **This path does not reach `read_csv`**: `research!` hands the rows
+  ;; to `save-table!`, which types a lake column from the Clojure values it is
+  ;; given, so `share_pct` is VARCHAR here where it was BIGINT.
+  ;;
+  ;; Measured 2026-08-19, and the reason this is written down rather than just
+  ;; edited: `fnlib/catalog` over these rows offers ONE builtin where it offered
+  ;; five — Group, Top N, Pivot, Change and Share all answer "needs a numeric
+  ;; column". Routing the salvage through the file connector, as `import-csv!`
+  ;; now goes, is what would make the intent true; it is a change to `research!`.
   (with-redefs [agent/chat-tools (fn [& _] "intro\n\nname | share_pct\n--- | ---\nA | 30%\nB | 20%\n\ndone")
                 loci.server/distill! (fn [& _] nil)]
     (let [st (store-with-table)
           r  (srv/research! st "space:n" "extract a table of shares")]
       (is (clojure.string/starts-with? (str (:openId r)) "tbl:extract"))
-      (is (= [{:name "A" :share_pct 30} {:name "B" :share_pct 20}]
+      (is (= [{:name "A" :share_pct "30"} {:name "B" :share_pct "20"}]
              (rows-of st (:openId r)))))))
 
 (deftest compute-retries-once-with-error-feedback
@@ -4282,16 +4306,18 @@
   ;; `rows-of` hydrates, so it reads an unconverted writer's literal rows just
   ;; as happily as a handle — which means no assertion above can tell whether
   ;; these three were converted at all. This is the one that can.
-  (let [st (store-with-table)
-        landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
-    (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
-        "import-csv!")
-    (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
-                                         {:by "revenue" :n "1" :order "desc"} nil)))
-        "the ƒ apply")
-    (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
-      (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
-          "compute-clj!"))))
+  (with-temp-data-dir
+    (fn []
+      (let [st (store-with-table)
+            landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
+        (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
+            "import-csv!")
+        (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                             {:by "revenue" :n "1" :order "desc"} nil)))
+            "the ƒ apply")
+        (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+          (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
+              "compute-clj!"))))))
 
 (deftest a-csv-with-only-a-header-is-an-empty-table-not-an-error
   ;; `Lake/put-rows!` refuses a table with no rows. Of the six writers this is
@@ -4300,10 +4326,52 @@
   ;; "the function did not return rows" for an empty result, measured
   ;; 2026-08-16. Before tables moved this committed `:value []` and the shell
   ;; drew an empty table; it still must.
-  (let [st (store-with-table)
-        r  (srv/import-csv! st "C" "region,revenue" nil)]
-    (is (nil? (:error r)) "a header-only CSV must not become an error")
-    (is (= [] (rows-of st (:openId r))))))
+  (with-temp-data-dir
+    (fn []
+      (let [st (store-with-table)
+            r  (srv/import-csv! st "C" "region,revenue" nil)]
+        (is (nil? (:error r)) "a header-only CSV must not become an error")
+        (is (= [] (rows-of st (:openId r))))))))
+
+(deftest a-header-only-csv-lands-an-empty-lake-table-not-a-literal
+  ;; The shape above changed underneath that test, and this is where it is
+  ;; pinned rather than left to be discovered. `tbl/table-value` refused an
+  ;; empty table and committed `:value []`; `create-from-relation!` makes a
+  ;; real, empty lake table and commits a handle with `:rows 0`. The test above
+  ;; still passes because it reads through `rows-of`, which hydrates — and
+  ;; hydrating an empty lake table gives `[]` exactly as a literal `[]` does.
+  ;;
+  ;; Landing the table is the simpler rule and the one that keeps `refresh!`
+  ;; working: `[]` is not a handle, so a `:value []` table carries no recipe to
+  ;; re-run.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "C" "region,revenue" nil)
+            h  (:value (sub/object st (:openId r)))]
+        (is (nil? (:error r)))
+        (is (tbl/handle? h) "a header-only CSV lands a handle, where table-value gave []")
+        (is (= 0 (:rows h)))
+        (is (= [] (:value (tbl/hydrate @lake/lake (sub/object st (:openId r))))))))))
+
+(deftest import-csv-answers-the-shell-the-three-keys-startImport-reads
+  ;; `resources/public/index.html`'s `startImport` reads `res.error`, then
+  ;; `applyState(res.state)` and `openObject(res.openId)`. `import-csv!` is a
+  ;; wrapper over `source-connect!` now, and this is the assertion that the
+  ;; wrapper actually connects rather than only writing the file: without the
+  ;; connect there is no object to open and `:openId` is nil.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "Sales" "region,revenue\nEMEA,1\n" nil)]
+        (is (nil? (:error r)))
+        (is (some? (:openId r)) "the id the shell opens")
+        (is (some? (:state r)) "and the state payload it applies")
+        (is (= :table (:kind (sub/object st (:openId r))))
+            "openObject must find a table there, not a missing id")
+        (is (= [{:region "EMEA" :revenue 1}] (rows-of st (:openId r))))
+        (is (= "loci://files/sales-" (subs (:uri (:source (sub/object st (:openId r)))) 0 19))
+            "and the CSV is on disk as a source, so refresh! has something to re-run")))))
 
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
   ;; the other half of the same measurement: this path refuses upstream, so the
