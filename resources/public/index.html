@@ -803,13 +803,42 @@ function editProse(i,idx,text){
   ed.querySelector('.prosed').focus();
 }
 
+// The inline forms a repaint would destroy — research, flow, ask, ＋ Data, the
+// prose editor and the ƒ palette. ONE definition, used by both guards below, so
+// the next panel someone adds is covered by both of them or by neither, rather
+// than by whichever one they remembered.
+//
+// Returns the ELEMENT and not a boolean, because `renderNotebook` needs its
+// identity: a form that was already there when a render started is one that
+// render is dismissing, while a DIFFERENT one appeared while it was in flight.
+const FORMSEL='#fq,#rq,#aq,.datapanel,.prosed,.fnpal';
+function formOpenIn(b){ return b?b.querySelector(FORMSEL):null; }
+
 async function renderNotebook(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
   // don't flash "loading…" (and reset scroll) when this notebook is already
   // painted — watchFlow re-renders every 2.5s; the fetch repaints fully below
   if(!b.querySelector('.cellwrap')) b.innerHTML='<div class="sec-h">loading notebook…</div>';
+  // What is open in this panel BEFORE the fetch. A form still standing when the
+  // answer lands is the one this render was called to dismiss — every Cancel
+  // (`#cancelImp`, `#cancelRes`, `#cancelFlow`, `#cancelAsk`, the prose
+  // editor's) calls renderBody while its own markup is still on screen, so
+  // skipping on presence alone would make Cancel a button that does nothing.
+  const wasOpen=formOpenIn(b);
   const nb=await API.notebook(sp.id,tat());
   if(mode!=='focus'||i!==focusIdx||openId) return;   // panel moved on while we fetched
+  // A DIFFERENT form is one somebody opened while we were fetching, and the
+  // wholesale `b.innerHTML=` below would throw it away along with whatever they
+  // had typed. Measured: the window is one fetch — 26 ms idle — which is why
+  // this raced three full-suite runs in five and never once in isolation.
+  //
+  // The cost, which is the right way round but should be written down rather
+  // than discovered: a notebook that finishes loading while a form is open does
+  // NOT repaint, so the cells behind that form can be one fetch stale until it
+  // closes. Losing what someone typed is worse than showing slightly old cells
+  // behind a panel they are looking at.
+  const nowOpen=formOpenIn(b);
+  if(nowOpen && nowOpen!==wasOpen) return;
   if(nb.error){ b.innerHTML='<div style="color:var(--attn);font-size:13px">'+esc(nb.error)+'</div>'; return; }
   let cellsH='';
   nb.cells.forEach(c=>{
@@ -1110,12 +1139,12 @@ function watchFlow(i, job){
   const tick=async()=>{
     let s; try{ s=await API.job(job); }catch(e){ setTimeout(tick,4000); return; }
     const ae=document.activeElement, typing=ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
-    // an open inline form (research/flow/＋ Data/ask/prose edit/ƒ palette) would be
-    // destroyed by a repaint even when unfocused — keep polling, skip the paint.
-    // `.datapanel` and not `#csv` alone: the file tab carries neither #csv nor
-    // #ctitle, so a repaint would throw away a preview you were reading.
+    // an open inline form would be destroyed by a repaint even when unfocused —
+    // keep polling, skip the paint. `formOpenIn` and not an inline selector: it
+    // is the same list `renderNotebook`'s post-await guard reads, and two copies
+    // of it would drift the first time a panel is added.
     const b=document.getElementById('body'+i);
-    const formOpen=b&&b.querySelector('#fq,#rq,#aq,.datapanel,.prosed,.fnpal');
+    const formOpen=formOpenIn(b);
     if(!TIME && !typing && !formOpen && mode==='focus' && focusIdx===i && !openId) renderBody(i);
     if(!s.done){ setTimeout(tick,2500); return; }
     const r=s.result||{error:s.error||'job lost'};

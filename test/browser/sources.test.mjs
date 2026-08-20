@@ -371,3 +371,115 @@ test('the ＋ Data panel still pastes', async () => {
       'the pasted table drew no rows');
   });
 });
+
+// ---------------- the repaint that eats the panel --------------------------
+//
+// `renderNotebook` is async, and its post-await guard only asked whether the
+// panel had moved on — not whether something had been OPENED in it. So the
+// sequence below destroyed whatever you had typed:
+//
+//   enter(i) → renderBody → renderNotebook starts a fetch
+//   you click ＋ Data before it lands → the panel replaces the body
+//   the fetch lands → mode is still focus, i is still focusIdx, openId is still
+//   null → the guard passes → b.innerHTML replaces the body → panel gone
+//
+// Measured idle, that window is one fetch — 26 ms — which is why this raced in
+// roughly three of five full-suite runs and never once in isolation. `page.route`
+// widens it to 800 ms deterministically. The route is installed AFTER boot on
+// purpose: the first render has already drawn `＋ Data`, so what is slowed is
+// the SECOND render, which is the one that lands late and does the damage.
+//
+// This is not a ＋ Data defect. `#fq`, `#rq`, `#aq`, `.prosed` and `.fnpal` all
+// replace the body the same way and were equally exposed; ＋ Data is only the
+// first panel a test clicks fast enough to catch it.
+const slowNotebook = (page, ms) => page.route('**/api/notebook*', async route => {
+  await new Promise(r => setTimeout(r, ms));
+  await route.continue();
+});
+
+test('a notebook landing late does not wipe a panel opened while it was in flight', async () => {
+  await withPage(browser, 'sources-data-race', async (page) => {
+    await bootedShell(page, server.url);
+    const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+    assert.ok(i >= 0, 'space:cosmos missing — SOURCES_FIXTURE connects all three tables into it');
+    await slowNotebook(page, 800);
+
+    // `enter` starts the render that will land late. `＋ Data` is already on
+    // screen from the render before it, which is exactly the state a person is
+    // in when they click it.
+    await page.evaluate(n => enter(n), i);
+    await page.click(`#body${i} #dataBtn`);
+    await page.waitForSelector(`#body${i} .datapanel`);
+    await page.waitForSelector(`#body${i} [data-file]`, { timeout: 8000 });
+
+    // the in-flight notebook lands somewhere in here
+    await new Promise(r => setTimeout(r, 1600));
+    assert.equal(await page.locator(`#body${i} .datapanel`).count(), 1,
+      'the notebook fetch landed and replaced the body — the panel, and anything typed into it, is gone');
+    assert.ok(await page.locator(`#body${i} [data-file]`).count() > 0,
+      'the panel survived as an element but its contents were repainted away');
+    await page.unroute('**/api/notebook*');
+  });
+});
+
+// The trap in the fix, and the reason the guard cannot simply ask "is a form
+// open?".
+//
+// The prose editor is the case that separates the two. `editProse` does
+// `target.replaceWith(ed)` — it swaps ONE cell, so `.cellwrap` elements survive
+// beside it, so `renderNotebook`'s "don't flash loading…" line does not fire and
+// the panel is still standing when the fetch lands. Its Cancel calls renderBody
+// while `.prosed` is on screen, and a guard that skips on PRESENCE therefore
+// refuses the very repaint that was meant to clear it: Cancel becomes a button
+// that does nothing, permanently.
+//
+// ＋ Data cannot show this and must not be used for it. It replaces the whole
+// body, so no `.cellwrap` survives, so the loading line wipes it BEFORE the
+// guard is reached — measured: a presence-only guard passes a ＋ Data cancel
+// test three runs out of three. That version of this test certified instead of
+// testing, which is the failure this branch has already shipped five of.
+test('Cancel closes the prose editor even when the render lands late', async () => {
+  await withPage(browser, 'sources-data-cancel', async (page) => {
+    const i = await enterCosmos(page);
+    await page.click(`#body${i} #addProse`);
+    await page.waitForSelector(`#body${i} .prosed`);
+    assert.ok(await page.locator(`#body${i} .cellwrap`).count() > 0,
+      'the prose editor is not standing beside real cells — this test proves nothing without them');
+
+    // slow, so a guard that refuses the repaint leaves the editor up for good
+    // rather than for a few milliseconds nobody would notice
+    await slowNotebook(page, 800);
+    await page.click(`#body${i} [data-a="cancel"]`);
+    await until(async () => (await page.locator(`#body${i} .prosed`).count()) === 0,
+      'Cancel left the prose editor on screen — the repaint that clears it was refused', 8000);
+    await page.waitForSelector(`#body${i} #dataBtn`);
+    await page.unroute('**/api/notebook*');
+  });
+});
+
+// The first-run path: `<LOCI_DATA>/files/` exists and is empty. Stubbed rather
+// than given a second fixture — the fixture's whole point is that it HAS files,
+// and a server booted to have none would cost a cold JVM to assert one sentence.
+test('an empty files directory says so, and still offers the way out', async () => {
+  await withPage(browser, 'sources-data-empty', async (page) => {
+    await page.route('**/api/source/files', route => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ files: [] }) }));
+    const i = await enterCosmos(page);
+    await page.click(`#body${i} #dataBtn`);
+    await page.waitForSelector(`#body${i} .datapanel`);
+
+    const body = () => page.textContent(`#body${i} .dbody`).then(t => t.trim());
+    await until(async () => !/reading the file list/i.test(await body()),
+      async () => `the listing never resolved: ${JSON.stringify(await body())}`, 8000);
+    const t = await body();
+    assert.match(t, /nothing in loci’s files directory/i,
+      `an empty directory draws no explanation — it drew: ${JSON.stringify(t)}`);
+    assert.match(t, /paste is the other tab/i,
+      `it does not point at the door that still works: ${JSON.stringify(t)}`);
+    assert.equal(await page.locator(`#body${i} [data-file]`).count(), 0,
+      'rows were drawn for a listing with no files in it');
+    // an empty panel with no way out is a trap, not an answer
+    assert.equal(await page.locator(`#body${i} .dbody [data-a="dcancel"]`).count(), 1,
+      'the empty listing offers no Cancel');
+  });
+});
