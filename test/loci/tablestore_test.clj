@@ -221,3 +221,15 @@
     (is (thrown-with-msg? Exception #"disk on fire"
           (tbl/hydrate boom {:kind :table :value h}))
         "the original read error survives, not the one from asking about it")))
+
+(deftest check-names-refuses-two-names-that-become-one-column
+  (is (nil? (tbl/check-names! ["Total Revenue ($)" "Region"]))
+      "names that normalize apart pass silently")
+  (let [e (try (tbl/check-names! ["a b" "a_b"]) nil (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e) "two names normalizing to one column must throw")
+    (is (= :a_b (:column (ex-data e))))
+    (is (= ["a b" "a_b"] (sort (map str (:from (ex-data e)))))))
+  (let [e (try (tbl/normalize-rows [{"a b" 1 :a_b 2}]) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :a_b (:column (ex-data e)))
+        "normalize-rows must keep throwing exactly as it did, through the same check")))

@@ -5,8 +5,7 @@
 
    This is where MCP servers would register too: same shape — a JSON spec + a
    handler — so the model reaches every connected source through one mechanism."
-  (:require [clojure.data.csv :as csv]
-            [clojure.data.json :as json]
+  (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as hc]
             [loci.config :as config]
@@ -17,18 +16,6 @@
             [loci.viewspec :as vs]))
 
 (defn- table-objs [st] (->> (sub/objects st) vals (filter #(= :table (:kind %)))))
-
-;; ---- CSV ----
-(defn- ->val [s]
-  (let [s (str/trim (str s))]
-    (cond (re-matches #"-?\d+" s)        (Long/parseLong s)
-          (re-matches #"-?\d+\.\d+" s)   (Double/parseDouble s)
-          :else s)))
-
-(defn parse-csv [text]
-  (let [[hdr & rows] (csv/read-csv (java.io.StringReader. (str/trim text)))
-        ks (mapv sub/col-kw hdr)]                          ; "Total Revenue ($)" → :total_revenue
-    (mapv (fn [r] (into {} (map vector ks (map ->val r)))) rows)))
 
 ;; ---- markdown-table salvage: models sometimes write the table INTO prose
 ;; instead of calling save_table. Deterministic extraction from the agent's
@@ -44,10 +31,33 @@
 (defn- md-cell-val
   "\"~30% (estimated)\" → 30; \"1.5\" → 1.5. Letters-first cells stay strings,
    and so does anything with MORE digits after the number (\"$1,234\",
-   \"2025-06-01\") — half-parsing those would be silently wrong."
+   \"2025-06-01\") — half-parsing those would be silently wrong.
+
+   **This is prose salvage, and it returns a number.** An earlier draft of the
+   external-sources plan had it return the extracted *string*, on the theory
+   that DuckDB should do all the typing and loci none — the same rule that
+   took `->val` out of `loci.tools` and made `read_csv` the only way a CSV a
+   user imports becomes rows. That rule does not reach here, and the reason is
+   worth writing down: these rows never touch `read_csv`. `md-table->rows`' only
+   caller is `server/research!`, which hands them to `save-table!` → `put-rows!` →
+   `load-rows!`, and that path writes NDJSON and reads it back with
+   `read_json_auto`. **DuckDB types these cells either way.** The only thing
+   decided here is whether it is handed a JSON number or a JSON string, and a
+   cell that says `~30%` holds a number.
+
+   Measured 2026-08-19, handing it a string instead: the lake column comes back
+   `VARCHAR`, and `fnlib/numeric-cols` answers `[]` where it answered
+   `[:share]`. `fnlib/catalog` still LISTS Group, Top N, Change and Share, each
+   greyed with `{:ok false :why needs-a-numeric-column}` — `needs-numeric`
+   is wired into all five. So the table is not broken, it is inert: the palette
+   says why, and the user is left reading `~30%` as text nobody can total.
+
+   So: extracting a number out of a model's sentence is loci's job, because
+   nothing else will ever do it; deciding what that number IS remains DuckDB's."
   [s]
   (if-let [m (re-matches #"[^A-Za-z0-9]*?(-?\d+(?:\.\d+)?)[^0-9]*" s)]
-    (->val (second m))
+    (let [n (second m)]
+      (if (str/includes? n ".") (Double/parseDouble n) (Long/parseLong n)))
     s))
 
 (defn md-table->rows
@@ -136,15 +146,15 @@
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
   (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
-    ;; `hydrate` degrades a reclaimed table to `:value []` rather than throwing,
+    ;; `hydrate` degrades an unusable table to `:value []` rather than throwing,
     ;; so without this the tool answers `{:rows []}` — "your filter matched
     ;; nothing" — and the model reports a real zero. Worse on the `save_as` path,
     ;; where it would commit an empty derived table over the answer. An `:error`
-    ;; naming the date is something the model can act on and say out loud.
-    (if (:table/reclaimed o)
-      {:error (str "table " table_id " was reclaimed on "
-                   (tbl/reclaimed-str (:table/reclaimed o))
-                   " — its rows are no longer stored")}
+    ;; naming the reason is something the model can act on and say out loud, and
+    ;; `tbl/unusable` is where every reader gets that sentence — a reclamation,
+    ;; a source file that is gone, a source whose columns moved.
+    (if-let [why (tbl/unusable o)]
+      {:error (str "table " table_id " cannot be read: " why)}
       (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
             rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
         (if save_as

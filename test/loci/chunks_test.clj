@@ -330,6 +330,89 @@
           (is (= ["Gone"] (map :text (get by-object "tbl:gone")))
               "and the reclaimed one falls back to its title, which is all that is left"))))))
 
+;; ---- passthrough sources: the sweep degrades the way hydrate does ----
+
+(defn- csv!
+  "A temp CSV holding `text`, as a file:// uri. Never cleaned up inside a test —
+   the OS temp dir is the fixture, exactly as in `loci.source-test`."
+  [text]
+  (let [f (java.io.File/createTempFile "chunks-src-" ".csv")]
+    (spit f text)
+    (str "file://" (.getAbsolutePath f))))
+
+(defn- source-handle [uri cols]
+  {:store :source :uri uri :format :csv :cols cols :raw (mapv name cols)
+   :rows 1 :at "2026-08-19T10:00:00Z"})
+
+(defn- substrate-with-a-broken-source
+  "A store holding one broken passthrough source, one healthy lake table and one
+   healthy doc, plus the lake the first two read through. Calls `(f st)`.
+
+   The two healthy objects are the point of every test below. A source's file
+   can vanish or change its header with **no event committed**, so the only
+   thing that notices is a read — and `all-chunks` reads every object in the
+   substrate on a 15-second timer. A test that asserted only on the broken
+   object would have passed throughout the outage these tests exist to catch."
+  [broken-uri f]
+  (lf/with-temp-lake
+    (fn []
+      (let [lk   @lake/lake
+            good (tbl/put-rows! lk "tbl:good" [{:region "EMEA" :rev 10}])
+            st   (sub/fresh-store)]
+        (sub/commit! st {:op :put :id "tbl:good"
+                         :value {:id "tbl:good" :kind :table :title "Good" :value good}})
+        (sub/commit! st {:op :put :id "tbl:src"
+                         :value {:id "tbl:src" :kind :table :title "Source"
+                                 :value (source-handle broken-uri [:a :b])}})
+        (sub/commit! st {:op :put :id "doc:d"
+                         :value {:id "doc:d" :kind :doc :title "D" :value "some prose here"}})
+        (f st)))))
+
+(defn- assert-only-the-source-degraded [st]
+  (let [by-object (group-by :object (ch/all-chunks st))]
+    (is (seq (get by-object "doc:d"))
+        "the doc still chunks — one broken source must not cost the substrate its indexing")
+    (is (re-find #"EMEA" (:text (first (get by-object "tbl:good"))))
+        "and the healthy lake table still chunks with its samples")
+    (is (= ["Source"] (map :text (get by-object "tbl:src")))
+        "while the broken source falls back to its title, as a reclaimed table does")))
+
+(deftest a-source-whose-file-is-gone-does-not-stop-the-sweep
+  ;; `reclaimed-at` answers nil for a `:source` handle by design — nothing can
+  ;; reclaim a file loci does not own — so the catch that asks it rethrew every
+  ;; passthrough failure. Measured 2026-08-20 before the fix: `all-chunks`,
+  ;; `pending` and `sweep!` all threw `java.sql.SQLException`, and `doc:d` was
+  ;; never chunked at all, every 15 seconds, until the file came back.
+  (let [uri (csv! "a,b\n1,x\n")]
+    (.delete (java.io.File. ^String (subs uri 7)))
+    (substrate-with-a-broken-source uri assert-only-the-source-degraded)))
+
+(deftest a-source-whose-columns-drifted-does-not-stop-the-sweep
+  ;; The second failure mode, and it fails differently: the file IS there and
+  ;; DuckDB answers with a binder error rather than an IO one. `hydrate` tells
+  ;; the two apart because they want different repairs; the sweep must survive
+  ;; both, and testing only the missing file leaves half the outage in place.
+  (let [uri (csv! "a,b\n1,x\n")]
+    (spit (subs uri 7) "c,d\n1,x\n")                     ; same file, new header
+    (substrate-with-a-broken-source uri assert-only-the-source-degraded)))
+
+(deftest a-sweep-over-a-broken-source-returns-rather-than-throwing
+  ;; `sweep!`'s own docstring says it never throws, and `start-chunk-sweep!`'s
+  ;; `catch Throwable` keeps the thread alive while the pass does nothing. The
+  ;; same throw reaches `GET /api/leap?deep=1` through `pending`, where nothing
+  ;; catches it at all.
+  (let [uri (csv! "a,b\n1,x\n")]
+    (.delete (java.io.File. ^String (subs uri 7)))
+    (substrate-with-a-broken-source
+     uri
+     (fn [st]
+       (with-tmpfile [path]
+         (let [cs (ch/file-chunks path)]
+           (is (= 3 (count (ch/pending st cs "m")))
+               "one chunk per object, the broken source's title among them")
+           (is (= {:off true :retired 0} (with-env {} #(ch/sweep! st cs)))
+               "and the sweep completes")))))))
+
 (deftest a-broken-sweep-is-not-silently-a-quiet-one
   ;; The catch has to ask the catalog. An unconditional one turns a failing disk
   ;; into a substrate of bare titles, sweep after sweep, with nothing raised.

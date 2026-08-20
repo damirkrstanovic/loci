@@ -22,6 +22,7 @@
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools]
@@ -395,9 +396,9 @@
   [st m id view]
   (let [o (tbl/hydrate lake/lake (sub/object st id))]
     (cond
-      ;; RECLAIMED — first, and before the view branches, because a reclaimed
-      ;; table can still have a viewspec pointed at it and `vs/interpret` over
-      ;; `[]` would draw an empty chart rather than say anything.
+      ;; UNUSABLE — first, and before the view branches, because such a table
+      ;; can still have a viewspec pointed at it and `vs/interpret` over `[]`
+      ;; would draw an empty chart rather than say anything.
       ;;
       ;; `hydrate` handed us `:value []`, and every branch below would render
       ;; that as a table with no rows in it — indistinguishable from a table the
@@ -405,8 +406,13 @@
       ;; answer. The cols and the true count come off the handle, so the page can
       ;; still say what was there. `:rendered` and `:alternatives` are present
       ;; and empty because the shell reads both on every payload.
-      (:table/reclaimed o)
+      ;;
+      ;; `:unusable` is the sentence — reclaimed, source gone, source drifted —
+      ;; and `:reclaimed` stays beside it, unchanged, because the shell renders
+      ;; that key today and teaching it the other three is Phase 2.
+      (tbl/unusable o)
       {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
+       :unusable (tbl/unusable o)
        :table/total (:table/total o) :table/cols (:table/cols o)
        :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
@@ -589,8 +595,16 @@
             ;; lake-backed table no longer costs a row read for that:
             ;; `all-chunks` builds its synopsis from `tbl/column-samples`, which
             ;; the lake answers with one `SELECT DISTINCT … LIMIT 3` per column
-            ;; and memoizes per `[table, snapshot]`. A handle is immutable, so
-            ;; each one is queried once in the life of the process.
+            ;; and memoizes per `[lake version from cols per-col]` — see
+            ;; `lake/sample-cache`. A `:lake` handle is immutable and its FROM
+            ;; text already names its snapshot, so each one is queried once in
+            ;; the life of the process.
+            ;;
+            ;; A passthrough `:source` handle is NOT once per process. Its key
+            ;; carries the handle's `:at`, so a `refresh!` mints a fresh entry:
+            ;; once per refresh rather than once per handle. And a miss costs
+            ;; more there — the FROM text is `read_csv(…)` over the file itself,
+            ;; so every one of those per-column queries re-parses it.
             ;;
             ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
             ;; chunks / 31 row-bearing tables. Interleaved after 30 warmup
@@ -1095,8 +1109,9 @@
 ;; Forward-declared because the minting below starts ~500 lines before these are
 ;; defined, down beside the entity work `next-id-in` was split out for. Both are
 ;; 1 + the highest existing suffix. Every unguarded count-based minter in this
-;; file now goes through one of them; `import-csv!` is the one holdout, and it
-;; still carries the `(rand-int 9999)` suffix the forensics addendum argues about.
+;; file goes through one of them. `import-csv!` was the last holdout, with its
+;; `(rand-int 9999)` suffix; it mints nothing now — `loci.source/mint-id` names
+;; the table, as it does for every other connected source.
 (declare next-id next-id-in)
 
 (defn edit! [st id value]
@@ -1306,8 +1321,9 @@
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
-        ;; The hydrated OBJECT, not just its `:value` — a source whose rows were
-        ;; reclaimed hydrates to `:value []`, which is not nil, so the "is gone"
+        ;; The hydrated OBJECT, not just its `:value` — a source that cannot be
+        ;; read (reclaimed, or a live source whose file is gone or whose columns
+        ;; moved) hydrates to `:value []`, which is not nil, so the "is gone"
         ;; branch below cannot see it and the chain recomputes over zero rows.
         ;; Before tables could degrade, that case raised and the chain stopped.
         ;;
@@ -1325,11 +1341,20 @@
         known  (get working src-id)
         src    (when-not known (tbl/hydrate lake/lake (sub/object st src-id)))
         rows   (or known (:value src))
-        via    (:via obj)]
+        via    (:via obj)
+        ;; Bound rather than called twice in the `cond` below. `unusable` is
+        ;; nil-safe and cheap, so evaluating it eagerly costs nothing even when
+        ;; `src` is nil because the ancestor was already refreshed in this run.
+        why    (tbl/unusable src)]
     (cond
-      ;; Before `nil?`: `[]` passes that check.
-      (:table/reclaimed src) {:why (str "source " src-id "'s rows were reclaimed on "
-                                        (tbl/reclaimed-str (:table/reclaimed src)))}
+      ;; **Before the `via` branches**, which is the ordering that matters — not
+      ;; its position relative to `nil?`. A `lib:` builtin fires on `[]` rows and
+      ;; answers "no rows came out — nothing to keep", so a refusal placed after
+      ;; them never runs and the chain reports a misleading reason instead of the
+      ;; real one. Measured 2026-08-19: moved below `via`, the file-is-gone test
+      ;; gets `lib:top`'s answer. Moving it below `nil?` changes nothing, because
+      ;; `hydrate` degrades to `[]` and `(nil? [])` is false.
+      why {:why (str "source " src-id "'s rows are unusable: " why)}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
       (if-let [code (get-in (sub/object st via) [:value :code])]
@@ -1530,7 +1555,29 @@
    Reads `:table/reclaimed` first so a HYDRATED object answers without the map,
    and falls back to the handle's table name so an UNHYDRATED one answers too.
    Both shapes reach these readers: `tbl/hydrate` sets the key, and
-   `table-catalog` is handed unhydrated objects on purpose."
+   `table-catalog` is handed unhydrated objects on purpose.
+
+   **Not routed through `tbl/unusable`, and that is a decision, not an
+   oversight.** `unusable` answers about a HYDRATED object, and both callers
+   here are fed unhydrated ones — the whole reason the `dropped` map exists. So
+   it would be a no-op on the shape that actually arrives, and making it
+   meaningful would mean hydrating every candidate: the 282 ms per chat turn
+   `table-catalog` was rewritten to remove.
+
+   The consequence, stated rather than left to be discovered. A PASSTHROUGH
+   source whose file is gone is not caught here — measured 2026-08-19 against a
+   connected source whose CSV was then deleted: `table-shaped?` answers `true`,
+   `agent-ctx` still catalogues it, and `compute-clj!` answers
+   `\"compute works on tables\"`. Both readers therefore behave as they did for a
+   reclaimed table BEFORE this function grew its clause. What softens it is that
+   the refusals downstream all hold: `query_table` and `mold-payload` now answer
+   with `unusable`'s sentence and name the repair, and `compute-clj!` refuses on
+   `(seq rows)` over `:value []` — misleadingly, but it refuses. Nothing
+   overwrites good data.
+
+   Closing it needs a filesystem check per candidate rather than a catalog
+   lookup — `ssp/unreadable-because`, not `lake/dropped-tables` — which is a
+   different mechanism from the one this function is, and not phase 1's."
   [dropped o]
   (or (:table/reclaimed o) (get dropped (:table (:value o)))))
 
@@ -1946,18 +1993,185 @@
         {:answer answer}))
     (catch Exception e {:error (.getMessage e)})))
 
-(defn import-csv! [st title csv space]
-  (try
-    (let [rows (tools/parse-csv csv)
-          nid (str "tbl:csv-" (count (filter #(= :table (:kind %)) (vals (sub/objects st)))) "-" (inc (rand-int 9999)))
-          obj (tbl/table-object @lake/lake nid (or (not-empty title) "Imported CSV") rows)
-          base [{:op :put :id nid :value obj}]
-          evs (if (and space (space? st space))
-                (conj base (nb/append-cell-event st space {:ref nid}))
-                base)]
-      (sub/commit! st {:op :tx :events evs})
-      {:state (state-payload st) :openId nid})
-    (catch Exception e {:error (.getMessage e)})))
+
+;; ---- the three /api/source routes ----
+;;
+;; `loci.source` throws where these return; that is the whole of what these
+;; three add, and it is not optional. `handler` has no top-level catch, so an
+;; uncaught `ex-info` from a missing file leaves the shell parsing a stack
+;; trace as JSON. Every other mutating route in this namespace answers
+;; `{:error …}`, and `startImport` — the live caller these are shaped after —
+;; reads `res.error`, then `applyState(res.state)` and `openObject(res.openId)`.
+;; So `connect!` gets the same `{:state … :openId …}` idiom, and the shell has
+;; one thing to learn rather than two.
+;;
+;; **No monitor here.** `loci.source/connect!` already takes one, around its own
+;; mint-and-commit, and it lives there rather than in the route because
+;; `loci.source` is a facade meant to be called from a REPL attached to the live
+;; server — a lock in `server.clj` would leave a REPL caller racing an in-flight
+;; request, which is the one case the route cannot see. A second monitor would
+;; be a second thing to be wrong, and would serialise nothing the first does not.
+
+(defn source-describe
+  "Preview a source: its columns, their types, and the SQL that reads them.
+
+   Commits nothing, which is why `loci.source` has no `:dry-run?` flag — this
+   IS the dry run, and it is what the shell shows before anything lands.
+
+   Takes `st` and ignores it, so the three routes read alike and a later
+   preview that wants the store does not change the route."
+  [_st src]
+  (try (src/describe @lake/lake (update src :format keyword))
+       (catch Exception e {:error (.getMessage e)})))
+
+(defn source-connect!
+  "Land `src` as a `:kind :table` object and answer the shell's three keys.
+
+   `:format` is coerced to a keyword HERE and nowhere deeper, because
+   `body-json` keywordises a map's keys and leaves its values alone, so the
+   shell sends `{:format \"csv\"}`; `sourcespec/relation` looks the format up in
+   `readers`, which is keyed by keyword, and a string misses every entry — the
+   refusal is *loci does not know the format \"csv\"*, about the one format it
+   certainly does know. Nothing downstream validates it, so this is the only
+   place it can be fixed.
+
+   **`:mode` is NOT coerced, deliberately.** `loci.source/connect!` normalizes a
+   string and refuses anything that is neither `:materialise` nor
+   `:passthrough` by name — it is the one place that decides, and everything
+   downstream trusts the answer. Coercing here too would put the decision in two
+   places, and would report an unknown mode as `:nonsense` rather than as the
+   `\"nonsense\"` the caller actually typed.
+
+   The `space?` guard is `import-csv!`'s, kept for `import-csv!`'s reason: an
+   existence check alone lets a table id through, and appending a cell to its
+   vector `:value` poisons the log."
+  ([st src] (source-connect! st src nil))
+  ([st src space]
+   (try (let [r (src/connect! st (update src :format keyword)
+                              (when (and space (space? st space)) space))]
+          ;; `:openId` as well as `:id`, and the duplication is deliberate.
+          ;; `:openId` is the shell's word — `import-csv!` returns it and
+          ;; `startImport` reads it — while `:id` is what the facade returns and
+          ;; what a REPL or a non-shell API caller wants to name the table by.
+          ;; Dropping either would make one of those two callers reach into a
+          ;; key that is not about them.
+          (assoc r :state (state-payload st) :openId (:id r)))
+        (catch Exception e {:error (.getMessage e)}))))
+
+(defn source-refresh!
+  "Re-run `id`'s recorded recipe and answer with the state the write produced.
+
+   No `:openId`: the object the shell is looking at is the one it asked to
+   refresh, so there is nothing new to open."
+  [st id]
+  (try (assoc (src/refresh! st id) :state (state-payload st))
+       (catch Exception e {:error (.getMessage e)})))
+
+(defn- content-hash
+  "The first 16 hex characters of `text`'s SHA-256 — the whole name of the file
+   holding that text.
+
+   Sixteen because this IS the filename rather than a suffix on one: 64 bits,
+   so two different CSVs collide at around four billion files, and `data/files`
+   holds one entry per distinct import. The same digest `lake/table-name`
+   truncates for the same reason, kept longer here because there is no other
+   component to fall back on."
+  [text]
+  (->> (.getBytes (str text) "UTF-8")
+       (.digest (java.security.MessageDigest/getInstance "SHA-256"))
+       (take 8)
+       (map #(format "%02x" %))
+       (apply str)))
+
+(defn import-csv!
+  "Posted CSV **text** → a table, through the same reader as every other source.
+
+   The text is written under `<LOCI_DATA>/files/` and connected as a `loci://`
+   source, so this route and a phase-2 upload land identically: one inference,
+   one refresh path, and a file that stays reproducible. `tools/parse-csv` typed
+   a CSV with three regexes — Long, Double, String — where `read_csv` sniffs per
+   column and gives real DATE, TIMESTAMP and BOOLEAN types. Two inferences meant
+   the same CSV became different rows depending on which door it came through;
+   this is the door that closed.
+
+   Two consequences worth stating, because both are visible from the shell:
+
+   · **The id is a slug now**, `tbl:sales` rather than `tbl:csv-19-7071` —
+     `loci.source/mint-id` names every connected table the same way, and that
+     retires the `(rand-int 9999)` suffix this was the last holder of.
+   · **A header-only CSV lands a real, empty lake table** instead of the
+     `:value []` `tbl/table-value` used to commit for it. It hydrates to `[]`
+     either way, so the shell still draws an empty table; the difference is that
+     an empty table carries a recipe and `[]` cannot be refreshed.
+
+   It keeps the in-RAM copy of the posted body, because a JSON string body is
+   already the whole file in memory. That is the limit this route has always
+   had and the reason the streaming upload route exists in phase 2 — not a
+   regression introduced here.
+
+   `source-connect!` rather than `src/connect!` is what makes this a wrapper
+   rather than a second route: `startImport` reads `res.error`, then
+   `res.state` and `res.openId`, and those three keys are added there."
+  [st title csv space]
+  (let [written
+        (try (let [dir (io/file (sub/data-dir) "files")
+                   nm  (str (content-hash csv) ".csv")
+                   f   (io/file dir nm)]
+               (.mkdirs dir)
+               ;; **The name IS the content, and nothing else is in it.**
+               ;;
+               ;; A `title-<millis>.csv` name lost data: measured 2026-08-19,
+               ;; 20 concurrent posts of one title minted 20 correct, distinct
+               ;; table objects while the 20 `spit`s landed on ONE file, and
+               ;; every table afterwards held whichever body was written last.
+               ;;
+               ;; A unique-per-call name fixes that but accumulates, and
+               ;; **nothing deletes this directory** — the design says so
+               ;; outright. Content addressing fixes both: the same bytes are
+               ;; one file however many times they arrive, and a file whose
+               ;; name is its content can never be rewritten with different
+               ;; bytes, which is what makes it safe for a `loci://`
+               ;; passthrough source to re-read on every query. It is the rule
+               ;; the big-content design already chose for blobs, arriving
+               ;; early: *a changed image is different bytes, so a different
+               ;; hash, so a different handle*.
+               ;;
+               ;; **No title in the name**, and that is the whole point rather
+               ;; than an omission. A stem would read nicely in a directory
+               ;; listing and would defeat the dedup the moment the same CSV
+               ;; arrived under two titles — measured, `"Sales"` and `"Sales
+               ;; again"` wrote two copies of identical bytes. What a person
+               ;; browses is the table's `:title`; the file is addressed, not
+               ;; named. It also retires a title-shaped class of bug outright:
+               ;; no path separators to strip, no leading dot to hide the file,
+               ;; no 255-byte filename limit to bound, no three-character
+               ;; minimum to pad.
+               ;;
+               ;; Written only when absent — re-writing identical bytes is
+               ;; harmless but not free, and skipping it is what lets the
+               ;; caller be told the file was already here.
+               (when-not (.exists f) (spit f csv))
+               nm)
+             ;; Its own catch: an unwritable data directory fails HERE, before
+             ;; `source-connect!` — whose catch would otherwise never see it —
+             ;; and `handler` has no top-level catch to turn a throw into
+             ;; `{:error …}`.
+             (catch Exception e {:error (.getMessage e)}))]
+    (if (map? written)
+      written
+      (let [uri  (str "loci://files/" written)
+            ;; The table this exact file already made, if any. One pass over
+            ;; the objects, which `mint-id` inside `connect!` is about to make
+            ;; anyway. Reported rather than refused: two tables from one file
+            ;; is a thing someone may well want, and loci's answer to a mistake
+            ;; is `undo!`, not a veto.
+            seen (->> (sub/objects st) vals
+                      (filter #(= uri (:uri (:source %))))
+                      (map :id) sort first)
+            r    (source-connect! st {:uri uri :format :csv :mode :materialise
+                                      :title (or (not-empty title) "Imported CSV")}
+                                  space)]
+        (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
@@ -2994,6 +3208,27 @@
       (= uri "/api/ask")     (let [{:keys [prompt space]} (body-json req)] (json-resp (ask! st prompt space)))
       (= uri "/api/keep-note")(let [{:keys [space title text]} (body-json req)] (json-resp (keep-note! st space title text)))
       (= uri "/api/import-csv")(let [{:keys [title csv space]} (body-json req)] (json-resp (import-csv! st title csv space)))
+      ;; Not method-gated, and that is the file's own rule rather than an
+      ;; oversight. `/api/storage/reclaim` above tests `:request-method` because
+      ;; it DELETES Parquet — "two cheap answers to one irreversible call".
+      ;;
+      ;; The line it draws is destroying existing data against making new data,
+      ;; **not** free against costly, and these three are on the making side. A
+      ;; materialise `connect!` is not free: it reads the whole file and writes
+      ;; Parquet, and `undo!` pops the event without deleting those bytes —
+      ;; `loci.lakegc` reclaims them later, as it does for any superseded
+      ;; version. What it cannot do is overwrite something that was already
+      ;; there. `describe` does not even commit.
+      ;;
+      ;; Measured 2026-08-19: a GET carrying a JSON body does land a table here,
+      ;; exactly as a POST would — and `/api/import-csv`, which these are
+      ;; modelled on, has the identical exposure. Of 42 routes in this `cond`,
+      ;; two test the method. Gating these three and not the other eighteen
+      ;; mutating ones would be a new inconsistency rather than a fix.
+      (= uri "/api/source/describe")(let [b (body-json req)] (json-resp (source-describe st b)))
+      (= uri "/api/source/connect")(let [b (body-json req)]
+                                     (json-resp (source-connect! st (dissoc b :space) (:space b))))
+      (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))

@@ -39,6 +39,19 @@
     (when (.isDirectory f) (run! rm-rf (.listFiles f)))
     (.delete f)))
 
+(defn- with-temp-data-dir
+  "Run `f` with `sub/data-dir` answering a fresh temp directory, removed after.
+
+   `import-csv!` writes the posted text under `<LOCI_DATA>/files/` before it
+   connects, so without this the suite drops a CSV into the real `data/` on
+   every run. Redefining the ONE function is what keeps the round trip whole:
+   `sourcespec/locate` resolves `loci://` through the same var, so the write and
+   the read cannot end up in different directories."
+  [f]
+  (let [d (str (System/getProperty "java.io.tmpdir") "/loci-server-data-" (System/nanoTime))]
+    (try (with-redefs [sub/data-dir (constantly d)] (f))
+         (finally (rm-rf d)))))
+
 (defn- rows-of
   "A table object's rows, through the same seam the server reads them through.
 
@@ -729,6 +742,21 @@
       (is (= before (count (sub/history st)))))))          ; nothing committed
 
 (deftest research-salvages-prose-tables
+  ;; The salvaged cells are NUMBERS: `md-cell-val` pulls a figure out of the
+  ;; model's sentence, which nothing else will do, and `put-rows!` hands it to
+  ;; `read_json_auto` — so DuckDB still decides the type. Handing it a string
+  ;; instead makes the column VARCHAR and `fnlib/numeric-cols` answer [], which
+  ;; costs Group, Top N, Change and Share at apply time. Measured 2026-08-19 —
+  ;; `->val` was loci's second CSV inference and `read_csv` is the only one
+  ;; left. **This path does not reach `read_csv`**: `research!` hands the rows
+  ;; to `save-table!`, which types a lake column from the Clojure values it is
+  ;; given, so `share_pct` is VARCHAR here where it was BIGINT.
+  ;;
+  ;; Measured 2026-08-19, and the reason this is written down rather than just
+  ;; edited: `fnlib/catalog` over these rows offers ONE builtin where it offered
+  ;; five — Group, Top N, Pivot, Change and Share all answer "needs a numeric
+  ;; column". Routing the salvage through the file connector, as `import-csv!`
+  ;; now goes, is what would make the intent true; it is a change to `research!`.
   (with-redefs [agent/chat-tools (fn [& _] "intro\n\nname | share_pct\n--- | ---\nA | 30%\nB | 20%\n\ndone")
                 loci.server/distill! (fn [& _] nil)]
     (let [st (store-with-table)
@@ -4282,16 +4310,18 @@
   ;; `rows-of` hydrates, so it reads an unconverted writer's literal rows just
   ;; as happily as a handle — which means no assertion above can tell whether
   ;; these three were converted at all. This is the one that can.
-  (let [st (store-with-table)
-        landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
-    (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
-        "import-csv!")
-    (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
-                                         {:by "revenue" :n "1" :order "desc"} nil)))
-        "the ƒ apply")
-    (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
-      (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
-          "compute-clj!"))))
+  (with-temp-data-dir
+    (fn []
+      (let [st (store-with-table)
+            landed? (fn [id] (tbl/handle? (:value (sub/object st id))))]
+        (is (landed? (:openId (srv/import-csv! st "C" "region,revenue\nEMEA,1" nil)))
+            "import-csv!")
+        (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
+                                             {:by "revenue" :n "1" :order "desc"} nil)))
+            "the ƒ apply")
+        (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+          (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
+              "compute-clj!"))))))
 
 (deftest a-csv-with-only-a-header-is-an-empty-table-not-an-error
   ;; `Lake/put-rows!` refuses a table with no rows. Of the six writers this is
@@ -4300,10 +4330,53 @@
   ;; "the function did not return rows" for an empty result, measured
   ;; 2026-08-16. Before tables moved this committed `:value []` and the shell
   ;; drew an empty table; it still must.
-  (let [st (store-with-table)
-        r  (srv/import-csv! st "C" "region,revenue" nil)]
-    (is (nil? (:error r)) "a header-only CSV must not become an error")
-    (is (= [] (rows-of st (:openId r))))))
+  (with-temp-data-dir
+    (fn []
+      (let [st (store-with-table)
+            r  (srv/import-csv! st "C" "region,revenue" nil)]
+        (is (nil? (:error r)) "a header-only CSV must not become an error")
+        (is (= [] (rows-of st (:openId r))))))))
+
+(deftest a-header-only-csv-lands-an-empty-lake-table-not-a-literal
+  ;; The shape above changed underneath that test, and this is where it is
+  ;; pinned rather than left to be discovered. `tbl/table-value` refused an
+  ;; empty table and committed `:value []`; `create-from-relation!` makes a
+  ;; real, empty lake table and commits a handle with `:rows 0`. The test above
+  ;; still passes because it reads through `rows-of`, which hydrates — and
+  ;; hydrating an empty lake table gives `[]` exactly as a literal `[]` does.
+  ;;
+  ;; Landing the table is the simpler rule and the one that keeps `refresh!`
+  ;; working: `[]` is not a handle, so a `:value []` table carries no recipe to
+  ;; re-run.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "C" "region,revenue" nil)
+            h  (:value (sub/object st (:openId r)))]
+        (is (nil? (:error r)))
+        (is (tbl/handle? h) "a header-only CSV lands a handle, where table-value gave []")
+        (is (= 0 (:rows h)))
+        (is (= [] (:value (tbl/hydrate @lake/lake (sub/object st (:openId r))))))))))
+
+(deftest import-csv-answers-the-shell-the-three-keys-startImport-reads
+  ;; `resources/public/index.html`'s `startImport` reads `res.error`, then
+  ;; `applyState(res.state)` and `openObject(res.openId)`. `import-csv!` is a
+  ;; wrapper over `source-connect!` now, and this is the assertion that the
+  ;; wrapper actually connects rather than only writing the file: without the
+  ;; connect there is no object to open and `:openId` is nil.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "Sales" "region,revenue\nEMEA,1\n" nil)]
+        (is (nil? (:error r)))
+        (is (some? (:openId r)) "the id the shell opens")
+        (is (some? (:state r)) "and the state payload it applies")
+        (is (= :table (:kind (sub/object st (:openId r))))
+            "openObject must find a table there, not a missing id")
+        (is (= [{:region "EMEA" :revenue 1}] (rows-of st (:openId r))))
+        (is (re-matches #"loci://files/[0-9a-f]{16}\.csv"
+                      (:uri (:source (sub/object st (:openId r)))))
+            "and the CSV is on disk as a source, so refresh! has something to re-run")))))
 
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
   ;; the other half of the same measurement: this path refuses upstream, so the
@@ -4545,3 +4618,234 @@
           (is (= :no-object (:error r)) "a refusal, not a sweep of the orphans")
           (is (= 0 (:freed r)))
           (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))
+
+(deftest mold-payload-says-why-a-table-cannot-be-read
+  ;; `:unusable` is the sentence every reader shares; `:reclaimed` stays beside
+  ;; it because the shell formats that instant itself (`toLocaleString`) and a
+  ;; baked ISO string in prose cannot be localised. Phase 2 decides which wins.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [p (srv/mold-payload st no-memory "tbl:gone" nil)]
+        (is (:reclaimed p) "the raw instant survives, for the shell to format")
+        (is (re-find #"reclaimed on " (:unusable p)) "and the sentence is there too")
+        (is (string? (json/write-str p)) "and the whole payload still serialises")))))
+
+;; ---------------------------------------------------------------------------
+;; /api/source/describe, /api/source/connect and /api/source/refresh
+;;
+;; A nested `with-temp-lake` inside the namespace's `:once` one, for the reason
+;; the storage tests above give: these materialise real lake tables under ids
+;; another test in this file could also mint, and `lake/create-from-relation!`
+;; names a directory after the id — a shared lake makes two suites' `tbl:a`
+;; the same table.
+;; ---------------------------------------------------------------------------
+
+(defn- source-csv
+  "A `file://` URI naming a fresh temp CSV holding `text`.
+
+   The path is `(subs uri 7)`, which is how `loci.source-test` rewrites a file
+   under a connected source to make a `refresh!` see something new."
+  [text]
+  (let [f (java.io.File/createTempFile "api-src-" ".csv")]
+    (spit f text)
+    (str "file://" (.getAbsolutePath f))))
+
+(deftest source-describe-previews-without-committing
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            d  (srv/source-describe st {:uri (source-csv "Total Revenue ($)\n5\n") :format :csv})]
+        (is (= [:total_revenue] (mapv :col (:cols d))))
+        (is (empty? (sub/objects st)) "describe commits nothing — it IS the dry run")))))
+
+(deftest source-connect-then-refresh-over-the-api
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            u  (source-csv "a\n1\n")
+            c  (srv/source-connect! st {:uri u :format :csv :mode :materialise :title "A"})]
+        (is (nil? (:error c)))
+        (is (= "tbl:a" (:openId c)))
+        (is (:state c) "connect returns the state payload, like every other mutating route")
+        (spit (subs u 7) "a\n1\n2\n")
+        (let [r (srv/source-refresh! st "tbl:a")]
+          (is (= 2 (:rows r)))
+          (is (:state r)))))))
+
+(deftest source-connect-returns-an-error-map-rather-than-throwing
+  ;; `loci.source`'s three entry points all throw — a bad location, an unknown
+  ;; format, two headers that collapse to one column — and `handler` has no
+  ;; top-level catch, so without the `try` here /api/source/connect answers a
+  ;; missing file with a stack trace. Every other mutating route in this file
+  ;; answers `{:error …}`; all three of these must too.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri "file:///no/such.csv" :format :csv})]
+        (is (:error c) "a bad location is an error map, not a 500")
+        (is (empty? (sub/objects st)) "and nothing was committed on the way to it")
+        (is (:error (srv/source-describe st {:uri "file:///no/such.csv" :format :csv}))
+            "describe answers the same way")
+        (is (:error (srv/source-refresh! st "tbl:never-connected"))
+            "and so does a refresh of an id no source ever landed")))))
+
+(deftest source-connect-accepts-a-format-as-a-json-string
+  ;; `body-json` keywordises a map's KEYS and leaves its VALUES alone, so a
+  ;; shell POST carries `{:format "csv"}`. `sourcespec/relation` looks `format`
+  ;; up in `readers`, which is keyed by keyword, and a string misses every key —
+  ;; the refusal is *loci does not know the format "csv"*, about the one format
+  ;; it certainly does know.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri (source-csv "a\n1\n")
+                                        :format "csv" :mode "materialise" :title "S"})]
+        (is (nil? (:error c)))
+        (is (= "tbl:s" (:openId c)))))))
+
+(deftest the-mode-is-the-facades-decision-and-the-route-does-not-repeat-it
+  ;; `:mode` arrives from JSON as a string exactly as `:format` does, and is
+  ;; deliberately NOT coerced here: `loci.source/connect!` normalizes it and
+  ;; refuses an unknown one by name, precisely because a silently-defaulted mode
+  ;; materialises a file the user asked not to copy. Both halves are asserted,
+  ;; because only the second can tell the difference — a route-level
+  ;; `(update :mode keyword)` still lands the passthrough below, and only the
+  ;; refusal shows the decision having moved: it would name `:nonsense`, a
+  ;; keyword the caller never typed and cannot find in their own request.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            c  (srv/source-connect! st {:uri (source-csv "a\n1\n2\n")
+                                        :format "csv" :mode "passthrough" :title "P"})]
+        (is (nil? (:error c)))
+        (is (= :passthrough (:mode c)) "the facade normalized the string it was handed")
+        (is (= :source (:store (:value (sub/object st "tbl:p"))))
+            "and a passthrough handle landed — no bytes were copied")
+        (let [bad (srv/source-connect! st {:uri (source-csv "a\n1\n") :format "csv"
+                                           :mode "nonsense" :title "N"})]
+          (is (str/includes? (str (:error bad)) "\"nonsense\"")
+              "the refusal names what the caller typed, not a keyword the route made")
+          (is (nil? (sub/object st "tbl:n")) "and refused before committing anything"))))))
+
+(deftest the-source-routes-answer-through-the-URL
+  ;; Handler tests cannot see a route typo, and these three are otherwise only
+  ;; ever called as functions. `c/store` is a delay behind an ordinary var, so
+  ;; rebinding it means the user's Datalevin store is never opened — the trick
+  ;; `the-materialize-route-answers-through-the-URL` uses.
+  ;;
+  ;; It also asserts the JSON round-trip, which the function tests cannot: a
+  ;; `:col` is a keyword in Clojure and `"total_revenue"` by the time the shell
+  ;; reads it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st    (sub/fresh-store)
+            post! (fn [uri body]
+                    (with-redefs [c/store (delay st)]
+                      (json/read-str (:body (srv/handler
+                                             {:uri uri :request-method :post
+                                              :body (java.io.StringReader. (json/write-str body))}))
+                                     :key-fn keyword)))
+            _     (sub/commit! st {:op :put :id "space:n"
+                                   :value {:id "space:n" :kind :space :title "N"
+                                           :value {:intent "i" :cells []}}})
+            u     (source-csv "Total Revenue ($)\n1\n")
+            d     (post! "/api/source/describe" {:uri u :format "csv"})]
+        (is (= ["total_revenue"] (mapv :col (:cols d))) "describe round-trips as JSON")
+        (is (nil? (sub/object st "tbl:sales")) "and committed nothing")
+        (let [c (post! "/api/source/connect" {:uri u :format "csv" :mode "materialise"
+                                              :title "Sales" :space "space:n"})]
+          (is (nil? (:error c)))
+          (is (= "tbl:sales" (:openId c)) "the shell's openObject id")
+          (is (:state c) "and the state payload it applies")
+          (is (= [{:ref "tbl:sales"}] (nb/cells-of (sub/object st "space:n")))
+              "`:space` still appends a cell — `import-csv!`'s shape, kept"))
+        (spit (subs u 7) "Total Revenue ($)\n1\n2\n")
+        (let [r (post! "/api/source/refresh" {:id "tbl:sales"})]
+          (is (= 2 (:rows r)))
+          (is (:state r)))
+        (is (:error (post! "/api/source/connect" {:uri "file:///no/such.csv" :format "csv"}))
+            "and a bad location comes back as a message, never a 500")))))
+
+(deftest source-connect-with-no-mode-defaults-in-one-place-only
+  ;; The default lives in `loci.source/connect!`. This pins that the route does
+  ;; not quietly grow a second one — which would interact badly with the route
+  ;; deliberately NOT coercing `:mode`, since a route-side default would be a
+  ;; keyword the caller never sent sitting beside a validator built to name what
+  ;; they did send.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            f  (doto (java.io.File/createTempFile "nomode-" ".csv") (spit "a\n1\n"))
+            c  (srv/source-connect! st {:uri (str "file://" (.getAbsolutePath f))
+                                        :format "csv" :title "NoMode"})]
+        (is (nil? (:error c)))
+        (is (= :materialise (:mode c)) "the facade's default, reported as a keyword")
+        (is (= :lake (:store (:value (sub/object st (:openId c)))))
+            "and it really materialised")))))
+
+(deftest concurrent-imports-of-one-title-keep-their-own-rows
+  ;; Measured 2026-08-19 with a clock-derived filename: 20 concurrent posts of
+  ;; one title minted 20 distinct table objects — `mint-id` and `connect-lock`
+  ;; did their job — but the 20 writes landed on ONE file at millisecond
+  ;; resolution, and every table afterwards held whichever body was written
+  ;; last. Distinct ids pointing at one file is worse than a collision that
+  ;; errors, because it looks like success.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+       (fn []
+        (let [st  (sub/fresh-store)
+            n   12
+            rs  (mapv deref
+                      (mapv (fn [i]
+                              (future (srv/import-csv! st "Race"
+                                                       (str "a\n" i "\n") nil)))
+                            (range n)))
+            ids (mapv :openId rs)]
+        (is (every? nil? (map :error rs)) "every import succeeds")
+        (is (= n (count (distinct ids))) "and each gets its own id")
+        (let [vals (->> ids
+                        (map #(sub/object st %))
+                        (map #(tbl/hydrate @lake/lake %))
+                        (mapcat :value)
+                        (map :a)
+                        set)]
+          (is (= n (count vals))
+              (str "each table must hold the rows its OWN request carried; got "
+                   (count vals) " distinct values across " n " tables")))))))))
+
+(deftest importing-one-file-twice-writes-it-once-and-says-so
+  ;; Content addressing, arriving early from the big-content design's rule for
+  ;; blobs. Nothing deletes <LOCI_DATA>/files, so a unique-per-call name would
+  ;; keep a copy per import forever; a name that IS the content keeps one. And
+  ;; because the name cannot be rewritten with different bytes, a loci://
+  ;; passthrough source re-reading it on every query is safe.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                csv "region,revenue\nEMEA,1\n"
+                a   (srv/import-csv! st "Sales" csv nil)
+                b   (srv/import-csv! st "Sales again" csv nil)
+                c   (srv/import-csv! st "Different" "region,revenue\nAPAC,2\n" nil)
+                dir (io/file (sub/data-dir) "files")]
+            (is (every? nil? (map :error [a b c])))
+            (is (nil? (:duplicateOf a)) "the first import is not a duplicate")
+            (is (= (:openId a) (:duplicateOf b))
+                "the second names the table the first made, rather than refusing")
+            (is (nil? (:duplicateOf c)) "different bytes are not a duplicate")
+            (is (not= (:openId a) (:openId b)) "but it still makes its own table")
+            (is (= 2 (count (.listFiles dir)))
+                "two distinct bodies, two files — the repeat wrote nothing")))))))
+
+(deftest a-hashed-name-survives-a-one-letter-title
+  ;; The bug the previous naming scheme had: File/createTempFile refuses a
+  ;; prefix under three characters, and "C" is a title this file already uses.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [r (srv/import-csv! (sub/fresh-store) "C" "region,revenue\nEMEA,1\n" nil)]
+            (is (nil? (:error r)))
+            (is (some? (:openId r)))))))))

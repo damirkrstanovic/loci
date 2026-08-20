@@ -5,7 +5,7 @@
             [clojure.test :refer [deftest is]]
             [loci.config :as config]
             [loci.lake :as lake]
-            [loci.lake-fixture :refer [rm-rf with-lake]]
+            [loci.lake-fixture :as lf :refer [rm-rf with-lake]]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -418,6 +418,25 @@
           (is (string? (json/write-str (tbl/rows lk h {})))
               "stored, the rows would be unserializable"))))))
 
+(deftest create-from-relation-projects-raw-headers-onto-loci-columns
+  (lf/with-lake [lk]
+    (let [f (java.io.File/createTempFile "rel-" ".csv")]
+      (try
+        (spit f "Total Revenue ($),Region\n5,north\n7,south\n")
+        (let [h (lake/create-from-relation!
+                 lk "tbl:rev"
+                 [{:raw "Total Revenue ($)" :col :total_revenue} {:raw "Region" :col :region}]
+                 (str "read_csv('" (.getAbsolutePath f) "')"))]
+          (is (= :lake (:store h)) "materialise yields today's handle, unchanged")
+          (is (= [:total_revenue :region] (:cols h)))
+          (is (= 2 (:rows h)) "the row count comes from the table, not from a caller")
+          (is (number? (:snapshot h)))
+          (is (= [{:total_revenue 5 :region "north"}
+                  {:total_revenue 7 :region "south"}]
+                 (tbl/rows lk h {})))
+          (is (= 2 (tbl/row-count lk h))))
+        (finally (.delete f))))))
+
 (deftest table-gc-is-off-and-says-so
   (with-lake [lk]
     (let [r (lake/sweep! lk #{})]
@@ -631,3 +650,29 @@
               (is (str/includes? (or (some-> ^Throwable t .getCause .getMessage) "") "Permission denied")
                   "and DuckDB's own error survives as the cause")))
           (finally (.setWritable f true) (rm-rf ext) (rm-rf dir)))))))
+
+(deftest unwrap-renders-temporal-types-as-iso-strings
+  ;; DuckDB's CSV sniffer gives LocalDate for DATE and java.sql.Timestamp for
+  ;; TIMESTAMP. json/write-str throws on the first and shifts the second
+  ;; through the JVM default zone. Measured 2026-08-19:
+  ;;   (json/write-str {:d (java.sql.Date/valueOf "2026-01-02")})
+  ;;   => "{\"d\":\"2026-01-01T23:00:00Z\"}"   ; wrong by a day
+  (lf/with-lake [lk]
+    (let [f (java.io.File/createTempFile "unwrap-" ".csv")]
+      (try
+        (spit f "day,when,amount,flag\n2026-01-02,2026-01-02 03:04:05,7,true\n")
+        (let [h (lake/create-from-relation!
+                 lk "tbl:temporal"
+                 [{:raw "day" :col :day} {:raw "when" :col :when}
+                  {:raw "amount" :col :amount} {:raw "flag" :col :flag}]
+                 (str "read_csv('" (.getAbsolutePath f) "')"))
+              r (first (tbl/rows lk h {}))]
+          (is (= "2026-01-02" (:day r))
+              "a DATE must render as the day the file says, with no zone shift")
+          (is (= "2026-01-02T03:04:05" (:when r))
+              "a TIMESTAMP must render as written, with no zone applied")
+          (is (= 7 (:amount r)))
+          (is (= true (:flag r)))
+          (is (string? (json/write-str r))
+              "the whole row must survive json/write-str — this is the defect"))
+        (finally (.delete f))))))

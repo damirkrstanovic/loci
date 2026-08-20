@@ -7,6 +7,7 @@
    store a test uses when it has nothing to say about DuckLake, the same role
    `substrate/PersistentStore` plays next to `dlv/DatalevinStore`."
   (:require [clojure.string :as str]
+            [loci.sourcespec :as ssp]
             [loci.substrate :as sub]))
 
 (defprotocol TableStore
@@ -77,9 +78,15 @@
   "True for a handle this namespace produced. The `:store` key is explicit
    rather than inferred from shape, because a table's rows are a vector of maps
    and a handle is a map — close enough that a shape test would be one refactor
-   from being wrong."
+   from being wrong.
+
+   `:source` is the passthrough handle, and it is the odd one: it carries no
+   rows and names no storage, because it IS the recipe — a location, a format,
+   and the columns observed when it was connected under BOTH names: `:raw`, the
+   file's own header, and `:cols`, loci's. Reading it runs the reader function
+   against the file every time, projecting the first onto the second."
   [v]
-  (and (map? v) (contains? #{:inline :lake} (:store v))))
+  (and (map? v) (contains? #{:inline :lake :source} (:store v))))
 
 (defn cols-of
   "The column order to preserve: every key any row has, in the order first seen.
@@ -103,10 +110,15 @@
   [rows]
   (into [] (distinct) (map sub/col-kw (mapcat keys rows))))
 
-(defn- collisions
-  "The source keys `col-kw` would collapse onto one column, as
+(defn- name-collisions
+  "The source names `col-kw` would collapse onto one column, as
    `{normalized [source …]}` — empty whenever the normalization is injective,
    which it is for all 31 tables in the corpus (measured 2026-08-16).
+
+   Takes NAMES rather than rows, so a CSV header and a vector of row maps run
+   the same check: `loci.source/describe` calls `check-names!` on the header
+   before anything is created, and `normalize-rows` calls it on every key any
+   row has.
 
    Across the whole table rather than per row, deliberately. A per-row check
    passes a ragged table whose row 1 says `\"a b\"` and whose row 2 says `:a_b`:
@@ -115,11 +127,30 @@
    invariant that produces it is one too — and the table-level check is a strict
    superset, since a row is a table of one.
 
-   One extra pass over every key, on top of the one `cols-of` already makes."
-  [rows]
+   Private: `check-names!` is the only caller and the only thing anyone should
+   need. A reader that wants to LIST collisions rather than refuse them can have
+   this made public on the day it exists."
+  [names]
   (into (sorted-map)
         (keep (fn [[k ks]] (when (next ks) [k (vec (sort-by pr-str ks))])))
-        (group-by sub/col-kw (into #{} (mapcat keys) rows))))
+        (group-by sub/col-kw (set names))))
+
+(defn check-names!
+  "Throw if two of `names` would become one column. Returns nil otherwise.
+
+   Refusing rather than merging is the register this codebase already keeps:
+   `put-rows!` throws on a table with no rows, and `safe-event` throws rather
+   than write a line it could not read back. `{\"a b\" 1, :a_b 2}` loses a whole
+   column — both keys become `:a_b`, one value wins, and nothing downstream can
+   tell, because `:cols` and the rows still agree with each other perfectly."
+  [names]
+  (let [cs (name-collisions names)]
+    (when (seq cs)
+      (let [[k ks] (first cs)]
+        (throw (ex-info (str "two column names would become one column: "
+                             (str/join " and " (map pr-str ks))
+                             " both normalize to " k " — refusing to merge them")
+                        {:column k :from ks :collisions cs}))))))
 
 (defn- nested-value
   "The first `[column value]` whose value is a vector, map or set — or nil.
@@ -181,13 +212,7 @@
    divergence is the failure this move has spent four tasks closing, and a check
    that lived in one store would be one more."
   [rows]
-  (let [cs (collisions rows)]
-    (when (seq cs)
-      (let [[k ks] (first cs)]
-        (throw (ex-info (str "two column names would become one column: "
-                             (str/join " and " (map pr-str ks))
-                             " both normalize to " k " — refusing to merge them")
-                        {:column k :from ks :collisions cs})))))
+  (check-names! (into #{} (mapcat keys) rows))
   (when-let [[k v] (nested-value rows)]
     (throw (ex-info (str "column " k " holds a " (.getSimpleName (class v))
                          " — a loci table column holds scalars, not a vector or a map."
@@ -227,14 +252,19 @@
    rows.
 
    **The empty case is not a handle** because `Lake/put-rows!` refuses an empty
-   table and two writers can honestly produce one: `query_table :save_as` over a
-   filter that matched nothing, and `import-csv!` on a header-only file. Both
-   committed `:value []` before tables moved and the shell drew an empty table;
-   letting the throw through would turn \"nothing matched\" into an error string,
-   and on the `save_as` path into an uncaught exception inside the agent's tool
-   loop. `[]` is not a handle, so `hydrate` passes it through and everything
-   downstream sees what it saw before — and `[]` in the log is not rows in the
-   log, so the guard costs the move nothing.
+   table and a writer can honestly produce one: `query_table :save_as` over a
+   filter that matched nothing. `import-csv!` on a header-only file was the
+   second such writer and is not one any longer — it lands through
+   `source/connect!`, which materialises a real, empty lake table out of
+   `read_csv` rather than handing rows here; see
+   `a-header-only-csv-lands-an-empty-lake-table-not-a-literal` in
+   `loci.server-test`. Both committed `:value []` before tables moved and the
+   shell drew an empty table; letting the throw through would turn
+   \"nothing matched\" into an error string, and on the `save_as` path into an
+   uncaught exception inside the agent's tool loop. `[]` is not a handle, so
+   `hydrate` passes it through and everything downstream sees what it saw
+   before — and `[]` in the log is not rows in the log, so the guard costs the
+   move nothing.
 
    The other five writers cannot reach the empty case, measured 2026-08-16, and
    this is worth knowing before anyone \"simplifies\" one of them: `save-table!`
@@ -329,6 +359,26 @@
   [^java.util.Date d]
   (when d (str (.toInstant d))))
 
+(defn unusable
+  "Why a hydrated table's rows must not be acted on, as one sentence — or nil
+   when they may be.
+
+   One function rather than a marker check per reader, because there are now
+   four markers and four readers, and the failure this prevents is arithmetic:
+   sixteen places to be right, and `recompute` has already been wrong once by
+   being ready to rebuild a derived table from zero rows and commit the empty
+   result over good data.
+
+   `:table/passthrough` is deliberately NOT here. It is a badge, not a refusal —
+   a live table's rows are as real as any other's."
+  [o]
+  (cond
+    (:table/reclaimed o)    (str "its rows were reclaimed on " (reclaimed-str (:table/reclaimed o)))
+    (:table/unavailable o)  (str "its source is unreachable — " (:table/unavailable o))
+    (:table/source-drift o) (str "its source's columns changed — " (:table/source-drift o)
+                                 " — reconnect or refresh it")
+    :else nil))
+
 (defn hydrate
   "An object whose `:value` is a table handle → the same object with rows in
    its place, capped, plus `:table/total`.
@@ -352,31 +402,98 @@
    `[]` rather than the handle because every downstream shape guard —
    `(and (sequential? v) (seq v) (every? map? v))`, repeated in a dozen readers
    — then behaves as it does for an empty table, a state they all already
-   handle. **A reader that acts on the rows must check `:table/reclaimed`
-   first**, because `[]` and \"no rows\" are indistinguishable otherwise:
-   `server/recompute` refuses on the marker for exactly this reason, having
+   handle. **A reader that acts on the rows must call `unusable` first**,
+   because `[]` and \"no rows\" are indistinguishable otherwise:
+   `server/recompute` refuses on its answer for exactly this reason, having
    otherwise been ready to recompute a derived table from zero rows and commit
-   the empty result over good data.
+   the empty result over good data. `unusable` and not `:table/reclaimed` — that
+   was the whole check when reclamation was the only degradation; the two
+   passthrough markers below arrived afterwards, and a reader still testing the
+   one key acts on `[]` for both of them.
 
-   Only a store that says the rows were reclaimed may be swallowed. Any other
-   failure is rethrown untouched, so a broken disk stays a broken disk — and
-   asking the store is itself wrapped, because a catalog too damaged to answer
-   must not replace the error the caller actually needs to see."
+   For a `:lake` handle, only a store that says the rows were reclaimed may be
+   swallowed. Any other failure is rethrown untouched, so a broken disk stays a
+   broken disk — and asking the store is itself wrapped, because a catalog too
+   damaged to answer must not replace the error the caller actually needs to see.
+
+   **A passthrough table adds three more shapes, and it is NOT the same rule.**
+   A healthy one carries `:table/passthrough true` beside its rows, so a reader
+   can tell that its `:table/total` is the count recorded at connect rather than
+   a fact about the file right now. A failing one degrades exactly as a reclaimed
+   one does — `:value []`, the count and cols off the handle — and carries a
+   marker saying which repair it needs: `:table/unavailable` when there is no
+   readable file there, or `:table/source-drift` when there is one and it no
+   longer matches the columns recorded at connect. Find the file, versus
+   reconnect it.
+
+   **Nothing on the `:source` branch rethrows, and that is a real cost rather
+   than an oversight.** There is no record of a deliberate loss to consult — a
+   source's file can vanish or change its header with no event committed, and
+   `reclaimed-at` answers nil for such a handle by design — so the only two
+   things this branch can ask are whether loci itself can read the file and, if
+   it can, what DuckDB said. A fault that is neither therefore lands in the
+   `else` and is reported as drift. Measured 2026-08-20 against a closed lake
+   connection, with the file present and correct: `:table/source-drift` reading
+   \"it was connected as a, b — Connection was closed\", which sends the operator
+   to reconnect a file that is fine, where the same closed connection on a
+   `:lake` handle threw `java.sql.SQLException: Connection was closed`. Accepted
+   because the alternative is worse: separating the two by DuckDB's message is
+   what `loci.sourcespec`'s docstring calls the fragile alternative, that driver
+   already answers real source failures with an unrelated `NullPointerException`,
+   and a rethrow here would put every passthrough table in the substrate back
+   behind one unreadable file. `loci.chunks/with-samples` makes the same trade on
+   the same handle, deliberately — see its docstring for the predicate and why
+   nothing narrower was reachable.
+
+   Not everything is swallowed even so: this catches `Exception`, so an `Error` —
+   `OutOfMemoryError`, `StackOverflowError` — passes through both branches
+   untouched.
+
+   **`:table/passthrough` says how a table is stored, never whether it is well.**
+   It is `true` on all three shapes, the two failures included, so a reader must
+   not take it for a liveness signal — ask `unusable`, which is the one answer to
+   that question and the thing readers should call.
+
+   **The two markers carry messages from different places, deliberately.**
+   `:table/unavailable` carries loci's own phrase, because loci looked at the
+   filesystem to choose this branch and knows the real answer — where DuckDB's
+   driver, for an unreadable file, reports either a four-line dump or a bare
+   `NullPointerException`. `:table/source-drift` carries DuckDB's, because there
+   the message is the actionable part: it names the columns the file has now."
   [ts o]
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
-          h  (:value o)]
+          h  (:value o)
+          pt (= :source (:store h))]
       (try
-        (assoc o :value       (rows ts h {:limit mold-cap})
-                 :table/total (row-count ts h))
+        (cond-> (assoc o :value       (rows ts h {:limit mold-cap})
+                         :table/total (row-count ts h))
+          pt (assoc :table/passthrough true))
         (catch Exception e
-          (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
-            ;; `:value []` rather than the handle, so every downstream shape
-            ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
-            ;; in a dozen readers — behaves as it does for an empty table, which
-            ;; is a state they all already handle. The cols and the true row
-            ;; count survive because they live on the handle, not in the rows.
-            (assoc o :value [] :table/total (:rows h)
-                     :table/cols (:cols h) :table/reclaimed at)
-            (throw e)))))
+          ;; `:value []` rather than the handle, so every downstream shape
+          ;; guard — `(and (sequential? v) (seq v) (every? map? v))`, repeated
+          ;; in a dozen readers — behaves as it does for an empty table, which
+          ;; is a state they all already handle. The cols and the true row
+          ;; count survive because they live on the handle, not in the rows.
+          (let [gone (assoc o :value [] :table/total (:rows h) :table/cols (:cols h))]
+            (if pt
+              (if-let [why (ssp/unreadable-because (:uri h))]
+                (assoc gone :table/passthrough true :table/unavailable why)
+                (assoc gone :table/passthrough true
+                            :table/source-drift
+                            ;; The columns it was connected as come first,
+                            ;; because they are true whatever the driver says.
+                            ;; DuckDB's own text is usually the better half — it
+                            ;; names what the file holds NOW — but it is not
+                            ;; reliable: on a long-lived connection its JDBC
+                            ;; driver sometimes reports an unrelated
+                            ;; `NullPointerException` instead of the binder
+                            ;; error, observed twice on 2026-08-19. So the half
+                            ;; loci can always vouch for leads.
+                            (str "it was connected as "
+                                 (str/join ", " (map name (:cols h)))
+                                 " — " (ssp/duckdb-said e))))
+              (if-let [at (try (reclaimed-at ts h) (catch Exception _ nil))]
+                (assoc gone :table/reclaimed at)
+                (throw e)))))))
     o))

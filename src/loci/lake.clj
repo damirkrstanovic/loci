@@ -10,6 +10,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [loci.config :as config]
+            [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
 
@@ -38,6 +39,23 @@
    `:growth_pct`, `:unemployment_pct`), `tbl:csv-19-7071` (`:density_per_km2`)
    and `tbl:extract-20-8413` (`:approx_low_income_share`).
 
+   **The two `tbl:csv-*` are historical, and no CSV connected today can join
+   them.** They were imported by `tools/parse-csv`, which typed one CELL at a
+   time, so a blank cell arrived beside numbers as `\"\"` and `read_json_auto`
+   had to widen the column to hold both. `read_csv` sniffs per COLUMN and makes
+   that same blank a SQL NULL inside a `DOUBLE` — measured 2026-08-20.
+
+   So the **`JsonNode` branch** below is now reachable only through `put-rows!`,
+   which is still every row loci writes out of RAM: `save_table`, `seed!`,
+   `tablemigrate`. It is not that this whole function is — `unwrap` runs on
+   every value of every row read, `:lake` and `:source` handles alike, and its
+   temporal branches exist precisely for a source-connected CSV with a date
+   column. `create-from-relation!` issues `CREATE TABLE … AS SELECT … FROM
+   read_csv(…)` and never goes near `read_json_auto`, so a CSV connected today
+   cannot produce a `JsonNode` at all. Their Parquet was re-read the same day and all four
+   columns are still `JSON`; `tbl:extract-20-8413` is inlined in the catalog
+   with no Parquet to read, so it is the one not re-measured.
+
    A `JsonNode`'s `toString` is the JSON text of the value it holds, so parsing
    it back is lossless and none of the three needs refusing: `50` returns as
    `50` and `\"~13% (1 of 8 countries)\"` as that string. Refusing them was the
@@ -53,9 +71,31 @@
    **Two spellings of \"no value\", one result.** A SQL NULL never reaches here
    at all: JDBC returns Java `null` for it, JsonNode or not. A JSON `null`
    literal parses to `nil`. Both land on `nil`, which is what every other column
-   type already gives."
+   type already gives.
+
+   **Temporal types render through `java.time`, never through `java.sql`.**
+   `read_csv` types a date column DATE, and JDBC hands it back as
+   `java.time.LocalDate` — a class `clojure.data.json` refuses outright, exactly
+   as it refuses `JsonNode`:
+
+     Don't know how to write JSON of class java.time.LocalDate
+
+   `java.sql.Timestamp` is the worse case because it does NOT throw. It
+   serializes through the JVM default zone, so `2026-01-02` comes back
+   `\"2026-01-01T23:00:00Z\"` — measured 2026-08-19, wrong by a day and silent.
+   `.toLocalDateTime` / `.toLocalDate` take the wall-clock value the file
+   actually contains and `str` renders it ISO-8601 with no zone applied, which
+   is what a CSV cell meant."
   [v]
-  (if (instance? org.duckdb.JsonNode v) (json/read-str (str v)) v))
+  (condp instance? v
+    org.duckdb.JsonNode      (json/read-str (str v))
+    java.time.LocalDate      (str v)
+    java.time.LocalDateTime  (str v)
+    java.time.LocalTime      (str v)
+    java.sql.Timestamp       (str (.toLocalDateTime ^java.sql.Timestamp v))
+    java.sql.Date            (str (.toLocalDate ^java.sql.Date v))
+    java.sql.Time            (str (.toLocalTime ^java.sql.Time v))
+    v))
 
 (defn- rs->maps
   "Drain a ResultSet into row maps, naming column `i` with `(nth ks i)` and
@@ -582,20 +622,178 @@
                   "', format='newline_delimited')"))
       (finally (.delete f)))))
 
+(defn- projection
+  "`\"Total Revenue ($)\" AS \"total_revenue\", …` from `describe`'s column list.
+
+   Named rather than `SELECT *` on purpose, and the reason is passthrough: a
+   named projection THROWS when the file's header changes, where `SELECT *`
+   would quietly return a differently-shaped table. That throw is what
+   `hydrate` turns into `:table/source-drift`.
+
+   **A header that is already loci's column name is emitted bare, with no `AS`**,
+   and that is about the message rather than the SQL — the two forms select the
+   same thing. `\"a\" AS \"a\"` puts DuckDB on its lateral-column-alias path, so
+   when the file no longer has an `a` it answers about the SELECT list instead of
+   about the file. Measured 2026-08-20, same relation, header now `c,d`:
+
+     \"a\" AS \"a\" → Column \"a\" referenced that exists in the SELECT clause -
+                  but this column cannot be referenced before it is defined
+     \"a\"        → Referenced column \"a\" not found in FROM clause!
+                  Candidate bindings: \"c\"
+
+   `Candidate bindings` is the half that names what the file holds NOW, which is
+   the one thing a reader needs in order to reconnect — see `duckdb-said`, whose
+   whole paragraph rule exists to keep it. The redundant alias would drop it for
+   exactly the CSVs whose headers were already clean."
+  [cols]
+  (str/join ", "
+            (map (fn [{:keys [raw col]}]
+                   (if (= (name raw) (name col))
+                     (ident col)
+                     (str (ident raw) " AS " (ident col))))
+                 cols)))
+
+(defn create-from-relation!
+  "Materialise `rel` — any SQL relation expression — into a new lake table, and
+   return the handle. The rows never enter this process: DuckDB reads the file
+   and writes Parquet, and loci sees a count.
+
+   The counterpart to `load-rows!`, which is the path for rows ALREADY in RAM.
+   Both mint a table name per call, because writes never overwrite.
+
+   `cols` is `loci.source/describe`'s output: `[{:raw \"…\" :col :…} …]`."
+  [lk id cols rel]
+  (let [table (table-name id (System/nanoTime))]
+    (x! lk (str "CREATE TABLE " table " AS SELECT " (projection cols) " FROM " rel))
+    {:store :lake :table table :snapshot (current-snapshot lk)
+     :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
+     :cols  (mapv :col cols)}))
+
+(defn relation-rows
+  "Every row of `rel` — any SQL relation expression — read into this process
+   under `describe`'s column names, **creating nothing**.
+
+   `create-from-relation!`'s sibling, one `CREATE TABLE … AS` short of it: same
+   `projection`, so the raw header becomes the same normalized column, and the
+   same `q-as`, so `unwrap` renders a DATE the same way. Measured 2026-08-20
+   over the five `corpus/` CSVs — 1,311 rows — the two paths are `=` row for
+   row and value for value, which is what lets a caller read a file the way a
+   materialised import will store it without storing it.
+
+   Wanted for exactly one thing, and it is the thing `create-from-relation!`
+   cannot do: `loci.corpus` reads each of its files to CHECK it and to derive
+   facts from it, on dry runs as well as live ones, and a preview that landed a
+   table per file would leave the orphans and snapshots `import-corpus!`'s
+   `InlineTable` exists to avoid. Measured the same day: five
+   `create-from-relation!` calls take a fresh lake from 1 snapshot to 6 and
+   leave five tables; five `relation-rows` calls leave 1 and none.
+
+   **Not a way to read a table.** A `:lake` handle names a table and a version
+   and `tbl/rows` pages it; this reads a *recipe* and holds all of it, so the
+   caller has to know the relation is small. The corpus's largest file is 445
+   rows."
+  [lk cols rel]
+  (q-as lk (str "SELECT " (projection cols) " FROM " rel) (mapv :col cols)))
+
+(defn- from-of
+  "The FROM text for a handle: a versioned table, or a source's reader call
+   **already renamed to loci's columns**.
+
+   Both modes go through one function so a read cannot resolve differently from
+   the projection built beside it — and for a `:source` handle the projection is
+   INSIDE here rather than beside it, because there are two callers and they
+   build different SELECTs. `rows` projects the columns; `column-samples` CASTs
+   one at a time. Measured 2026-08-20, with the rename left to each of them, a
+   passthrough source over `Total Revenue ($),Region` failed BOTH ways with
+
+     Binder Error: Referenced column \"total_revenue\" not found in FROM clause!
+     Candidate bindings: \"Total Revenue ($)\"
+
+   — because a handle's `:cols` are loci's names and `read_csv` exposes the
+   file's. Renaming in the FROM is what `create-from-relation!` gets for free by
+   writing a table whose columns already carry them, and it means neither caller
+   has to know the difference. Anything reading through this sees loci's names.
+
+   `:raw` is the file's own header, recorded at connect beside `:cols`. A
+   `:source` handle committed before `:raw` existed falls back to `:cols` —
+   correct exactly when the headers were already identifiers, which is the only
+   case such a handle could ever have read in. `refresh!` re-describes and
+   writes `:raw`, so it repairs one.
+
+   Still a NAMED projection and not `SELECT *`: a positional read would quietly
+   return a differently-shaped table where this throws, and that throw is what
+   `hydrate` turns into `:table/source-drift`."
+  [h]
+  (if (= :source (:store h))
+    (str "(SELECT " (projection (map (fn [raw col] {:raw raw :col col})
+                                     (or (:raw h) (:cols h))
+                                     (:cols h)))
+         " FROM " (ssp/relation h (ssp/locate (:uri h))) ")")
+    (str (:table h) " AT (VERSION => " (long (:snapshot h)) ")")))
+
+(defn- samples-version
+  "What `from-of` cannot say: **which bytes**. nil when the FROM text already
+   settles it.
+
+   A cache key here does two jobs — separate different tables, and change when
+   one table's bytes change — and for a `:lake` handle the FROM text does both
+   on its own, because it names the table *and* the snapshot and a write never
+   overwrites. Measured 2026-08-19: two `put-rows!` under one object id land in
+   `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. So there is nothing to add,
+   and nil is the whole answer.
+
+   A `:source` handle's FROM text names a path, and the file at that path can be
+   rewritten with no event anywhere. Its `:at` — the instant of the connect or
+   refresh that last looked — is the only thing that moves when the bytes do.
+
+   **An object id is deliberately NOT here.** It looks like it belongs, because
+   an id is what separates two tables; but two source handles sharing a path
+   share bytes, so sharing their samples is correct rather than a collision, and
+   the path is already in the FROM text. An id in this key would be a component
+   no test could distinguish — which is worse than absent, because it reads as a
+   guarantee.
+
+   **`:at` is a refresh marker, not a version.** Overwrite the file without
+   refreshing and the synopsis is stale and nothing detects it. Only the
+   synopsis: the ROWS are always live, because they go straight to the file.
+
+   Two refreshes *are* distinguished, and it is worth saying why rather than
+   assuming it. `:at` is `(str (java.time.Instant/now))`, which is nanosecond
+   resolution — measured 2026-08-19, 2000 consecutive calls gave 2000 distinct
+   strings — while the cheapest possible refresh is a `describe` round trip at
+   2.24 ms. Two refreshes of one path would have to land in the same nanosecond
+   with 2.24 ms of work between them. No tiebreaker is needed here; if `:at`
+   ever comes from something coarser than `Instant/now`, this is the paragraph
+   that stops being true."
+  [h]
+  (when (= :source (:store h)) (:at h)))
+
 (def ^:private sample-cache
-  "Samples for a `[table snapshot]`, computed once.
+  "Samples for a `[lake version from cols per-col]`, computed once. `from` is the
+   FROM text — a lake table with its snapshot, or a source's relation over a path
+   — and `version` is what that text cannot say: nil for a `:lake` handle, the
+   handle's `:at` for a `:source`. See `from-of` and `samples-version`.
 
-   `memoize` rather than a hand-rolled atom, and sound rather than merely
-   convenient: a handle is immutable, because `put-rows!` always creates a new
-   lake table and nothing overwrites one. So a hit is not a stale answer, it is
-   the only answer.
+   `memoize` rather than a hand-rolled atom, and **sound for a `:lake` handle
+   rather than merely convenient**: such a handle is immutable, because
+   `put-rows!` always creates a new lake table and nothing overwrites one. So for
+   those a hit is not a stale answer, it is the only answer.
 
-   That is the same invariant `current-snapshot` above depends on, and it stops
-   holding on the same day: **whoever adds in-place mutation has to invalidate
-   this**. `restore-to!` is already a `CREATE OR REPLACE` and is the closest
-   thing to a counter-example, but it is not one — measured 2026-08-16, a
-   cached answer still matches a fresh one across an `UPDATE` and a
-   `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
+   **A `:source` handle does not get that guarantee, and cannot.** Its bytes live
+   in a file loci does not own, and `:at` is the instant of the last connect or
+   refresh rather than a version of the file — so overwrite the file without
+   refreshing and a hit here is a stale synopsis and nothing detects it, exactly
+   as `samples-version` says. That is a bounded staleness and it is the one
+   loci chose: only the SYNOPSIS goes stale, because the rows are read straight
+   from the file on every query, and `refresh!` moves `:at` and mints a fresh
+   entry. Do not read the soundness paragraph above as covering both.
+
+   That first invariant is the same one `current-snapshot` above depends on, and
+   it stops holding on the same day: **whoever adds in-place mutation to the lake
+   has to invalidate this**. `restore-to!` is already a `CREATE OR REPLACE` and
+   is the closest thing to a counter-example, but it is not one — measured
+   2026-08-16, a cached answer still matches a fresh one across an `UPDATE` and
+   a `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
    snapshot and the rewrite only moves the write head.
 
    Unbounded, and that is affordable *because the clip happens in SQL rather
@@ -609,9 +807,16 @@
    It retains more than the samples: the key holds the `Lake` it was asked
    about, so an entry pins a JDBC connection. In the server there is one lake
    and so one reference; a test run that opens many leaks one each until the
-   var is rebound. Measure before replacing this with an eviction policy."
+   var is rebound. Measure before replacing this with an eviction policy.
+
+   **`_version` is in the argument list only to be part of the memo key**, and it
+   is what keeps the soundness argument true now that a passthrough handle
+   exists. See `samples-version`: a `:lake` handle contributes nil, because its
+   FROM text already names a table and a snapshot that never change; a `:source`
+   handle contributes its `:at`, because its FROM text names only a path and the
+   file there can be rewritten with no event anywhere."
   (memoize
-   (fn [lk table snapshot cols per-col]
+   (fn [lk _version from cols per-col]
      (into {} (for [c cols]
                 [c (mapv #(str (first (vals %)))
                          ;; Clipped BEFORE the DISTINCT, matching
@@ -621,7 +826,7 @@
                                     " THEN substr(s, 1, " tbl/sample-max-chars ") || '…'"
                                     " ELSE s END AS v FROM ("
                                     "SELECT CAST(" (ident c) " AS VARCHAR) AS s"
-                                    " FROM " table " AT (VERSION => " (long snapshot) ")"
+                                    " FROM " from
                                     " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
@@ -639,17 +844,28 @@
 
   (rows [lk h {:keys [offset limit]}]
     (q-as lk (str "SELECT " (select-cols (:cols h))
-                  " FROM " (:table h) " AT (VERSION => " (long (:snapshot h)) ")"
+                  " FROM " (from-of h)
                   (when limit  (str " LIMIT "  (long limit)))
                   (when offset (str " OFFSET " (long offset))))
           (:cols h)))
 
   (row-count [_ h] (:rows h))
 
-  (reclaimed-at [lk h] (dropped-at lk (:table h)))
+  (reclaimed-at [lk h]
+    ;; Nothing can reclaim a file loci does not own, so a source handle is never
+    ;; reclaimed — its failure modes are unavailable and drift, which `hydrate`
+    ;; classifies.
+    ;;
+    ;; The guard saves a scan, not a crash. Measured 2026-08-19: `dropped-at`
+    ;; with a nil table answers nil quite happily, because `dropped-tables`
+    ;; queries the whole catalog and no real table is ever named nil. So this is
+    ;; here to say that the question is meaningless for a source — and to stop a
+    ;; catalog-wide query being run to answer it.
+    (when-not (= :source (:store h)) (dropped-at lk (:table h))))
 
   (column-samples [lk h per-col max-cols]
-    (sample-cache lk (:table h) (:snapshot h) (vec (take max-cols (:cols h))) per-col)))
+    (sample-cache lk (samples-version h) (from-of h)
+                  (vec (take max-cols (:cols h))) per-col)))
 
 (defn sweep!
   "Automatic table GC. Disabled, deliberately, and it reports that rather than

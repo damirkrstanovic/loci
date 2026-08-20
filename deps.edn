@@ -2,7 +2,9 @@
  :deps {org.clojure/clojure    {:mvn/version "1.12.0"}
         http-kit/http-kit      {:mvn/version "2.8.0"}
         org.clojure/data.json  {:mvn/version "2.5.0"}
-        org.clojure/data.csv   {:mvn/version "1.1.0"}
+        ;; org.clojure/data.csv is gone as of 2026-08-20. DuckDB's `read_csv` is
+        ;; the only CSV reader loci has; `loci.corpus` was the last namespace
+        ;; parsing one itself, and it now imports through the file connector.
         org.babashka/sci       {:mvn/version "0.8.43"}
         datalevin/datalevin    {:mvn/version "1.0.0"}
         org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}}

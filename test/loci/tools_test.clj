@@ -3,13 +3,28 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
+            [loci.fnlib :as fnlib]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
+            [loci.server :as server]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools]))
 
 (use-fixtures :once loci.lake-fixture/with-temp-lake)
+
+(defn- with-temp-data-dir
+  "Run `f` with `sub/data-dir` answering a fresh temp directory, removed after.
+
+   `import-csv!` writes the posted text under `<LOCI_DATA>/files/` before it
+   connects, so without this the suite drops a CSV into the real `data/` on
+   every run. Redefining the ONE function is what keeps the round trip whole:
+   `sourcespec/locate` resolves `loci://` through the same var, so the write
+   and the read cannot end up in different directories."
+  [f]
+  (let [d (str (System/getProperty "java.io.tmpdir") "/loci-tools-data-" (System/nanoTime))]
+    (try (with-redefs [sub/data-dir (constantly d)] (f))
+         (finally (lf/rm-rf d)))))
 
 (deftest md-table-salvage-parses-prose-tables
   ;; live-fire finding #3: the model wrote the table INTO the note instead of
@@ -23,7 +38,7 @@
         rows (tools/md-table->rows text)]
     (is (= 2 (count rows)))
     (is (= "JSR Corporation (Japan)" (:supplier (first rows))))
-    (is (= 30 (:market_share_pct (first rows))))          ; "~30% (estimated)" → 30
+    (is (= 30 (:market_share_pct (first rows))))         ; "~30% (estimated)" → 30
     (is (= 25 (:market_share_pct (second rows))))))
 
 (deftest md-table-salvage-piped-and-typed
@@ -59,9 +74,18 @@
     ;; and `:cols` is where the column keywords travel through it as a *value*
     (is (= h (edn/read-string (pr-str h))))))
 
-(deftest parse-csv-sanitizes-headers
-  (let [rows (tools/parse-csv "Key Proponent(s),Total Revenue ($)\nCanon,5")]
-    (is (= {:key_proponent_s "Canon" :total_revenue 5} (first rows)))))
+(deftest import-csv-sanitizes-headers-through-read-csv
+  ;; What `parse-csv` used to prove, proved where the work now happens. The
+  ;; header normalization is still `sub/col-kw`; the inference underneath it is
+  ;; DuckDB's sniffer and nothing else in loci.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (server/import-csv! st "T" "Key Proponent(s),Total Revenue ($)\nCanon,5\n" nil)
+            o  (tbl/hydrate @lake/lake (sub/object st (:openId r)))]
+        (is (nil? (:error r)))
+        (is (= [{:key_proponent_s "Canon" :total_revenue 5}] (:value o))
+            "the header normalization is the same; the inference is DuckDB's")))))
 
 ;; ---- the agent's two table tools read through the handle, not around it ----
 ;; A table's rows live in the lake and the log holds a handle. Both tools used
@@ -206,3 +230,12 @@
             "list_tables no longer reaches the model as ISO-UTC")
         (is (str/includes? err (:reclaimed wire))
             (str "two spellings of one instant: " (pr-str (:reclaimed wire)) " vs " (pr-str err)))))))
+
+(deftest a-salvaged-number-column-is-numeric-to-the-palette
+  ;; The property that actually degrades if `md-cell-val` returns a string.
+  ;; Pinned on `numeric-cols` rather than on `catalog` because `catalog` still
+  ;; LISTS Group, Top N, Change and Share — greyed, with a :why naming a numeric
+  ;; column"` — so its shape does not change and an assertion on it would not
+  ;; bite. What changes is whether the column counts as a number at all.
+  (let [rows (tools/md-table->rows "| region | share |\n|---|---|\n| EMEA | ~30% |\n| APAC | ~25% |\n")]
+    (is (= [:share] (fnlib/numeric-cols rows)))))

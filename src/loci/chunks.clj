@@ -331,23 +331,63 @@
    single deleted Parquet stopped semantic-recall indexing for **every** object
    in the substrate, every 15 seconds, until somebody noticed.
 
-   Only a store that says the rows were reclaimed may be swallowed, and asking
-   it is itself wrapped — the same shape as `tbl/hydrate`, for the same two
+   **Two ways to be a deliberate loss, because there are two kinds of handle.**
+   A `:lake` handle's rows are loci's own bytes, so only a store that says they
+   were reclaimed may be swallowed; any other failure is rethrown untouched, and
+   asking is itself wrapped — the same shape as `tbl/hydrate`, for the same two
    reasons. A failing disk must stay a failing disk rather than becoming a
    substrate of bare titles nothing raised about, and a catalog too damaged to
    answer must not replace the error the caller actually needs to see.
 
+   **A `:source` handle has no such record to consult, so every read failure on
+   one degrades.** `tbl/reclaimed-at` answers nil for a source by design —
+   nothing can reclaim a file loci does not own — so the reclamation question
+   above, asked of a passthrough table, is always no, and the catch above it
+   always rethrew. That left this the last place in the substrate still asking a
+   question only a `:lake` handle can answer, while `hydrate` had already grown
+   two markers for what goes wrong with a source instead. Measured 2026-08-20
+   over a store holding one source whose file had been deleted, one healthy lake
+   table and one doc: `tbl/hydrate` degraded correctly while `#'with-samples`,
+   `all-chunks`, `pending` and `sweep!` all threw `java.sql.SQLException`, and
+   **the doc was never chunked at all** — verbatim the regression the paragraph
+   above records as fixed, arriving through a second door.
+
+   **`(= :source (:store h))` rather than something narrower, deliberately.**
+   The two failures a source really has — no readable file, and a file whose
+   header no longer matches what was recorded at connect — are indistinguishable
+   from a lake fault by the time the exception arrives here.
+   `ssp/unreadable-because` classifies only the first, and drift throws
+   identically (both measured 2026-08-20, one `java.sql.SQLException` apiece);
+   separating them by DuckDB's message is what `loci.sourcespec`'s own docstring
+   calls the fragile alternative, and `ssp/duckdb-said` records that driver
+   answering a source failure with an unrelated `NullPointerException` instead —
+   so a text-matched predicate would fail open into exactly the rethrow this
+   removes. The widening is therefore accepted and named: a genuine lake fault
+   met while reading a source costs that source's chunk its synopsis until the
+   next cold sweep. It is not silence — every `:lake` handle in the same
+   substrate still rethrows, `hydrate` already makes this same choice on this
+   same handle, and two readers of one handle disagreeing about what \"broken\"
+   means would be the next defect rather than a safeguard.
+
    **The catch fires only on a cold `lake/sample-cache`, and in the server that
-   means after a restart.** Samples are memoized per `[table snapshot]`, so a
-   table the 15-second sweep has already described keeps producing its full
-   synopsis from the memo after its Parquet is deleted — measured 2026-08-17:
-   two identically injured tables, the sampled one answered `{:a [\"0\" \"1\"
-   \"10\"]}` and the unsampled one threw `IO Error: Cannot open file`. So
-   reclaiming costs nothing at all until the process next starts cold, and then
-   exactly one re-embedding for that one chunk: the text goes from synopsis to
-   title, so its `:hash` moves, and `sweep!` reports `{:embedded 1 :retired 0}`
-   and asks the model for `[\"Gone\"]`. Nothing is retired — the chunk id is the
-   object's id plus its index, which does not move."
+   means after a restart.** Samples are memoized per `[lake version from cols
+   per-col]`, where `from` names a lake table and its snapshot or a source's
+   path, and `version` is nil for the first and the source's `:at` for the
+   second — see `lake/samples-version`. So a table the 15-second sweep has
+   already described keeps producing its full synopsis from the memo after its
+   Parquet is deleted — measured 2026-08-17: two identically injured tables, the
+   sampled one answered `{:a [\"0\" \"1\" \"10\"]}` and the unsampled one threw
+   `IO Error: Cannot open file`. A source behaves the same way, and its entry is
+   additionally keyed by the handle's `:at`, so a `refresh!` mints a fresh one
+   rather than reusing a synopsis of bytes that have since changed — measured
+   2026-08-20: a source sampled before its file was deleted still answered
+   `{:a [\"1\"]}`, while the same handle read through a lake with no memo fell to
+   its title. So reclaiming costs nothing at all until the process next starts
+   cold, and then exactly one re-embedding for that one chunk: the text goes from
+   synopsis to title, so its `:hash` moves, and `sweep!` reports
+   `{:embedded 1 :retired 0}` and asks the model for `[\"Gone\"]`. Nothing is
+   retired — the chunk id is the object's id plus its index, which does not
+   move."
   [o]
   (if (tbl/handle? (:value o))
     (let [h (:value o)]
@@ -363,8 +403,15 @@
         (catch Exception e
           ;; `o` unchanged on purpose: with no `:table/samples`, `texts-of`'s
           ;; `(:table :metric)` branch falls to the title, which is already how
-          ;; it handles a table it cannot describe.
-          (if (try (tbl/reclaimed-at (force lake/lake) h) (catch Exception _ nil))
+          ;; it handles a table it cannot describe. A marker key would be the
+          ;; obvious alternative and would be read by nothing — `chunks-of` is a
+          ;; pure function of the object and puts only text in a chunk.
+          ;;
+          ;; The source test comes first so a passthrough failure never asks the
+          ;; catalog a question that is meaningless for it — the same guard
+          ;; `lake/reclaimed-at` keeps on its own side, for the same reason.
+          (if (or (= :source (:store h))
+                  (try (tbl/reclaimed-at (force lake/lake) h) (catch Exception _ nil)))
             o
             (throw e)))))
     o))
@@ -409,6 +456,30 @@
      In `tbl:extract-20-8413`'s `approx_low_income_share` the quote also
      reorders: `10, 50, ~13% (1 of 8 countries)` against
      `\"~13% (1 of 8 countries)\", 10, 50`.
+
+   **Both bullets are about ROWS, and the `tbl:csv-*` examples are history.**
+   `read_json_auto` is what `put-rows!` reads its NDJSON back with, so the
+   widening is live wherever loci hands the lake Clojure values — `save_table`,
+   `content/seed!`, `tablemigrate`. It is not what a CSV meets any more. Those
+   two tables were imported by `tools/parse-csv`, which typed one CELL at a
+   time, so a single column could hold a Long, a Double and a `\"\"` at once and
+   the lake had to reconcile them; every import now goes through `read_csv`,
+   which sniffs per COLUMN. Measured 2026-08-20 over a CSV of that exact shape
+   — `100` beside `87.6` in one column, a blank cell in the next — `describe`
+   answers `DOUBLE` and `DOUBLE`, the samples are `100.0, 23.0, 87.6` and
+   `13.1, 25.4, 347.8`, and the blank is a SQL NULL that `column-samples` drops.
+   The same four rows through `put-rows!` still give `DOUBLE` and `JSON`,
+   sampling `\"\", 13.1, 25.4, 347.8`. So the first bullet's *rendering* outlives
+   the change and only its *cause* is gone; the second cannot happen to a CSV
+   at all.
+
+   The examples were re-read from their own Parquet on 2026-08-20 and all still
+   hold: `urban_pct` DOUBLE sampling `100.0` first, `density_per_km2` JSON
+   sampling `\"\"` first, `tbl:csv-18-1542`'s three JSON, and `tbl:corpus-2`'s
+   `production_tonnes` DOUBLE sampling `100.0, 1000.0, 10000.0`.
+   `tbl:extract-20-8413` holds too few rows for DuckLake to write it a Parquet
+   at all — it is inlined in the catalog — so its line above is the one thing
+   here not re-measured.
 
    The fourth is this function's own, and is the price of asking SQL rather
    than Clojure to render. `tbl:corpus-2`'s `production_tonnes` samples

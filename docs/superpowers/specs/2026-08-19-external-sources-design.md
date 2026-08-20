@@ -28,11 +28,22 @@ The CSV path is not that machinery, and is the thing being replaced:
 | parse | `tools/parse-csv` → `clojure.data.csv` → a vector of Clojure maps, all in RAM |
 | types | `tools/->val` — three regexes: `-?\d+`, `-?\d+\.\d+`, else string |
 | then | those maps re-serialized to NDJSON and read back by DuckDB |
-| callers in the shell | **none** — `grep` finds no caller of `/api/import-csv` in `index.html` |
+| callers in the shell | **one** — `startImport`, a paste-CSV-into-a-textarea flow (`resources/public/index.html:1102`) |
 
-Three full in-memory copies before a byte reaches DuckDB, and no user-reachable path. The only
-CSV ingest anyone actually runs is `loci.corpus`, which reads files off disk and builds events
-directly.
+Three full in-memory copies before a byte reaches DuckDB — and the copies are the whole story,
+because there **is** a user-reachable path and it is the one that makes them unavoidable.
+`startImport` gives you a textarea to paste a CSV into, so the file arrives as a JSON string in a
+request body and is already in RAM before loci sees it. That is fine for the paste it was built
+for and cannot be made to work for a 500 MB file, which is why phase 2 adds a streaming upload
+rather than widening this one.
+
+**Corrected 2026-08-19.** An earlier draft of this table said the shell had no caller at all. That
+came from grepping `index.html` at the repo root — a different, unserved file. The shell is
+`resources/public/index.html` (2952 lines), which is what `server.clj:2991` slurps, and a plain
+`grep` on it silently reports zero matches because its long lines make grep treat it as binary.
+Use `grep -a`, and grep the served file.
+
+The other CSV ingest is `loci.corpus`, which reads files off disk and builds events directly.
 
 `loci.tools` already declares the seam this design takes up: *"This is where MCP servers would
 register too: same shape — a JSON spec + a handler — so the model reaches every connected source
@@ -76,8 +87,14 @@ materialise and passthrough cannot disagree about what the columns are:
    existing `sub/col-kw`. Both modes build their projection from this.
 3. **The schema a preview shows**, so the shell can display it before anything is committed.
 
-`tablestore/collisions` applies unchanged to a header: two CSV columns normalizing onto one
-column name is caught at connect rather than silently dropping a column.
+`tablestore/check-names!` applies unchanged to a header: two CSV columns normalizing onto one
+column name is caught at connect rather than silently dropping a column. (It was extracted from
+`normalize-rows`' private `collisions` for exactly this, so rows and headers run one check.)
+
+**Two literally identical headers are not loci's problem** — measured 2026-08-19, DuckDB dedupes
+them before `DESCRIBE` returns: `Region,Region,Total` describes as `Region`, `Region_1`, `Total`,
+which normalize apart. So `describe` never sees a duplicate name, and `check-names!` is only ever
+asked the normalization question it was written for.
 
 ### A source lives on the table object
 
@@ -106,11 +123,17 @@ to build the abstraction that connector will want.
 | mode | handle | reads |
 |---|---|---|
 | `:materialise` | `{:store :lake :table … :snapshot … :rows … :cols …}` — **unchanged** | `… FROM t AT (VERSION => n)` |
-| `:passthrough` | `{:store :source :id … :uri … :format … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
+| `:passthrough` | `{:store :source :uri … :format … :options … :cols … :rows … :at …}` — **the handle is the recipe** | `… FROM read_csv('…')` |
 
-The passthrough handle carries its object `:id` and its `:at` because `column-samples` receives
-**only the handle** — see "The synopsis cache needs a key that can change" for what those two
-are for.
+The passthrough handle carries its `:at` because `column-samples` receives **only the handle** —
+see "The synopsis cache needs a key that can change" for what it is for.
+
+**It carries its `:options` for the same reason, and this is the easier one to lose.** A read
+rebuilds the relation from the handle alone, so a source connected with `{:delim ";"}` that does
+not record it would read correctly once — `describe` saw the real options — and then fall back to
+DuckDB's sniffer on every read afterwards. The likely symptom is not an error but a spurious
+`:table/source-drift` on a file that never changed, because the sniffer guessed differently
+without the option it was not given.
 
 Passthrough creates **no catalog object**: no DuckLake view, no snapshot to fake, nothing for GC
 to track. `Lake` executes both — a `:source` handle inlines the relation expression where a
@@ -178,7 +201,12 @@ A passthrough table's bytes can change with no event. That breaks a promise the 
 everywhere else. The design makes it **visible and bounded**; it does not paper over it.
 
 Reads are bounded exactly as everything else is: `SELECT <projection> FROM read_csv('…')
-LIMIT 2000`, the same `mold-cap`. So a 10M-row passthrough file renders like a 10M-row
+LIMIT 2000`, the same `mold-cap`. **Which** 2000 is not promised, and that is not new: a
+`LIMIT` without an `ORDER BY` has no guaranteed row order over Parquet either, which is
+why `tablestore/column-samples` already sorts in SQL — *"the lake has no row order to
+appeal to without an `ORDER BY`, and a synopsis whose values vary between runs would move
+its hash on every sweep and re-embed forever."* A molded table has always been a page of an
+unordered relation; passthrough inherits that rather than introducing it. So a 10M-row passthrough file renders like a 10M-row
 materialised one. `row-count` would be a full scan, so the handle carries the count observed at
 connect and `hydrate` reports it as `:table/total` **with the passthrough marker attached** — a
 stale count that announces itself is safe; one that does not, is not.
@@ -216,16 +244,24 @@ answer it the key has to do two jobs: **separate** different tables from one ano
 does both in a single token, because every write mints a new name. That is why the existing key
 carries no object id and has never needed one.
 
-Passthrough splits the two jobs apart, and an object id only does the first. An id is fixed for
-the life of the object while the file underneath it can be overwritten any number of times. Key
-on the id alone and the samples are computed once, on the first read, and never again — replace
-the CSV, refresh, and the table goes on describing the file you deleted, with nothing able to
-invalidate it.
+Passthrough splits the two jobs apart — but not the way it first appears, and the difference is
+worth stating because the obvious answer produces a key no test can check.
 
-So: **a passthrough handle keys the sample cache on `[id at]`** — the object id for job one, the
-source's `:source :at` for job two, since `at` is the only thing that moves when the operator
-says the bytes changed. It must not reuse `(:table h)` and `(:snapshot h)`, which are `nil` for
-this handle shape.
+The **separating** job is already done. The cached SQL is keyed on its own FROM text, and a
+passthrough handle's FROM text names the file's path, so two sources at two paths can never
+collide. Two sources at *one* path are a different matter, and they must share: one file is one
+set of bytes, so one answer is the right answer. An object id in this key would therefore be
+inert — it would distinguish only cases that must not be distinguished, and read as a guarantee
+it is not making.
+
+What is genuinely missing is the **version**. A `:lake` handle's FROM text carries one already:
+it names the table and the snapshot, and a write never overwrites — measured 2026-08-19, two
+`put-rows!` under a single object id land in `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. A
+path carries none.
+
+So: **a passthrough handle keys the sample cache on its `:at`**, the instant of the connect or
+refresh that last looked, and a `:lake` handle adds nothing. `:at` is the only thing in a source
+that moves when the operator says the bytes changed.
 
 **The known limit, stated rather than hidden.** For a materialised table the version in the key
 is a fact DuckLake guarantees. For a passthrough table `at` is a claim loci makes on the
@@ -330,6 +366,16 @@ Three plans, each its own `writing-plans` pass.
 2. **Upload + shell.** Streamed raw-body route into `<LOCI_DATA>/files/`; the Connect data
    affordance, the preview, the mode toggle, the refresh button, the live badge and the scrubbed
    wording; `/api/storage` reports `data/files`.
+
+   **It must raise http-kit's `:max-body`, and that is a live defect today, not a new
+   requirement.** Measured 2026-08-20: `server.clj`'s `run-server` passes only `{:port port}`, so
+   the default 8,388,608-byte limit applies. Against a running loci, a 9.7 MB body is refused
+   with **413 and 0 bytes uploaded in 0.6 ms** — the request never reaches `import-csv!`, and the
+   shell's paste-CSV flow shows whatever a 413 renders as. The largest CSV that fits is 8,388,588
+   bytes, **203,163 rows** — 2% of this design's stated target. So the shell has silently had a
+   ~200k-row ceiling all along, unrelated to anything phase 1 changed, and a streaming route
+   inherits it unless the option is set. Phase 1 does not set it: choosing a byte limit is a
+   deployment judgement that belongs with the route that streams.
 3. **Remote locations.** httpfs, `s3://`/`gs://`/`https://`, and DuckDB `SECRET`s — which is also
    the spec that unblocks SQL databases, since credentials are the thing they share.
 
@@ -353,6 +399,141 @@ fixture can establish that a mechanism works and never that a cost is real.
 4. **Both suites**: `clojure -M:test` and `npm run test:browser`. Neither is "all the tests".
 5. **Every regression test proved to fail when its fix is reverted.** A test that passes either
    way is worse than none, because it certifies.
+
+## Measured
+
+Measured **2026-08-20**, on the machine this was written on: 6 cores, 15 GiB RAM, JDK default max
+heap **3,976 MB** — no `-Xmx` given, because the default is what `clojure -M:serve` runs with and
+item 4 below only means anything against it. DuckDB 1.5.5.1, `memory_limit` 12.4 GiB, `threads` 6.
+
+Method, because the numbers are only as good as it. Each figure is its own fresh JVM, so nothing
+carries over between sizes. Memory is **sampled on a 20 ms daemon thread for the length of every
+call** and the maximum reported — heap as `.totalMemory - .freeMemory`, process RSS as field 2 of
+`/proc/self/statm` — because a before/after delta misses the peak entirely; a triple `System/gc`
+brackets each call for the live-heap figures beside it. The fixture lives on real disk under
+`/var/tmp`, deliberately **not** on this machine's `/tmp`, which is a tmpfs and would have made
+the file's own bytes count against RAM.
+
+Item 3 of the list above — the corpus re-import — belongs to its own plan task and is not in this
+run.
+
+### The file
+
+`id,region,amount,day`, from which DuckDB infers `BIGINT, VARCHAR, DOUBLE, DATE`; `region` carries
+six distinct values.
+
+| rows | bytes | generated in |
+|---|---|---|
+| 10,000,000 | 417,658,901 (398 MiB) | 2,457 ms |
+| 1,000,000 | 40,765,900 (39 MiB) | 296 ms |
+
+398 MiB rather than the ~500 MB asked for above. The row count is the target and it is exact; the
+byte count falls out of the column shape.
+
+### 1. Materialise — memory does not scale with the file
+
+| | 1M rows / 39 MiB | 10M rows / 398 MiB |
+|---|---|---|
+| `source/connect!` wall | 238 ms | **893 ms** |
+| peak JVM heap | 57 MB | **57 MB** |
+| live heap, before → after | 55 → 55 MB | 55 → 55 MB |
+| peak process RSS | 744 MB | 953 MB |
+| RSS across the call | 620 → 712 MB | 585 → 914 MB |
+| Parquet written | 9.3 MB | 89 MB |
+
+Repeated three times in one JVM at 10M, because 893 ms was surprising enough to want measuring
+twice: 751 / 747 / 792 ms, peak heap 56 / 56 / 57 MB, RSS 609 → 725 → 766 → 873 MB, and DuckDB's
+own `duckdb_memory()` reporting 4.0 / 6.4 / 6.4 MB throughout. Each of the three tables verified
+independently — `count(*)` 10,000,000, `min(id)` 1, `max(id)` 10,000,000, six distinct regions,
+identical `sum(amount)`.
+
+**This is the claim the design rests on, and it holds — with one correction.** The JVM heap is
+flat to the megabyte: 57 MB at 1M and 57 MB at 10M, live heap 55 MB either side, because the rows
+never enter this process. Process **RSS is not flat**, and pretending otherwise would be the easy
+lie here: a file 10× larger cost 3.6× the RSS delta, +92 MB against +329 MB. That is DuckDB's
+native buffer manager, bounded by its own `memory_limit` rather than by the file — three
+successive passes over the same 398 MiB added ~90 MB each, not 398 MB each.
+
+The 893 ms also settles the note above about `put-rows!`. DuckDB reading the CSV directly is
+**three times faster** than the 2.9 s NDJSON path, from a starting state — a file on disk — that
+the NDJSON path cannot reach at all.
+
+### 2. Passthrough at 10M rows
+
+| | |
+|---|---|
+| `DESCRIBE SELECT *` — the sniff `describe` runs | 42 ms |
+| `SELECT count(*)` over the whole 398 MiB file | 244 ms (246 ms on a repeat) |
+| `connect!` with `:mode :passthrough`, total | **294 ms** |
+| bytes written to the lake | **21,543** — catalog only, no Parquet |
+| `tbl/hydrate` — the `LIMIT 2000` render plus `row-count` | 124 ms cold, 94 ms warm |
+| peak heap during hydrate | 139 MB |
+
+`hydrate` returned 2,000 rows, `:table/total 10000000`, `:table/passthrough true`, and
+`tablestore/unusable` nil. `row-count` costs no query at all — it is `(:rows h)` off the handle.
+
+**The `count(*)` is 244 of the 294 ms — 83% of a passthrough connect.** That is the one thing that
+makes passthrough not free at connect time, and it deserves saying plainly: connecting live is
+3× cheaper than materialising and writes nothing, but it is not O(1). It reads the file once, to
+learn how many rows are in it.
+
+### 3. What the JSON-string import path actually does
+
+**It does not fail.** The prediction above — *expected to fail outright; that failure is the
+number that justifies this work* — is wrong at 10M rows, and the justification has to change with
+it.
+
+**Over HTTP the file never reaches loci at all.** `server.clj` calls
+`(http/run-server #'handler {:port port})` with no `:max-body`, and http-kit 2.8.0 defaults that
+to 8,388,608 bytes. Posted at a live loci:
+
+| POST to `/api/import-csv` | answer |
+|---|---|
+| 116-byte body | 200, `tbl:tiny`, 2 rows, 85 ms |
+| 9,688,511-byte body | **413** `request body 9688511; max request body 8388608` — **0 bytes uploaded**, 0.6 ms |
+| 427,658,912-byte body, the 10M CSV | **413**, same message, **0 bytes uploaded**, 0.7 ms |
+| 8,388,588-byte body — the largest that fits | 200, **203,163 rows**, 2.15 s |
+
+So today's ceiling on this route is ~8 MiB of JSON body ≈ **203,163 rows of this shape**, two
+percent of the target, refused on the `Content-Length` header before a byte is read. That is a
+hard ceiling rather than a memory pressure, and lifting it is phase 2's first job.
+
+**In process, with the cap out of the way, the whole chain succeeds on the default heap.**
+
+| step | wall | peak heap | peak RSS |
+|---|---|---|---|
+| `slurp` the 418 MB CSV into one String | 420–475 ms | 1,480 MB | 1,968 MB |
+| `json/write-str {:csv …}` → a 427,658,912-char body | 7,712 ms | 2,439 MB | 2,890 MB |
+| `json/read-str` it back — what `body-json` does | 2,529 ms | 2,616 MB | 3,524 MB |
+| `body-json` over the 408 MiB body read off disk | 2,922 ms | **2,476 MB** | 3,028 MB |
+| `server/import-csv!` on the parsed String | 2,387 ms | 865 MB | 2,304 MB |
+
+The table lands — `tbl:sales_http`, 10,000,000 rows, `:materialise` — with no `OutOfMemoryError`
+anywhere, and the round trip is exact at 417,658,901 characters back.
+
+So the number that justifies the streaming route is not a crash. It is **2,476 MB of peak heap,
+62% of the default 3,976 MB and roughly six times the file**, to move bytes that DuckDB reads in
+893 ms holding 57 MB. `import-csv!` also writes a **second full copy** of the CSV into
+`<LOCI_DATA>/files/` — 417,658,901 bytes — on top of the 89 MB of Parquet, which the streaming
+route removes as well. Constant memory, not feasibility.
+
+### 4. Both suites
+
+- `clojure -M:test` — **769 tests, 4,279 assertions, 0 failures, 0 errors**, 59.5 s.
+- `npm run test:browser` — **135 pass, 0 fail**, 309.9 s.
+
+### Which of the two things each number establishes
+
+CLAUDE.md's rule: a measurement tells you a mechanism works, **or** that a cost is real, never
+both. Sorted, so nobody has to guess:
+
+- **That the cost is real.** Every figure at 10M rows, all taken at the design's stated target and
+  none over `data/`: the 57 MB heap flat against a 398 MiB file, the 244 ms `count(*)` that is
+  83% of a passthrough connect, the 2,476 MB peak of the JSON path, and the 8 MiB HTTP cap with
+  its 203,163-row ceiling.
+- **That the mechanism works.** The inferred `BIGINT, VARCHAR, DOUBLE, DATE`; the
+  `:table/passthrough` shape and its nil `unusable`; the byte-exact JSON round trip; both suites.
+  These say the code is correct. They say nothing about whether anything costs too much.
 
 ## Deliberately not in this spec
 

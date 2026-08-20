@@ -21,7 +21,23 @@
   (clojure.test/test-vars [#'loci.source-test/the-one-test])
   ```
   `clojure -M:test` is for the single full-suite run in Task 14.
+- **The nREPL on port 7888 is shared.** If more than one agent is working at once, another agent's mid-edit definitions live in the same JVM as yours, and a namespace you did not touch can fail — or, worse, *pass* — for reasons that are not on disk. Observed 2026-08-19: `loci.tablestore-test` reported 8 failures against a `tablestore.clj` that `git diff` showed clean. Always `(require '[the.ns] :reload)` from disk before trusting any cross-namespace result, and treat a surprising result as possible contamination before treating it as a finding. The controller runs agents serially for this reason; if you see evidence of a second writer, stop and report it.
+- **A sabotage that did not take effect is a false green — check that it landed.** Two ways to get
+  this wrong were hit on 2026-08-19. `(in-ns 'loci.x)` nested inside a `do`/vector does NOT change
+  the namespace the enclosing form is *compiled* in, so the `defn` beside it defines `user/foo`
+  and sabotages nothing — send `in-ns` as its own top-level form, or edit the file. And
+  `with-redefs` on a widely-used helper can break more than the target (`sub/col-kw` also breaks
+  `check-names!`, giving 3 failures where 1 was wanted) — when the signal is muddy, edit the
+  source instead. Either way: if the sabotage run reports 0 failures, that is a finding about your
+  sabotage, not about the code.
 - **Prove every test bites.** After a test passes, break the implementation it covers, re-run, confirm FAIL, restore. A test that passes either way is worse than none, because it certifies.
+- **End every commit message with** `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. This
+  branch's earlier commits predate the rule and are not being rewritten for it.
+- **The shell is `resources/public/index.html`, and plain `grep` lies about it.** The repo root
+  holds a different, unserved `index.html`; `server.clj:2991` slurps the one under `resources`.
+  And grep treats the served file as binary because of its long lines, so it reports zero matches
+  silently — always `grep -a`. A conclusion of "nothing in the shell calls this" drawn any other
+  way is worthless; one was drawn that way on 2026-08-19 and was wrong.
 - **`data/` is disposable.** Do not checksum it, do not rehearse on copies. Prefer a throwaway `LOCI_DATA` where a test does not need the real store.
 
 ## File structure
@@ -32,7 +48,7 @@
 | `src/loci/source.clj` | **new.** The facade: `describe`, `connect!`, `refresh!`. Commits events. |
 | `src/loci/lake.clj` | `unwrap` grows temporal types; `create-from-relation!`; `:source` handle reads; the sample-cache key. |
 | `src/loci/tablestore.clj` | `handle?` learns `:source`; `check-names!` extracted; `hydrate` grows three markers. |
-| `src/loci/tools.clj` | `parse-csv` and `->val` deleted; `md-cell-val` returns a string. |
+| `src/loci/tools.clj` | `parse-csv` and `->val` deleted; `md-cell-val` keeps returning a number. |
 | `src/loci/server.clj` | `import-csv!` rewritten as a wrapper; `/api/source/*` routes; four marker readers taught the new keys. |
 | `src/loci/corpus.clj` | imports its five CSVs through `source/describe` instead of `parse-csv`. |
 | `test/loci/sourcespec_test.clj` | **new.** Pure-function tests, no fixture. |
@@ -239,7 +255,14 @@ Expected: PASS, 6 assertions. Now re-run Task 1's test too; it should pass.
 
 - [ ] **Step 5: Prove the test bites**
 
-Change `projection` to return `"*"`, `:reload`, re-run. Expected: FAIL on `(:cols h)` — the columns come back as the raw header names. Restore.
+Change `projection` to return `"*"`, `:reload`, re-run. Expected: FAIL on the `(tbl/rows lk h {})` assertion, with
+
+```
+Binder Error: Referenced column "total_revenue" not found in FROM clause!
+Candidate bindings: "Total Revenue ($)"
+```
+
+**Not** on `(:cols h)`, which passes under the sabotage: the handle's `:cols` is echoed from the caller's argument rather than read back from the table, so it reports what `describe` claimed and not what the CREATE actually built. That is correct — `describe` read the real file — but it means the handle cannot self-check, and the read is what catches a projection that did not do its job. Restore afterwards.
 
 - [ ] **Step 6: Commit**
 
@@ -290,7 +313,7 @@ Expected: FAIL — `Unable to resolve symbol: check-names!`.
 In `src/loci/tablestore.clj`, replace the private `collisions` fn with these two (keep `collisions`' existing docstring on `name-collisions`, and add the sentence below):
 
 ```clojure
-(defn name-collisions
+(defn- name-collisions
   "The source names `col-kw` would collapse onto one column, as
    `{normalized [source …]}` — empty whenever the normalization is injective,
    which it is for all 31 tables in the corpus (measured 2026-08-16).
@@ -305,7 +328,11 @@ In `src/loci/tablestore.clj`, replace the private `collisions` fn with these two
    no single row loses a value there, and yet the table still ends with one
    column fed by two different names. `:cols` is a table-level fact, so the
    invariant that produces it is one too — and the table-level check is a strict
-   superset, since a row is a table of one."
+   superset, since a row is a table of one.
+
+   Private: `check-names!` is the only caller and the only thing anyone should
+   need. A reader that wants to LIST collisions rather than refuse them can have
+   this made public on the day it exists."
   [names]
   (into (sorted-map)
         (keep (fn [[k ks]] (when (next ks) [k (vec (sort-by pr-str ks))])))
@@ -415,6 +442,19 @@ Create `test/loci/sourcespec_test.clj`:
   (is (= "read_csv('/tmp/o''brien.csv')"
          (ssp/relation {:format :csv} "/tmp/o'brien.csv"))))
 
+(deftest relation-refuses-an-option-name-that-is-not-an-identifier
+  ;; :options reach here from a JSON body, and an option NAME cannot be quoted
+  ;; the way a value can — DuckDB wants a bare identifier. So it is checked.
+  (doseq [bad ["header, x" "1=1" "" "a b" "he'ader"]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ssp/relation {:format :csv :options {bad true}} "/tmp/a.csv"))
+        (str "must refuse option name " (pr-str bad)))))
+
+(deftest relation-refuses-an-option-value-it-cannot-render
+  (is (thrown? clojure.lang.ExceptionInfo
+               (ssp/relation {:format :csv :options {:columns {"a" "INT"}}} "/tmp/a.csv"))
+      "a map is not a reader option value, and must not be interpolated raw"))
+
 (deftest relation-refuses-an-unknown-format
   (let [e (try (ssp/relation {:format :xlsx} "/tmp/a.xlsx") nil
                (catch clojure.lang.ExceptionInfo e e))]
@@ -485,7 +525,16 @@ Create `src/loci/sourcespec.clj`:
         (str (sub/data-dir) "/" rel))
 
       (str/starts-with? uri "file://")
-      (let [p (.getPath (java.net.URI. uri))]
+      ;; `java.net.URI.` throws its own `URISyntaxException` before the blank
+      ;; check can run — a bare `file://` gives "Expected authority at index 7",
+      ;; which names neither loci nor the thing the caller typed. Every other
+      ;; branch here answers with an `ex-info` carrying `:uri`, and `describe`'s
+      ;; catch turns the message into what the shell shows, so this one does too.
+      (let [p (try (.getPath (java.net.URI. uri))
+                   (catch java.net.URISyntaxException e
+                     (throw (ex-info (str "not a usable file:// location: " uri
+                                          " — " (.getMessage e))
+                                     {:uri uri} e))))]
         (when (str/blank? p)
           (throw (ex-info (str "file:// location has no path: " uri) {:uri uri})))
         p)
@@ -501,17 +550,42 @@ Create `src/loci/sourcespec.clj`:
   [s]
   (str "'" (str/replace (str s) "'" "''") "'"))
 
+(def ^:private option-name
+  "What may appear to the left of the `=` in a reader option: a SQL identifier,
+   and nothing else.
+
+   `:options` arrive from a JSON body on `/api/source/connect`, which makes this
+   the one place in the framework where a caller chooses SQL *text* rather than a
+   value. `sql-str` quotes a value; there is no equivalent for an option NAME,
+   because DuckDB wants a bare identifier there and a quoted one is a syntax
+   error. So the name is CHECKED rather than escaped, and anything that is not an
+   identifier is refused."
+  #"[A-Za-z_][A-Za-z0-9_]*")
+
 (defn- opt-sql [[k v]]
-  (str (name k) "="
-       (cond (string? v)  (sql-str v)
-             (boolean? v) (if v "true" "false")
-             :else        v)))
+  (let [k (name k)]
+    (when-not (re-matches option-name k)
+      (throw (ex-info (str "not a reader option name: " (pr-str k)) {:option k})))
+    (str k "="
+         (cond (string? v)  (sql-str v)
+               (boolean? v) (if v "true" "false")
+               (number? v)  v
+               :else (throw (ex-info (str "a reader option takes a string, a number or a boolean — "
+                                          (pr-str k) " got " (pr-str v))
+                                     {:option k :value v}))))))
 
 (defn relation
   "A source → the SQL relation expression that reads it at `location`.
 
    Options are emitted in key order so the text is deterministic and the whole
-   function is testable with `=`. DuckDB does not care about the order."
+   function is testable with `=`. DuckDB does not care about the order.
+
+   Ordered by the key's NAME rather than the key, because `sort-by key` is a
+   partial comparator: two options whose keys are a string and a keyword —
+   reachable by hand from the REPL facade, if not from a JSON body — throw a
+   `ClassCastException` out of the sort before `opt-sql` can refuse them with a
+   sentence. Same order for a keyword-only map, one word longer, and the
+   friendly error always wins."
   [{:keys [format options]} location]
   (let [f (get readers format)]
     (when-not f
@@ -520,7 +594,7 @@ Create `src/loci/sourcespec.clj`:
                       {:format format})))
     (str f "(" (sql-str location)
          (when (seq options)
-           (str ", " (str/join ", " (map opt-sql (sort-by key options)))))
+           (str ", " (str/join ", " (map opt-sql (sort-by (comp name key) options)))))
          ")")))
 ```
 
@@ -532,11 +606,13 @@ Create `src/loci/sourcespec.clj`:
 (clojure.test/run-tests 'loci.sourcespec-test)
 ```
 
-Expected: PASS, 8 tests, 0 failures.
+Expected: PASS, 12 tests, 0 failures.
 
 - [ ] **Step 5: Prove the tests bite**
 
-Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then change `sort-by key` to `identity` in `relation`, re-run, expect FAIL on the options test (it may pass by luck of map ordering — if it does, that is itself the finding: replace the assertion with three options that expose it). Restore.
+Delete the `(some #{".."} …)` clause from `locate`, `:reload`, re-run. Expected: FAIL on `locate-refuses-a-loci-path-that-escapes-the-data-dir`. Restore. Then delete the `re-matches option-name` guard, `:reload`, re-run. Expected: FAIL on `relation-refuses-an-option-name-that-is-not-an-identifier`, and read the SQL it produces — `read_csv('/tmp/a.csv', 1=1=true)` is the shape the guard exists to stop. Restore. Then **delete the sort entirely** — `(map opt-sql options)` — `:reload`, re-run. Expect FAIL on `relation-orders-options-so-the-text-is-deterministic` with the options in hash order.
+
+Do **not** try `sort-by identity` as the sabotage: it is not a distinguishing mutation, and measuring why is worth more than the sabotage was. A `MapEntry` is a `clojure.lang.APersistentVector`, so `identity` compares `[k v]` element-wise — key first, value only on a tie — and map keys are unique, so the value is never consulted. `sort-by identity` and `sort-by key` are provably the same for any map with mutually-comparable keys. Removing the sort is the only mutation that changes the output.
 
 - [ ] **Step 6: Commit**
 
@@ -668,6 +744,18 @@ Create `src/loci/source.clj`:
                             :col  (sub/col-kw (:column_name r))
                             :type (:column_type r)})
                    rows)]
+    ;; Kept, and **not** the guard against an empty file, which was what it was
+    ;; written for. Measured 2026-08-19: DuckDB's auto-detection never returns
+    ;; zero columns for one. A zero-byte CSV and a newline-only CSV both describe
+    ;; as a single fabricated `column0 VARCHAR`; an empty JSON file and `[]` both
+    ;; describe as a single `json JSON`. So connecting an empty source SUCCEEDS,
+    ;; with one garbage column and no rows — undoable like any other `:put`, and
+    ;; nobody has asked for it to be refused.
+    ;;
+    ;; It stays because it costs one line and `readers` will grow: a format whose
+    ;; reader is less inventive than `read_csv` can return nothing, and the
+    ;; alternative to this line is `create-from-relation!` emitting `SELECT  FROM`
+    ;; and DuckDB answering with a bare parser error.
     (when (empty? cols)
       (throw (ex-info (str "the source has no columns: " (:uri src)) {:uri (:uri src)})))
     (tbl/check-names! (map :raw cols))
@@ -714,7 +802,7 @@ Append to `test/loci/source_test.clj`:
 (deftest a-source-handle-reads-the-file-on-every-query
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n2,y\n")
-          h   {:store :source :id "tbl:live" :uri uri :format :csv
+          h   {:store :source :uri uri :format :csv
                :cols [:a :b] :rows 2 :at "2026-08-19T10:00:00Z"}]
       (is (true? (tbl/handle? h)) "a :source map is a handle")
       (is (= [{:a 1 :b "x"} {:a 2 :b "y"}] (tbl/rows lk h {})))
@@ -728,7 +816,7 @@ Append to `test/loci/source_test.clj`:
 (deftest a-source-handle-keys-its-samples-on-id-and-at
   (let [lk @lake/lake]
     (let [uri (csv! "a\nfirst\n")
-          h   {:store :source :id "tbl:s" :uri uri :format :csv
+          h   {:store :source :uri uri :format :csv
                :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}]
       (is (= {:a ["first"]} (tbl/column-samples lk h 3 8)))
       (spit (subs uri 7) "a\nsecond\n")
@@ -737,19 +825,37 @@ Append to `test/loci/source_test.clj`:
       (is (= {:a ["second"]} (tbl/column-samples lk (assoc h :at "2026-08-19T11:00:00Z") 3 8))
           "a new :at is a new key, so refresh is what moves a synopsis"))))
 
-(deftest two-source-handles-with-the-same-columns-do-not-share-samples
-  ;; N tables with identical headers is ordinary. The id is what separates them,
-  ;; and it must be in the key.
-  (let [lk @lake/lake]
-    (let [jan (csv! "a\njanuary\n")
-          feb (csv! "a\nfebruary\n")
-          at  "2026-08-19T10:00:00Z"]
-      (is (= {:a ["january"]}
-             (tbl/column-samples lk {:store :source :id "tbl:jan" :uri jan :format :csv
-                                     :cols [:a] :rows 1 :at at} 3 8)))
-      (is (= {:a ["february"]}
-             (tbl/column-samples lk {:store :source :id "tbl:feb" :uri feb :format :csv
-                                     :cols [:a] :rows 1 :at at} 3 8))))))
+(deftest two-source-handles-at-different-paths-do-not-share-samples
+  ;; N tables with identical headers is ordinary, and what separates them is the
+  ;; PATH, which is already in the FROM text — not the object id. Same `:at`
+  ;; deliberately, so the only thing that can be doing the separating is `from`.
+  (let [lk @lake/lake
+        jan (csv! "a\njanuary\n")
+        feb (csv! "a\nfebruary\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["january"]}
+           (tbl/column-samples lk {:store :source :uri jan :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (is (= {:a ["february"]}
+           (tbl/column-samples lk {:store :source :uri feb :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))))
+
+(deftest two-source-handles-at-one-path-share-samples-on-purpose
+  ;; The other half, and the reason no object id is in the key: one file is one
+  ;; set of bytes, so two handles reading it must agree. A test that only ever
+  ;; compares different files cannot tell an id-keyed cache from a path-keyed
+  ;; one, and would pass with the key wrong.
+  (let [lk  @lake/lake
+        uri (csv! "a\nshared\n")
+        at  "2026-08-19T10:00:00Z"]
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8)))
+    (spit (subs uri 7) "a\nrewritten\n")
+    (is (= {:a ["shared"]}
+           (tbl/column-samples lk {:store :source :uri uri :format :csv
+                                   :cols [:a] :rows 1 :at at} 3 8))
+        "the same path and the same :at is the same cache entry")))
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -791,27 +897,33 @@ In `src/loci/lake.clj`, add `[loci.sourcespec :as ssp]` to the ns `:require`, th
     (ssp/relation h (ssp/locate (:uri h)))
     (str (:table h) " AT (VERSION => " (long (:snapshot h)) ")")))
 
-(defn- samples-key
-  "What identifies the bytes a handle's samples came from.
+(defn- samples-version
+  "What `from-of` cannot say: **which bytes**. nil when the FROM text already
+   settles it.
 
-   A cache key here does two jobs — **separate** different tables, and **change**
-   when one table's bytes change. For a lake handle the table name does both in
-   one token, because every write mints a new name; that is why the key has
-   never carried an object id.
+   A cache key here does two jobs — separate different tables, and change when
+   one table's bytes change — and for a `:lake` handle the FROM text does both
+   on its own, because it names the table *and* the snapshot and a write never
+   overwrites. Measured 2026-08-19: two `put-rows!` under one object id land in
+   `t_tbl_same_d08b834d` and `t_tbl_same_912090c8`. So there is nothing to add,
+   and nil is the whole answer.
 
-   A `:source` handle splits them. Its id separates it from every other source
-   and never moves, while the file underneath can be overwritten any number of
-   times — so keying on the id alone would compute the samples once, on the
-   first read, and never again. It takes the id AND the `:at` of the connect or
-   refresh that last looked.
+   A `:source` handle's FROM text names a path, and the file at that path can be
+   rewritten with no event anywhere. Its `:at` — the instant of the connect or
+   refresh that last looked — is the only thing that moves when the bytes do.
+
+   **The object id is deliberately NOT here.** It looks like it belongs, because
+   an id is what separates two tables; but two source handles sharing a path
+   share bytes, so sharing their samples is correct rather than a collision, and
+   the path is already in the FROM text. An id in this key would be a component
+   no test could distinguish — which is worse than absent, because it reads as a
+   guarantee.
 
    **`:at` is a refresh marker, not a version.** Overwrite the file without
    refreshing and the synopsis is stale and nothing detects it. Only the
    synopsis: the ROWS are always live, because they go straight to the file."
   [h]
-  (if (= :source (:store h))
-    [:source (:id h) (:at h)]
-    [:lake (:table h) (:snapshot h)]))
+  (when (= :source (:store h)) (:at h)))
 ```
 
 Change `sample-cache`'s memoized function to take the key and the FROM text — replace its argument vector and the `FROM` fragment inside the SQL:
@@ -833,11 +945,12 @@ Change `sample-cache`'s memoized function to take the key and the FROM text — 
 Append to `sample-cache`'s docstring:
 
 ```
-   **`_key` is in the argument list only to be part of the memo key**, and it is
-   what keeps the soundness argument true now that a passthrough handle exists.
-   See `samples-key`: a `:lake` handle keys on its table and snapshot, a
-   `:source` handle on its object id and its `:at`, because a source's location
-   separates nothing and its bytes can change under a fixed id.
+   **`_version` is in the argument list only to be part of the memo key**, and it
+   is what keeps the soundness argument true now that a passthrough handle
+   exists. See `samples-version`: a `:lake` handle contributes nil, because its
+   FROM text already names a table and a snapshot that never change; a `:source`
+   handle contributes its `:at`, because its FROM text names only a path and the
+   file there can be rewritten with no event anywhere.
 ```
 
 Then replace the four `extend-type Lake` methods that touch a handle:
@@ -859,7 +972,7 @@ Then replace the four `extend-type Lake` methods that touch a handle:
     (when-not (= :source (:store h)) (dropped-at lk (:table h))))
 
   (column-samples [lk h per-col max-cols]
-    (sample-cache lk (samples-key h) (from-of h)
+    (sample-cache lk (samples-version h) (from-of h)
                   (vec (take max-cols (:cols h))) per-col)))
 ```
 
@@ -877,7 +990,9 @@ Expected: PASS on both namespaces, 0 failures. `loci.lake-test` matters here —
 
 - [ ] **Step 6: Prove the tests bite**
 
-Change `samples-key`'s `:source` branch to `[:source (:id h)]` (drop `at`), `:reload`, re-run. Expected: FAIL on `a-source-handle-keys-its-samples-on-id-and-at` — the third assertion, the one that says a refresh moves the synopsis. Then change it to `[:source (:at h)]` (drop the id). Expected: FAIL on `two-source-handles-with-the-same-columns-do-not-share-samples`. Restore.
+Make `samples-version` return `nil` unconditionally, `:reload`, re-run. Expected: FAIL on `a-source-handle-keys-its-samples-on-id-and-at`, third assertion — a new `:at` no longer moves the synopsis, so a refreshed source keeps describing the file it saw first.
+
+Then check the other direction, which is the one that matters for whether the key is honest: **add** `(:uri h)` into `samples-version`'s `:source` branch — so it returns `[(:uri h) (:at h)]` — and re-run. Use `:uri`, a field every handle really carries; adding `(:id h)` proves nothing, because no source handle has an `:id` and the component is always nil whatever the key design. Expected: **everything still passes.** That is the finding, not a failure — it is why the id is not in the key. A component no test can distinguish reads as a guarantee and is not one. Restore.
 
 - [ ] **Step 7: Commit**
 
@@ -907,7 +1022,7 @@ Append to `test/loci/source_test.clj`:
 (deftest hydrate-marks-a-passthrough-table-as-live
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n")
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:live" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [{:a 1 :b "x"}] (:value o)))
       (is (true? (:table/passthrough o)) "a reader has to be able to tell")
@@ -919,7 +1034,7 @@ Append to `test/loci/source_test.clj`:
   (let [lk @lake/lake]
     (let [uri (csv! "a\n1\n")
           _   (.delete (java.io.File. (subs uri 7)))
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:gone" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [] (:value o)) "the same shape every downstream guard already handles")
       (is (= 1 (:table/total o)) "the count survives on the handle")
@@ -931,7 +1046,7 @@ Append to `test/loci/source_test.clj`:
   (let [lk @lake/lake]
     (let [uri (csv! "a,b\n1,x\n")
           _   (spit (subs uri 7) "c,d\n1,x\n")            ; same file, new header
-          o   (tbl/hydrate lk (src-obj {:store :source :id "tbl:drift" :uri uri :format :csv
+          o   (tbl/hydrate lk (src-obj {:store :source :uri uri :format :csv
                                         :cols [:a :b] :rows 1 :at "2026-08-19T10:00:00Z"}))]
       (is (= [] (:value o)))
       (is (string? (:table/source-drift o))
@@ -1182,11 +1297,16 @@ Append to `src/loci/source.clj`:
    nothing and keeps the recipe."
   [lk id src d at]
   (if (= :passthrough (:mode src))
-    {:store :source :id id :uri (:uri src) :format (:format src)
-     :options (:options src)
-     :cols (mapv :col (:cols d))
-     :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
-     :at at}
+    (cond-> {:store :source :uri (:uri src) :format (:format src)
+             :cols (mapv :col (:cols d))
+             :rows (:n (first (lake/q lk (str "SELECT count(*) AS n FROM " (:relation d)))))
+             :at at}
+      ;; `:options` are load-bearing on the handle, not decoration: every read
+      ;; rebuilds the relation from the handle alone, so a source connected with
+      ;; `{:delim ";"}` that did not record it would read right once and then
+      ;; fall back to the sniffer forever after. `cond->` rather than an
+      ;; unconditional key so a source with no options gets no `:options nil`.
+      (seq (:options src)) (assoc :options (:options src)))
     (lake/create-from-relation! lk id (:cols d) (:relation d))))
 
 (defn- source-of
@@ -1272,7 +1392,17 @@ git commit -m "feat: connect a source, and refresh it as a put rather than a mut
 
 ### Task 9: the four marker readers refuse on an unavailable or drifted source
 
-`server/recompute` already refuses on `:table/reclaimed` rather than recomputing a derived table from zero rows and committing the empty result over good data. Three other readers report it. All four must treat the new markers the same way, or the first missing file silently overwrites good data.
+`server/recompute` already refuses on `:table/reclaimed` rather than recomputing a derived table from zero rows and committing the empty result over good data. Two other readers report it. All three must treat the new markers the same way, or the first missing file silently overwrites good data.
+
+**There is a fifth reader and it is deliberately not routed.** `server/reclaimed-on` feeds
+`table-catalog` and `table-shaped?`, which take **unhydrated** objects on purpose — hydrating a
+whole workspace to write a catalog is the cost `table-shape` exists to avoid — so `unusable`,
+which reads keys only `hydrate` sets, would be a no-op there. Measured 2026-08-19: a passthrough
+source whose file is gone is still listed to the agent by `table-catalog` and still passes
+`table-shaped?`. Nothing acts on its rows — `query_table` and `recompute` both refuse through
+`unusable` — so no data is at risk; the cost is one wasted agent step and a misleading message
+from `compute-clj!`. Closing it needs a filesystem stat per candidate on a path that runs every
+agent turn, for a failure nobody has had, so **phase 1 records it rather than closing it**.
 
 **Files:**
 - Modify: `src/loci/tools.clj:144` (the `query_table` reader)
@@ -1361,7 +1491,7 @@ In `src/loci/server.clj` at line ~1331, replace the `(:table/reclaimed src)` cla
       (tbl/unusable src) {:why (str "source " src-id " cannot be read: " (tbl/unusable src))}
 ```
 
-`(tbl/unusable src)` is called twice here. That is deliberate — it is a `cond` test whose truthiness IS the message, and binding it would need a `cond`-to-`let` rewrite of a function this task is otherwise not touching.
+Bind it as `why` in `recompute`'s **existing** `let` and use it in both places. An earlier draft of this plan justified calling `(tbl/unusable src)` twice by claiming a binding would need a `cond`-to-`let` rewrite; that was simply wrong — `recompute` already opens with a `let` binding `src-id`, `known`, `src`, `rows` and `via`. `unusable` is nil-safe and cheap, so eager evaluation costs nothing even when `src` is nil.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -1391,6 +1521,23 @@ git commit -m "feat: one answer for why a table's rows must not be acted on"
 ---
 
 ### Task 10: the `/api/source/*` routes
+
+**Three things Task 8 handed forward — deal with them here, they are not optional:**
+
+1. **`connect!` and `refresh!` throw; routes must not.** Every other mutating route in `server.clj`
+   returns `{:error …}` rather than a 500. The handlers below already wrap in `try`/`catch`; keep it.
+2. **The mint-and-commit monitor is already taken, and it lives in `loci.source`.** Do NOT add a
+   second one here. It went into the facade rather than the route because `loci.source` is
+   callable from a REPL attached to the live server — a lock in `server.clj` would leave a REPL
+   call racing an in-flight request, which is the one case the route cannot see. That is where the
+   analogy to `server/materialize-lock` stops: its lock and its facade are the same function.
+   Measured before the fix: 8 concurrent `connect!`s minted one id and 7 callers got a success
+   response for data unreachable by the id they were handed.
+3. **A passthrough `connect!`/`refresh!` runs `SELECT count(*)` over the whole file.** That is a
+   full parse of a 500 MB CSV on an explicit user action, which is the right place to pay it —
+   but Task 14 must report the number, not assume it.
+
+
 
 **Files:**
 - Modify: `src/loci/server.clj` — the route `cond` (search for `(= uri "/api/import-csv")`)
@@ -1458,9 +1605,12 @@ In `src/loci/server.clj`, next to `import-csv!`, add:
    Commits nothing, which is why `loci.source` has no `:dry-run?` flag — this
    is the dry run, and the shell shows its answer before anything lands.
 
-   `:format` and `:mode` arrive from JSON as strings — `body-json` gives
-   `{:format \"csv\"}` — and `loci.sourcespec` keys on keywords, so both are
-   coerced at this boundary and nowhere deeper."
+   `:format` arrives from JSON as a string — `body-json` gives `{:format
+   \"csv\"}`, keywordising a map's keys and not its values — and
+   `loci.sourcespec` keys on a keyword, so it is coerced here and nowhere
+   deeper. **`:mode` is not coerced here**: `loci.source/connect!` validates it
+   itself and refuses an unknown one by name, and a second coercion would mean
+   the refusal named a keyword the caller never typed."
   [_st src]
   (try (src/describe @lake/lake (update src :format keyword))
        (catch Exception e {:error (.getMessage e)})))
@@ -1468,8 +1618,7 @@ In `src/loci/server.clj`, next to `import-csv!`, add:
 (defn source-connect!
   ([st src] (source-connect! st src nil))
   ([st src space]
-   (try (let [src (cond-> (update src :format keyword)
-                    (:mode src) (update :mode keyword))
+   (try (let [src (update src :format keyword)   ; :format only — never :mode
               r   (src/connect! st src (when (and space (space? st space)) space))]
           (assoc r :state (state-payload st) :openId (:id r)))
         (catch Exception e {:error (.getMessage e)}))))
@@ -1491,7 +1640,7 @@ Then in the route `cond`, beside `/api/import-csv`:
                                       (json-resp (source-refresh! st id)))
 ```
 
-The coercion of `:format` and `:mode` from JSON strings to keywords is already in both handlers above. This test is what holds it there:
+`:format` is coerced in the handlers above. **`:mode` is not, and must not be** — `loci.source/connect!` validates and normalises it itself, refusing anything that is not `:materialise` or `:passthrough` with a named error, precisely because a silently-defaulted mode materialises a file the user asked not to copy. Coercing here as well would put the decision in two places. This test is what holds the `:format` coercion:
 
 ```clojure
 (deftest source-connect-accepts-a-format-as-a-json-string
@@ -1519,6 +1668,8 @@ Expected: PASS, 0 failures.
 
 Delete the `(update src :format keyword)` coercion, `:reload`, re-run. Expected: FAIL on `source-connect-accepts-a-format-as-a-json-string` with *loci does not know the format "csv"*. Restore.
 
+Then **add** a `:mode` coercion — `(cond-> src (:mode src) (update :mode keyword))` — and re-run. Expected: FAIL on the unknown-mode test. Note what does **not** work as a check here: passing `"passthrough"` through the route and watching a passthrough handle land proves nothing, because `(keyword "passthrough")` gives the same answer whether the route coerced it or the facade did. The discriminating case is an *unknown* mode, where a route-level coercion turns the refusal from `"nonsense"` into `:nonsense` and names something the caller never typed. Restore.
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -1530,7 +1681,11 @@ git commit -m "feat: describe, connect and refresh a source over the API"
 
 ### Task 11: delete `parse-csv` and `->val`
 
-`read_csv` becomes the only way a CSV becomes rows. The markdown salvage keeps its regex — extracting `30` from `"~30% (estimated)"` is prose salvage, not type inference, and DuckDB will never do it — but it now returns the extracted **string** and lets DuckDB type it.
+`read_csv` becomes the only way a **CSV file** becomes rows. The markdown salvage keeps its regex *and keeps returning a number* — extracting `30` from `"~30% (estimated)"` is prose salvage, not type inference, and DuckDB will never do it.
+
+**An earlier draft of this task had the salvage return a string, and the premise was wrong.** These rows never reach `read_csv`: `md-table->rows`' only caller is `server/research!`, which hands them to `save-table!` → `put-rows!` → `load-rows!`, and that writes NDJSON and reads it back with `read_json_auto`. **DuckDB types them either way** — the only choice here is whether it is handed a JSON number or a JSON string. Measured 2026-08-19 with a string: the lake column comes back `VARCHAR` and `fnlib/numeric-cols` answers `[]` where it answered `[:share]`, and `fnlib/catalog` does *not* gate on that — so Group, Top N, Change and Share stay on the palette and fail only when applied.
+
+"One inference" survives, because the inference was always DuckDB's: `read_csv` for a file, `read_json_auto` for rows already in hand. What dies is loci having a second one of its own, which is `->val`.
 
 **Files:**
 - Modify: `src/loci/tools.clj` — delete `->val` and `parse-csv`, change `md-cell-val`
@@ -1558,7 +1713,7 @@ And change `md-cell-val`'s expectations in `test/loci/tools_test.clj` (line ~35)
 (deftest md-cell-val-extracts-the-number-as-text-for-duckdb-to-type
   (let [rows (tools/md-table->rows "a | b | c | d\n---|---|---|---\n$1,234 | 2025-06-01 | ~30% | -5")]
     (is (= [{:a "$1,234" :b "2025-06-01" :c "30" :d "-5"}] rows)
-        "prose salvage pulls the number OUT as text; DuckDB decides what it is")))
+        "a number out of prose is loci's job; deciding what it IS stays DuckDB's")))
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1580,7 +1735,7 @@ Delete `->val` and `parse-csv` entirely. Replace `md-cell-val`:
    they are, and so does anything with MORE digits after the number
    (\"$1,234\", \"2025-06-01\") — half-parsing those would be silently wrong.
 
-   **Returns a string, always.** This is prose salvage, not type inference:
+   **Returns a number.** This is prose salvage, not type inference:
    pulling a number out of a model's sentence is something DuckDB will never do,
    and deciding what that number IS is something only DuckDB should do. The
    salvaged rows go on to `read_csv` like every other table, so there is one
@@ -1624,7 +1779,7 @@ In `src/loci/server.clj`, replace `import-csv!` (line ~1949) with:
     (catch Exception e {:error (.getMessage e)})))
 ```
 
-The last line must be `(source-connect! st {…} space)`, not `src/connect!` — the route's callers want `{:state … :openId …}` and Task 10's handler is what adds them. Two existing tests in `test/loci/server_test.clj` hold that shape and must stay green:
+The last line must be `(source-connect! st {…} space)`, not `src/connect!` — the route's callers want `{:state … :openId …}` and Task 10's handler is what adds them. **This is a live shell contract, not just a test's:** `resources/public/index.html:1102` reads `res.error`, then `applyState(res.state)` and `openObject(res.openId)`. Break the shape and the paste-CSV flow breaks with it. Two existing tests in `test/loci/server_test.clj` hold that shape and must stay green:
 
 - `every-server-writer-lands-a-handle` (line ~4280) asserts `(tbl/handle? (:value (sub/object st (:openId …))))`. `create-from-relation!` returns `{:store :lake …}`, so this passes unchanged.
 - `a-csv-with-only-a-header-is-an-empty-table-not-an-error` (line ~4295) asserts a header-only CSV gives no `:error` and `(= [] (rows-of st (:openId r)))`.
@@ -1872,7 +2027,7 @@ git commit -m "measure: a 10M-row CSV through the file connector"
 - [ ] `refresh!` commits a new handle; `undo!` walks back to one whose rows still read
 - [ ] A passthrough table renders live, and degrades to `:table/unavailable` / `:table/source-drift` with `:value []`
 - [ ] `tbl/unusable` is the single answer, and all four readers go through it
-- [ ] `tools/parse-csv` and `tools/->val` do not exist; `grep -rn "parse-csv\|->val" src/ test/` is clean
+- [ ] `tools/parse-csv` and `tools/->val` do not exist **as code**. The grep is NOT clean and cannot be: about a dozen hits remain, all prose — docstrings in `lake.clj`, `chunks.clj`, `server.clj` and `tools.clj` explaining why three live tables carry `JSON` columns, plus two false positives on the literal `column->value`. Deleting the names would make those paragraphs unintelligible. Check `grep -rn "(defn-? (parse-csv|->val)" src/` instead.
 - [ ] The corpus imports through the connector, and the type changes are written down
 - [ ] `clojure -M:test` and `npm run test:browser` both green
 - [ ] Every regression test above proved to fail when its fix is reverted
