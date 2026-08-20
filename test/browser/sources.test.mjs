@@ -115,3 +115,56 @@ test('a drifted source names both column sets and offers a refresh', async () =>
       'refresh — adopt the new columns — is the repair a drift wants, and it is not offered');
   });
 });
+
+// The other caller. `renderMold` serves the molder and every notebook cell, so
+// a cell draws these blocks too — and `wireSourceButtons` is called from
+// renderNotebook for that exact reason. reclaimed.test.mjs asserts both
+// surfaces on the same argument, and the second half of it is what this pins:
+// markup that renders identically proves nothing about listeners attached by a
+// different function.
+//
+// The click is `reconnect` and not `refresh` deliberately. Reconnect opens the
+// import panel and writes NOTHING, so this test stays read-only and the file
+// stays order-independent; a refresh click-through mutates the fixture and
+// belongs last in the file, the way storage.test.mjs orders its mutating tests.
+test('a notebook cell draws the same faces, and its buttons are wired there too', async () => {
+  await withPage(browser, 'sources-cells', async (page) => {
+    await bootedShell(page, server.url);
+    const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+    assert.ok(i >= 0, 'space:cosmos missing — SOURCES_FIXTURE connects all three tables into it');
+    await page.evaluate(n => enter(n), i);
+    await page.waitForSelector(`#body${i} .cellmold .bd`);
+
+    // space:cosmos carries the seeded cells as well as ours, so a cell is
+    // reached through the object it references and never by position.
+    const cellFor = async (title) => {
+      const id = await page.evaluate(t => {
+        const o = Object.values(STATE.objects).find(x => x.title === t);
+        if (!o) throw new Error('no object titled ' + t + ' — SOURCES_FIXTURE did not land');
+        return o.id;
+      }, title);
+      const c = page.locator(`#body${i} .cellmold`, { has: page.locator(`[data-open="${id}"]`) });
+      assert.equal(await c.count(), 1, `${title} has no cell in space:cosmos`);
+      return c;
+    };
+
+    // 1. the badge, drawn by the other caller
+    const live = await cellFor('Live source');
+    assert.equal(await live.locator('.livebadge').count(), 1,
+      'a live source draws its badge in the molder but not in a cell');
+    assert.match((await live.locator('.bd').textContent()).trim(), /EMEA/,
+      'and the cell still shows its rows');
+
+    // 2. and a broken one draws its block rather than the word empty
+    const gone = await cellFor('Gone source');
+    const t = (await gone.locator('.bd').textContent()).trim();
+    assert.match(t, /unreachable/i, `the cell does not say it — it drew: ${JSON.stringify(t)}`);
+    assert.doesNotMatch(t, /^\s*empty\s*$/i, 'still drawing the italic word "empty"');
+
+    // 3. the repair is LIVE here, not just drawn. Without this the test passes
+    // on markup alone, and renderNotebook could stop wiring the buttons
+    // altogether without a single assertion moving.
+    await gone.locator('[data-a="reconnect"]').click();
+    await page.waitForSelector(`#body${i} #csv`, { timeout: 5000 });
+  });
+});
