@@ -392,7 +392,13 @@
                   (:table/passthrough o)  "live"
                   :else                   "stored")
      :uri   (:uri src)
-     :mode  (name (:mode src))}))
+     ;; Total rather than `(name …)`, which throws on nil and on anything not
+     ;; Named. `connect!`'s `mode-of` refuses those, so the sanctioned path
+     ;; cannot produce one — but a `:source` written by hand from a REPL can,
+     ;; and that is a path CLAUDE.md sanctions. A bad mode should cost this one
+     ;; key, not every `/api/mold` and `/api/object` read of the object.
+     :mode  (let [m (:mode src)]
+              (when (or (keyword? m) (string? m)) (name m)))}))
 
 (defn mold-payload
   "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what

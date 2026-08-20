@@ -4929,3 +4929,20 @@
                       "the app: branch carries the block too")
                   (is (= "live" (get-in vp [:source :state]))
                       "the view: branch carries the block too"))))))))))
+
+(deftest a-hand-written-source-with-a-bad-mode-costs-one-key-not-the-page
+  ;; `connect!`'s validator refuses a mode that is not :materialise or
+  ;; :passthrough, so this shape cannot arrive through the API. It can arrive
+  ;; through a REPL commit, which CLAUDE.md names as a way to reach storage —
+  ;; and `(name nil)` would take out every read of the object rather than the
+  ;; one key that cannot be answered.
+  (let [st (sub/fresh-store)]
+    (doseq [bad [nil 5 {:a 1}]]
+      (sub/commit! st {:op :put :id "tbl:handmade"
+                       :value {:id "tbl:handmade" :kind :table :title "Hand"
+                               :value [{:a 1}]
+                               :source {:uri "loci://files/x.csv" :format :csv :mode bad}}})
+      (let [p (srv/mold-payload st no-memory "tbl:handmade" nil)]
+        (is (= "stored" (get-in p [:source :state])) (str "still answers for mode " (pr-str bad)))
+        (is (nil? (get-in p [:source :mode])) "and says nothing rather than throwing")
+        (is (seq (:rendered p)) "and the rows still render")))))
