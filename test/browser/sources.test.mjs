@@ -168,3 +168,79 @@ test('a notebook cell draws the same faces, and its buttons are wired there too'
     await page.waitForSelector(`#body${i} #csv`, { timeout: 5000 });
   });
 });
+
+// A passthrough table's handle IS the recipe — every read inlines
+// `read_csv('…')` against whatever bytes sit on disk right now. `as-of` rewinds
+// loci's LOG, never the file, so scrubbed into the past there is no other
+// answer than today's file: the badge is where the page has to admit that,
+// rather than silently keep saying "live source" as though the rows on screen
+// were the rows AT that point.
+//
+// Driven through the real controls — #timeBtn and #timeRange, the same pair
+// timescrub.test.mjs drives — and never `window.TIME` set by hand: a test that
+// pokes state the app never produces on its own would prove nothing about
+// liveBadge.
+// `why` may be a plain string or an async thunk — the two calls below that pass
+// a thunk want the CURRENT badge text at the moment of timeout, not the one at
+// the moment `until` was called (which would always say "live source", since
+// that is what triggered the wait in the first place).
+const until = async (fn, why, ms = 5000) => {
+  const t0 = Date.now();
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() - t0 > ms) throw new Error(typeof why === 'function' ? await why() : why);
+    await new Promise(r => setTimeout(r, 50));
+  }
+};
+
+const scrubTo = async (page, n) => {
+  await page.evaluate(x => {
+    const r = document.getElementById('timeRange');
+    r.value = String(x);
+    r.dispatchEvent(new Event('input', { bubbles: true }));
+  }, n);
+  await until(async () => (await page.evaluate(() => TIME && TIME.n)) === n,
+    `the scrubber never settled on event ${n}`);
+};
+
+test('a live badge admits it cannot scrub, and stops admitting it back at now', async () => {
+  await withPage(browser, 'sources-badge-time', async (page) => {
+    await open(page, 'Live source');
+    const badgeText = () => page.textContent('.molder-b .badge').then(t => t.trim());
+    const pastCount = () => page.locator('.molder-b .badge.past').count();
+
+    const plain = await badgeText();
+    assert.doesNotMatch(plain, /not the contents|showing current/i,
+      `a live badge at "now", before anything was scrubbed, already talks about the past: ${plain}`);
+    assert.equal(await pastCount(), 0, `the badge already carries .past before scrubbing anywhere: ${plain}`);
+
+    // into the past, through the real slider
+    await page.click('#timeBtn');
+    await page.waitForFunction(() => typeof TIME !== 'undefined' && TIME !== null);
+    const total = Number(await page.getAttribute('#timeRange', 'max'));
+    await scrubTo(page, total - 1);
+
+    // timeCaption() is the shell's own phrase for this exact point in time — the
+    // task says reuse it rather than reformat TIME by hand, so it is also this
+    // test's oracle for what the badge ought to quote back.
+    const caption = await page.evaluate(() => timeCaption());
+    await until(async () => /not the contents|showing current/i.test(await badgeText()),
+      async () => `the badge never changed once scrubbed into the past: ${await badgeText()}`);
+    const scrubbed = await badgeText();
+    assert.match(scrubbed, /not the contents|showing current/i,
+      `the badge does not admit it is not showing the contents at that point: ${scrubbed}`);
+    assert.ok(scrubbed.includes(caption),
+      `the badge does not quote timeCaption()'s own phrase (${JSON.stringify(caption)}): ${scrubbed}`);
+    assert.equal(await pastCount(), 1, `the badge does not carry .past while scrubbed into the past: ${scrubbed}`);
+
+    // and the "now" end of the slider — the case !!TIME gets wrong, because
+    // TIME is non-null there too
+    await scrubTo(page, total);
+    await until(async () => (await pastCount()) === 0,
+      async () => `the badge is still marked .past at "now": ${await badgeText()}`);
+    const atNow = await badgeText();
+    assert.doesNotMatch(atNow, /not the contents|showing current/i,
+      `scrubbed back to "now" (TIME.n===TIME.total, still non-null), the badge still talks about the past: ${atNow}`);
+    assert.equal(atNow, plain, `the badge at "now" while still in time mode differs from the badge before time mode: ${atNow} vs ${plain}`);
+  });
+});

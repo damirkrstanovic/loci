@@ -201,6 +201,9 @@
   .livebadge .muted{color:var(--muted)}
   .badge{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;padding:3px 7px;border-radius:3px;
          background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent)}
+  /* scrubbed into the past: --attn, because this one DOES raise a state — the
+     rows on screen are not the rows at that point, and the badge is admitting it */
+  .badge.past{background:var(--attn-soft);border-color:var(--attn);color:var(--attn)}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
   .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
@@ -1573,10 +1576,25 @@ function sourceHTML(m, cur){
 //
 // No row count: `:table/total` rides the payload only on the degraded branch,
 // where the rows are gone and the count is the only thing left to say.
+// TIME is an event POSITION, not an instant (`{n,total,events}`), and it is
+// non-null at "now" too — paintTime's own comment says "read-only, at ANY
+// slider position". So `TIME.n<TIME.total` is the only correct test for "in
+// the past"; `!!TIME` would leave this badge lying at the "now" end of the
+// scrubber, exactly where a reader is most likely to trust it.
+//
+// A passthrough table's handle IS the recipe — every read inlines
+// `read_csv('…')` against whatever bytes sit on disk right now. `as-of`
+// rewinds loci's LOG, never the file, so scrubbed into the past there is no
+// other answer than today's file — this is the one place phase 2 has to say
+// something true rather than merely prettier.
 function liveBadge(m){
   const s=m.source||{};
   if(s.state!=='live') return '';
-  return '<div class="livebadge"><span class="badge">live source</span>'+
+  const past=TIME && TIME.n<TIME.total;
+  const cls=past?'badge past':'badge';
+  const label=past?'live source — showing current contents, not the contents at '+esc(timeCaption())
+                  :'live source';
+  return '<div class="livebadge"><span class="'+cls+'">'+label+'</span>'+
     '<span class="muted">read from '+esc(srcFile(s.uri))+'</span>'+
     '<button class="btn ghost sm" data-a="refresh" data-id="'+esc(m.id)+'">Refresh</button></div>';
 }
