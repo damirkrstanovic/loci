@@ -28,6 +28,14 @@
   unrelated `Connection was closed` failures across the whole namespace. Observed 2026-08-20. Wait for
   the REPL to go idle before re-running, and treat a sudden broad connection failure as this before
   treating it as a finding.
+- **Ask what the assertion looks like when the mechanism is absent.** The sabotage step catches a
+  broken fix, not a broken assertion — five assertions on these two phases could not have failed, and
+  running the sabotage found none of them. Task 2's `/takings/` check over the whole page is the
+  clearest: DuckDB's own error message in the fallback already contains the column names, so it
+  passed against a block that fetched nothing. **Print what the sabotaged output actually says and
+  read it.** Prefer a scoped element you created over a substring of the page, and a value only the
+  mechanism can produce over one the failure mode also produces. If a sabotage fails a *different*
+  assertion than you expected, that is a finding about the test.
 - **Prove every test bites.** Break the fix, re-run, confirm FAIL, restore. **If a sabotage reports 0 failures, that is a finding about your sabotage** — four tests on phase 1 could not fail, two of them written by the plan's author.
 - End every commit message with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
