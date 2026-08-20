@@ -1,5 +1,6 @@
 (ns loci.source-test
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.server :as server]
@@ -50,7 +51,13 @@
   ;; one only asserts it. Parquet is written BY duckdb so the test needs no
   ;; second library.
   (let [lk @lake/lake
-        pq (str (System/getProperty "java.io.tmpdir") "/src-" (System/nanoTime) ".parquet")
+        ;; Absolute, like the JSON half below. `file://` plus a RELATIVE path is
+        ;; not a file URI — it reads the first segment as a host. It only ever
+        ;; worked here because `java.io.tmpdir` happened to be `/tmp`; the test
+        ;; alias now sets `.tmp`, and `deps.edn` says why.
+        pq (.getAbsolutePath
+            (io/file (System/getProperty "java.io.tmpdir")
+                     (str "src-" (System/nanoTime) ".parquet")))
         js (java.io.File/createTempFile "src-" ".json")]
     (lake/x! lk (str "COPY (SELECT 1 AS a, 'x' AS b) TO '" pq "' (FORMAT parquet)"))
     (spit js "[{\"a\":1,\"b\":\"x\"}]")

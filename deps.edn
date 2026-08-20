@@ -9,6 +9,25 @@
         datalevin/datalevin    {:mvn/version "1.0.0"}
         org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}}
 
+ ;; **`-Djava.io.tmpdir=.tmp` on every alias below, and it is RELATIVE.**
+ ;;
+ ;; /tmp on the machine this was built on is a 7.8 GB tmpfs on a 15 GB box, so
+ ;; everything written there is RAM. DuckDB's JDBC driver extracts a 58 MB native
+ ;; library into java.io.tmpdir on every JVM start, and the browser harness makes
+ ;; a temp directory per server. Both clean up on a GRACEFUL exit and neither
+ ;; gets one when a run is killed. Measured 2026-08-20: /tmp reached 100%
+ ;; mid-session and stopped the build, holding ~4 GB of leaked libraries and
+ ;; 9,918 fixture directories. It had already distorted two measurements — see
+ ;; the 2026-08-08 Datahike bench and phase 1's 10M-row gate, which reached for
+ ;; /var/tmp by hand.
+ ;;
+ ;; Relative because deps.edn cannot interpolate a path, and `clojure` always
+ ;; runs from the directory holding this file. **The consequence to know:**
+ ;; `(str (System/getProperty "java.io.tmpdir") "/x")` is now a relative
+ ;; path, which is fine as a path and NOT fine concatenated after `file://` — a
+ ;; file URI needs an absolute path or the first segment reads as a host. Build
+ ;; one with `(.getAbsolutePath (io/file tmp name))`. That caught
+ ;; `loci.source-test`'s parquet fixture on the day this landed.
  :aliases
  ;; the loci shell — Clojure substrate served to a web frontend
  ;; run:  clojure -M:serve   then open http://localhost:7777
