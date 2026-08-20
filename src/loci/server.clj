@@ -478,13 +478,15 @@
       (let [vo (sub/object st view)]
         {:id id :title (:title o) :kind "applet" :view view
          :label (get-in vo [:value :label]) :code (get-in vo [:value :code])
-         :rendered (:value o) :alternatives (alternatives st o)})
+         :rendered (:value o) :alternatives (alternatives st o)
+         :source (source-block o)})
       ;; an agent-proposed view-spec — interpret it deterministically
       (and view (str/starts-with? view "view:"))
       (let [vo (sub/object st view)
             {:keys [kind rendered]} (vs/interpret (get-in vo [:value :spec]) (:value o))]
         {:id id :title (:title o) :kind (name kind) :view view
-         :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)})
+         :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)
+         :source (source-block o)})
       ;; a built-in viewer. `mv`, not `m`: `m` is this function's MEMORY, and
       ;; shadowing it here would be correct only for as long as this branch never
       ;; needs the memory — which is exactly the assumption the entity branch

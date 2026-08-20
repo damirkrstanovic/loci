@@ -144,7 +144,14 @@ In `src/loci/server.clj`, above `mold-payload`, add:
      :mode  (name (:mode src))}))
 ```
 
-Then in `mold-payload`, add `:source (source-block o)` to **both** the degraded branch (the one testing `(tbl/unusable o)`) and the normal table branch. Find the normal branch by looking for where `:rendered` is built from `mold/mold`; add the key to the same map.
+Then add `:source (source-block o)` to **every branch of `mold-payload` that can render a table** — there are four, and an earlier draft of this plan said two:
+
+1. the degraded branch — the clause testing `(tbl/unusable o)`
+2. the normal viewer branch — the trailing `:else`, where `:rendered` comes from `mold/mold`
+3. the `app:` branch — `(and view (str/starts-with? view "app:"))`
+4. the `view:` branch — `(and view (str/starts-with? view "view:"))`
+
+Branches 3 and 4 are reachable with a hydrated table: `make-view!` and `describe!` each refuse a non-table and then call `mold-payload` with the minted id as `view`. Leaving them out means a broken passthrough source renders silently empty when opened through a code view — the defect phase 2 exists to remove, arriving through a different door. `source-block` is pure and cheap: a payload key present and not yet drawn costs nothing, a missing one forces a second server change later.
 
 - [ ] **Step 4: Run them, confirm they PASS**
 

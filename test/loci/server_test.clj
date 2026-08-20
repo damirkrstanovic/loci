@@ -4899,3 +4899,33 @@
   (let [st (store-with-table)
         p  (srv/mold-payload st no-memory "tbl:t" nil)]
     (is (nil? (:source p)) "absent, not a block saying nothing")))
+
+(deftest a-code-view-of-a-source-still-says-it-is-a-source
+  ;; Four branches of `mold-payload` can render a table. A broken passthrough
+  ;; source must not render silently empty just because it was reached through
+  ;; a custom `app:` or `view:` id instead of the table's default view —
+  ;; `make-view!` and `describe!` both refuse anything whose rows are not
+  ;; tabular, so both are real doors onto a connected source, not a hypothetical
+  ;; one.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "cv.csv")
+                _   (spit f "a,b\n1,x\n")
+                r   (src/connect! st {:uri "loci://files/cv.csv" :format :csv
+                                      :mode :passthrough :title "Viewed"})]
+            (with-redefs [agent/make-applet   (fn [& _] "el.textContent = data.length")
+                          agent/describe-view (fn [& _] {:label "as table" :kind "table"})]
+              (let [av  (srv/make-view! st (:id r) "show it")
+                    dv  (srv/describe! st (:id r) "chart it")]
+                (is (nil? (:error av)))
+                (is (nil? (:error dv)))
+                (let [ap (srv/mold-payload st no-memory (:id r) (:view av))
+                      vp (srv/mold-payload st no-memory (:id r) (:view dv))]
+                  (is (= "live" (get-in ap [:source :state]))
+                      "the app: branch carries the block too")
+                  (is (= "live" (get-in vp [:source :state]))
+                      "the view: branch carries the block too"))))))))))
