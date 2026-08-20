@@ -95,10 +95,15 @@ loci a person can repair, so they get a button and not only a sentence.
 | state | drawn as |
 |---|---|
 | healthy | a `live source` badge above the rows, naming the file |
-| `:table/unavailable` | the block, the sentence loci already composes, the columns it had, **Reconnect…** |
+| `:table/unavailable` | the block, the sentence loci already composes, the columns it had, **Reconnect…** and **Try again** |
 | `:table/source-drift` | the block, **both** column sets, **Refresh — adopt the new columns** |
 
 Drift gets the stronger offer because `refresh!` genuinely resolves it in one click.
+
+**Unavailable gets a refresh too**, which an earlier draft of this table left out. A file that is
+gone now may be back in a moment — a mount that dropped, a sync that had not finished, a container
+restarted — and `refresh!` is exactly the thing that would notice. It is the weaker of the two offers
+there, not the absent one.
 
 **Where the file's current columns come from.** Not by parsing them out of the message — phase 1's
 sentence does carry them (`Candidate bindings: "Gross Revenue ($)"`) but reading them back out of
