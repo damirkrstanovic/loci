@@ -367,6 +367,33 @@
   (vec (concat (mapv (fn [[vid lbl]] [(kw->str vid) lbl]) (:alternatives (mold/mold (:value o))))
                (mapv (fn [v] [(:id v) (get-in v [:value :label])]) (dynamic-views st (:id o))))))
 
+(defn- source-block
+  "What the shell needs to draw a sourced table, as data rather than as prose.
+
+   **The state is structural on purpose.** `:unusable` carries a sentence and
+   the sentence names the failure, but reading a state back out of English is
+   exactly what `tablestore/hydrate` refuses to do — it asks the filesystem
+   through `sourcespec/unreadable-because` rather than matching on DuckDB's
+   words, because the driver's wording is not a contract. A shell branching on
+   `indexOf('unreachable')` would reintroduce that.
+
+   Four states, and `stored` is the one that is easy to leave out: a
+   MATERIALISED source is not live and is not broken, and it still has a recipe,
+   so it still refreshes. Refresh belongs to any table with a `:source`; the
+   live badge belongs only to `:passthrough`.
+
+   nil for a table nobody connected — absent rather than a block saying nothing,
+   so the shell's test is `if (m.source)` and not a comparison against a
+   sentinel."
+  [o]
+  (when-let [src (:source o)]
+    {:state (cond (:table/unavailable o)  "unavailable"
+                  (:table/source-drift o) "drift"
+                  (:table/passthrough o)  "live"
+                  :else                   "stored")
+     :uri   (:uri src)
+     :mode  (name (:mode src))}))
+
 (defn mold-payload
   "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
    every `:ref` cell of a notebook payload is built out of.
@@ -412,7 +439,7 @@
       ;; that key today and teaching it the other three is Phase 2.
       (tbl/unusable o)
       {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
-       :unusable (tbl/unusable o)
+       :unusable (tbl/unusable o) :source (source-block o)
        :table/total (:table/total o) :table/cols (:table/cols o)
        :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
@@ -465,7 +492,8 @@
       :else
       (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
         {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
-         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)}))))
+         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)
+         :source (source-block o)}))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;

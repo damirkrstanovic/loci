@@ -13,6 +13,7 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools])
@@ -4849,3 +4850,52 @@
           (let [r (srv/import-csv! (sub/fresh-store) "C" "region,revenue\nEMEA,1\n" nil)]
             (is (nil? (:error r)))
             (is (some? (:openId r)))))))))
+
+(deftest mold-payload-says-which-source-state-a-table-is-in
+  ;; The shell branches on this rather than on `unusable`'s wording. Reading a
+  ;; state out of an English sentence is what `hydrate` deliberately does not do.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "live.csv")
+                _   (spit f "a,b\n1,x\n")
+                uri (str "loci://files/" (.getName f))
+                r   (src/connect! st {:uri uri :format :csv
+                                      :mode :passthrough :title "Live"})
+                p   (srv/mold-payload st no-memory (:id r) nil)]
+            (is (= "live" (get-in p [:source :state])) "a healthy passthrough reads live")
+            (is (= uri    (get-in p [:source :uri])))
+            (is (= "passthrough" (get-in p [:source :mode])))
+            (.delete f)
+            (let [p2 (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "unavailable" (get-in p2 [:source :state])))
+              (is (string? (:unusable p2)) "the sentence still ships beside it"))
+            (spit f "c,d\n1,x\n")
+            (let [p3 (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "drift" (get-in p3 [:source :state]))))))))))
+
+(deftest a-materialised-source-is-stored-not-live
+  ;; Refresh applies to any table with a recipe; the LIVE badge only to
+  ;; passthrough. A materialised source must be distinguishable from both a
+  ;; passthrough one and a table nobody connected.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                _   (spit (io/file dir "m.csv") "a\n1\n")
+                r   (src/connect! st {:uri "loci://files/m.csv" :format :csv
+                                      :mode :materialise :title "Stored"})
+                p   (srv/mold-payload st no-memory (:id r) nil)]
+            (is (= "stored" (get-in p [:source :state])))
+            (is (= "materialise" (get-in p [:source :mode])))
+            (is (seq (:rendered p)) "and it still renders its rows")))))))
+
+(deftest a-table-nobody-connected-has-no-source-block
+  (let [st (store-with-table)
+        p  (srv/mold-payload st no-memory "tbl:t" nil)]
+    (is (nil? (:source p)) "absent, not a block saying nothing")))
