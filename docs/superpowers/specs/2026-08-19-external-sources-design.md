@@ -34,8 +34,13 @@ Three full in-memory copies before a byte reaches DuckDB — and the copies are 
 because there **is** a user-reachable path and it is the one that makes them unavoidable.
 `startImport` gives you a textarea to paste a CSV into, so the file arrives as a JSON string in a
 request body and is already in RAM before loci sees it. That is fine for the paste it was built
-for and cannot be made to work for a 500 MB file, which is why phase 2 adds a streaming upload
-rather than widening this one.
+for and cannot be made to work for a 500 MB file, which is why phase 2 adds an upload path rather
+than widening this one.
+
+**Corrected 2026-08-20:** an earlier draft said "a streaming upload". It cannot stream — measured,
+http-kit 2.8.0 holds the whole request body as a `byte[]` before a handler runs, so `:body` is an
+`InputStream` over bytes that already exist. Phase 2 chunks from the browser instead; see
+`2026-08-20-external-sources-phase-2-design.md`.
 
 **Corrected 2026-08-19.** An earlier draft of this table said the shell had no caller at all. That
 came from grepping `index.html` at the repo root — a different, unserved file. The shell is
@@ -363,7 +368,8 @@ Three plans, each its own `writing-plans` pass.
    `loci://` and `file://`; CSV, Parquet, JSON; both modes; the `:source` handle and its markers;
    `unwrap` grown; `parse-csv` and `->val` deleted; corpus re-seeded; `/api/import-csv` rewritten
    as a wrapper.
-2. **Upload + shell.** Streamed raw-body route into `<LOCI_DATA>/files/`; the Connect data
+2. **Upload + shell.** A chunked upload into `<LOCI_DATA>/files/` — *not* a streamed raw body, which
+   http-kit cannot do (measured 2026-08-20; it buffers the whole body in heap). The Connect data
    affordance, the preview, the mode toggle, the refresh button, the live badge and the scrubbed
    wording; `/api/storage` reports `data/files`.
 
