@@ -204,6 +204,20 @@
   /* scrubbed into the past: --attn, because this one DOES raise a state — the
      rows on screen are not the rows at that point, and the badge is admitting it */
   .badge.past{background:var(--attn-soft);border-color:var(--attn);color:var(--attn)}
+  /* ---- the ＋ Data panel: two doors, one panel ---- */
+  .dtabs{margin-bottom:11px}
+  /* a listing, not a grid: the name is what you read and the size is the tiebreak,
+     so the rows are one column of full-width targets rather than cards to scan */
+  .filelist{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto}
+  .filerow{display:flex;align-items:baseline;gap:10px;width:100%;text-align:left;cursor:pointer;font:inherit;
+           font-size:13px;border:1px solid var(--line);background:var(--white);border-radius:9px;padding:8px 11px}
+  .filerow:hover{border-color:var(--record)}
+  .filerow .fmeta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  /* what `describe` answered, boxed so it reads as the FILE's shape and not as
+     the table's — there is no table yet, and that is the whole point of it */
+  .srcpreview{border:1px solid var(--line);border-radius:9px;padding:3px 11px 5px;background:var(--white);
+              max-height:280px;overflow:auto}
+  .dmode{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--ink-2)}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
   .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
@@ -839,7 +853,7 @@ async function renderNotebook(i){
     '<button class="btn ghost sm" id="sgBtn">✧ Suggest</button>'+
     '<button class="btn ghost sm" id="flowBtn">⚑ Flow</button>'+
     '<button class="btn ghost sm" id="draftBtn">✎ Draft</button>'+
-    '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button>'+
+    '<button class="btn ghost sm" id="dataBtn">＋ Data</button>'+
     '<button class="btn ghost sm" id="tagBtn">⌗ tags</button></div>'+
     (nb['spawned-by']?'<div style="font-size:11px;font-family:var(--mono);color:var(--faint);margin-bottom:8px">spawned from <span class="ghostchip" data-space="'+esc(nb['spawned-by'].space)+'">'+esc(nb['spawned-by'].space)+'</span> · “'+esc(nb['spawned-by'].prompt||'')+'”</div>':'');
   // The outline. Only from two cells up: a one-cell notebook has nothing to
@@ -890,7 +904,7 @@ async function renderNotebook(i){
     applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
     showToast('Draft written by the agent (reversible)', undo);
   });
-  b.querySelector('#importBtn').addEventListener('click',()=>startImport(i));
+  b.querySelector('#dataBtn').addEventListener('click',()=>startData(i));
   b.querySelector('#tagBtn').addEventListener('click',()=>startTags(i));
   // Proposing writes nothing, so this changes the button and nothing else: the
   // notebook stays readable while the agent thinks, and putting it back needs no
@@ -1096,10 +1110,12 @@ function watchFlow(i, job){
   const tick=async()=>{
     let s; try{ s=await API.job(job); }catch(e){ setTimeout(tick,4000); return; }
     const ae=document.activeElement, typing=ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
-    // an open inline form (research/flow/import/ask/prose edit/ƒ palette) would be
-    // destroyed by a repaint even when unfocused — keep polling, skip the paint
+    // an open inline form (research/flow/＋ Data/ask/prose edit/ƒ palette) would be
+    // destroyed by a repaint even when unfocused — keep polling, skip the paint.
+    // `.datapanel` and not `#csv` alone: the file tab carries neither #csv nor
+    // #ctitle, so a repaint would throw away a preview you were reading.
     const b=document.getElementById('body'+i);
-    const formOpen=b&&b.querySelector('#fq,#rq,#csv,#aq,#ctitle,.prosed,.fnpal');
+    const formOpen=b&&b.querySelector('#fq,#rq,#aq,.datapanel,.prosed,.fnpal');
     if(!TIME && !typing && !formOpen && mode==='focus' && focusIdx===i && !openId) renderBody(i);
     if(!s.done){ setTimeout(tick,2500); return; }
     const r=s.result||{error:s.error||'job lost'};
@@ -1112,25 +1128,179 @@ function watchFlow(i, job){
   };
   setTimeout(tick,1500);
 }
-function startImport(i){
+// ---------------- ＋ Data: two doors, one panel ----------------------------
+//
+// The action bar does not grow. It already carries seven buttons, and a second
+// "get data in" door beside `＋ Import CSV` would make a reader choose between
+// them before knowing the difference. So the button widened to `＋ Data` and
+// paste became ONE TAB of its panel rather than the whole of it — which is what
+// paste now is: one origin among several, and the most constrained.
+//
+// What earns the tabs rather than a file row bolted onto the paste panel is
+// `describe`. It commits nothing, so a file can be read and its columns shown
+// BEFORE anything lands — most of why connecting a file beats pasting one — and
+// that answer needs somewhere to live.
+function startData(i,tab){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
-  b.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
+  b.innerHTML='<div class="datapanel"><div class="actions dtabs">'+
+    '<button class="btn sm" data-tab="file">From a file</button>'+
+    '<button class="btn ghost sm" data-tab="paste">Paste</button></div>'+
+    '<div class="dbody"></div></div>';
+  const host=b.querySelector('.dbody');
+  const pick=t=>{
+    b.querySelectorAll('[data-tab]').forEach(el=>el.className='btn sm'+(el.dataset.tab===t?'':' ghost'));
+    (t==='paste'?dataPasteTab:dataFileTab)(i,sp,host);
+  };
+  b.querySelectorAll('[data-tab]').forEach(el=>el.addEventListener('click',()=>pick(el.dataset.tab)));
+  pick(tab==='paste'?'paste':'file');
+}
+// The file tab, in its two states — the listing, and one file's preview. Both
+// draw into the same host, and the preview offers a way back: a preview of the
+// wrong file is otherwise a dead end that costs you the whole panel.
+//
+// `/api/source/files` lists the DIRECTORY rather than anything loci recorded, so
+// a file dropped in by hand is offered and a file whose table exists but whose
+// bytes are gone is not.
+function dataFileTab(i,sp,host){
+  host.innerHTML='<div style="color:var(--muted);font-size:13px;padding:6px 0">reading the file list…</div>';
+  const back='<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
+  const wireCancel=()=>host.querySelectorAll('[data-a="dcancel"]')
+    .forEach(el=>el.addEventListener('click',()=>renderBody(i)));
+  API.sourceFiles().then(r=>{
+    if(!host.isConnected) return;    // the panel was closed while we asked
+    const files=(r&&r.files)||[];
+    if(r&&r.error){
+      host.innerHTML='<div class="reclaimed"><p>'+esc(r.error)+'</p></div>'+
+        '<div class="actions" style="margin-top:10px">'+back+'</div>';
+      wireCancel(); return;
+    }
+    if(!files.length){
+      host.innerHTML='<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
+        'Nothing in loci’s files directory yet — paste is the other tab.</div>'+
+        '<div class="actions">'+back+'</div>';
+      wireCancel(); return;
+    }
+    // The name the manifest remembers, or the file itself when it remembers
+    // none — a hand-placed file is listed under what it is called on disk,
+    // permanently, and that is not a degraded case.
+    host.innerHTML='<div class="sec-h">files loci can read</div><div class="filelist">'+
+      files.map(f=>'<button type="button" class="filerow" data-file="'+esc(f.file)+'">'+
+        '<span class="fn">'+esc(f.name||f.file)+'</span>'+
+        '<span class="fmeta">'+esc(srcFormat(f.uri))+' · '+fmtBytes(f.bytes)+'</span></button>').join('')+
+      '</div><div class="actions" style="margin-top:11px">'+back+'</div>';
+    wireCancel();
+    host.querySelectorAll('[data-file]').forEach(el=>el.addEventListener('click',()=>
+      dataPreview(i,sp,host,files.find(f=>f.file===el.dataset.file))));
+  }).catch(()=>{
+    if(!host.isConnected) return;
+    host.innerHTML='<div class="reclaimed"><p>loci could not read the file list.</p></div>'+
+      '<div class="actions" style="margin-top:10px">'+back+'</div>';
+    wireCancel();
+  });
+}
+// One file, described and not connected. `describe` IS the dry run — it reads
+// the file, answers with the columns it has right now, and commits nothing — so
+// this preview costs an event only if you go on to press Connect, and Cancel
+// owes no undo.
+//
+// All three of raw header, loci's column name and DuckDB's type, because the
+// three differ exactly where a surprise lives: `Total Revenue ($)` lands as
+// `total_revenue`, and a column that sniffs as VARCHAR when you expected a
+// number is the thing worth seeing BEFORE the table exists.
+function dataPreview(i,sp,host,f){
+  if(!f) return dataFileTab(i,sp,host);
+  const uri=f.uri, label=f.name||f.file,
+        // From the extension and never from a control: `srcFormat`'s own comment
+        // says why — a dropdown would be a second place to say it and so a
+        // second place to be wrong.
+        format=srcFormat(uri),
+        base=label.replace(/\.[a-z0-9]+$/i,'');
+  const head=n=>'<div class="sec-h">'+esc(label)+' · '+esc(format)+(n?' · '+n+' column'+(n===1?'':'s'):'')+'</div>';
+  const nav='<button class="btn ghost sm" data-a="dback">‹ another file</button>'+
+            '<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
+  const wireNav=()=>{
+    host.querySelectorAll('[data-a="dback"]').forEach(el=>el.addEventListener('click',()=>dataFileTab(i,sp,host)));
+    host.querySelectorAll('[data-a="dcancel"]').forEach(el=>el.addEventListener('click',()=>renderBody(i)));
+  };
+  host.innerHTML=head()+'<div style="color:var(--muted);font-size:13px;padding:6px 0">reading its columns…</div>';
+  API.sourceDescribe({uri,format}).then(d=>{
+    if(!host.isConnected) return;
+    if(!d||d.error||!d.cols||!d.cols.length){
+      host.innerHTML=head()+'<div class="reclaimed"><p>'+esc((d&&d.error)||('loci cannot read '+label))+'</p></div>'+
+        '<div class="actions" style="margin-top:10px">'+nav+'</div>';
+      wireNav(); return;
+    }
+    // The mode travels on the control as the word the SERVER knows, never as the
+    // word on the label. `connect!` refuses anything that is neither
+    // `materialise` nor `passthrough` BY NAME, which is a feature: a typo comes
+    // back as a message quoting what was sent. Translating "copy in" here would
+    // put loci's vocabulary in a second place and throw that away.
+    const rn='dmode'+i;
+    host.innerHTML=head(d.cols.length)+
+      '<div class="srcpreview"><table class="mold"><thead><tr>'+
+        '<th class="txt">header</th><th class="txt">column</th><th class="txt">type</th></tr></thead><tbody>'+
+        d.cols.map(c=>'<tr><td class="txt">'+esc(c.raw)+'</td><td class="txt">'+esc(c.col)+'</td>'+
+          '<td class="txt"><span class="chip">'+esc(c.type)+'</span></td></tr>').join('')+
+      '</tbody></table></div>'+
+      '<div class="actions" style="margin-top:11px">'+
+        '<input id="dtitle" placeholder="'+esc(base)+'" '+
+        'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
+        '<label class="dmode"><input type="radio" name="'+rn+'" value="materialise" checked> copy in</label>'+
+        '<label class="dmode"><input type="radio" name="'+rn+'" value="passthrough"> read live</label>'+
+        '<button class="btn sm" data-a="connect">Connect</button>'+nav+'</div>'+
+      '<div style="font-size:12px;color:var(--muted);margin-top:8px"><b>copy in</b> stores the rows in loci, '+
+      'so they stay as they are now. <b>read live</b> keeps the file as the truth and re-reads it every '+
+      'time — nothing is copied, and the rows change when the file does.</div>';
+    wireNav();
+    const btn=host.querySelector('[data-a="connect"]');
+    const go=async()=>{
+      if(TIME){ showToast('time mode — ↩ now to connect'); return; }
+      const title=host.querySelector('#dtitle').value.trim()||base;
+      const mode=host.querySelector('input[name="'+rn+'"]:checked').value;
+      const restore=()=>{ btn.disabled=false; btn.textContent='Connect'; };
+      btn.disabled=true; btn.textContent='connecting…';
+      let res; try{ res=await API.sourceConnect({uri,format,mode,title}, sp.id); }
+      catch(e){ restore(); showToast('connect: network error'); return; }
+      if(TIME){ showToast('finished — ↩ now to see it'); return; }
+      if(res.error){ restore(); showToast('connect: '+res.error); return; }
+      applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
+      // `res.mode` is read off the handle that was built, not echoed from the
+      // radio — the two disagreeing is the whole of the string-mode defect
+      // `connect!` was written against, so the toast quotes the answer.
+      showToast(res.mode==='passthrough' ? 'Connected — loci reads '+label+' live (reversible)'
+                                         : 'Connected — the rows were copied in (reversible)', undo);
+    };
+    btn.addEventListener('click',go);
+    host.querySelector('#dtitle').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
+    host.querySelector('#dtitle').focus();
+  }).catch(()=>{
+    if(!host.isConnected) return;
+    host.innerHTML=head()+'<div class="reclaimed"><p>loci could not read '+esc(label)+'.</p></div>'+
+      '<div class="actions" style="margin-top:10px">'+nav+'</div>';
+    wireNav();
+  });
+}
+// The paste tab — `startImport`'s body, moved and not rewritten, ids included.
+// A CSV you can paste is one somebody already has in a clipboard, which makes
+// this the narrowest of the doors and no longer the only one.
+function dataPasteTab(i,sp,host){
+  host.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
     'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
     '<button class="btn sm" id="goImp">Import</button><button class="btn ghost sm" id="cancelImp">Cancel</button></div>'+
     '<textarea id="csv" placeholder="paste CSV here — first row is the header" '+
     'style="width:100%;min-height:160px;margin-top:10px;font:12px/1.5 var(--mono);border:1px solid var(--line);border-radius:8px;padding:10px;box-sizing:border-box"></textarea>';
   const go=async()=>{
-    const csv=b.querySelector('#csv').value.trim(); if(!csv) return;
-    const title=b.querySelector('#ctitle').value.trim()||'Imported CSV';
+    const csv=host.querySelector('#csv').value.trim(); if(!csv) return;
+    const title=host.querySelector('#ctitle').value.trim()||'Imported CSV';
     const res=await API.importCsv(title, csv, sp.id);
     if(TIME){ showToast('finished — ↩ now to see it'); return; }
     if(res.error){ showToast('import: '+res.error); return; }
     applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
     showToast('CSV imported as a table — reversible', undo);
   };
-  b.querySelector('#goImp').addEventListener('click',go);
-  b.querySelector('#cancelImp').addEventListener('click',()=>renderBody(i));
-  b.querySelector('#ctitle').focus();
+  host.querySelector('#goImp').addEventListener('click',go);
+  host.querySelector('#cancelImp').addEventListener('click',()=>renderBody(i));
+  host.querySelector('#ctitle').focus();
 }
 function startAsk(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
@@ -1598,7 +1768,7 @@ function liveBadge(m){
     '<span class="muted">read from '+esc(srcFile(s.uri))+'</span>'+
     '<button class="btn ghost sm" data-a="refresh" data-id="'+esc(m.id)+'">Refresh</button></div>';
 }
-// Which panel an element is in. The repairs need it because `startImport` takes
+// Which panel an element is in. The repairs need it because `startData` takes
 // a panel index, and a block patched in from askSourceNow's callback has no
 // index in hand.
 function panelIdx(el){ const p=el.closest('.panel'); return p?+p.dataset.i:focusIdx; }
@@ -1622,10 +1792,9 @@ function wireSourceButtons(root,i){
   }));
   root.querySelectorAll('[data-a="reconnect"]').forEach(el=>el.addEventListener('click',ev=>{
     ev.stopPropagation();
-    // The ＋ Data panel replaces this — it is where picking a file lives, and
-    // reconnecting IS picking a file. Until it exists, the paste-CSV panel is
-    // the only import surface there is.
-    startImport(i);
+    // The ＋ Data panel, on its file tab: picking a file is what it is for, and
+    // reconnecting IS picking a file. The same door, not a second one.
+    startData(i);
   }));
 }
 function renderCards(rows){

@@ -165,7 +165,11 @@ test('a notebook cell draws the same faces, and its buttons are wired there too'
     // on markup alone, and renderNotebook could stop wiring the buttons
     // altogether without a single assertion moving.
     await gone.locator('[data-a="reconnect"]').click();
-    await page.waitForSelector(`#body${i} #csv`, { timeout: 5000 });
+    // The ＋ Data panel, on its file tab: reconnecting IS picking a file, so it
+    // is the same door and not a second one. This waited for `#csv` while paste
+    // was the only import surface there was; the listing is the stronger wait
+    // anyway, because it only appears once /api/source/files has answered.
+    await page.waitForSelector(`#body${i} .datapanel [data-file]`, { timeout: 8000 });
   });
 });
 
@@ -242,5 +246,128 @@ test('a live badge admits it cannot scrub, and stops admitting it back at now', 
     assert.doesNotMatch(atNow, /not the contents|showing current/i,
       `scrubbed back to "now" (TIME.n===TIME.total, still non-null), the badge still talks about the past: ${atNow}`);
     assert.equal(atNow, plain, `the badge at "now" while still in time mode differs from the badge before time mode: ${atNow} vs ${plain}`);
+  });
+});
+
+// ---------------- the ＋ Data panel ----------------------------------------
+//
+// The action bar does not grow. It already carries seven buttons, and a second
+// "get data in" door would make a reader choose between them before knowing the
+// difference — so `＋ Import CSV` becomes `＋ Data`, and paste becomes ONE TAB of
+// its panel rather than the whole of it. That is what paste now is: one origin
+// among several, and the most constrained.
+//
+// What earns the tabs is `describe`. It commits nothing, so a file can be read
+// and its columns shown BEFORE anything lands — most of why connecting a file
+// beats pasting one — and that answer needs somewhere to live. A file row bolted
+// onto the paste panel has nowhere to put it.
+//
+// These two write, so they come last in the file: the five above read the
+// fixture, and storage.test.mjs orders its mutating tests the same way.
+const enterCosmos = async (page) => {
+  await bootedShell(page, server.url);
+  const i = await page.evaluate(() => STATE.spaces.findIndex(s => s.id === 'space:cosmos'));
+  assert.ok(i >= 0, 'space:cosmos missing — SOURCES_FIXTURE connects all three tables into it');
+  await page.evaluate(n => enter(n), i);
+  await page.waitForSelector(`#body${i} #dataBtn`);
+  return i;
+};
+
+// The toast that reports a refused connect is gone in 2.5s, so it is caught as
+// it appears rather than read after the wait gives up. Without this a wrong
+// `mode` on the wire reads as a bare selector timeout, and the server's refusal
+// — which names what was actually sent — never reaches the failure message.
+const catchToast = (page, box) => page.evaluate(() => {
+  const t = document.getElementById('toast');
+  return t && t.classList.contains('on') ? t.textContent.trim() : '';
+}).then(s => { if (s) box.text = s; });
+
+test('the ＋ Data panel previews a file before connecting it', async () => {
+  await withPage(browser, 'sources-data-file', async (page) => {
+    const i = await enterCosmos(page);
+    const at = `#body${i} `;
+
+    await page.click(`${at}#dataBtn`);
+    // /api/source/files lists the DIRECTORY, not anything loci recorded — which
+    // is why gone.csv, whose table still exists, is not offered: the fixture
+    // deleted the file.
+    await page.waitForSelector(`${at}[data-file="live.csv"]`, { timeout: 8000 });
+    assert.equal(await page.locator(`${at}[data-file="drift.csv"]`).count(), 1,
+      'the listing shows only one of the two files on disk');
+    assert.equal(await page.locator(`${at}[data-file="gone.csv"]`).count(), 0,
+      'gone.csv is offered as a file to connect, and it was deleted — the listing is not of the directory');
+
+    // Asked of the SERVER, not read off `STATE`. `STATE.events` only moves when
+    // the shell calls applyState, so a preview that committed would leave it
+    // untouched and this would certify rather than test — the exact shape of
+    // assertion this branch has already shipped five of.
+    const events = () => page.evaluate(() => API.state().then(s => s.events));
+    const before = await events();
+    await page.click(`${at}[data-file="live.csv"]`);
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 8000 });
+
+    // Scoped to `.srcpreview`, and asserting a TYPE. A column name over the whole
+    // body would pass on the file's own name and on the title field beside it;
+    // `VARCHAR` and `BIGINT` are things only /api/source/describe can say.
+    const prev = (await page.textContent(`${at}.srcpreview`)).trim();
+    assert.match(prev, /region/, `the preview does not name the file's columns: ${JSON.stringify(prev)}`);
+    assert.match(prev, /revenue/, `the preview does not name the file's columns: ${JSON.stringify(prev)}`);
+    assert.match(prev, /VARCHAR/, `the preview does not show DuckDB's type for a text column: ${JSON.stringify(prev)}`);
+    assert.match(prev, /BIGINT/, `the preview does not show DuckDB's type for a numeric column: ${JSON.stringify(prev)}`);
+
+    // `describe` IS the dry run. If a preview cost an event the panel would be
+    // committing before you had decided, and Cancel would owe you an undo.
+    assert.equal(await events(), before,
+      'previewing a file committed an event — describe is supposed to commit nothing');
+
+    // copy in / read live, and the wire word is what the control carries: phase 1
+    // refuses a mode BY NAME, so the UI's own phrasing must not reach it.
+    assert.equal(await page.inputValue(`${at}input[name^="dmode"]:checked`), 'materialise',
+      'the mode does not default to copy in, or it does not send materialise');
+
+    await page.fill(`${at}#dtitle`, 'From the panel');
+    const toast = { text: '' };
+    await page.click(`${at}[data-a="connect"]`);
+    await until(async () => {
+      await catchToast(page, toast);
+      return (await page.locator('.molder-h .t').count()) > 0;
+    }, () => `the connected table never opened. the page said: ${JSON.stringify(toast.text)}`, 20000);
+
+    assert.match((await page.textContent('.molder-h .t')).trim(), /From the panel/,
+      'something opened, but not the table the panel just made');
+    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
+      'the connected table drew no rows');
+    assert.match(await page.textContent('.molder-b'), /EMEA/,
+      'the table landed with none of the file’s rows in it');
+    // And the same oracle the "describe commits nothing" check used, now moving
+    // — without this that check is unfalsifiable furniture, because a counter
+    // that never moves reads as "nothing was committed" forever.
+    assert.ok(await events() > before,
+      'the connect committed no event, so the count above proves nothing about describe');
+  });
+});
+
+test('the ＋ Data panel still pastes', async () => {
+  await withPage(browser, 'sources-data-paste', async (page) => {
+    const i = await enterCosmos(page);
+    const at = `#body${i} `;
+
+    await page.click(`${at}#dataBtn`);
+    await page.click(`${at}[data-tab="paste"]`);
+    // the same ids the paste panel has always had — this body is unchanged, and
+    // that is the point: paste moved behind a tab, it did not get rewritten
+    await page.fill(`${at}#csv`, 'x,y\n1,2\n3,4\n');
+    await page.fill(`${at}#ctitle`, 'Pasted still works');
+    const toast = { text: '' };
+    await page.click(`${at}#goImp`);
+    await until(async () => {
+      await catchToast(page, toast);
+      return (await page.locator('.molder-h .t').count()) > 0;
+    }, () => `the pasted table never opened. the page said: ${JSON.stringify(toast.text)}`, 20000);
+
+    assert.match((await page.textContent('.molder-h .t')).trim(), /Pasted still works/,
+      'something opened, but not the table the paste tab just made');
+    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
+      'the pasted table drew no rows');
   });
 });
