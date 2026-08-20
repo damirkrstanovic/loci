@@ -143,7 +143,8 @@ In `src/loci/server.clj`, above `mold-payload`, add:
    sentinel."
   [o]
   (when-let [src (:source o)]
-    {:state (cond (:table/unavailable o)  "unavailable"
+    {:state (cond (:table/reclaimed o)    "reclaimed"
+                  (:table/unavailable o)  "unavailable"
                   (:table/source-drift o) "drift"
                   (:table/passthrough o)  "live"
                   :else                   "stored")
