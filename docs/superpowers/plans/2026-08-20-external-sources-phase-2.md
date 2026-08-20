@@ -447,16 +447,21 @@ test('scrubbed into the past, a live source says it is still showing now', async
 
 - [ ] **Step 3: Implement**
 
-In `liveBadge`, replace the badge span with:
+**Two facts to build on, both checked 2026-08-20 — an earlier draft of this step got both wrong:**
+
+1. **`TIME` is not an instant.** It is `{n, total, events}` — an event *position* (`index.html:625`). There is no `fmtTime`. The shell already has **`timeCaption()`** (`index.html:1880`) which renders exactly the phrase wanted: `event 12/40 · <label> · <localised date>`, or `the beginning — before the first event`. **Reuse it.**
+
+2. **`TIME` is non-null at *any* slider position, including "now".** `paintTime`'s own comment says so: *"time mode on ⇒ read-only, at ANY slider position"*, and `timeCaption` tests `TIME.n >= TIME.total` for the now case. So `!!TIME` is the **wrong** test for "in the past" — a badge built on it would claim the reader is not seeing current contents while the scrubber sits at now. The test is `TIME && TIME.n < TIME.total`.
+
+In `liveBadge`, make the label conditional on that:
 
 ```javascript
-  const past = !!TIME;
-  const label = past ? 'live source — showing current contents, not the contents at '+esc(fmtTime(TIME))
+  const past  = TIME && TIME.n < TIME.total;   // NOT !!TIME — see above
+  const label = past ? 'live source — showing current contents, not the contents at '+esc(timeCaption())
                      : 'live source';
-  return '<div class="livebadge"><span class="badge'+(past?' past':'')+'">'+label+'</span> '+ …
 ```
 
-Use whatever the shell already calls to format a scrub instant — `grep -a -n "toLocaleString" resources/public/index.html` and reuse it rather than adding a formatter.
+and give the span the `past` class when it applies, so the badge changes colour as well as wording.
 
 - [ ] **Step 4: Run it, confirm it PASSES.**
 
