@@ -24,11 +24,19 @@ pastes text into a textarea, and a table whose source has vanished draws as the 
 
 ## The rule
 
-**Three of the four pieces need no new server surface.** Showing a broken source, connecting a file
-and refreshing are shell work against API that phase 1 shipped and tested. Upload is the only piece
-with new server code, and the only one that cannot be verified without a browser.
+**No new server *route* until upload.** Connecting a file and refreshing are shell work against API
+phase 1 shipped and tested. Upload is the only piece with a new route, and the only one that cannot
+be verified without a browser.
 
-That ordering is the plan: the shell can be made honest before it is made capable.
+**Corrected while writing the plan:** showing a broken source does need a small server change, and an
+earlier draft of this section said it did not. `mold-payload` sends `:unusable` — a *sentence* — and
+nothing that says which failure it is; `grep table/passthrough src/loci/server.clj` returns nothing, so
+a healthy passthrough table's payload is indistinguishable from a materialised one. The shell could
+match on the sentence's words, but that is exactly the fragile classification phase 1 rejected:
+`hydrate` asks the filesystem rather than reading DuckDB's prose. So the payload gains a structural
+`:source` block — the state, the uri, the mode — and the shell branches on that.
+
+That ordering is still the plan: the shell can be made honest before it is made capable.
 
 ## Measured 2026-08-20: http-kit buffers the whole request body in heap
 
@@ -87,8 +95,14 @@ loci a person can repair, so they get a button and not only a sentence.
 | `:table/unavailable` | the block, the sentence loci already composes, the columns it had, **Reconnect…** |
 | `:table/source-drift` | the block, **both** column sets, **Refresh — adopt the new columns** |
 
-Drift gets the stronger offer because `refresh!` genuinely resolves it in one click, and phase 1's
-message already carries what the file holds now (`Candidate bindings: "Gross Revenue ($)"`).
+Drift gets the stronger offer because `refresh!` genuinely resolves it in one click.
+
+**Where the file's current columns come from.** Not by parsing them out of the message — phase 1's
+sentence does carry them (`Candidate bindings: "Gross Revenue ($)"`) but reading them back out of
+prose is the thing this design keeps refusing to do. The shell calls `/api/source/describe` with the
+recorded uri instead: a real dry run, shipped and tested, that answers with the file's shape as it is
+now. One extra request, only for a drifted table, only when it is drawn. If that call fails too, the
+block falls back to the sentence, which still names them.
 
 ### The scrubber
 
