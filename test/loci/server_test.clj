@@ -4906,7 +4906,10 @@
   ;; a custom `app:` or `view:` id instead of the table's default view —
   ;; `make-view!` and `describe!` both refuse anything whose rows are not
   ;; tabular, so both are real doors onto a connected source, not a hypothetical
-  ;; one.
+  ;; one. `unavailable`/`drift` genuinely cannot reach these branches — the
+  ;; `(tbl/unusable o)` clause is checked first in `mold-payload` — but `stored`
+  ;; can, and nothing proved `source-block` behaved the same there as from the
+  ;; default `:else` branch.
   (lf/with-temp-lake
     (fn []
       (with-temp-data-dir
@@ -4916,19 +4919,32 @@
                 f   (io/file dir "cv.csv")
                 _   (spit f "a,b\n1,x\n")
                 r   (src/connect! st {:uri "loci://files/cv.csv" :format :csv
-                                      :mode :passthrough :title "Viewed"})]
+                                      :mode :passthrough :title "Viewed"})
+                m   (spit (io/file dir "cv-stored.csv") "a,b\n1,x\n")
+                rm  (src/connect! st {:uri "loci://files/cv-stored.csv" :format :csv
+                                      :mode :materialise :title "Stored, viewed"})]
             (with-redefs [agent/make-applet   (fn [& _] "el.textContent = data.length")
                           agent/describe-view (fn [& _] {:label "as table" :kind "table"})]
               (let [av  (srv/make-view! st (:id r) "show it")
-                    dv  (srv/describe! st (:id r) "chart it")]
+                    dv  (srv/describe! st (:id r) "chart it")
+                    avm (srv/make-view! st (:id rm) "show it")
+                    dvm (srv/describe! st (:id rm) "chart it")]
                 (is (nil? (:error av)))
                 (is (nil? (:error dv)))
-                (let [ap (srv/mold-payload st no-memory (:id r) (:view av))
-                      vp (srv/mold-payload st no-memory (:id r) (:view dv))]
+                (is (nil? (:error avm)))
+                (is (nil? (:error dvm)))
+                (let [ap  (srv/mold-payload st no-memory (:id r) (:view av))
+                      vp  (srv/mold-payload st no-memory (:id r) (:view dv))
+                      apm (srv/mold-payload st no-memory (:id rm) (:view avm))
+                      vpm (srv/mold-payload st no-memory (:id rm) (:view dvm))]
                   (is (= "live" (get-in ap [:source :state]))
                       "the app: branch carries the block too")
                   (is (= "live" (get-in vp [:source :state]))
-                      "the view: branch carries the block too"))))))))))
+                      "the view: branch carries the block too")
+                  (is (= "stored" (get-in apm [:source :state]))
+                      "stored reaches the app: branch too, not just :else")
+                  (is (= "stored" (get-in vpm [:source :state]))
+                      "stored reaches the view: branch too, not just :else"))))))))))
 
 (deftest a-hand-written-source-with-a-bad-mode-costs-one-key-not-the-page
   ;; `connect!`'s validator refuses a mode that is not :materialise or
@@ -4946,3 +4962,36 @@
         (is (= "stored" (get-in p [:source :state])) (str "still answers for mode " (pr-str bad)))
         (is (nil? (get-in p [:source :mode])) "and says nothing rather than throwing")
         (is (seq (:rendered p)) "and the rows still render")))))
+
+(deftest a-reclaimed-materialised-source-agrees-with-itself
+  ;; source-block must mirror tbl/unusable's precedence: both are readings of
+  ;; one hydrate and must never be able to disagree. Reproduced by the
+  ;; reviewer against ordinary use — connect materialise, refresh, the old
+  ;; lake version ages past the GC window, browse it with ?at= — and before
+  ;; the reclaimed clause this cond answered "stored" while :unusable and
+  ;; :reclaimed both said the rows were gone.
+  ;;
+  ;; 100 rows, not fewer: below ~10-20 rows DuckLake inlines the insert into
+  ;; catalog.duckdb, so the table owns no Parquet, reclaim! has nothing to
+  ;; delete, and the read afterwards succeeds — the same trap
+  ;; `lake-fixture/with-reclaimed-table` documents for tbl:gone. The assert on
+  ;; reclaim!'s return is what makes a false green impossible here too.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "gc.csv")
+                _   (spit f (str "a\n" (str/join "\n" (range 100)) "\n"))
+                r   (src/connect! st {:uri "loci://files/gc.csv" :format :csv
+                                      :mode :materialise :title "GC me"})
+                h   (:value (sub/object st (:id r)))]
+            (is (= 1 (count (lf/reclaim! @lake/lake (:table h))))
+                "no Parquet was deleted — the test would prove nothing")
+            (let [p (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "reclaimed" (get-in p [:source :state]))
+                  "source.state must agree with :unusable and :reclaimed, not report stored")
+              (is (:reclaimed p) "the payload still says so rather than showing an empty table")
+              (is (str/includes? (:unusable p) "reclaimed")
+                  "the sentence and the structural state name the same failure"))))))))

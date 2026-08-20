@@ -377,17 +377,28 @@
    words, because the driver's wording is not a contract. A shell branching on
    `indexOf('unreachable')` would reintroduce that.
 
-   Four states, and `stored` is the one that is easy to leave out: a
-   MATERIALISED source is not live and is not broken, and it still has a recipe,
-   so it still refreshes. Refresh belongs to any table with a `:source`; the
-   live badge belongs only to `:passthrough`.
+   **The `cond` mirrors `tbl/unusable`'s precedence by construction, `reclaimed`
+   first for the same reason it is first there.** Both read the same markers off
+   the same hydrated object — two views of one `hydrate`, not two independent
+   judgments — so they must never be able to disagree. They did once: a
+   MATERIALISED source whose old lake version aged past the GC window reclaimed
+   like any other table, and this `cond` answered `stored` for it — live and
+   well — while `:unusable` said its rows were reclaimed. Reachable by ordinary
+   use: connect, refresh, wait out the window, browse with `?at=`.
+
+   Five states, not four. `stored` is still the one that is easy to leave out
+   on the happy path: a materialised source that has NOT been reclaimed is
+   neither live nor broken and still has a recipe, so it still refreshes —
+   refresh belongs to any table with a `:source`, the live badge belongs only
+   to `:passthrough`.
 
    nil for a table nobody connected — absent rather than a block saying nothing,
    so the shell's test is `if (m.source)` and not a comparison against a
    sentinel."
   [o]
   (when-let [src (:source o)]
-    {:state (cond (:table/unavailable o)  "unavailable"
+    {:state (cond (:table/reclaimed o)    "reclaimed"
+                  (:table/unavailable o)  "unavailable"
                   (:table/source-drift o) "drift"
                   (:table/passthrough o)  "live"
                   :else                   "stored")
