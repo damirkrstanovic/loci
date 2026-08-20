@@ -4995,3 +4995,66 @@
               (is (:reclaimed p) "the payload still says so rather than showing an empty table")
               (is (str/includes? (:unusable p) "reclaimed")
                   "the sentence and the structural state name the same failure"))))))))
+
+;; ---------------------------------------------------------------------------
+;; GET /api/source/files — what is in <LOCI_DATA>/files/, for the shell's
+;; file picker (Task 5)
+;; ---------------------------------------------------------------------------
+
+(deftest source-files-lists-what-is-in-the-directory
+  (with-temp-data-dir
+    (fn []
+      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+        (spit (io/file dir "hand-placed.csv") "b\n2\n")
+        (.mkdirs (io/file dir ".partial"))
+        (spit (io/file dir ".partial" "half") "not done")
+        (let [r (srv/source-files)]
+          (is (= #{"72b441a9c3e05f18.csv" "hand-placed.csv"} (set (map :file (:files r))))
+              "both files, and never the .partial working directory")
+          (is (every? #(number? (:bytes %)) (:files r)))
+          (is (= "loci://files/hand-placed.csv"
+                 (:uri (first (filter #(= "hand-placed.csv" (:file %)) (:files r)))))))))))
+
+(deftest source-files-is-empty-and-not-an-error-before-anything-is-imported
+  (with-temp-data-dir
+    (fn [] (is (= [] (:files (srv/source-files)))))))
+
+(deftest source-files-skips-directories-that-are-not-dotfiles
+  ;; The two tests above only ever put a DIRECTORY under a dot-prefixed name
+  ;; (`.partial`), so they cannot tell the dotfile filter from the directory
+  ;; filter — either alone would pass them. A subdirectory with an ordinary
+  ;; name is what makes `remove #(.isDirectory %)` load-bearing on its own.
+  (with-temp-data-dir
+    (fn []
+      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+        (spit (io/file dir "real.csv") "a\n1\n")
+        (.mkdirs (io/file dir "subdir"))
+        (spit (io/file dir "subdir" "nested.csv") "a\n1\n")
+        (is (= #{"real.csv"} (set (map :file (:files (srv/source-files)))))
+            "a subdirectory is not content, dotfile-named or not")))))
+
+(deftest source-files-skips-dotfiles-that-are-not-directories
+  ;; The other three fixtures only ever dot-prefix a DIRECTORY (`.partial`),
+  ;; so the `isDirectory` filter alone already protects them — dropping the
+  ;; dotfile filter by itself changes nothing they can see. A dot-prefixed
+  ;; ORDINARY FILE is what makes `remove #(str/starts-with? … ".")` load-
+  ;; bearing on its own.
+  (with-temp-data-dir
+    (fn []
+      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+        (spit (io/file dir "real.csv") "a\n1\n")
+        (spit (io/file dir ".DS_Store") "junk")
+        (is (= #{"real.csv"} (set (map :file (:files (srv/source-files)))))
+            "a dotfile is not content, directory or not")))))
+
+(deftest source-files-answers-through-the-URL
+  ;; A handler test cannot catch a typo'd URI, per `the-source-routes-answer-
+  ;; through-the-URL` above.
+  (with-temp-data-dir
+    (fn []
+      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+        (spit (io/file dir "hand-placed.csv") "b\n2\n")
+        (let [r (json/read-str (:body (srv/handler {:uri "/api/source/files"}))
+                                :key-fn keyword)]
+          (is (= ["hand-placed.csv"] (mapv :file (:files r)))))))))

@@ -2220,6 +2220,37 @@
                                   space)]
         (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
 
+(def ^:private source-names
+  "Stub until `loci.files` lands in Task 6, when this becomes `files/names`.
+   Every file therefore lists under its own filename until then, which is
+   exactly what a hand-placed file does permanently."
+  (constantly {}))
+
+(defn source-files
+  "What is in `<LOCI_DATA>/files/`, as `{:files [{:file :uri :bytes :name} …]}`.
+
+   Two mechanisms write this directory — `import-csv!` and the upload route,
+   both content-addressed — and a person may drop a file in by hand or mount
+   one. So the listing is of the DIRECTORY rather than of any record loci
+   keeps: a file loci did not put there still connects, and pretending
+   otherwise would make the picker lie about what is available.
+
+   `:name` is the manifest's memory of what an upload was called, and is
+   absent for anything loci did not name. `.partial` is a working directory,
+   not content, and never appears."
+  []
+  (let [dir   (io/file (sub/data-dir) "files")
+        named (source-names)]
+    {:files (->> (.listFiles dir)
+                 (remove #(.isDirectory %))
+                 (remove #(str/starts-with? (.getName %) "."))
+                 (sort-by #(.getName %))
+                 (mapv (fn [f]
+                         (cond-> {:file  (.getName f)
+                                  :uri   (str "loci://files/" (.getName f))
+                                  :bytes (.length f)}
+                           (named (.getName f)) (assoc :name (named (.getName f)))))))}))
+
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
 
@@ -3276,6 +3307,7 @@
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
       (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
+      (= uri "/api/source/files")(json-resp (source-files))
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
