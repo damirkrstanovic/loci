@@ -21,6 +21,13 @@
 - **A `"` inside a Clojure docstring must be `\"`** in the source, or you get a `defn` macroexpansion error. Script languages eat one backslash level.
 - **Never use an unanchored global find-and-replace on source.** One on this branch changed `(take 6)` → `(take 8)` for a hash width and silently broke an unrelated cap.
 - `:reload` does not drop vars for renamed-away tests — `(remove-ns 'the.ns)` first. Reloading `loci.tablestore` invalidates `reify`s in `loci.tablestore-test`.
+- **A client-side timeout does not stop DuckDB.** The REPL tool times out at 20 s; a native JDBC call
+  keeps running server-side and does not reliably honour an interrupt. Re-issuing `run-tests`
+  immediately then races the first run, and two concurrent `with-temp-lake` fixtures stomp the same
+  globally-`with-redefs`'d `lake/lake` var and close each other's connections — producing a wall of
+  unrelated `Connection was closed` failures across the whole namespace. Observed 2026-08-20. Wait for
+  the REPL to go idle before re-running, and treat a sudden broad connection failure as this before
+  treating it as a finding.
 - **Prove every test bites.** Break the fix, re-run, confirm FAIL, restore. **If a sabotage reports 0 failures, that is a finding about your sabotage** — four tests on phase 1 could not fail, two of them written by the plan's author.
 - End every commit message with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
