@@ -769,19 +769,31 @@
   (when (= :source (:store h)) (:at h)))
 
 (def ^:private sample-cache
-  "Samples for a `[table snapshot]`, computed once.
+  "Samples for a `[lake version from cols per-col]`, computed once. `from` is the
+   FROM text — a lake table with its snapshot, or a source's relation over a path
+   — and `version` is what that text cannot say: nil for a `:lake` handle, the
+   handle's `:at` for a `:source`. See `from-of` and `samples-version`.
 
-   `memoize` rather than a hand-rolled atom, and sound rather than merely
-   convenient: a handle is immutable, because `put-rows!` always creates a new
-   lake table and nothing overwrites one. So a hit is not a stale answer, it is
-   the only answer.
+   `memoize` rather than a hand-rolled atom, and **sound for a `:lake` handle
+   rather than merely convenient**: such a handle is immutable, because
+   `put-rows!` always creates a new lake table and nothing overwrites one. So for
+   those a hit is not a stale answer, it is the only answer.
 
-   That is the same invariant `current-snapshot` above depends on, and it stops
-   holding on the same day: **whoever adds in-place mutation has to invalidate
-   this**. `restore-to!` is already a `CREATE OR REPLACE` and is the closest
-   thing to a counter-example, but it is not one — measured 2026-08-16, a
-   cached answer still matches a fresh one across an `UPDATE` and a
-   `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
+   **A `:source` handle does not get that guarantee, and cannot.** Its bytes live
+   in a file loci does not own, and `:at` is the instant of the last connect or
+   refresh rather than a version of the file — so overwrite the file without
+   refreshing and a hit here is a stale synopsis and nothing detects it, exactly
+   as `samples-version` says. That is a bounded staleness and it is the one
+   loci chose: only the SYNOPSIS goes stale, because the rows are read straight
+   from the file on every query, and `refresh!` moves `:at` and mints a fresh
+   entry. Do not read the soundness paragraph above as covering both.
+
+   That first invariant is the same one `current-snapshot` above depends on, and
+   it stops holding on the same day: **whoever adds in-place mutation to the lake
+   has to invalidate this**. `restore-to!` is already a `CREATE OR REPLACE` and
+   is the closest thing to a counter-example, but it is not one — measured
+   2026-08-16, a cached answer still matches a fresh one across an `UPDATE` and
+   a `restore-to!`, because `AT (VERSION => n)` resolves the handle's own
    snapshot and the rewrite only moves the write head.
 
    Unbounded, and that is affordable *because the clip happens in SQL rather

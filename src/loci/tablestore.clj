@@ -402,30 +402,57 @@
    `[]` rather than the handle because every downstream shape guard —
    `(and (sequential? v) (seq v) (every? map? v))`, repeated in a dozen readers
    — then behaves as it does for an empty table, a state they all already
-   handle. **A reader that acts on the rows must check `:table/reclaimed`
-   first**, because `[]` and \"no rows\" are indistinguishable otherwise:
-   `server/recompute` refuses on the marker for exactly this reason, having
+   handle. **A reader that acts on the rows must call `unusable` first**,
+   because `[]` and \"no rows\" are indistinguishable otherwise:
+   `server/recompute` refuses on its answer for exactly this reason, having
    otherwise been ready to recompute a derived table from zero rows and commit
-   the empty result over good data.
+   the empty result over good data. `unusable` and not `:table/reclaimed` — that
+   was the whole check when reclamation was the only degradation; the two
+   passthrough markers below arrived afterwards, and a reader still testing the
+   one key acts on `[]` for both of them.
 
-   Only a store that says the rows were reclaimed may be swallowed. Any other
-   failure is rethrown untouched, so a broken disk stays a broken disk — and
-   asking the store is itself wrapped, because a catalog too damaged to answer
-   must not replace the error the caller actually needs to see.
+   For a `:lake` handle, only a store that says the rows were reclaimed may be
+   swallowed. Any other failure is rethrown untouched, so a broken disk stays a
+   broken disk — and asking the store is itself wrapped, because a catalog too
+   damaged to answer must not replace the error the caller actually needs to see.
 
-   **A passthrough table adds three more shapes on the same rule.** A healthy one
-   carries `:table/passthrough true` beside its rows, so a reader can tell that
-   its `:table/total` is the count recorded at connect rather than a fact about
-   the file right now. A failing one degrades exactly as a reclaimed one does —
-   `:value []`, the count and cols off the handle — and carries a marker saying
-   which repair it needs: `:table/unavailable` when there is no readable file
-   there, or `:table/source-drift` when there is one and it no longer matches
-   the columns recorded at connect. Find the file, versus reconnect it.
+   **A passthrough table adds three more shapes, and it is NOT the same rule.**
+   A healthy one carries `:table/passthrough true` beside its rows, so a reader
+   can tell that its `:table/total` is the count recorded at connect rather than
+   a fact about the file right now. A failing one degrades exactly as a reclaimed
+   one does — `:value []`, the count and cols off the handle — and carries a
+   marker saying which repair it needs: `:table/unavailable` when there is no
+   readable file there, or `:table/source-drift` when there is one and it no
+   longer matches the columns recorded at connect. Find the file, versus
+   reconnect it.
+
+   **Nothing on the `:source` branch rethrows, and that is a real cost rather
+   than an oversight.** There is no record of a deliberate loss to consult — a
+   source's file can vanish or change its header with no event committed, and
+   `reclaimed-at` answers nil for such a handle by design — so the only two
+   things this branch can ask are whether loci itself can read the file and, if
+   it can, what DuckDB said. A fault that is neither therefore lands in the
+   `else` and is reported as drift. Measured 2026-08-20 against a closed lake
+   connection, with the file present and correct: `:table/source-drift` reading
+   \"it was connected as a, b — Connection was closed\", which sends the operator
+   to reconnect a file that is fine, where the same closed connection on a
+   `:lake` handle threw `java.sql.SQLException: Connection was closed`. Accepted
+   because the alternative is worse: separating the two by DuckDB's message is
+   what `loci.sourcespec`'s docstring calls the fragile alternative, that driver
+   already answers real source failures with an unrelated `NullPointerException`,
+   and a rethrow here would put every passthrough table in the substrate back
+   behind one unreadable file. `loci.chunks/with-samples` makes the same trade on
+   the same handle, deliberately — see its docstring for the predicate and why
+   nothing narrower was reachable.
+
+   Not everything is swallowed even so: this catches `Exception`, so an `Error` —
+   `OutOfMemoryError`, `StackOverflowError` — passes through both branches
+   untouched.
 
    **`:table/passthrough` says how a table is stored, never whether it is well.**
    It is `true` on all three shapes, the two failures included, so a reader must
-   not take it for a liveness signal — ask the specific marker. `loci.tablestore/unusable`
-   is the one answer to that question and the thing readers should call.
+   not take it for a liveness signal — ask `unusable`, which is the one answer to
+   that question and the thing readers should call.
 
    **The two markers carry messages from different places, deliberately.**
    `:table/unavailable` carries loci's own phrase, because loci looked at the

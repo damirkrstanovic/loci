@@ -595,8 +595,16 @@
             ;; lake-backed table no longer costs a row read for that:
             ;; `all-chunks` builds its synopsis from `tbl/column-samples`, which
             ;; the lake answers with one `SELECT DISTINCT … LIMIT 3` per column
-            ;; and memoizes per `[table, snapshot]`. A handle is immutable, so
-            ;; each one is queried once in the life of the process.
+            ;; and memoizes per `[lake version from cols per-col]` — see
+            ;; `lake/sample-cache`. A `:lake` handle is immutable and its FROM
+            ;; text already names its snapshot, so each one is queried once in
+            ;; the life of the process.
+            ;;
+            ;; A passthrough `:source` handle is NOT once per process. Its key
+            ;; carries the handle's `:at`, so a `refresh!` mints a fresh entry:
+            ;; once per refresh rather than once per handle. And a miss costs
+            ;; more there — the FROM text is `read_csv(…)` over the file itself,
+            ;; so every one of those per-column queries re-parses it.
             ;;
             ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
             ;; chunks / 31 row-bearing tables. Interleaved after 30 warmup
