@@ -24,9 +24,9 @@ pastes text into a textarea, and a table whose source has vanished draws as the 
 
 ## The rule
 
-**No new server *route* until upload.** Connecting a file and refreshing are shell work against API
-phase 1 shipped and tested. Upload is the only piece with a new route, and the only one that cannot
-be verified without a browser.
+**The shell can be made honest before it is made capable.** Showing a broken source, and refreshing
+one, change nothing about what loci can do — they make visible what phase 1 already built. Connecting
+and uploading extend it. Build in that order, because the first half is what a person hits today.
 
 **Corrected while writing the plan:** showing a broken source does need a small server change, and an
 earlier draft of this section said it did not. `mold-payload` sends `:unusable` — a *sentence* — and
@@ -35,6 +35,9 @@ a healthy passthrough table's payload is indistinguishable from a materialised o
 match on the sentence's words, but that is exactly the fragile classification phase 1 rejected:
 `hydrate` asks the filesystem rather than reading DuckDB's prose. So the payload gains a structural
 `:source` block — the state, the uri, the mode — and the shell branches on that.
+
+The file picker needs a listing too — `GET /api/source/files` — so this phase adds **two** routes, not
+one. The earlier claim of "no new route until upload" was wrong in both halves.
 
 That ordering is still the plan: the shell can be made honest before it is made capable.
 
