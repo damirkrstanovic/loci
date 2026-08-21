@@ -12,6 +12,10 @@
 // Its own server and its own substrate — see SOURCES_FIXTURE in harness.mjs.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startServer, launchBrowser, withPage, bootedShell, SOURCES_FIXTURE } from './harness.mjs';
 
 let server, browser;
@@ -19,7 +23,24 @@ before(async () => {
   server = await startServer({ fresh: true, extra: SOURCES_FIXTURE });
   browser = await launchBrowser();
 });
-after(async () => { await browser?.close(); await server?.stop(); });
+
+// `page.setInputFiles` needs a real path on this machine, so the upload tests
+// below write one. `.tmp` and not `os.tmpdir()`: deps.edn and package.json both
+// point there, so an interrupted run leaves its litter inside the repo where it
+// can be seen, rather than in RAM where a 200 MB fixture would sit on the heap.
+const REPO = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const written = [];
+const fixture = async (name, text) => {
+  await mkdir(join(REPO, '.tmp'), { recursive: true });
+  const path = join(REPO, '.tmp', name), buf = Buffer.from(text, 'utf8');
+  await writeFile(path, buf);
+  written.push(path);
+  return { path, name, buf };
+};
+after(async () => {
+  for (const p of written) await rm(p, { force: true });
+  await browser?.close(); await server?.stop();
+});
 
 // By title and not by a hard-coded `tbl:live_source`: `mint-id` slugs the title
 // and suffixes on collision, so the id is derived and the title is the fixture's
@@ -481,5 +502,210 @@ test('an empty files directory says so, and still offers the way out', async () 
     // an empty panel with no way out is a trap, not an answer
     assert.equal(await page.locator(`#body${i} .dbody [data-a="dcancel"]`).count(), 1,
       'the empty listing offers no Cancel');
+  });
+});
+
+// ---------------- upload ----------------------------------------------------
+//
+// The file tab lists loci's own directory, and a file on YOUR machine is not in
+// it yet. Upload is the door for that, and its whole success path is to put the
+// bytes where the listing already looks — so it hands `dataPreview` the same
+// `{file,name,uri,bytes}` a picked row carries and connects nothing itself.
+// There is one describe→preview→connect flow, and this is not a second one.
+//
+// Chunked because http-kit buffers a whole request body in heap. That makes the
+// REQUEST the thing that has to stay small, which is why `UPLOAD_CHUNK` exists
+// and why the second test below can move it.
+//
+// These write, so they come last, after the two panel tests that also write.
+
+// The name a file is STORED under is the first 16 hex characters of the SHA-256
+// of its bytes — `loci.files/content-hash`, byte for byte. Recomputing it here is
+// the one oracle in this file that no wrong byte survives. A corrupted chunk
+// still reads back as a table, is still remembered under its original name, and
+// need not even change the length; what it cannot do is land under the hash of
+// the bytes that were sent.
+const storedName = buf => createHash('sha256').update(buf).digest('hex').slice(0, 16) + '.csv';
+
+const listedFiles = page => page.evaluate(() => API.sourceFiles().then(r => r.files));
+
+// Open ＋ Data on its file tab and wait for the upload control. Waiting for
+// `.dupfile` and not for `[data-file]` on purpose: the listing and the upload
+// row arrive together, and a first-run loci with an empty directory has to offer
+// the upload anyway.
+const openUpload = async (page) => {
+  const i = await enterCosmos(page);
+  await page.click(`#body${i} #dataBtn`);
+  await page.waitForSelector(`#body${i} .dupfile`, { timeout: 8000 });
+  return i;
+};
+
+// Connect what the preview is showing, under `title`, and wait for the table to
+// open — the same controls and the same toast-catching the picker's test uses.
+const connectPreview = async (page, at, title) => {
+  await page.fill(`${at}#dtitle`, title);
+  const toast = { text: '' };
+  await page.click(`${at}[data-a="connect"]`);
+  await until(async () => {
+    await catchToast(page, toast);
+    return (await page.locator('.molder-h .t').count()) > 0;
+  }, () => `the uploaded table never opened. the page said: ${JSON.stringify(toast.text)}`, 20000);
+  assert.match((await page.textContent('.molder-h .t')).trim(), new RegExp(title),
+    'something opened, but not the table the upload just made');
+};
+
+test('a file uploaded from the file tab previews, connects, and keeps its name', async () => {
+  await withPage(browser, 'sources-upload', async (page) => {
+    // A token in the bytes, so nothing already in files/ can hash to this and
+    // make every assertion below pass on a file an earlier test put there. And a
+    // name with a space, an accent and a token in it — the stored name is 16 hex
+    // characters, so "the listing shows the original name" cannot pass by the
+    // two strings happening to be equal.
+    const tok = 'u' + Math.random().toString(36).slice(2, 9);
+    const f = await fixture(`café takings ${tok}.csv`,
+      `region,revenue,token\nEMEA,10,${tok}\nAPAC,20,${tok}\n`);
+    const i = await openUpload(page);
+    const at = `#body${i} `;
+
+    const before = await listedFiles(page);
+    assert.ok(!before.some(x => x.file === storedName(f.buf)),
+      `${storedName(f.buf)} is already in files/ — this test would pass without uploading anything`);
+
+    await page.setInputFiles(`${at}.dupfile`, f.path);
+    // `.srcpreview` is `describe`'s answer, and describe reads the file — so it
+    // cannot appear until the bytes are on the server's disk.
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+
+    const prev = (await page.textContent(`${at}.srcpreview`)).trim();
+    assert.match(prev, /region/, `the preview does not name the uploaded file's columns: ${JSON.stringify(prev)}`);
+    assert.match(prev, /BIGINT/, `the preview does not show DuckDB's type for its numeric column: ${JSON.stringify(prev)}`);
+
+    // The directory, asked of the server. Every claim here is about the file
+    // that landed and none of it is read back off the page.
+    const now = await listedFiles(page);
+    const rec = now.find(x => x.file === storedName(f.buf));
+    assert.ok(rec, `nothing in files/ is named for the SHA-256 of the bytes that were sent ` +
+      `(${storedName(f.buf)}); the listing holds ${JSON.stringify(now.map(x => x.file))}`);
+    assert.equal(rec.bytes, f.buf.length,
+      `the stored file is ${rec.bytes} bytes and ${f.buf.length} were sent`);
+    assert.equal(rec.name, f.name,
+      `the listing does not remember the name the file arrived under: ${JSON.stringify(rec.name)}`);
+    assert.notEqual(rec.name, rec.file,
+      'the remembered name and the content-addressed name are the same string — the check above proves nothing');
+
+    await connectPreview(page, at, 'Uploaded ' + tok);
+    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
+      'the uploaded table drew no rows');
+    assert.match(await page.textContent('.molder-b'), /EMEA/,
+      'the table landed with none of the uploaded file’s rows in it');
+  });
+});
+
+test('a multi-byte character split across a chunk boundary arrives intact', async () => {
+  await withPage(browser, 'sources-upload-bytes', async (page) => {
+    const tok = 'b' + Math.random().toString(36).slice(2, 9);
+    const f = await fixture(`accents ${tok}.csv`,
+      `region,note\nEMEA,café\nAPAC,naïve\nLATAM,${tok}\n`);
+
+    // The boundary goes THROUGH `é`. Measured on the server side 2026-08-21:
+    // decoding a chunk to text turns `c3 a9` split in half into
+    // `ef bf bd ef bf bd` — one replacement character per half, 24 bytes
+    // arriving as 28. The two asserts below are what keeps this test about that:
+    // edit the fixture text and they fail here, loudly, rather than letting this
+    // quietly become an ordinary one-chunk upload that proves nothing.
+    const cut = f.buf.indexOf(Buffer.from('é', 'utf8')) + 1;
+    assert.equal(f.buf[cut - 1], 0xc3, 'the chunk boundary does not fall inside a multi-byte character');
+    assert.equal(f.buf[cut], 0xa9, 'the chunk boundary does not fall inside a multi-byte character');
+    const total = Math.ceil(f.buf.length / cut);
+    assert.ok(total >= 3, `the fixture splits into ${total} chunks — no middle chunk to get wrong`);
+
+    const i = await openUpload(page);
+    const at = `#body${i} `;
+    // A 4 MB fixture would prove the same thing and cost far more to move through
+    // a browser, so the chunk size is the thing that shrinks. UPLOAD_CHUNK is a
+    // top-level `let` for exactly this.
+    await page.evaluate(n => { UPLOAD_CHUNK = n; }, cut);
+
+    // Counted from the wire, so "it was chunked" is not taken on trust: if the
+    // assignment above stopped taking effect this would read 1 and the byte
+    // assertions below would be about a file that was never split.
+    let requests = 0;
+    const count = r => { if (r.url().endsWith('/api/source/upload')) requests++; };
+    page.on('request', count);
+
+    await page.setInputFiles(`${at}.dupfile`, f.path);
+    // Waited for on the WIRE and BEFORE the preview, which is not where this
+    // started: measured against a deliberately broken slicer, one chunk lands a
+    // file cut off mid-`é`, DuckDB refuses the invalid tail, no preview is ever
+    // drawn, and a count that sits after `.srcpreview` is never reached — the
+    // test still failed, but on a selector timeout that says nothing at all
+    // about the chunking it is here to pin.
+    await until(() => requests >= total,
+      () => `the file went in ${requests} request(s), not ${total} — it was not sliced`, 20000);
+    page.off('request', count);
+    assert.equal(requests, total, `the file went in ${requests} requests, not ${total}`);
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+
+    const rec = (await listedFiles(page)).find(x => x.file === storedName(f.buf));
+    assert.ok(rec, `no file in files/ is named for the SHA-256 of the bytes that were sent ` +
+      `(${storedName(f.buf)}) — a byte changed on the way, and a content-addressed file ` +
+      `cannot say which`);
+    assert.equal(rec.bytes, f.buf.length,
+      `the stored file is ${rec.bytes} bytes and ${f.buf.length} were sent`);
+
+    // And the human-visible half: DuckDB reads the file back, so the accent has
+    // to survive all the way onto the screen.
+    await connectPreview(page, at, 'Accents ' + tok);
+    const body = await page.textContent('.molder-b');
+    assert.match(body, /café/, `the accented value did not survive the chunk boundary: ${JSON.stringify(body)}`);
+    assert.match(body, /naïve/, `the accented value did not survive the chunk boundary: ${JSON.stringify(body)}`);
+    assert.doesNotMatch(body, /�/,
+      `a replacement character reached the table — a chunk was decoded as text: ${JSON.stringify(body)}`);
+  });
+});
+
+test('the panel counts the chunks while they go', async () => {
+  await withPage(browser, 'sources-upload-progress', async (page) => {
+    const tok = 'p' + Math.random().toString(36).slice(2, 9);
+    const f = await fixture(`progress ${tok}.csv`,
+      `region,revenue,token\nEMEA,10,${tok}\nAPAC,20,${tok}\nLATAM,30,${tok}\nNAMER,40,${tok}\n`);
+    const i = await openUpload(page);
+    const at = `#body${i} `;
+
+    const cut = Math.ceil(f.buf.length / 3);
+    const total = Math.ceil(f.buf.length / cut);
+    assert.equal(total, 3, `the fixture splits into ${total} chunks, and the counter below expects 3`);
+    await page.evaluate(n => { UPLOAD_CHUNK = n; }, cut);
+
+    // Three requests to 127.0.0.1 are over inside one sample, so each is held for
+    // 300 ms — the counter is a thing a person is meant to READ, and a test that
+    // could only ever catch it by luck would be certifying rather than testing.
+    await page.route('**/api/source/upload', async route => {
+      await new Promise(r => setTimeout(r, 300));
+      await route.continue();
+    });
+    // Sampled off the element the panel draws into, at 15 ms against a 900 ms
+    // upload. Consecutive duplicates are dropped, so what comes back is the
+    // sequence of DISTINCT things the counter said.
+    await page.evaluate(() => {
+      window.__prog = [];
+      window.__progT = setInterval(() => {
+        const el = document.querySelector('.dprog'), s = el && el.textContent.trim();
+        if (s && window.__prog[window.__prog.length - 1] !== s) window.__prog.push(s);
+      }, 15);
+    });
+
+    await page.setInputFiles(`${at}.dupfile`, f.path);
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+    const seen = await page.evaluate(() => { clearInterval(window.__progT); return window.__prog; });
+    await page.unroute('**/api/source/upload');
+
+    // n/total, counting up. Not "it said something" — a progress line stuck on
+    // 1/3 forever, or one that only ever appeared once, is the failure this is
+    // about, and both of those match a looser assertion.
+    assert.deepEqual(seen.map(s => (s.match(/(\d+)\s*\/\s*(\d+)/) || [])[0]), ['1/3', '2/3', '3/3'],
+      `the panel did not count 1/3, 2/3, 3/3 while the chunks went — it said ${JSON.stringify(seen)}`);
+    assert.ok(seen.every(s => s.includes(f.name)),
+      `the counter does not say which file is going up: ${JSON.stringify(seen)}`);
   });
 });

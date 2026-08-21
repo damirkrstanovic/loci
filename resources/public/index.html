@@ -213,6 +213,16 @@
            font-size:13px;border:1px solid var(--line);background:var(--white);border-radius:9px;padding:8px 11px}
   .filerow:hover{border-color:var(--record)}
   .filerow .fmeta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  /* the other door into the same directory. The listing can only offer what loci
+     already holds; a file on YOUR machine is not in it yet, and this is what puts
+     it there — after which it is an ordinary row, previewed and connected by the
+     same code a picked one is. */
+  .dupload{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 13px}
+  .dupload input[type=file]{font:inherit;font-size:12.5px;color:var(--ink-2);max-width:100%}
+  /* n/total while the chunks go, and the refusal if one is refused — the same
+     line, because they are the same question: where did the file get to? */
+  .dprog{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .dprog.bad{color:var(--attn)}
   /* what `describe` answered, boxed so it reads as the FILE's shape and not as
      the table's — there is no table yet, and that is the whole point of it */
   .srcpreview{border:1px solid var(--line);border-radius:9px;padding:3px 11px 5px;background:var(--white);
@@ -1183,6 +1193,62 @@ function startData(i,tab){
   b.querySelectorAll('[data-tab]').forEach(el=>el.addEventListener('click',()=>pick(el.dataset.tab)));
   pick(tab==='paste'?'paste':'file');
 }
+// ~4 MB per request, and a `let` rather than a `const` because it is the one
+// number here a test needs to move: proving that a multi-byte character
+// straddling a chunk boundary survives means putting a boundary inside one, and
+// a 4 MB fixture in a browser test costs far more than that proof is worth.
+//
+// The size is http-kit's, not a guess. It buffers a whole request body in heap,
+// so the REQUEST is the thing that has to stay small — and 4 MB sits comfortably
+// under its default 8 MiB `:max-body`, which is why this phase adds no config
+// knob and makes no deployment judgement about a byte limit.
+let UPLOAD_CHUNK=4*1024*1024;
+// The upload id names a file under `.partial` and the server refuses anything
+// outside `[A-Za-z0-9_-]{1,64}`. randomUUID satisfies it and needs no thought —
+// the fallback is for a loci served over plain http to something that is not
+// localhost, where `crypto.randomUUID` is not defined at all.
+const uploadId=()=>(self.crypto&&crypto.randomUUID?crypto.randomUUID()
+  :'u'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10));
+// A header value is a BYTE string: a code point above U+00FF throws on the way
+// into `Headers`, and one between U+0080 and U+00FF goes out as a single Latin-1
+// byte the server would then read as UTF-8. The file's name is the one
+// caller-supplied string in this header, so it is escaped to pure ASCII — which
+// every JSON reader, `clojure.data.json` included, decodes back.
+const headerJson=o=>JSON.stringify(o).replace(/[\u007f-\uffff]/g,
+  c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
+// Send one file to /api/source/upload, a slice per request, and answer with the
+// last chunk's reply — `{file, uri, existed}`.
+//
+// **The body is the Blob and never a string.** Measured on the server side
+// 2026-08-21: decoding a chunk to text turns a 24-byte CSV split one byte into
+// the two bytes of `é` into 28 bytes, `c3 a9` coming back as
+// `ef bf bd ef bf bd` — one replacement character per half. The stored file is
+// content-addressed, so that corruption would land under a hash OF the corrupt
+// bytes and be indistinguishable from a good file forever after. `File.slice`
+// hands back bytes and `fetch` sends them; nothing on this path decodes, and
+// nothing on it may start to — no FileReader, no TextDecoder, no base64.
+//
+// The metadata rides in `X-Loci-Upload` for the same reason the route takes it
+// there: a JSON envelope with the chunk base64'd into a field would inflate
+// every chunk by a third and re-buffer the whole of it to decode, on a route
+// whose entire purpose is that the file never sits in memory.
+//
+// It does not connect. The caller hands the uri to `dataPreview`, which is the
+// picker's own path — so an upload is a file ARRIVING in loci's directory and
+// not a second way to connect one.
+async function uploadChunks(f,onProgress){
+  const id=uploadId(), total=Math.max(1,Math.ceil(f.size/UPLOAD_CHUNK));
+  let last=null;
+  for(let n=0;n<total;n++){
+    onProgress(n+1,total);
+    const r=await fetch('/api/source/upload',{method:'POST',
+      headers:{'X-Loci-Upload':headerJson({id,seq:n,name:f.name,final:n===total-1})},
+      body:f.slice(n*UPLOAD_CHUNK,Math.min(f.size,(n+1)*UPLOAD_CHUNK))});
+    last=await r.json();
+    if(last&&last.error) throw new Error(last.error);
+  }
+  return last;
+}
 // The file tab, in its two states — the listing, and one file's preview. Both
 // draw into the same host, and the preview offers a way back: a preview of the
 // wrong file is otherwise a dead end that costs you the whole panel.
@@ -1195,6 +1261,42 @@ function dataFileTab(i,sp,host){
   const back='<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
   const wireCancel=()=>host.querySelectorAll('[data-a="dcancel"]')
     .forEach(el=>el.addEventListener('click',()=>renderBody(i)));
+  // The upload row, drawn above the listing — and above the sentence that
+  // stands in for one when the directory is empty, which is precisely the state
+  // where uploading is the only thing there is to do.
+  const up='<div class="dupload"><input type="file" class="dupfile" accept=".csv,.parquet,.json">'+
+    '<span class="dprog"></span></div>';
+  const wireUpload=()=>{
+    const inp=host.querySelector('.dupfile'), prog=host.querySelector('.dprog');
+    if(!inp) return;
+    inp.addEventListener('change',async()=>{
+      const f=inp.files&&inp.files[0]; if(!f) return;
+      inp.disabled=true; prog.className='dprog';
+      let r;
+      try{ r=await uploadChunks(f,(n,t)=>{ prog.textContent=f.name+' — '+n+'/'+t; }); }
+      catch(e){
+        if(!host.isConnected) return;
+        // The panel keeps its listing and says what the server said. Every
+        // refusal this route can answer already has a sentence from phase 1;
+        // the one new one is a chunk out of sequence, and it names itself.
+        inp.disabled=false; inp.value='';
+        prog.className='dprog bad';
+        prog.textContent='upload: '+((e&&e.message)||'network error');
+        return;
+      }
+      if(!host.isConnected) return;
+      inp.disabled=false; prog.textContent='';
+      // `:existed` means the hash was already in the directory, so nothing was
+      // written — worth saying, because the file about to be previewed is the
+      // one loci had rather than the one you just chose. They are the same
+      // bytes; that is what a matching hash means.
+      if(r&&r.existed) showToast('loci already had these exact bytes — connecting the file it holds');
+      // The same `{file,name,uri,bytes}` shape the listing answers with, handed
+      // to the same preview a picked row gets. An upload is a file ARRIVING in
+      // loci's directory, and there is one describe→preview→connect flow.
+      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size});
+    });
+  };
   API.sourceFiles().then(r=>{
     if(!host.isConnected) return;    // the panel was closed while we asked
     const files=(r&&r.files)||[];
@@ -1204,20 +1306,20 @@ function dataFileTab(i,sp,host){
       wireCancel(); return;
     }
     if(!files.length){
-      host.innerHTML='<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
-        'Nothing in loci’s files directory yet — paste is the other tab.</div>'+
+      host.innerHTML=up+'<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
+        'Nothing in loci’s files directory yet — upload one above, or paste is the other tab.</div>'+
         '<div class="actions">'+back+'</div>';
-      wireCancel(); return;
+      wireCancel(); wireUpload(); return;
     }
     // The name the manifest remembers, or the file itself when it remembers
     // none — a hand-placed file is listed under what it is called on disk,
     // permanently, and that is not a degraded case.
-    host.innerHTML='<div class="sec-h">files loci can read</div><div class="filelist">'+
+    host.innerHTML=up+'<div class="sec-h">or pick a file loci already has</div><div class="filelist">'+
       files.map(f=>'<button type="button" class="filerow" data-file="'+esc(f.file)+'">'+
         '<span class="fn">'+esc(f.name||f.file)+'</span>'+
         '<span class="fmeta">'+esc(srcFormat(f.uri))+' · '+fmtBytes(f.bytes)+'</span></button>').join('')+
       '</div><div class="actions" style="margin-top:11px">'+back+'</div>';
-    wireCancel();
+    wireCancel(); wireUpload();
     host.querySelectorAll('[data-file]').forEach(el=>el.addEventListener('click',()=>
       dataPreview(i,sp,host,files.find(f=>f.file===el.dataset.file))));
   }).catch(()=>{
