@@ -139,6 +139,33 @@ Two rules keep it from rotting:
 - **`.partial/` is swept on server start.** An abandoned upload is the one piece of garbage this
   design creates that is not a table, so it is the one thing that needs a sweep.
 
+### Measured while building it, 2026-08-20: three things this section had wrong
+
+**`slurp` on a chunk is not byte-exact, and the corruption is permanent.** An earlier draft of the
+route read the body with `(slurp (:body req))`. Measured: `region,café\nEMEA,€10\n` sliced one byte
+into the two bytes of `é`, each half slurped and re-encoded, is **24 bytes in and 28 bytes out** —
+`c3 a9` becomes `ef bf bd ef bf bd`, one U+FFFD per half. An incomplete UTF-8 sequence at either end
+of a slice decodes to a replacement character, and a 4 MB slice of an arbitrary file is exactly where
+that happens. Because the file is **content-addressed**, the damage lands under a hash *of the
+corrupt bytes* and is thereafter indistinguishable from a good file. So nothing on the path is ever a
+String: the route hands `(:body req)` through and `io/copy` streams it. The browser must match —
+`Blob` from `File.slice` as the body, never `readAsText`.
+
+**Hashing the finished file must stream too.** `content-hash` took a String. Hashing a completed
+200 MB upload through it means holding 200 MB as a String, which is the exact property this phase
+exists to remove. It now has a `File` arity over a 64 KB buffer, and the two arities are proved equal
+on the same bytes — that equality is what makes a pasted CSV and an uploaded one dedup against each
+other, and nothing else was checking it.
+
+**The upload id is caller-supplied and becomes a path.** It names a file under `.partial/`, so
+`{"id": "../escaped.csv"}` writes outside it. Constrained to `[A-Za-z0-9_-]{1,64}`.
+
+And one behaviour this section did not specify: **chunk 0 truncates rather than appends.** The
+expected-sequence atom is process state that no file on disk backs, so a leftover entry from an
+abandoned upload would refuse a *new* upload reusing that id, forever. Making chunk 0 a restart makes
+the leftover entry harmless as well as small — which is why abandonment leaves it there rather than
+buying an eviction nobody asked for.
+
 ### The manifest
 
 `data/files/` holds `72b441a9c3e05f18.csv`. The name you uploaded lives beside it in
