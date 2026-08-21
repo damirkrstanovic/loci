@@ -2115,22 +2115,6 @@
   (try (assoc (src/refresh! st id) :state (state-payload st))
        (catch Exception e {:error (.getMessage e)})))
 
-(defn- content-hash
-  "The first 16 hex characters of `text`'s SHA-256 — the whole name of the file
-   holding that text.
-
-   Sixteen because this IS the filename rather than a suffix on one: 64 bits,
-   so two different CSVs collide at around four billion files, and `data/files`
-   holds one entry per distinct import. The same digest `lake/table-name`
-   truncates for the same reason, kept longer here because there is no other
-   component to fall back on."
-  [text]
-  (->> (.getBytes (str text) "UTF-8")
-       (.digest (java.security.MessageDigest/getInstance "SHA-256"))
-       (take 8)
-       (map #(format "%02x" %))
-       (apply str)))
-
 (defn import-csv!
   "Posted CSV **text** → a table, through the same reader as every other source.
 
@@ -2163,7 +2147,7 @@
   [st title csv space]
   (let [written
         (try (let [dir (files/dir)
-                   nm  (str (content-hash csv) ".csv")
+                   nm  (str (files/content-hash csv) ".csv")
                    f   (io/file dir nm)]
                (.mkdirs dir)
                ;; **The name IS the content, and nothing else is in it.**
@@ -2232,6 +2216,55 @@
    that all answer maps."
   []
   {:files (files/listing)})
+
+(defn source-upload!
+  "`POST /api/source/upload` — one chunk of a file being uploaded from the
+   browser. Answers `{:id :seq :bytes}` while the file is still arriving, and
+   `{:file :uri :existed}` once `:final` lands it.
+
+   **It does not connect.** The panel takes the `:uri` and calls the shipped
+   `/api/source/describe` and `/api/source/connect` with it, so the preview a
+   person is looking at survives the upload and there is one connect path
+   rather than two — the same reason `import-csv!` goes through
+   `source-connect!` instead of `src/connect!`.
+
+   Chunked because http-kit buffers a whole request body in heap: measured
+   during this phase, one request per file puts the whole file there, and one
+   request per 4 MB slice never does. Everything after the buffer streams —
+   `files/append-chunk!` copies to disk and `files/content-hash` digests from
+   disk — so the completed file is never in memory at any size.
+
+   The envelope is all that is left here. The rules — the sequence, the
+   `.partial` working file, the hash, the discard-don't-rewrite — are
+   `loci.files`'s, which owns the directory they are about. Those throw, and
+   this is the `try`/`catch` that turns a throw into the `{:error …}` every
+   other route in this file answers with."
+  [{:keys [id final] s :seq nm :name} chunk]
+  (try
+    ;; `append-chunk!`'s own answer is passed through rather than rebuilt: its
+    ;; `:bytes` is the partial's length on disk, which is the one progress
+    ;; number the browser cannot compute — it knows what it SENT, not what
+    ;; landed.
+    (let [landed (files/append-chunk! id s chunk)]
+      (if final
+        (files/finish-upload! id nm)
+        landed))
+    (catch Exception e {:error (.getMessage e)})))
+
+(defn- upload-meta
+  "The `X-Loci-Upload` header — `{id, seq, name, final}` — as a map.
+
+   **The metadata rides in a header and the chunk IS the raw body.** The
+   alternative, a JSON envelope with the chunk base64'd into a field, inflates
+   every chunk by a third and re-buffers the whole of it to decode — on a route
+   whose entire purpose is that the file never sits in memory.
+
+   A missing or unparseable header answers `nil`, which `source-upload!` turns
+   into a sentence about the header rather than a stack trace about `nil`."
+  [req]
+  (try (let [m (json/read-str (get-in req [:headers "x-loci-upload"]) :key-fn keyword)]
+         (when (map? m) m))
+       (catch Exception _ nil)))
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
@@ -3290,6 +3323,20 @@
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
       (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
       (= uri "/api/source/files")(json-resp (source-files))
+      ;; `(:body req)` is handed STRAIGHT to `source-upload!` — no `slurp`, and
+      ;; that is load-bearing rather than a style choice. `slurp` decodes bytes
+      ;; to a String, and a chunk boundary falls at an arbitrary byte: measured
+      ;; 2026-08-21, splitting `region,café\nEMEA,€10\n` one byte into the two
+      ;; bytes of `é` and slurping each half turns 24 bytes into 28 — `c3 a9`
+      ;; comes back as `ef bf bd ef bf bd`, two replacement characters, one per
+      ;; half. The file is content-addressed, so the corruption would land under
+      ;; a hash OF the corrupt bytes and be indistinguishable from a good file
+      ;; forever after. The body streams to disk as bytes and is never a String.
+      (= uri "/api/source/upload")
+      (json-resp (if-let [m (upload-meta req)]
+                   (source-upload! m (:body req))
+                   {:error (str "POST /api/source/upload needs an X-Loci-Upload "
+                                "header carrying {id, seq, name, final}")}))
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
