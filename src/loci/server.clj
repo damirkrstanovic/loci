@@ -16,6 +16,7 @@
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.files :as files]
             [loci.fnlib :as fnlib]
             [loci.lake :as lake]
             [loci.lakegc :as gc]
@@ -2220,12 +2221,6 @@
                                   space)]
         (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
 
-(def ^:private source-names
-  "Stub until `loci.files` lands in Task 6, when this becomes `files/names`.
-   Every file therefore lists under its own filename until then, which is
-   exactly what a hand-placed file does permanently."
-  (constantly {}))
-
 (defn source-files
   "What is in `<LOCI_DATA>/files/`, as `{:files [{:file :uri :bytes :name} …]}`.
 
@@ -2240,7 +2235,7 @@
    not content, and never appears."
   []
   (let [dir   (io/file (sub/data-dir) "files")
-        named (source-names)]
+        named (files/names)]
     {:files (->> (.listFiles dir)
                  (remove #(.isDirectory %))
                  (remove #(str/starts-with? (.getName %) "."))
@@ -3429,6 +3424,25 @@
   (.join thread 2000)
   (not (.isAlive thread)))
 
+(defn sweep-partials-at-boot!
+  "Clear abandoned upload partials, and say so only if there were any. Returns
+   the names removed.
+
+   Its own var rather than a line inside `-main`, for the reason
+   `start-chunk-sweep!` and `close-lake-at-exit!` are: `-main` ends in
+   `@(promise)` and can never be called by a test, so anything boot does that a
+   test should be able to see has to be a function boot calls.
+
+   At boot and nowhere else, because it needs no thread and no timer. The 24
+   hours `files/sweep-partials!` measures against is what makes an in-flight
+   upload safe from it, not the moment it runs — a restart mid-upload loses that
+   transfer anyway, since the browser is posting to a process that is gone."
+  []
+  (let [gone (files/sweep-partials!)]
+    (when (seq gone)
+      (println (str "  swept " (count gone) " abandoned upload partial(s)")))
+    gone))
+
 (defn- close-lake-at-exit!
   "Register the shutdown hook that closes `lk`, and return the thread.
 
@@ -3514,6 +3528,7 @@
     (reset! server (http/run-server #'handler {:port port}))
     (println (str "loci shell on http://localhost:" port
                   "  (substrate: " dir ", " (count (sub/history (store))) " events)"))
+    (sweep-partials-at-boot!)
     ;; The embedding backfill, started HERE and nowhere else. loci.memory spawns
     ;; nothing on require, so a test or a REPL that loads it leaves no thread
     ;; behind; a server process is the one place that wants a timer.

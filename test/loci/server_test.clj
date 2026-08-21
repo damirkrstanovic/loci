@@ -7,6 +7,7 @@
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.files :as files]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.memory :as mem]
@@ -5058,3 +5059,36 @@
         (let [r (json/read-str (:body (srv/handler {:uri "/api/source/files"}))
                                 :key-fn keyword)]
           (is (= ["hand-placed.csv"] (mapv :file (:files r)))))))))
+
+;; ---------------------------------------------------------------------------
+;; the manifest behind that listing, and the boot-time .partial sweep (Task 6)
+;; ---------------------------------------------------------------------------
+
+(deftest source-files-reports-the-manifest-name-for-a-file-loci-named
+  (with-temp-data-dir
+    (fn []
+      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+        (spit (io/file dir "hand-placed.csv") "b\n2\n")
+        (files/remember! "72b441a9c3e05f18.csv" "sales-2026.csv")
+        (let [by-file (into {} (map (juxt :file identity)) (:files (srv/source-files)))]
+          (is (= "sales-2026.csv" (:name (by-file "72b441a9c3e05f18.csv")))
+              "the listing reads the real manifest, not the stub that answered {}")
+          (is (nil? (:name (by-file "hand-placed.csv")))
+              "and a file loci never named has no name, rather than borrowing one"))))))
+
+(deftest boot-sweeps-an-abandoned-partial-and-leaves-one-in-flight
+  ;; `-main` ends in `@(promise)` and can never be called by a test, so what
+  ;; boot does is testable only through the functions boot calls — the same
+  ;; reason `start-chunk-sweep!` and `close-lake-at-exit!` are their own vars.
+  (with-temp-data-dir
+    (fn []
+      (let [p    (doto (io/file (sub/data-dir) "files" ".partial") .mkdirs)
+            old  (io/file p "abandoned")
+            live (io/file p "in-flight")]
+        (spit old "region,rev") (spit live "region,rev")
+        (.setLastModified old (- (System/currentTimeMillis) (* 25 60 60 1000)))
+        (is (= ["abandoned"] (srv/sweep-partials-at-boot!))
+            "the server's own boot step sweeps, and says what it swept")
+        (is (not (.exists old)))
+        (is (.exists live) "an upload that started an hour ago is not garbage")))))
