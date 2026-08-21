@@ -368,6 +368,100 @@ test('the ＋ Data panel previews a file before connecting it', async () => {
   });
 });
 
+// The other mode, and the half of the Definition of done the test above cannot
+// reach: `materialise` is covered end to end there, `passthrough` was covered by
+// a radio carrying the right word.
+//
+// What makes this hard to test is that **both modes draw the same rows from the
+// same file**. Every assertion about the rows, the column names or the table
+// existing passes in either, so a test built out of those would certify rather
+// than test. The difference is what was WRITTEN: a materialise copies the file
+// into a lake table, a passthrough writes none and keeps the recipe.
+//
+// So this connects live.csv TWICE — live, then copied in — and holds the two
+// against each other. `/api/storage` is the oracle: `lakegc/classify` walks the
+// log for handles naming a lake table, and a passthrough handle names none, so
+// the copy earns a row there and the live one cannot. The copy's row is what
+// keeps the live one's absence from being unfalsifiable furniture — the same
+// move the test above makes when it watches the event counter move on connect.
+//
+// Parquet is deliberately NOT the oracle. live.csv is two rows, which DuckLake
+// inlines into catalog.duckdb, so both connects write zero Parquet bytes and a
+// "nothing was written" assertion counted in bytes would pass at this size
+// whatever the mode did. The catalog row is what exists at every size.
+test('the ＋ Data panel connects a file live, and copies nothing into the lake', async () => {
+  await withPage(browser, 'sources-data-live', async (page) => {
+    // The panel, from the file listing to an open table, in the mode asked for.
+    // Re-entered from the top each time because a connect opens the molder over
+    // the notebook the panel was in.
+    const connect = async (mode, title) => {
+      const i = await enterCosmos(page);
+      const at = `#body${i} `;
+      await page.click(`${at}#dataBtn`);
+      await page.waitForSelector(`${at}[data-file="live.csv"]`, { timeout: 8000 });
+      await page.click(`${at}[data-file="live.csv"]`);
+      await page.waitForSelector(`${at}.srcpreview`, { timeout: 8000 });
+
+      await page.check(`${at}input[name^="dmode"][value="${mode}"]`);
+      // Read back off the control, because the control is what the panel sends:
+      // phase 1 refuses a mode BY NAME, so a radio carrying "read live" would be
+      // refused rather than quietly materialised. This is also the line that
+      // says which of the two connects below is which.
+      assert.equal(await page.inputValue(`${at}input[name^="dmode"]:checked`), mode,
+        `the panel would not send ${mode} — the radio for it carries something else`);
+
+      await page.fill(`${at}#dtitle`, title);
+      const toast = { text: '' };
+      await page.click(`${at}[data-a="connect"]`);
+      await until(async () => {
+        await catchToast(page, toast);
+        return (await page.locator('.molder-h .t').count()) > 0;
+      }, () => `the ${mode} table never opened. the page said: ${JSON.stringify(toast.text)}`, 20000);
+      assert.match((await page.textContent('.molder-h .t')).trim(), new RegExp(title),
+        'something opened, but not the table the panel just made');
+
+      const id = await page.evaluate(() => openId);
+      assert.ok(id, 'the panel opened a table it cannot name, and every check below would be about nothing');
+      return id;
+    };
+
+    const live = await connect('passthrough', 'Read live from the panel');
+
+    // The payload, and BOTH of its keys, because they have different
+    // provenances. `mode` is what `connect!` recorded as asked for; `state` is
+    // read off the handle that was actually BUILT — `:store :source` becomes
+    // `:table/passthrough` becomes `live`. A connect that accepted passthrough
+    // and copied anyway is exactly the two disagreeing.
+    const p = await page.evaluate(i => API.object(i), live);
+    assert.equal(p.source && p.source.mode, 'passthrough',
+      `the table the panel made is not recorded as connected live: ${JSON.stringify(p.source)}`);
+    assert.equal(p.source.state, 'live',
+      `read live built a stored handle — the rows were copied in: ${JSON.stringify(p.source)}`);
+
+    // and the shell drew the difference rather than only the server knowing it
+    assert.equal(await page.locator('.molder-b .livebadge').count(), 1,
+      'the table just connected live draws no badge — a reader cannot tell it from a copy');
+    assert.match((await page.textContent('.molder-b .livebadge')).trim(), /live\.csv/,
+      'the badge does not say which file the table reads');
+    assert.match(await page.textContent('.molder-b'), /EMEA/,
+      'the live table drew none of the file’s rows');
+
+    // The same file, copied in. Everything from here is the contrast: without it
+    // the two checks below are "an absence", and an absence proves nothing about
+    // a mechanism that was never exercised.
+    const copy = await connect('materialise', 'Copied in from the panel');
+    assert.equal(await page.locator('.molder-b .livebadge').count(), 0,
+      'a copied-in table draws the live badge too, so the badge above says nothing about the mode');
+
+    const inLake = await page.evaluate(() => API.storage().then(r => r.tables.map(t => t.id)));
+    assert.ok(inLake.includes(copy),
+      `copying live.csv in wrote no lake table — the lake holds ${JSON.stringify(inLake)}, ` +
+      `so the absence asserted next would pass whatever the mode did`);
+    assert.ok(!inLake.includes(live),
+      `read live wrote ${live} into the lake — the file was copied after all: ${JSON.stringify(inLake)}`);
+  });
+});
+
 test('the ＋ Data panel still pastes', async () => {
   await withPage(browser, 'sources-data-paste', async (page) => {
     const i = await enterCosmos(page);
