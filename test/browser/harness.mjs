@@ -272,7 +272,15 @@ async function bootServer(extra = '') {
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
-  const proc = spawn('clojure', ['-M', '-e', serverMain(extra)],
+  //
+  // -J-Djava.io.tmpdir: package.json's TMPDIR=.tmp moves node's own mkdtemp above,
+  // but a JVM ignores TMPDIR on Linux, and this spawn takes no alias — so every
+  // -Djava.io.tmpdir in deps.edn, which lives inside one, misses it. Each server
+  // here extracts DuckDB's ~58 MB native library, and deleteOnExit does not fire
+  // when we kill the group. Relative, so it resolves under cwd: REPO.
+  const proc = spawn('clojure',
+    ['-J--enable-native-access=ALL-UNNAMED', '-J-Djava.io.tmpdir=.tmp',
+     '-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
 
