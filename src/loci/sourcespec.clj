@@ -37,7 +37,23 @@
    event resolves in a container, on another laptop, or out of a restored
    backup. Which is why a `loci://` path that climbs out of the data directory
    is refused — not as a guard, but because such a path is not a loci path. A
-   host path is spelled `file://`, which is unrestricted by decision."
+   host path is spelled `file://`, which is unrestricted by decision.
+
+   **Unrestricted, but still a URI**: after `file://` comes a HOST, and the path
+   begins at the third slash. So `file://data/x.csv` does not name a relative
+   path — it names `/x.csv` on a machine called `data` — and it is refused
+   rather than resolved, because resolving it hands the caller a path at the
+   filesystem root they never typed. That is the trap `5a11360` hit with
+   `file://.tmp/…` and fixed at one call site; this closes it.
+
+   `file://localhost/x` is the one authority that is ACCEPTED, because RFC 8089
+   defines it as this machine, which makes it the three-slash form spelled
+   long. Accepting it costs one clause and buys a refusal message that is always
+   right: every authority it can now fire on really is a first path segment
+   someone typed with two slashes instead of three, so naming that as what they
+   meant is never a guess. Refusing localhost too would be one clause shorter
+   and would have to tell the one caller who spelled it correctly to use
+   `file:///localhost/x`, which is a different file."
   [uri]
   (let [uri (str uri)]
     (cond
@@ -58,11 +74,24 @@
       ;; which names neither loci nor the thing the caller typed. Every other
       ;; branch here answers with an `ex-info` carrying `:uri`, and `describe`'s
       ;; catch turns the message into what the shell shows, so this one does too.
-      (let [p (try (.getPath (java.net.URI. uri))
-                   (catch java.net.URISyntaxException e
-                     (throw (ex-info (str "not a usable file:// location: " uri
-                                          " — " (.getMessage e))
-                                     {:uri uri} e))))]
+      (let [^java.net.URI u (try (java.net.URI. uri)
+                                 (catch java.net.URISyntaxException e
+                                   (throw (ex-info (str "not a usable file:// location: " uri
+                                                        " — " (.getMessage e))
+                                                   {:uri uri} e))))
+            auth (.getAuthority u)
+            p    (.getPath u)]
+        ;; The AUTHORITY, not `.getHost`: `file://.tmp/x` has authority ".tmp"
+        ;; and host nil, because a leading dot is not a legal hostname. Reading
+        ;; the host would let exactly the shape that started this through.
+        (when (and auth (not= "localhost" auth))
+          (let [tail (subs uri (count "file://"))]
+            (throw (ex-info (str "not a file:// location: " uri
+                                 " — file:// is followed by a HOST, so " (pr-str auth)
+                                 " here names a machine and not the first directory."
+                                 " Use file:///" tail " for a path on this machine,"
+                                 " or loci://" tail " for a path under the data directory.")
+                            {:uri uri}))))
         (when (str/blank? p)
           (throw (ex-info (str "file:// location has no path: " uri) {:uri uri})))
         p)

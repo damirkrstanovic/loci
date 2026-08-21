@@ -1,5 +1,6 @@
 (ns loci.sourcespec-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]))
 
@@ -10,6 +11,44 @@
 (deftest locate-passes-a-file-uri-through-as-a-path
   (is (= "/data/sales.csv" (ssp/locate "file:///data/sales.csv")))
   (is (= "/data/with space.csv" (ssp/locate "file:///data/with%20space.csv"))))
+
+(deftest locate-refuses-a-file-uri-whose-first-segment-reads-as-a-host
+  ;; `file://data/sales.csv` is a plausible thing to type: loci:// is relative
+  ;; to the data directory, and file:// is documented one line away as "a host
+  ;; path". Java reads it as the path /sales.csv on a host called "data", so
+  ;; passing `.getPath` straight through did not refuse it — it RESOLVED it to
+  ;; a path at the filesystem root the caller never typed, and the failure then
+  ;; arrived from DuckDB naming that path. Same shape as `file://.tmp/…`, which
+  ;; 5a11360 fixed at one call site.
+  ;;
+  ;; So this asserts the SENTENCE, not the failure. "Connecting file://data/x
+  ;; fails" passed before the fix too, because /x does not exist either.
+  (doseq [bad ["file://data/sales.csv" "file://.tmp/src-1.parquet" "file://./x.csv"]]
+    (let [e   (try (ssp/locate bad) nil (catch clojure.lang.ExceptionInfo e e))
+          ;; `str` so that a nil message FAILS rather than NPEs — the sabotage
+          ;; run is read, and a stack trace hides which assertion bit.
+          msg (str (some-> e .getMessage))
+          tail (subs bad (count "file://"))]
+      (is (some? e) (str "must refuse " bad))
+      (is (= bad (:uri (ex-data e))) "carrying :uri, like every other branch here")
+      (is (re-find #"followed by a HOST" msg)
+          "and saying WHY, since the caller sees only this line")
+      (is (str/includes? msg (str "file:///" tail))
+          "and naming the three-slash form they probably meant")
+      (is (str/includes? msg (str "loci://" tail))
+          "and the loci:// spelling, for a path under the data directory")))
+  ;; `.tmp` is the case that proves `.getAuthority` rather than `.getHost` is
+  ;; the test: a leading dot is not a legal hostname, so `.getHost` is nil for
+  ;; exactly the URI that started this.
+  (is (nil? (.getHost (java.net.URI. "file://.tmp/src-1.parquet")))))
+
+(deftest locate-accepts-the-one-authority-that-means-this-machine
+  ;; RFC 8089 defines file://localhost/x as file:///x, and loci takes it, which
+  ;; is what keeps the refusal above honest: every authority it can fire on is
+  ;; then really a first path segment, so naming file:///<it> as the intent is
+  ;; never a guess. This pins a decision rather than guarding a bug — break it
+  ;; by refusing every authority, not by restoring the old `.getPath`.
+  (is (= "/data/sales.csv" (ssp/locate "file://localhost/data/sales.csv"))))
 
 (deftest locate-refuses-a-loci-path-that-escapes-the-data-dir
   ;; loci:// MEANS "under the data dir" — that is what makes a substrate

@@ -82,6 +82,24 @@
     (is (not (re-find #"LINE 1" (.getMessage e)))
         "and without a dump of SQL the caller never wrote")))
 
+(deftest describe-refuses-a-two-slash-file-uri-before-duckdb-sees-it
+  ;; What the ＋ Data connect box does with `file://data/sales.csv`. `locate`
+  ;; runs OUTSIDE describe's catch, so a refused location must never reach the
+  ;; lake — and the reader must not be told about a path they did not type.
+  ;; Before the refusal this read /sales.csv and DuckDB answered "No files
+  ;; found that match the pattern \"/sales.csv\"", so asserting only that it
+  ;; throws proves nothing: the absence of DuckDB's words is the whole point.
+  (let [e (try (src/describe @lake/lake {:uri "file://data/sales.csv" :format :csv}) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e))
+    (is (= "file://data/sales.csv" (:uri (ex-data e))))
+    (is (re-find #"file:///data/sales\.csv" (.getMessage e))
+        "it names the spelling that would have worked")
+    (is (not (re-find #"No files found" (.getMessage e)))
+        "and DuckDB never ran, so it cannot name /sales.csv")
+    (is (not (re-find #"loci cannot read" (.getMessage e)))
+        "this fails at locate, not at the read")))
+
 (deftest describe-succeeds-on-an-empty-source-with-a-fabricated-column
   ;; Pins what the empty-columns guard does NOT do. DuckDB's auto-detection
   ;; never returns zero columns, so an empty file connects as a one-column,
