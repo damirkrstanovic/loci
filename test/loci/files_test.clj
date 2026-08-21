@@ -56,3 +56,88 @@
   (with-dir
     (fn [_]
       (is (= [] (files/sweep-partials!))))))
+
+;; ---------------------------------------------------------------------------
+;; the listing the picker draws. These five moved here from `loci.server-test`
+;; with `loci.files/listing`: they are assertions about what the DIRECTORY
+;; contains and how it is ordered, and leaving them beside the route while the
+;; rules live here is the same split that let `.partial` be described in one
+;; namespace and created in another.
+;; ---------------------------------------------------------------------------
+
+(deftest listing-is-what-is-in-the-directory
+  (with-dir
+    (fn [_]
+      (let [dir (doto (files/dir) .mkdirs)]
+        ;; Reverse lexical on purpose — see the ordering test below.
+        (spit (io/file dir "hand-placed.csv") "b\n2\n")
+        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+        (.mkdirs (io/file dir ".partial"))
+        (spit (io/file dir ".partial" "half") "not done")
+        (let [r (files/listing)]
+          (is (= #{"72b441a9c3e05f18.csv" "hand-placed.csv"} (set (map :file r)))
+              "both files, and never the .partial working directory")
+          (is (= 4 (:bytes (first (filter #(= "72b441a9c3e05f18.csv" (:file %)) r))))
+              "the real length of \"a\\n1\\n\", not merely some number — a hashCode would be one of those")
+          (is (= "loci://files/hand-placed.csv"
+                 (:uri (first (filter #(= "hand-placed.csv" (:file %)) r))))
+              "and the loci:// spelling sourcespec/locate resolves"))))))
+
+(deftest listing-is-in-name-order-and-not-in-disk-order
+  ;; `File.listFiles` promises no order at all; measured 2026-08-21 it answers
+  ;; CREATION order here, and the docs allow hash order elsewhere. So a fixture
+  ;; written in sorted order comes back sorted whether or not anything sorted
+  ;; it — which is exactly how the `sort-by` in the code this moved from went
+  ;; five tests without a single assertion that could see it. Writing in
+  ;; reverse is what makes the sort the only thing that can produce this vector.
+  (with-dir
+    (fn [_]
+      (let [dir (doto (files/dir) .mkdirs)]
+        (doseq [n ["zulu.csv" "mike.csv" "kilo.csv" "alpha.csv"]]
+          (spit (io/file dir n) "x"))
+        (is (= ["alpha.csv" "kilo.csv" "mike.csv" "zulu.csv"] (mapv :file (files/listing)))
+            "a picker that reshuffles between two opens reads as something having happened")))))
+
+(deftest listing-is-empty-and-not-an-error-before-anything-is-imported
+  (with-dir
+    (fn [_] (is (= [] (files/listing))))))
+
+(deftest listing-skips-directories-that-are-not-dotfiles
+  ;; The tests above only ever put a DIRECTORY under a dot-prefixed name
+  ;; (`.partial`), so they cannot tell the dotfile filter from the directory
+  ;; filter — either alone would pass them. A subdirectory with an ordinary
+  ;; name is what makes the `.isDirectory` half of `content?` load-bearing.
+  (with-dir
+    (fn [_]
+      (let [dir (doto (files/dir) .mkdirs)]
+        (spit (io/file dir "real.csv") "a\n1\n")
+        (.mkdirs (io/file dir "subdir"))
+        (spit (io/file dir "subdir" "nested.csv") "a\n1\n")
+        (is (= ["real.csv"] (mapv :file (files/listing)))
+            "a subdirectory is not content, dotfile-named or not")))))
+
+(deftest listing-skips-dotfiles-that-are-not-directories
+  ;; The other fixtures only ever dot-prefix a DIRECTORY (`.partial`), so the
+  ;; `isDirectory` half already protects them — dropping the dotfile half by
+  ;; itself changes nothing they can see. A dot-prefixed ORDINARY FILE is what
+  ;; makes it load-bearing.
+  (with-dir
+    (fn [_]
+      (let [dir (doto (files/dir) .mkdirs)]
+        (spit (io/file dir "real.csv") "a\n1\n")
+        (spit (io/file dir ".DS_Store") "junk")
+        (is (= ["real.csv"] (mapv :file (files/listing)))
+            "a dotfile is not content, directory or not")))))
+
+(deftest listing-reports-the-manifest-name-for-a-file-loci-named
+  (with-dir
+    (fn [_]
+      (let [dir (doto (files/dir) .mkdirs)]
+        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+        (spit (io/file dir "hand-placed.csv") "b\n2\n")
+        (files/remember! "72b441a9c3e05f18.csv" "sales-2026.csv")
+        (let [by-file (into {} (map (juxt :file identity)) (files/listing))]
+          (is (= "sales-2026.csv" (:name (by-file "72b441a9c3e05f18.csv")))
+              "the listing reads the real manifest")
+          (is (nil? (:name (by-file "hand-placed.csv")))
+              "and a file loci never named has no name, rather than borrowing one"))))))

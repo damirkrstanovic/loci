@@ -4998,84 +4998,39 @@
                   "the sentence and the structural state name the same failure"))))))))
 
 ;; ---------------------------------------------------------------------------
-;; GET /api/source/files — what is in <LOCI_DATA>/files/, for the shell's
-;; file picker (Task 5)
+;; GET /api/source/files — the route and its envelope. What is IN the directory
+;; is `loci.files`'s rule and is tested in `loci.files-test` beside it; what is
+;; here is that the URL reaches it and that the payload keeps its shape.
 ;; ---------------------------------------------------------------------------
-
-(deftest source-files-lists-what-is-in-the-directory
-  (with-temp-data-dir
-    (fn []
-      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
-        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
-        (spit (io/file dir "hand-placed.csv") "b\n2\n")
-        (.mkdirs (io/file dir ".partial"))
-        (spit (io/file dir ".partial" "half") "not done")
-        (let [r (srv/source-files)]
-          (is (= #{"72b441a9c3e05f18.csv" "hand-placed.csv"} (set (map :file (:files r))))
-              "both files, and never the .partial working directory")
-          (is (every? #(number? (:bytes %)) (:files r)))
-          (is (= "loci://files/hand-placed.csv"
-                 (:uri (first (filter #(= "hand-placed.csv" (:file %)) (:files r)))))))))))
-
-(deftest source-files-is-empty-and-not-an-error-before-anything-is-imported
-  (with-temp-data-dir
-    (fn [] (is (= [] (:files (srv/source-files)))))))
-
-(deftest source-files-skips-directories-that-are-not-dotfiles
-  ;; The two tests above only ever put a DIRECTORY under a dot-prefixed name
-  ;; (`.partial`), so they cannot tell the dotfile filter from the directory
-  ;; filter — either alone would pass them. A subdirectory with an ordinary
-  ;; name is what makes `remove #(.isDirectory %)` load-bearing on its own.
-  (with-temp-data-dir
-    (fn []
-      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
-        (spit (io/file dir "real.csv") "a\n1\n")
-        (.mkdirs (io/file dir "subdir"))
-        (spit (io/file dir "subdir" "nested.csv") "a\n1\n")
-        (is (= #{"real.csv"} (set (map :file (:files (srv/source-files)))))
-            "a subdirectory is not content, dotfile-named or not")))))
-
-(deftest source-files-skips-dotfiles-that-are-not-directories
-  ;; The other three fixtures only ever dot-prefix a DIRECTORY (`.partial`),
-  ;; so the `isDirectory` filter alone already protects them — dropping the
-  ;; dotfile filter by itself changes nothing they can see. A dot-prefixed
-  ;; ORDINARY FILE is what makes `remove #(str/starts-with? … ".")` load-
-  ;; bearing on its own.
-  (with-temp-data-dir
-    (fn []
-      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
-        (spit (io/file dir "real.csv") "a\n1\n")
-        (spit (io/file dir ".DS_Store") "junk")
-        (is (= #{"real.csv"} (set (map :file (:files (srv/source-files)))))
-            "a dotfile is not content, directory or not")))))
 
 (deftest source-files-answers-through-the-URL
   ;; A handler test cannot catch a typo'd URI, per `the-source-routes-answer-
-  ;; through-the-URL` above.
+  ;; through-the-URL` above. `c/store` is a delay behind an ordinary var and
+  ;; `handler` binds `(store)` before the `cond` for every route, so without
+  ;; this rebind the mere act of asking for a file listing opens the user's
+  ;; Datalevin store and runs `c/seed!` — inside a `with-temp-data-dir` that
+  ;; then deletes it, leaving a process-wide realized delay over an unlinked
+  ;; env. Its four siblings all rebind for exactly this reason.
   (with-temp-data-dir
     (fn []
-      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
-        (spit (io/file dir "hand-placed.csv") "b\n2\n")
-        (let [r (json/read-str (:body (srv/handler {:uri "/api/source/files"}))
-                                :key-fn keyword)]
-          (is (= ["hand-placed.csv"] (mapv :file (:files r)))))))))
+      (with-redefs [c/store (delay (sub/fresh-store))]
+        (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+          ;; Written in REVERSE lexical order on purpose. `File.listFiles`
+          ;; promises no order and answers creation order here (measured
+          ;; 2026-08-21), so a fixture written a-then-b comes back sorted
+          ;; whether or not anything sorted it — which is how the sort in
+          ;; `files/listing` went five tests without an assertion that could
+          ;; see it.
+          (spit (io/file dir "hand-placed.csv") "b\n2\n")
+          (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+          (let [r (json/read-str (:body (srv/handler {:uri "/api/source/files"}))
+                                  :key-fn keyword)]
+            (is (= ["72b441a9c3e05f18.csv" "hand-placed.csv"] (mapv :file (:files r)))
+                "the route answers, under :files, in name order and not in disk order")))))))
 
 ;; ---------------------------------------------------------------------------
-;; the manifest behind that listing, and the boot-time .partial sweep (Task 6)
+;; the boot-time .partial sweep (Task 6)
 ;; ---------------------------------------------------------------------------
-
-(deftest source-files-reports-the-manifest-name-for-a-file-loci-named
-  (with-temp-data-dir
-    (fn []
-      (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
-        (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
-        (spit (io/file dir "hand-placed.csv") "b\n2\n")
-        (files/remember! "72b441a9c3e05f18.csv" "sales-2026.csv")
-        (let [by-file (into {} (map (juxt :file identity)) (:files (srv/source-files)))]
-          (is (= "sales-2026.csv" (:name (by-file "72b441a9c3e05f18.csv")))
-              "the listing reads the real manifest, not the stub that answered {}")
-          (is (nil? (:name (by-file "hand-placed.csv")))
-              "and a file loci never named has no name, rather than borrowing one"))))))
 
 (deftest boot-sweeps-an-abandoned-partial-and-leaves-one-in-flight
   ;; `-main` ends in `@(promise)` and can never be called by a test, so what

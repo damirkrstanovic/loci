@@ -2162,7 +2162,7 @@
    `res.state` and `res.openId`, and those three keys are added there."
   [st title csv space]
   (let [written
-        (try (let [dir (io/file (sub/data-dir) "files")
+        (try (let [dir (files/dir)
                    nm  (str (content-hash csv) ".csv")
                    f   (io/file dir nm)]
                (.mkdirs dir)
@@ -2207,7 +2207,7 @@
              (catch Exception e {:error (.getMessage e)}))]
     (if (map? written)
       written
-      (let [uri  (str "loci://files/" written)
+      (let [uri  (files/uri written)
             ;; The table this exact file already made, if any. One pass over
             ;; the objects, which `mint-id` inside `connect!` is about to make
             ;; anyway. Reported rather than refused: two tables from one file
@@ -2222,29 +2222,16 @@
         (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
 
 (defn source-files
-  "What is in `<LOCI_DATA>/files/`, as `{:files [{:file :uri :bytes :name} …]}`.
+  "`GET /api/source/files` — `files/listing` under the key the shell reads.
 
-   Two mechanisms write this directory — `import-csv!` and the upload route,
-   both content-addressed — and a person may drop a file in by hand or mount
-   one. So the listing is of the DIRECTORY rather than of any record loci
-   keeps: a file loci did not put there still connects, and pretending
-   otherwise would make the picker lie about what is available.
-
-   `:name` is the manifest's memory of what an upload was called, and is
-   absent for anything loci did not name. `.partial` is a working directory,
-   not content, and never appears."
+   All of the thinking is in `loci.files`, which owns the directory: where it
+   is, what in it counts as content, and how a file in it is spelled as a
+   location. What is left here is the envelope, and it is a real thing rather
+   than an alias — `{:files […]}` is the JSON contract `API.sourceFiles()`
+   destructures, and a bare vector would be a second answer shape among routes
+   that all answer maps."
   []
-  (let [dir   (io/file (sub/data-dir) "files")
-        named (files/names)]
-    {:files (->> (.listFiles dir)
-                 (remove #(.isDirectory %))
-                 (remove #(str/starts-with? (.getName %) "."))
-                 (sort-by #(.getName %))
-                 (mapv (fn [f]
-                         (cond-> {:file  (.getName f)
-                                  :uri   (str "loci://files/" (.getName f))
-                                  :bytes (.length f)}
-                           (named (.getName f)) (assoc :name (named (.getName f)))))))}))
+  {:files (files/listing)})
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
