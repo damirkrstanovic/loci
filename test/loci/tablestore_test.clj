@@ -233,3 +233,45 @@
                (catch clojure.lang.ExceptionInfo e e))]
     (is (= :a_b (:column (ex-data e)))
         "normalize-rows must keep throwing exactly as it did, through the same check")))
+
+(deftest handles-in-history-finds-a-handle-inside-a-tx
+  (let [st (sub/fresh-store)
+        h  {:store :lake :table "t_one" :snapshot 1}]
+    (sub/commit! st {:op :tx :events [{:op :put :id "tbl:a" :value {:id "tbl:a" :value h}}
+                                      {:op :put :id "note:a" :value {:id "note:a" :value "x"}}]})
+    (let [by-obj (tbl/handles-in-history st)]
+      (is (= ["t_one"] (map #(:table (:handle %)) (get by-obj "tbl:a")))
+          "a sub-event's handle is found — a walk that saw only top-level events would call
+           this orphaned and reclaim rows a live object is still using")
+      (is (= [(:ts (first (sub/history st)))] (mapv :ts (get by-obj "tbl:a")))
+          ;; Not `(every? :ts …)`, which the plan spelled and which CANNOT FAIL:
+          ;; `every?` over an empty seq is true, so it passes in precisely the
+          ;; state the assertion above exists to catch — the walk finding no
+          ;; sub-event at all. Measured 2026-08-22 by breaking the `:tx` branch:
+          ;; the first assertion failed, this one did not. Comparing against the
+          ;; transaction's own committed stamp cannot pass vacuously, and pins
+          ;; *inherits the transaction's* rather than merely *has one*. Read from
+          ;; the log, not written by the test, because `commit!` overwrites any
+          ;; `:ts` a caller supplies.
+          "and inherits the transaction's :ts, because a sub-event carries none of its own"))))
+
+(deftest handles-in-history-carries-the-source-a-materialised-refresh-drops
+  (let [st  (sub/fresh-store)
+        src {:uri "loci://files/abc.csv" :format :csv :mode :materialise}
+        v1  {:store :lake :table "t_one" :snapshot 1}
+        v2  {:store :lake :table "t_two" :snapshot 2}]
+    (sub/commit! st {:op :put :id "tbl:a" :value {:id "tbl:a" :value v1 :source src}})
+    (sub/commit! st {:op :assoc :id "tbl:a" :path [:value] :value v2})
+    (let [hs (get (tbl/handles-in-history st) "tbl:a")]
+      (is (= ["t_two" "t_one"] (map #(:table (:handle %)) hs))
+          "newest first, both versions")
+      (is (= [nil "loci://files/abc.csv"] (map #(:uri (:source %)) hs))
+          "the refresh names no uri — only the :put does. A files GC reading handles alone
+           would find this file unreferenced and reclaim a live table's source."))))
+
+(deftest handles-in-history-finds-a-passthrough-uri-on-the-handle-itself
+  (let [st (sub/fresh-store)
+        h  {:store :source :uri "loci://files/live.csv" :format :csv}]
+    (sub/commit! st {:op :put :id "tbl:b" :value {:id "tbl:b" :value h :source {:uri "loci://files/live.csv"}}})
+    (is (= "loci://files/live.csv" (:uri (:handle (first (get (tbl/handles-in-history st) "tbl:b")))))
+        "a passthrough handle IS the recipe and names its own location")))

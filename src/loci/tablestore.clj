@@ -88,6 +88,47 @@
   [v]
   (and (map? v) (contains? #{:inline :lake :source} (:store v))))
 
+(defn event-handles
+  "Every `{:handle :source :object :ts}` one event names, **including inside a `:tx`**.
+
+   Lifted out of `loci.lakegc` on 2026-08-22 when a second GC needed the same
+   walk. Its reasoning is why it is one function and not two: a `:tx` is several
+   sub-events committed as one undoable step, and `tools/save-table!` commits one
+   whenever it also appends a notebook cell. A classifier that walked only
+   top-level events would find no handle for those tables, call them orphaned,
+   and reclaim rows a live object is still using — the worst outcome either GC
+   can produce. Sub-events carry no `:ts` of their own, so they inherit the
+   transaction's.
+
+   Two shapes carry a handle: a `:put` whose value is the whole object, and an
+   `:assoc` at `[:value]` whose value is the handle itself (that is how
+   `rerun!` refreshes a table).
+
+   **`:source` is carried beside `:handle` and is not redundant.** A
+   materialised source's handle is `{:store :lake :table …}` and names no
+   location, so a refresh — an `:assoc` at `[:value]` — drops the uri
+   entirely. Only the `:put` of the whole object has it. A caller walking
+   handles alone would find a live materialised table's file unreferenced."
+  [ev]
+  (case (:op ev)
+    :tx (mapcat #(event-handles (assoc % :ts (:ts ev))) (:events ev))
+    (let [v (:value ev)
+          h (cond (handle? v)          v
+                  (handle? (:value v)) (:value v))]
+      (when h [{:handle h :source (:source v) :object (:id ev) :ts (:ts ev)}]))))
+
+(defn handles-in-history
+  "Every `{:handle :source :object :ts}` the log has ever named, newest first
+   per object, as `{object-id [entry …]}`.
+
+   From `sub/history` rather than from current state, because `as-of` and undo
+   can reach any of them — that is exactly what a GC window protects."
+  [st]
+  (->> (sub/history st)
+       (mapcat event-handles)
+       (group-by :object)
+       (into {} (map (fn [[o hs]] [o (vec (reverse hs))])))))
+
 (defn cols-of
   "The column order to preserve: every key any row has, in the order first seen.
 
