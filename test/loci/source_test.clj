@@ -1,5 +1,6 @@
 (ns loci.source-test
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is use-fixtures]]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.server :as server]
@@ -50,7 +51,13 @@
   ;; one only asserts it. Parquet is written BY duckdb so the test needs no
   ;; second library.
   (let [lk @lake/lake
-        pq (str (System/getProperty "java.io.tmpdir") "/src-" (System/nanoTime) ".parquet")
+        ;; Absolute, like the JSON half below. `file://` plus a RELATIVE path is
+        ;; not a file URI — it reads the first segment as a host. It only ever
+        ;; worked here because `java.io.tmpdir` happened to be `/tmp`; the test
+        ;; alias now sets `.tmp`, and `deps.edn` says why.
+        pq (.getAbsolutePath
+            (io/file (System/getProperty "java.io.tmpdir")
+                     (str "src-" (System/nanoTime) ".parquet")))
         js (java.io.File/createTempFile "src-" ".json")]
     (lake/x! lk (str "COPY (SELECT 1 AS a, 'x' AS b) TO '" pq "' (FORMAT parquet)"))
     (spit js "[{\"a\":1,\"b\":\"x\"}]")
@@ -74,6 +81,24 @@
         "without the JDBC driver's account of its own state")
     (is (not (re-find #"LINE 1" (.getMessage e)))
         "and without a dump of SQL the caller never wrote")))
+
+(deftest describe-refuses-a-two-slash-file-uri-before-duckdb-sees-it
+  ;; What the ＋ Data connect box does with `file://data/sales.csv`. `locate`
+  ;; runs OUTSIDE describe's catch, so a refused location must never reach the
+  ;; lake — and the reader must not be told about a path they did not type.
+  ;; Before the refusal this read /sales.csv and DuckDB answered "No files
+  ;; found that match the pattern \"/sales.csv\"", so asserting only that it
+  ;; throws proves nothing: the absence of DuckDB's words is the whole point.
+  (let [e (try (src/describe @lake/lake {:uri "file://data/sales.csv" :format :csv}) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e))
+    (is (= "file://data/sales.csv" (:uri (ex-data e))))
+    (is (re-find #"file:///data/sales\.csv" (.getMessage e))
+        "it names the spelling that would have worked")
+    (is (not (re-find #"No files found" (.getMessage e)))
+        "and DuckDB never ran, so it cannot name /sales.csv")
+    (is (not (re-find #"loci cannot read" (.getMessage e)))
+        "this fails at locate, not at the read")))
 
 (deftest describe-succeeds-on-an-empty-source-with-a-fabricated-column
   ;; Pins what the empty-columns guard does NOT do. DuckDB's auto-detection

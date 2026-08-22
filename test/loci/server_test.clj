@@ -7,12 +7,14 @@
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.files :as files]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.server :as srv]
+            [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
             [loci.tools :as tools])
@@ -4849,3 +4851,404 @@
           (let [r (srv/import-csv! (sub/fresh-store) "C" "region,revenue\nEMEA,1\n" nil)]
             (is (nil? (:error r)))
             (is (some? (:openId r)))))))))
+
+(deftest mold-payload-says-which-source-state-a-table-is-in
+  ;; The shell branches on this rather than on `unusable`'s wording. Reading a
+  ;; state out of an English sentence is what `hydrate` deliberately does not do.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "live.csv")
+                _   (spit f "a,b\n1,x\n")
+                uri (str "loci://files/" (.getName f))
+                r   (src/connect! st {:uri uri :format :csv
+                                      :mode :passthrough :title "Live"})
+                p   (srv/mold-payload st no-memory (:id r) nil)]
+            (is (= "live" (get-in p [:source :state])) "a healthy passthrough reads live")
+            (is (= uri    (get-in p [:source :uri])))
+            (is (= "passthrough" (get-in p [:source :mode])))
+            (.delete f)
+            (let [p2 (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "unavailable" (get-in p2 [:source :state])))
+              (is (string? (:unusable p2)) "the sentence still ships beside it"))
+            (spit f "c,d\n1,x\n")
+            (let [p3 (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "drift" (get-in p3 [:source :state]))))))))))
+
+(deftest a-materialised-source-is-stored-not-live
+  ;; Refresh applies to any table with a recipe; the LIVE badge only to
+  ;; passthrough. A materialised source must be distinguishable from both a
+  ;; passthrough one and a table nobody connected.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                _   (spit (io/file dir "m.csv") "a\n1\n")
+                r   (src/connect! st {:uri "loci://files/m.csv" :format :csv
+                                      :mode :materialise :title "Stored"})
+                p   (srv/mold-payload st no-memory (:id r) nil)]
+            (is (= "stored" (get-in p [:source :state])))
+            (is (= "materialise" (get-in p [:source :mode])))
+            (is (seq (:rendered p)) "and it still renders its rows")))))))
+
+(deftest a-table-nobody-connected-has-no-source-block
+  (let [st (store-with-table)
+        p  (srv/mold-payload st no-memory "tbl:t" nil)]
+    (is (nil? (:source p)) "absent, not a block saying nothing")))
+
+(deftest a-code-view-of-a-source-still-says-it-is-a-source
+  ;; Four branches of `mold-payload` can render a table. A broken passthrough
+  ;; source must not render silently empty just because it was reached through
+  ;; a custom `app:` or `view:` id instead of the table's default view —
+  ;; `make-view!` and `describe!` both refuse anything whose rows are not
+  ;; tabular, so both are real doors onto a connected source, not a hypothetical
+  ;; one. `unavailable`/`drift` genuinely cannot reach these branches — the
+  ;; `(tbl/unusable o)` clause is checked first in `mold-payload` — but `stored`
+  ;; can, and nothing proved `source-block` behaved the same there as from the
+  ;; default `:else` branch.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "cv.csv")
+                _   (spit f "a,b\n1,x\n")
+                r   (src/connect! st {:uri "loci://files/cv.csv" :format :csv
+                                      :mode :passthrough :title "Viewed"})
+                m   (spit (io/file dir "cv-stored.csv") "a,b\n1,x\n")
+                rm  (src/connect! st {:uri "loci://files/cv-stored.csv" :format :csv
+                                      :mode :materialise :title "Stored, viewed"})]
+            (with-redefs [agent/make-applet   (fn [& _] "el.textContent = data.length")
+                          agent/describe-view (fn [& _] {:label "as table" :kind "table"})]
+              (let [av  (srv/make-view! st (:id r) "show it")
+                    dv  (srv/describe! st (:id r) "chart it")
+                    avm (srv/make-view! st (:id rm) "show it")
+                    dvm (srv/describe! st (:id rm) "chart it")]
+                (is (nil? (:error av)))
+                (is (nil? (:error dv)))
+                (is (nil? (:error avm)))
+                (is (nil? (:error dvm)))
+                (let [ap  (srv/mold-payload st no-memory (:id r) (:view av))
+                      vp  (srv/mold-payload st no-memory (:id r) (:view dv))
+                      apm (srv/mold-payload st no-memory (:id rm) (:view avm))
+                      vpm (srv/mold-payload st no-memory (:id rm) (:view dvm))]
+                  (is (= "live" (get-in ap [:source :state]))
+                      "the app: branch carries the block too")
+                  (is (= "live" (get-in vp [:source :state]))
+                      "the view: branch carries the block too")
+                  (is (= "stored" (get-in apm [:source :state]))
+                      "stored reaches the app: branch too, not just :else")
+                  (is (= "stored" (get-in vpm [:source :state]))
+                      "stored reaches the view: branch too, not just :else"))))))))))
+
+(deftest a-hand-written-source-with-a-bad-mode-costs-one-key-not-the-page
+  ;; `connect!`'s validator refuses a mode that is not :materialise or
+  ;; :passthrough, so this shape cannot arrive through the API. It can arrive
+  ;; through a REPL commit, which CLAUDE.md names as a way to reach storage —
+  ;; and `(name nil)` would take out every read of the object rather than the
+  ;; one key that cannot be answered.
+  (let [st (sub/fresh-store)]
+    (doseq [bad [nil 5 {:a 1}]]
+      (sub/commit! st {:op :put :id "tbl:handmade"
+                       :value {:id "tbl:handmade" :kind :table :title "Hand"
+                               :value [{:a 1}]
+                               :source {:uri "loci://files/x.csv" :format :csv :mode bad}}})
+      (let [p (srv/mold-payload st no-memory "tbl:handmade" nil)]
+        (is (= "stored" (get-in p [:source :state])) (str "still answers for mode " (pr-str bad)))
+        (is (nil? (get-in p [:source :mode])) "and says nothing rather than throwing")
+        (is (seq (:rendered p)) "and the rows still render")))))
+
+(deftest a-reclaimed-materialised-source-agrees-with-itself
+  ;; source-block must mirror tbl/unusable's precedence: both are readings of
+  ;; one hydrate and must never be able to disagree. Reproduced by the
+  ;; reviewer against ordinary use — connect materialise, refresh, the old
+  ;; lake version ages past the GC window, browse it with ?at= — and before
+  ;; the reclaimed clause this cond answered "stored" while :unusable and
+  ;; :reclaimed both said the rows were gone.
+  ;;
+  ;; 100 rows, not fewer: below ~10-20 rows DuckLake inlines the insert into
+  ;; catalog.duckdb, so the table owns no Parquet, reclaim! has nothing to
+  ;; delete, and the read afterwards succeeds — the same trap
+  ;; `lake-fixture/with-reclaimed-table` documents for tbl:gone. The assert on
+  ;; reclaim!'s return is what makes a false green impossible here too.
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "gc.csv")
+                _   (spit f (str "a\n" (str/join "\n" (range 100)) "\n"))
+                r   (src/connect! st {:uri "loci://files/gc.csv" :format :csv
+                                      :mode :materialise :title "GC me"})
+                h   (:value (sub/object st (:id r)))]
+            (is (= 1 (count (lf/reclaim! @lake/lake (:table h))))
+                "no Parquet was deleted — the test would prove nothing")
+            (let [p (srv/mold-payload st no-memory (:id r) nil)]
+              (is (= "reclaimed" (get-in p [:source :state]))
+                  "source.state must agree with :unusable and :reclaimed, not report stored")
+              (is (:reclaimed p) "the payload still says so rather than showing an empty table")
+              (is (str/includes? (:unusable p) "reclaimed")
+                  "the sentence and the structural state name the same failure"))))))))
+
+;; ---------------------------------------------------------------------------
+;; GET /api/source/files — the route and its envelope. What is IN the directory
+;; is `loci.files`'s rule and is tested in `loci.files-test` beside it; what is
+;; here is that the URL reaches it and that the payload keeps its shape.
+;; ---------------------------------------------------------------------------
+
+(deftest source-files-answers-through-the-URL
+  ;; A handler test cannot catch a typo'd URI, per `the-source-routes-answer-
+  ;; through-the-URL` above. `c/store` is a delay behind an ordinary var and
+  ;; `handler` binds `(store)` before the `cond` for every route, so without
+  ;; this rebind the mere act of asking for a file listing opens the user's
+  ;; Datalevin store and runs `c/seed!` — inside a `with-temp-data-dir` that
+  ;; then deletes it, leaving a process-wide realized delay over an unlinked
+  ;; env. Its four siblings all rebind for exactly this reason.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))]
+        (let [dir (doto (io/file (sub/data-dir) "files") .mkdirs)]
+          ;; Written in REVERSE lexical order on purpose. `File.listFiles`
+          ;; promises no order and answers creation order here (measured
+          ;; 2026-08-21), so a fixture written a-then-b comes back sorted
+          ;; whether or not anything sorted it — which is how the sort in
+          ;; `files/listing` went five tests without an assertion that could
+          ;; see it.
+          (spit (io/file dir "hand-placed.csv") "b\n2\n")
+          (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
+          (let [r (json/read-str (:body (srv/handler {:uri "/api/source/files"}))
+                                  :key-fn keyword)]
+            (is (= ["72b441a9c3e05f18.csv" "hand-placed.csv"] (mapv :file (:files r)))
+                "the route answers, under :files, in name order and not in disk order")))))))
+
+;; ---------------------------------------------------------------------------
+;; the boot-time .partial sweep (Task 6)
+;; ---------------------------------------------------------------------------
+
+(deftest boot-sweeps-an-abandoned-partial-and-leaves-one-in-flight
+  ;; `-main` ends in `@(promise)` and can never be called by a test, so what
+  ;; boot does is testable only through the functions boot calls — the same
+  ;; reason `start-chunk-sweep!` and `close-lake-at-exit!` are their own vars.
+  (with-temp-data-dir
+    (fn []
+      (let [p    (doto (io/file (sub/data-dir) "files" ".partial") .mkdirs)
+            old  (io/file p "abandoned")
+            live (io/file p "in-flight")]
+        (spit old "region,rev") (spit live "region,rev")
+        (.setLastModified old (- (System/currentTimeMillis) (* 25 60 60 1000)))
+        (is (= ["abandoned"] (srv/sweep-partials-at-boot!))
+            "the server's own boot step sweeps, and says what it swept")
+        (is (not (.exists old)))
+        (is (.exists live) "an upload that started an hour ago is not garbage")))))
+
+;; ---------------------------------------------------------------------------
+;; POST /api/source/upload — chunked (Task 7)
+;;
+;; The rules live in `loci.files`, which owns the directory they are about, and
+;; are exercised here through `srv/source-upload!` because the seam a person
+;; reaches is the route: the sequence, the header, the raw body and the
+;; envelope only exist together.
+;; ---------------------------------------------------------------------------
+
+(deftest an-upload-arrives-in-chunks-and-lands-as-one-content-addressed-file
+  (with-temp-data-dir
+    (fn []
+      (let [a (srv/source-upload! {:id "up-1" :seq 0 :name "sales.csv"} "region,revenue\n")
+            b (srv/source-upload! {:id "up-1" :seq 1 :name "sales.csv" :final true} "EMEA,10\n")]
+        (is (nil? (:error a)))
+        (is (nil? (:uri a)) "no uri until the last chunk")
+        (is (= 15 (:bytes a)) "and the caller is told how much of the file has landed")
+        (is (nil? (:error b)))
+        (is (re-matches #"loci://files/[0-9a-f]{16}\.csv" (:uri b)))
+        (is (= (files/uri (:file b)) (:uri b))
+            "one spelling of the location, minted by loci.files and not by the route")
+        (is (= "region,revenue\nEMEA,10\n" (slurp (io/file (files/dir) (:file b))))
+            "the pieces are in order and nothing is lost")
+        ;; Not merely SOME 16 hex characters: the hash of the WHOLE file. A
+        ;; finalize that hashed only the last chunk — or the first — would still
+        ;; match the regex above and still produce one plausible file.
+        (is (= (files/content-hash "region,revenue\nEMEA,10\n") (subs (:file b) 0 16))
+            "the name is the hash of everything that arrived, not of a chunk of it")
+        (is (= "sales.csv" (get (files/names) (:file b)))
+            "and the name it arrived with is remembered")
+        (is (empty? (.list (io/file (files/dir) ".partial")))
+            "the partial is gone once it lands")))))
+
+(deftest a-chunk-out-of-sequence-is-refused-rather-than-silently-misordered
+  (with-temp-data-dir
+    (fn []
+      (srv/source-upload! {:id "oos" :seq 0 :name "x.csv"} "a\n")
+      (let [part (io/file (files/dir) ".partial" "oos")
+            r    (srv/source-upload! {:id "oos" :seq 5 :name "x.csv"} "b\n")]
+        ;; **First, and not last.** This is the assertion that separates
+        ;; "refused" from "accepted in the wrong order" — both of which could
+        ;; answer an `:error` — and putting it after the message checks would
+        ;; mean a sabotage that returns no error at all never reaches it.
+        (is (= "a\n" (slurp part))
+            "the refused bytes are not appended")
+        (is (:error r))
+        (is (nil? (:uri r)))
+        ;; The phrase alone is a weak assertion — plenty of failures could put
+        ;; those three words in a sentence. The NUMBERS are the part only the
+        ;; sequence check knows: which chunk came, and which one was due.
+        ;; `str` rather than the raw value so that a missing error FAILS here
+        ;; instead of throwing out of the deftest.
+        (is (re-find #"chunk 5 arrived out of sequence" (str (:error r))))
+        (is (re-find #"expected 1" (str (:error r)))
+            "and it says what would have been accepted, so a client can resume")
+        (let [ok (srv/source-upload! {:id "oos" :seq 1 :name "x.csv" :final true} "b\n")]
+          (is (= "a\nb\n" (slurp (io/file (files/dir) (:file ok))))
+              "and a refusal does not poison the upload: the chunk that was due still lands"))))))
+
+(deftest an-upload-that-restarts-under-the-same-id-starts-over-rather-than-appending
+  ;; An abandoned upload leaves its entry in the expected-sequence map, and that
+  ;; entry outlives the browser that made it — there is no eviction and the
+  ;; design says there should not be one. Two things follow, and neither has
+  ;; another test: chunk 0 must not be checked against the leftover number, or
+  ;; a reused id is refused forever by a state nothing on disk backs; and chunk
+  ;; 0 must truncate rather than append, or the dead attempt lands glued to the
+  ;; front of the good file, under a hash OF the corrupt bytes.
+  (with-temp-data-dir
+    (fn []
+      (srv/source-upload! {:id "retry" :seq 0 :name "x.csv"} "DEAD")
+      (srv/source-upload! {:id "retry" :seq 1 :name "x.csv"} "ATTEMPT")
+      (let [a (srv/source-upload! {:id "retry" :seq 0 :name "x.csv"} "a,b\n")
+            r (srv/source-upload! {:id "retry" :seq 1 :name "x.csv" :final true} "1,2\n")]
+        (is (nil? (:error a)) "beginning again is never out of sequence")
+        (is (= 4 (:bytes a)) "and the working file holds only what the retry has sent")
+        (is (= "a,b\n1,2\n" (slurp (io/file (files/dir) (:file r))))
+            "the abandoned attempt is gone, not glued to the front")
+        (is (= (files/content-hash "a,b\n1,2\n") (subs (:file r) 0 16))
+            "so the retry is named by its own bytes and dedups against the same file uploaded any other way")))))
+
+(deftest re-uploading-identical-bytes-is-discarded-rather-than-rewritten
+  (with-temp-data-dir
+    (fn []
+      (let [one (srv/source-upload! {:id "dup1" :seq 0 :name "a.csv" :final true} "a\n1\n")
+            f   (io/file (files/dir) (:file one))
+            ;; **The file count cannot tell "discarded" from "overwritten".**
+            ;; One file remains either way and the uri is equal either way — and
+            ;; overwriting is the thing the spec forbids outright, because a
+            ;; `loci://` passthrough source re-reads its file on every query. A
+            ;; sentinel is what makes the two outcomes different: if the second
+            ;; upload rewrites the destination, this is gone.
+            _   (spit f "SENTINEL\n")
+            two (srv/source-upload! {:id "dup2" :seq 0 :name "b.csv" :final true} "a\n1\n")]
+        (is (= (:uri one) (:uri two)) "the same bytes are the same file")
+        (is (false? (:existed one)))
+        (is (true? (:existed two)) "and the second arrival knows it is not new")
+        (is (= "SENTINEL\n" (slurp f))
+            "a file whose name is its content is never rewritten")
+        (is (= 1 (count (remove #(.isDirectory %) (.listFiles (files/dir))))))
+        (is (empty? (.list (io/file (files/dir) ".partial")))
+            "and the discarded upload leaves no partial behind")
+        (is (= "b.csv" (get (files/names) (:file two)))
+            "the manifest is last-wins, so the name it most recently arrived under is the one it answers to")))))
+
+(deftest a-chunk-boundary-inside-a-multi-byte-character-survives-byte-exact
+  ;; The plan's route sketch was `(slurp (:body req))`, and this is the test
+  ;; that says why it could not stay. `slurp` decodes bytes to a String, a chunk
+  ;; boundary falls at an arbitrary byte, and a 4 MB slice of a real CSV lands
+  ;; mid-character sooner or later. Measured 2026-08-21 on exactly the bytes
+  ;; below: slurping the two halves and re-encoding turns 24 bytes into 28 —
+  ;; `c3 a9` comes back as `ef bf bd ef bf bd`, one replacement character per
+  ;; half. The file is content-addressed, so the corruption lands under a hash
+  ;; OF the corrupt bytes and is indistinguishable from a good file ever after.
+  ;;
+  ;; Written as \u00e9 and \u20ac escapes rather than as the characters
+  ;; themselves, so that the test cannot be broken by how this source file is
+  ;; decoded — which is the one thing it is about.
+  (with-temp-data-dir
+    (fn []
+      (let [text  "region,caf\u00e9\nEMEA,\u20ac10\n"
+            bs    (.getBytes text "UTF-8")
+            cut   (inc (count (.getBytes (subs text 0 (str/index-of text "\u00e9")) "UTF-8")))
+            head  (java.util.Arrays/copyOfRange bs 0 cut)
+            tail  (java.util.Arrays/copyOfRange bs cut (alength bs))
+            hex   (fn [^bytes a] (apply str (map #(format "%02x" %) a)))]
+        (srv/source-upload! {:id "utf8" :seq 0 :name "c.csv"} head)
+        (let [r      (srv/source-upload! {:id "utf8" :seq 1 :name "c.csv" :final true} tail)
+              landed (.readAllBytes (io/input-stream (io/file (files/dir) (:file r))))]
+          (is (java.util.Arrays/equals bs landed)
+              (str "byte for byte what was sent: expected " (hex bs) " got " (hex landed)))
+          (is (= (files/content-hash text) (subs (:file r) 0 16))
+              "and so it is named by the hash of the text itself — which is what makes a pasted CSV and an uploaded one the same file rather than two"))))))
+
+(deftest content-hash-agrees-between-a-string-and-the-file-holding-those-bytes
+  ;; Nothing else checks this and everything rests on it. A CSV pasted into
+  ;; `/api/import-csv` is hashed as a String; the same CSV uploaded is hashed by
+  ;; streaming the completed file, because reading a 200 MB upload into a String
+  ;; would undo the chunking the route exists for. If the two shapes disagreed,
+  ;; the same bytes would land twice under two names and the dedup this
+  ;; directory is built on would fail for exactly the pair a person is most
+  ;; likely to produce.
+  (let [text (apply str (repeat 9137 "r\u00e9gion,\u20ac,revenue\n"))
+        f    (doto (java.io.File/createTempFile "loci-hash" ".csv") .deleteOnExit)]
+    (io/copy (.getBytes text "UTF-8") f)
+    (is (< 65536 (.length f))
+        "longer than the 64 KB read buffer, so the streaming loop runs more than once")
+    (is (pos? (mod (.length f) 65536))
+        "and not a whole number of buffers, so a loop that digested the WHOLE buffer on its short last read would disagree")
+    (is (= (files/content-hash text) (files/content-hash f))
+        "a pasted CSV and the same CSV uploaded are one file")
+    (is (re-matches #"[0-9a-f]{16}" (files/content-hash f))
+        "sixteen hex characters, because this IS the filename")))
+
+(deftest an-upload-id-that-would-escape-the-files-directory-is-refused
+  ;; The id arrives in a header from the browser and names a file under
+  ;; `.partial`. It is the one caller-supplied string on this route that becomes
+  ;; a path, so it is the one that can be a directory traversal.
+  (with-temp-data-dir
+    (fn []
+      ;; **One legitimate upload first, so that `.partial` EXISTS before the bad
+      ;; ids are tried.** Without it, `.partial/../escaped.csv` fails on the
+      ;; missing directory rather than being refused, and the `escaped.csv`
+      ;; assertion below passes for a reason that has nothing to do with the
+      ;; guard. Measured 2026-08-21 by dropping the guard: four of the five
+      ;; assertions here failed and that one passed anyway.
+      (srv/source-upload! {:id "good" :seq 0 :name "ok.csv"} "a\n")
+      (doseq [bad ["../escaped.csv" "a/b" "" nil]]
+        (is (re-find #"unusable upload id" (str (:error (srv/source-upload! {:id bad :seq 0 :name "x.csv"} "a\n"))))
+            (str "refused: " (pr-str bad))))
+      (is (not (.exists (io/file (files/dir) "escaped.csv")))
+          "`.partial/../escaped.csv` resolves to `files/escaped.csv`, and the OS resolves it at write time whether or not Java normalised the path")
+      (is (= ["good"] (seq (.list (io/file (files/dir) ".partial"))))
+          "and no working file was made under any of the four bad names"))))
+
+(deftest the-upload-route-answers-through-the-URL
+  ;; A handler test rather than four more calls to `source-upload!`, for the
+  ;; reason its siblings above give: nothing else can catch a typo'd URI. It is
+  ;; also the only thing that exercises the header, which is where the metadata
+  ;; rides precisely so the body can stay raw bytes. `c/store` is rebound
+  ;; because `handler` binds `(store)` before the `cond` for every route.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))]
+        (let [post (fn [m body]
+                     (json/read-str
+                      (:body (srv/handler
+                              {:uri "/api/source/upload"
+                               :request-method :post
+                               :headers {"x-loci-upload" (json/write-str m)}
+                               :body (java.io.ByteArrayInputStream. (.getBytes ^String body "UTF-8"))}))
+                      :key-fn keyword))]
+          (post {:id "url1" :seq 0 :name "via-url.csv"} "a,b\n")
+          (let [r (post {:id "url1" :seq 1 :name "via-url.csv" :final true} "1,2\n")]
+            (is (nil? (:error r)))
+            (is (= "a,b\n1,2\n" (slurp (io/file (files/dir) (:file r))))
+                "the raw body is the chunk and the header is the metadata")
+            (is (= "via-url.csv" (get (files/names) (:file r)))
+                "the name off the header reaches the manifest"))
+          (let [r (json/read-str (:body (srv/handler {:uri "/api/source/upload"
+                                                      :request-method :post
+                                                      :headers {}}))
+                                 :key-fn keyword)]
+            (is (re-find #"X-Loci-Upload" (:error r))
+                "a request with no header is told what it is missing, not handed a stack trace")))))))

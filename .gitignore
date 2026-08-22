@@ -22,3 +22,19 @@ test/browser/failures/
 loci.env
 .env
 loci.env.bak-*
+
+# Scratch for anything that would otherwise land in /tmp, which on this machine
+# is a 7.8 GB tmpfs on a 15 GB box — RAM. DuckDB's JDBC driver extracts a 58 MB
+# native library into java.io.tmpdir on every JVM start (it deletes it on a
+# GRACEFUL exit, so a killed run leaks one), and the browser harness makes a
+# temp dir per server. Measured 2026-08-20: those filled /tmp to 100% mid-run
+# and stopped the build, with 9,918 leaked fixture directories.
+#
+# Two earlier measurements were distorted by the same thing — the 2026-08-08
+# Datahike/Datalevin benchmark ("on tmpfs it could not have been answered
+# anyway") and phase 1's 10M-row gate, which had to use /var/tmp by hand.
+#
+# The .gitkeep is tracked on purpose: Java does not create java.io.tmpdir, so
+# the directory has to exist on a fresh clone.
+.tmp/*
+!.tmp/.gitkeep

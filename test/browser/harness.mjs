@@ -41,7 +41,11 @@ const FLOW_FIXTURE = `
 // list of BARE urls. Molded :text by doc/raw and drawn through mdToHtml, so it
 // is the end-to-end wiring the clickable-URL test pins. Appended through
 // nb/cells-of for the same reason as above.
-const SOURCES_FIXTURE = `
+//
+// Named for the note's `## Sources` heading and NOT for an external source —
+// `SOURCES_FIXTURE` below is the one about `loci.source`, and the two would be
+// one name for two unrelated things.
+const RESEARCH_NOTE_FIXTURE = `
 (let [st  @c/store
       doc (str "A short fixture note, of the shape research! saves.\\n"
                "\\n"
@@ -113,6 +117,44 @@ export const RECLAIMED_FIXTURE = `
   (run! #(clojure.java.io/delete-file % true) fs))
 `;
 
+// The three faces a passthrough source can wear, one table each, in
+// space:cosmos. A passthrough table copies nothing — its handle IS the recipe —
+// so its bytes can change with no event committed, and these are the states that
+// produces.
+//
+// The files live under the server's own LOCI_DATA, which is what `loci://`
+// resolves against (`sourcespec/locate`), so the server can read them and the
+// fixture can break them by path.
+//
+// Both broken faces are broken AFTER connecting, which is the only way to reach
+// them: `connect!` reads the file first, so a source that was never readable
+// never lands at all. `gone.csv` is deleted — no file, so
+// `sourcespec/unreadable-because` answers and the marker is
+// `:table/unavailable`. `drift.csv` is rewritten with a different header — the
+// same path, a different shape, so nothing is unreadable and the marker is
+// `:table/source-drift`. Nothing else distinguishes them.
+//
+// The cell append is `connect!`'s own, through `nb/append-cell-event`, which
+// computes the new cell vector when the event LANDS and seeds it from
+// `nb/cells-of` — so it cannot erase space:cosmos's seeded members, which is the
+// hazard the fixtures above hand-roll `nb/cells-of` to avoid.
+//
+// Its own server for RECLAIMED_FIXTURE's reason: three objects and three cells,
+// and tags.test.mjs counts the corpus.
+export const SOURCES_FIXTURE = `
+(let [st  @c/store
+      dir (doto (java.io.File. (str (sub/data-dir) "/files")) .mkdirs)
+      w   (fn [n t] (spit (java.io.File. dir n) t) (str "loci://files/" n))
+      con (fn [n t title]
+            (loci.source/connect! st {:uri (w n t) :format :csv :mode :passthrough :title title}
+                                  "space:cosmos"))]
+  (con "live.csv"  "region,revenue\\nEMEA,10\\nAPAC,20\\n" "Live source")
+  (con "gone.csv"  "region,revenue\\nEMEA,10\\n"           "Gone source")
+  (con "drift.csv" "region,revenue\\nEMEA,10\\n"           "Drifted source")
+  (assert (.delete (java.io.File. dir "gone.csv")) "gone.csv was never written — nothing to break")
+  (spit (java.io.File. dir "drift.csv") "area,takings\\nEMEA,10\\n"))
+`;
+
 // The three storage shapes the panel has to draw, in one lake: a table with
 // versions old enough to reclaim, a table DuckLake inlined into catalog.duckdb,
 // and an orphan.
@@ -182,9 +224,9 @@ const TAG_FIXTURE = `
 const serverMain = extra => `
 (require '[loci.server :as srv] '[loci.content :as c] '[loci.substrate :as sub]
          '[loci.notebook :as nb] '[loci.lake :as lake] '[loci.tablestore :as tbl]
-         'clojure.java.io 'org.httpkit.server)
+         'loci.source 'clojure.java.io 'org.httpkit.server)
 ${FLOW_FIXTURE}
-${SOURCES_FIXTURE}
+${RESEARCH_NOTE_FIXTURE}
 ${FAMILY_FIXTURE}
 ${TAG_FIXTURE}
 ${extra}
@@ -230,7 +272,15 @@ async function bootServer(extra = '') {
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
-  const proc = spawn('clojure', ['-M', '-e', serverMain(extra)],
+  //
+  // -J-Djava.io.tmpdir: package.json's TMPDIR=.tmp moves node's own mkdtemp above,
+  // but a JVM ignores TMPDIR on Linux, and this spawn takes no alias — so every
+  // -Djava.io.tmpdir in deps.edn, which lives inside one, misses it. Each server
+  // here extracts DuckDB's ~58 MB native library, and deleteOnExit does not fire
+  // when we kill the group. Relative, so it resolves under cwd: REPO.
+  const proc = spawn('clojure',
+    ['-J--enable-native-access=ALL-UNNAMED', '-J-Djava.io.tmpdir=.tmp',
+     '-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
 

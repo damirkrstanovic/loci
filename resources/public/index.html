@@ -191,6 +191,43 @@
   .reclaimed .sec-h{color:var(--attn);margin-bottom:7px}
   .reclaimed p{margin:0;font-size:13px;line-height:1.55;color:var(--ink-2)}
   .reclaimed p+p{margin-top:7px}
+  /* a broken external source. The same box, because a reader has already learned
+     it — what differs is that this one ends in a button: a reclaimed table is
+     permanent, a broken source is fixable. */
+  .srcblock .actions{margin-top:10px}
+  /* and a live one's badge. --accent, not --attn: this reports where the rows
+     come from, it does not raise a state. */
+  .livebadge{display:flex;align-items:center;gap:8px;margin:0 0 9px;font-size:11.5px}
+  .livebadge .muted{color:var(--muted)}
+  .badge{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;padding:3px 7px;border-radius:3px;
+         background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent)}
+  /* scrubbed into the past: --attn, because this one DOES raise a state — the
+     rows on screen are not the rows at that point, and the badge is admitting it */
+  .badge.past{background:var(--attn-soft);border-color:var(--attn);color:var(--attn)}
+  /* ---- the ＋ Data panel: two doors, one panel ---- */
+  .dtabs{margin-bottom:11px}
+  /* a listing, not a grid: the name is what you read and the size is the tiebreak,
+     so the rows are one column of full-width targets rather than cards to scan */
+  .filelist{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto}
+  .filerow{display:flex;align-items:baseline;gap:10px;width:100%;text-align:left;cursor:pointer;font:inherit;
+           font-size:13px;border:1px solid var(--line);background:var(--white);border-radius:9px;padding:8px 11px}
+  .filerow:hover{border-color:var(--record)}
+  .filerow .fmeta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  /* the other door into the same directory. The listing can only offer what loci
+     already holds; a file on YOUR machine is not in it yet, and this is what puts
+     it there — after which it is an ordinary row, previewed and connected by the
+     same code a picked one is. */
+  .dupload{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 13px}
+  .dupload input[type=file]{font:inherit;font-size:12.5px;color:var(--ink-2);max-width:100%}
+  /* n/total while the chunks go, and the refusal if one is refused — the same
+     line, because they are the same question: where did the file get to? */
+  .dprog{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .dprog.bad{color:var(--attn)}
+  /* what `describe` answered, boxed so it reads as the FILE's shape and not as
+     the table's — there is no table yet, and that is the whole point of it */
+  .srcpreview{border:1px solid var(--line);border-radius:9px;padding:3px 11px 5px;background:var(--white);
+              max-height:280px;overflow:auto}
+  .dmode{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--ink-2)}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
   .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
@@ -536,6 +573,15 @@ const API = {
   ask: (prompt,space) => POST('/api/ask',{prompt,space}),
   keepNote: (space,title,text) => POST('/api/keep-note',{space,title,text}),
   importCsv: (title,csv,space) => POST('/api/import-csv',{title,csv,space}),
+  // an external file source. `describe` IS the dry run — it commits nothing and
+  // answers with the columns the file has right now, which is why the shell asks
+  // it rather than reading a drifted table's current columns out of the sentence
+  // the server sent. `connect` and `refresh` both write, and both answer with
+  // `{state, …}` the way importCsv does, so the caller's success path is the same.
+  sourceDescribe: src => POST('/api/source/describe',src),
+  sourceConnect: (src,space) => POST('/api/source/connect',Object.assign({space},src)),
+  sourceRefresh: id => POST('/api/source/refresh',{id}),
+  sourceFiles: () => fetch('/api/source/files').then(r=>r.json()),
   research: (space,prompt) => POST('/api/research',{space,prompt}),
   flow: (space,goal) => POST('/api/flow',{space,goal}),
   flowGate: (id,approve) => POST('/api/flow-gate',{id,approve}),
@@ -767,13 +813,42 @@ function editProse(i,idx,text){
   ed.querySelector('.prosed').focus();
 }
 
+// The inline forms a repaint would destroy — research, flow, ask, ＋ Data, the
+// prose editor and the ƒ palette. ONE definition, used by both guards below, so
+// the next panel someone adds is covered by both of them or by neither, rather
+// than by whichever one they remembered.
+//
+// Returns the ELEMENT and not a boolean, because `renderNotebook` needs its
+// identity: a form that was already there when a render started is one that
+// render is dismissing, while a DIFFERENT one appeared while it was in flight.
+const FORMSEL='#fq,#rq,#aq,.datapanel,.prosed,.fnpal';
+function formOpenIn(b){ return b?b.querySelector(FORMSEL):null; }
+
 async function renderNotebook(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
   // don't flash "loading…" (and reset scroll) when this notebook is already
   // painted — watchFlow re-renders every 2.5s; the fetch repaints fully below
   if(!b.querySelector('.cellwrap')) b.innerHTML='<div class="sec-h">loading notebook…</div>';
+  // What is open in this panel BEFORE the fetch. A form still standing when the
+  // answer lands is the one this render was called to dismiss — every Cancel
+  // (`#cancelImp`, `#cancelRes`, `#cancelFlow`, `#cancelAsk`, the prose
+  // editor's) calls renderBody while its own markup is still on screen, so
+  // skipping on presence alone would make Cancel a button that does nothing.
+  const wasOpen=formOpenIn(b);
   const nb=await API.notebook(sp.id,tat());
   if(mode!=='focus'||i!==focusIdx||openId) return;   // panel moved on while we fetched
+  // A DIFFERENT form is one somebody opened while we were fetching, and the
+  // wholesale `b.innerHTML=` below would throw it away along with whatever they
+  // had typed. Measured: the window is one fetch — 26 ms idle — which is why
+  // this raced three full-suite runs in five and never once in isolation.
+  //
+  // The cost, which is the right way round but should be written down rather
+  // than discovered: a notebook that finishes loading while a form is open does
+  // NOT repaint, so the cells behind that form can be one fetch stale until it
+  // closes. Losing what someone typed is worse than showing slightly old cells
+  // behind a panel they are looking at.
+  const nowOpen=formOpenIn(b);
+  if(nowOpen && nowOpen!==wasOpen) return;
   if(nb.error){ b.innerHTML='<div style="color:var(--attn);font-size:13px">'+esc(nb.error)+'</div>'; return; }
   let cellsH='';
   nb.cells.forEach(c=>{
@@ -817,7 +892,7 @@ async function renderNotebook(i){
     '<button class="btn ghost sm" id="sgBtn">✧ Suggest</button>'+
     '<button class="btn ghost sm" id="flowBtn">⚑ Flow</button>'+
     '<button class="btn ghost sm" id="draftBtn">✎ Draft</button>'+
-    '<button class="btn ghost sm" id="importBtn">＋ Import CSV</button>'+
+    '<button class="btn ghost sm" id="dataBtn">＋ Data</button>'+
     '<button class="btn ghost sm" id="tagBtn">⌗ tags</button></div>'+
     (nb['spawned-by']?'<div style="font-size:11px;font-family:var(--mono);color:var(--faint);margin-bottom:8px">spawned from <span class="ghostchip" data-space="'+esc(nb['spawned-by'].space)+'">'+esc(nb['spawned-by'].space)+'</span> · “'+esc(nb['spawned-by'].prompt||'')+'”</div>':'');
   // The outline. Only from two cells up: a one-cell notebook has nothing to
@@ -868,7 +943,7 @@ async function renderNotebook(i){
     applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
     showToast('Draft written by the agent (reversible)', undo);
   });
-  b.querySelector('#importBtn').addEventListener('click',()=>startImport(i));
+  b.querySelector('#dataBtn').addEventListener('click',()=>startData(i));
   b.querySelector('#tagBtn').addEventListener('click',()=>startTags(i));
   // Proposing writes nothing, so this changes the button and nothing else: the
   // notebook stays readable while the agent thinks, and putting it back needs no
@@ -888,6 +963,7 @@ async function renderNotebook(i){
     });
   });
   b.querySelector('#flowBtn').addEventListener('click',()=>startFlow(i));
+  wireSourceButtons(b,i);   // a cell draws the same block the molder does
   b.querySelectorAll('[data-remold]').forEach(sel=>sel.addEventListener('change',()=>cellOp(i,{op:'set-view',idx:+sel.dataset.remold,view:sel.value})));
   b.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>openObject(el.dataset.open)));
   b.querySelectorAll('[data-make]').forEach(el=>el.addEventListener('click',ev=>{ev.stopPropagation();makeOn(el.dataset.make);}));
@@ -1073,10 +1149,12 @@ function watchFlow(i, job){
   const tick=async()=>{
     let s; try{ s=await API.job(job); }catch(e){ setTimeout(tick,4000); return; }
     const ae=document.activeElement, typing=ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
-    // an open inline form (research/flow/import/ask/prose edit/ƒ palette) would be
-    // destroyed by a repaint even when unfocused — keep polling, skip the paint
+    // an open inline form would be destroyed by a repaint even when unfocused —
+    // keep polling, skip the paint. `formOpenIn` and not an inline selector: it
+    // is the same list `renderNotebook`'s post-await guard reads, and two copies
+    // of it would drift the first time a panel is added.
     const b=document.getElementById('body'+i);
-    const formOpen=b&&b.querySelector('#fq,#rq,#csv,#aq,#ctitle,.prosed,.fnpal');
+    const formOpen=formOpenIn(b);
     if(!TIME && !typing && !formOpen && mode==='focus' && focusIdx===i && !openId) renderBody(i);
     if(!s.done){ setTimeout(tick,2500); return; }
     const r=s.result||{error:s.error||'job lost'};
@@ -1089,25 +1167,271 @@ function watchFlow(i, job){
   };
   setTimeout(tick,1500);
 }
-function startImport(i){
+// ---------------- ＋ Data: two doors, one panel ----------------------------
+//
+// The action bar does not grow. It already carries seven buttons, and a second
+// "get data in" door beside `＋ Import CSV` would make a reader choose between
+// them before knowing the difference. So the button widened to `＋ Data` and
+// paste became ONE TAB of its panel rather than the whole of it — which is what
+// paste now is: one origin among several, and the most constrained.
+//
+// What earns the tabs rather than a file row bolted onto the paste panel is
+// `describe`. It commits nothing, so a file can be read and its columns shown
+// BEFORE anything lands — most of why connecting a file beats pasting one — and
+// that answer needs somewhere to live.
+function startData(i,tab){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
-  b.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
+  b.innerHTML='<div class="datapanel"><div class="actions dtabs">'+
+    '<button class="btn sm" data-tab="file">From a file</button>'+
+    '<button class="btn ghost sm" data-tab="paste">Paste</button></div>'+
+    '<div class="dbody"></div></div>';
+  const host=b.querySelector('.dbody');
+  const pick=t=>{
+    b.querySelectorAll('[data-tab]').forEach(el=>el.className='btn sm'+(el.dataset.tab===t?'':' ghost'));
+    (t==='paste'?dataPasteTab:dataFileTab)(i,sp,host);
+  };
+  b.querySelectorAll('[data-tab]').forEach(el=>el.addEventListener('click',()=>pick(el.dataset.tab)));
+  pick(tab==='paste'?'paste':'file');
+}
+// ~4 MB per request, and a `let` rather than a `const` because it is the one
+// number here a test needs to move: proving that a multi-byte character
+// straddling a chunk boundary survives means putting a boundary inside one, and
+// a 4 MB fixture in a browser test costs far more than that proof is worth.
+//
+// The size is http-kit's, not a guess. It buffers a whole request body in heap,
+// so the REQUEST is the thing that has to stay small — and 4 MB sits comfortably
+// under its default 8 MiB `:max-body`, which is why this phase adds no config
+// knob and makes no deployment judgement about a byte limit.
+let UPLOAD_CHUNK=4*1024*1024;
+// The upload id names a file under `.partial` and the server refuses anything
+// outside `[A-Za-z0-9_-]{1,64}`. randomUUID satisfies it and needs no thought —
+// the fallback is for a loci served over plain http to something that is not
+// localhost, where `crypto.randomUUID` is not defined at all.
+const uploadId=()=>(self.crypto&&crypto.randomUUID?crypto.randomUUID()
+  :'u'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10));
+// A header value is a BYTE string: a code point above U+00FF throws on the way
+// into `Headers`, and one between U+0080 and U+00FF goes out as a single Latin-1
+// byte the server would then read as UTF-8. The file's name is the one
+// caller-supplied string in this header, so it is escaped to pure ASCII — which
+// every JSON reader, `clojure.data.json` included, decodes back.
+const headerJson=o=>JSON.stringify(o).replace(/[\u007f-\uffff]/g,
+  c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
+// Send one file to /api/source/upload, a slice per request, and answer with the
+// last chunk's reply — `{file, uri, existed}`.
+//
+// **The body is the Blob and never a string.** Measured on the server side
+// 2026-08-21: decoding a chunk to text turns a 24-byte CSV split one byte into
+// the two bytes of `é` into 28 bytes, `c3 a9` coming back as
+// `ef bf bd ef bf bd` — one replacement character per half. The stored file is
+// content-addressed, so that corruption would land under a hash OF the corrupt
+// bytes and be indistinguishable from a good file forever after. `File.slice`
+// hands back bytes and `fetch` sends them; nothing on this path decodes, and
+// nothing on it may start to — no FileReader, no TextDecoder, no base64.
+//
+// The metadata rides in `X-Loci-Upload` for the same reason the route takes it
+// there: a JSON envelope with the chunk base64'd into a field would inflate
+// every chunk by a third and re-buffer the whole of it to decode, on a route
+// whose entire purpose is that the file never sits in memory.
+//
+// It does not connect. The caller hands the uri to `dataPreview`, which is the
+// picker's own path — so an upload is a file ARRIVING in loci's directory and
+// not a second way to connect one.
+async function uploadChunks(f,onProgress){
+  const id=uploadId(), total=Math.max(1,Math.ceil(f.size/UPLOAD_CHUNK));
+  let last=null;
+  for(let n=0;n<total;n++){
+    onProgress(n+1,total);
+    const r=await fetch('/api/source/upload',{method:'POST',
+      headers:{'X-Loci-Upload':headerJson({id,seq:n,name:f.name,final:n===total-1})},
+      body:f.slice(n*UPLOAD_CHUNK,Math.min(f.size,(n+1)*UPLOAD_CHUNK))});
+    last=await r.json();
+    if(last&&last.error) throw new Error(last.error);
+  }
+  return last;
+}
+// The file tab, in its two states — the listing, and one file's preview. Both
+// draw into the same host, and the preview offers a way back: a preview of the
+// wrong file is otherwise a dead end that costs you the whole panel.
+//
+// `/api/source/files` lists the DIRECTORY rather than anything loci recorded, so
+// a file dropped in by hand is offered and a file whose table exists but whose
+// bytes are gone is not.
+function dataFileTab(i,sp,host){
+  host.innerHTML='<div style="color:var(--muted);font-size:13px;padding:6px 0">reading the file list…</div>';
+  const back='<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
+  const wireCancel=()=>host.querySelectorAll('[data-a="dcancel"]')
+    .forEach(el=>el.addEventListener('click',()=>renderBody(i)));
+  // The upload row, drawn above the listing — and above the sentence that
+  // stands in for one when the directory is empty, which is precisely the state
+  // where uploading is the only thing there is to do.
+  const up='<div class="dupload"><input type="file" class="dupfile" accept=".csv,.parquet,.json">'+
+    '<span class="dprog"></span></div>';
+  const wireUpload=()=>{
+    const inp=host.querySelector('.dupfile'), prog=host.querySelector('.dprog');
+    if(!inp) return;
+    inp.addEventListener('change',async()=>{
+      const f=inp.files&&inp.files[0]; if(!f) return;
+      inp.disabled=true; prog.className='dprog';
+      let r;
+      try{ r=await uploadChunks(f,(n,t)=>{ prog.textContent=f.name+' — '+n+'/'+t; }); }
+      catch(e){
+        if(!host.isConnected) return;
+        // The panel keeps its listing and says what the server said. Every
+        // refusal this route can answer already has a sentence from phase 1;
+        // the one new one is a chunk out of sequence, and it names itself.
+        inp.disabled=false; inp.value='';
+        prog.className='dprog bad';
+        prog.textContent='upload: '+((e&&e.message)||'network error');
+        return;
+      }
+      if(!host.isConnected) return;
+      inp.disabled=false; prog.textContent='';
+      // `:existed` means the hash was already in the directory, so nothing was
+      // written — worth saying, because the file about to be previewed is the
+      // one loci had rather than the one you just chose. They are the same
+      // bytes; that is what a matching hash means.
+      if(r&&r.existed) showToast('loci already had these exact bytes — connecting the file it holds');
+      // The same `{file,name,uri,bytes}` shape the listing answers with, handed
+      // to the same preview a picked row gets. An upload is a file ARRIVING in
+      // loci's directory, and there is one describe→preview→connect flow.
+      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size});
+    });
+  };
+  API.sourceFiles().then(r=>{
+    if(!host.isConnected) return;    // the panel was closed while we asked
+    const files=(r&&r.files)||[];
+    if(r&&r.error){
+      host.innerHTML='<div class="reclaimed"><p>'+esc(r.error)+'</p></div>'+
+        '<div class="actions" style="margin-top:10px">'+back+'</div>';
+      wireCancel(); return;
+    }
+    if(!files.length){
+      host.innerHTML=up+'<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
+        'Nothing in loci’s files directory yet — upload one above, or paste is the other tab.</div>'+
+        '<div class="actions">'+back+'</div>';
+      wireCancel(); wireUpload(); return;
+    }
+    // The name the manifest remembers, or the file itself when it remembers
+    // none — a hand-placed file is listed under what it is called on disk,
+    // permanently, and that is not a degraded case.
+    host.innerHTML=up+'<div class="sec-h">or pick a file loci already has</div><div class="filelist">'+
+      files.map(f=>'<button type="button" class="filerow" data-file="'+esc(f.file)+'">'+
+        '<span class="fn">'+esc(f.name||f.file)+'</span>'+
+        '<span class="fmeta">'+esc(srcFormat(f.uri))+' · '+fmtBytes(f.bytes)+'</span></button>').join('')+
+      '</div><div class="actions" style="margin-top:11px">'+back+'</div>';
+    wireCancel(); wireUpload();
+    host.querySelectorAll('[data-file]').forEach(el=>el.addEventListener('click',()=>
+      dataPreview(i,sp,host,files.find(f=>f.file===el.dataset.file))));
+  }).catch(()=>{
+    if(!host.isConnected) return;
+    host.innerHTML='<div class="reclaimed"><p>loci could not read the file list.</p></div>'+
+      '<div class="actions" style="margin-top:10px">'+back+'</div>';
+    wireCancel();
+  });
+}
+// One file, described and not connected. `describe` IS the dry run — it reads
+// the file, answers with the columns it has right now, and commits nothing — so
+// this preview costs an event only if you go on to press Connect, and Cancel
+// owes no undo.
+//
+// All three of raw header, loci's column name and DuckDB's type, because the
+// three differ exactly where a surprise lives: `Total Revenue ($)` lands as
+// `total_revenue`, and a column that sniffs as VARCHAR when you expected a
+// number is the thing worth seeing BEFORE the table exists.
+function dataPreview(i,sp,host,f){
+  if(!f) return dataFileTab(i,sp,host);
+  const uri=f.uri, label=f.name||f.file,
+        // From the extension and never from a control: `srcFormat`'s own comment
+        // says why — a dropdown would be a second place to say it and so a
+        // second place to be wrong.
+        format=srcFormat(uri),
+        base=label.replace(/\.[a-z0-9]+$/i,'');
+  const head=n=>'<div class="sec-h">'+esc(label)+' · '+esc(format)+(n?' · '+n+' column'+(n===1?'':'s'):'')+'</div>';
+  const nav='<button class="btn ghost sm" data-a="dback">‹ another file</button>'+
+            '<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
+  const wireNav=()=>{
+    host.querySelectorAll('[data-a="dback"]').forEach(el=>el.addEventListener('click',()=>dataFileTab(i,sp,host)));
+    host.querySelectorAll('[data-a="dcancel"]').forEach(el=>el.addEventListener('click',()=>renderBody(i)));
+  };
+  host.innerHTML=head()+'<div style="color:var(--muted);font-size:13px;padding:6px 0">reading its columns…</div>';
+  API.sourceDescribe({uri,format}).then(d=>{
+    if(!host.isConnected) return;
+    if(!d||d.error||!d.cols||!d.cols.length){
+      host.innerHTML=head()+'<div class="reclaimed"><p>'+esc((d&&d.error)||('loci cannot read '+label))+'</p></div>'+
+        '<div class="actions" style="margin-top:10px">'+nav+'</div>';
+      wireNav(); return;
+    }
+    // The mode travels on the control as the word the SERVER knows, never as the
+    // word on the label. `connect!` refuses anything that is neither
+    // `materialise` nor `passthrough` BY NAME, which is a feature: a typo comes
+    // back as a message quoting what was sent. Translating "copy in" here would
+    // put loci's vocabulary in a second place and throw that away.
+    const rn='dmode'+i;
+    host.innerHTML=head(d.cols.length)+
+      '<div class="srcpreview"><table class="mold"><thead><tr>'+
+        '<th class="txt">header</th><th class="txt">column</th><th class="txt">type</th></tr></thead><tbody>'+
+        d.cols.map(c=>'<tr><td class="txt">'+esc(c.raw)+'</td><td class="txt">'+esc(c.col)+'</td>'+
+          '<td class="txt"><span class="chip">'+esc(c.type)+'</span></td></tr>').join('')+
+      '</tbody></table></div>'+
+      '<div class="actions" style="margin-top:11px">'+
+        '<input id="dtitle" placeholder="'+esc(base)+'" '+
+        'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
+        '<label class="dmode"><input type="radio" name="'+rn+'" value="materialise" checked> copy in</label>'+
+        '<label class="dmode"><input type="radio" name="'+rn+'" value="passthrough"> read live</label>'+
+        '<button class="btn sm" data-a="connect">Connect</button>'+nav+'</div>'+
+      '<div style="font-size:12px;color:var(--muted);margin-top:8px"><b>copy in</b> stores the rows in loci, '+
+      'so they stay as they are now. <b>read live</b> keeps the file as the truth and re-reads it every '+
+      'time — nothing is copied, and the rows change when the file does.</div>';
+    wireNav();
+    const btn=host.querySelector('[data-a="connect"]');
+    const go=async()=>{
+      if(TIME){ showToast('time mode — ↩ now to connect'); return; }
+      const title=host.querySelector('#dtitle').value.trim()||base;
+      const mode=host.querySelector('input[name="'+rn+'"]:checked').value;
+      const restore=()=>{ btn.disabled=false; btn.textContent='Connect'; };
+      btn.disabled=true; btn.textContent='connecting…';
+      let res; try{ res=await API.sourceConnect({uri,format,mode,title}, sp.id); }
+      catch(e){ restore(); showToast('connect: network error'); return; }
+      if(TIME){ showToast('finished — ↩ now to see it'); return; }
+      if(res.error){ restore(); showToast('connect: '+res.error); return; }
+      applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
+      // `res.mode` is read off the handle that was built, not echoed from the
+      // radio — the two disagreeing is the whole of the string-mode defect
+      // `connect!` was written against, so the toast quotes the answer.
+      showToast(res.mode==='passthrough' ? 'Connected — loci reads '+label+' live (reversible)'
+                                         : 'Connected — the rows were copied in (reversible)', undo);
+    };
+    btn.addEventListener('click',go);
+    host.querySelector('#dtitle').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
+    host.querySelector('#dtitle').focus();
+  }).catch(()=>{
+    if(!host.isConnected) return;
+    host.innerHTML=head()+'<div class="reclaimed"><p>loci could not read '+esc(label)+'.</p></div>'+
+      '<div class="actions" style="margin-top:10px">'+nav+'</div>';
+    wireNav();
+  });
+}
+// The paste tab — `startImport`'s body, moved and not rewritten, ids included.
+// A CSV you can paste is one somebody already has in a clipboard, which makes
+// this the narrowest of the doors and no longer the only one.
+function dataPasteTab(i,sp,host){
+  host.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
     'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
     '<button class="btn sm" id="goImp">Import</button><button class="btn ghost sm" id="cancelImp">Cancel</button></div>'+
     '<textarea id="csv" placeholder="paste CSV here — first row is the header" '+
     'style="width:100%;min-height:160px;margin-top:10px;font:12px/1.5 var(--mono);border:1px solid var(--line);border-radius:8px;padding:10px;box-sizing:border-box"></textarea>';
   const go=async()=>{
-    const csv=b.querySelector('#csv').value.trim(); if(!csv) return;
-    const title=b.querySelector('#ctitle').value.trim()||'Imported CSV';
+    const csv=host.querySelector('#csv').value.trim(); if(!csv) return;
+    const title=host.querySelector('#ctitle').value.trim()||'Imported CSV';
     const res=await API.importCsv(title, csv, sp.id);
     if(TIME){ showToast('finished — ↩ now to see it'); return; }
     if(res.error){ showToast('import: '+res.error); return; }
     applyState(res.state); openId=res.openId; rebuild(); openObject(res.openId);
     showToast('CSV imported as a table — reversible', undo);
   };
-  b.querySelector('#goImp').addEventListener('click',go);
-  b.querySelector('#cancelImp').addEventListener('click',()=>renderBody(i));
-  b.querySelector('#ctitle').focus();
+  host.querySelector('#goImp').addEventListener('click',go);
+  host.querySelector('#cancelImp').addEventListener('click',()=>renderBody(i));
+  host.querySelector('#ctitle').focus();
 }
 function startAsk(i){
   const sp=STATE.spaces[i], b=document.getElementById('body'+i);
@@ -1228,6 +1552,7 @@ function renderDetail(i,m){
   if(selEl) selEl.addEventListener('change',()=>remold(m.id, selEl.value));
   const eb=b.querySelector('#editbtn'); if(eb) eb.addEventListener('click',()=>startEdit(i,m));
   const mk=b.querySelector('#makebtn'); if(mk) mk.addEventListener('click',()=>startDo(i,m));
+  wireSourceButtons(b,i);
   b.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click',()=>openObject(el.dataset.open)));
   // A notebook is not a document. renderBody and renderNotebook have carried this
   // delegation all along; the molder had not needed it until an entity page drew a
@@ -1365,8 +1690,18 @@ function renderMold(m){
   // reach this one function, so the molder (renderDetail) and every notebook
   // cell say it with one guard.
   if(m.reclaimed) return reclaimedHTML(m);
+  // A broken external source, drawn as the state it is in. AFTER the reclaimed
+  // guard and never before it: a materialised source whose old lake version
+  // aged past the GC window is reclaimed AND sourced, and `source-block`'s cond
+  // answers `reclaimed` for it for exactly that reason — the two must not be
+  // able to disagree. Only the two repairable states land here; `live` and
+  // `stored` have their rows and render them like any other table.
+  if(m.source && (m.source.state==='unavailable'||m.source.state==='drift')){
+    if(m.source.state==='drift') askSourceNow(m);
+    return '<div class="srcblock" data-src="'+esc(m.id)+'">'+sourceHTML(m,SRCNOW[m.id])+'</div>';
+  }
   switch(m.kind){
-    case 'table':  return tableHTML(d);
+    case 'table':  return liveBadge(m)+tableHTML(d);
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
     case 'text':   return '<div class="moldtext">'+mdToHtml(d)+'</div>';
     case 'chart':  return chartSVG(d);
@@ -1458,6 +1793,140 @@ function reclaimedHTML(m){
     (cols.length?'<p>It had '+cols.length+' column'+(cols.length===1?'':'s')+': '+
        cols.map(c=>'<span class="chip">'+esc(c)+'</span>').join(' ')+'</p>':'')+
     '</div>';
+}
+// ---------------- an external source, and the two states you can repair ----
+//
+// A passthrough table copies nothing: its handle IS the recipe, so the file
+// stays the truth and its bytes can change with no event committed. `hydrate`
+// therefore degrades such a table with a marker rather than throwing, and the
+// server ships the state STRUCTURALLY on `m.source` — reading it back out of
+// `m.unusable`'s English is what `hydrate` itself refuses to do, and a shell
+// branching on `indexOf('unreachable')` would reintroduce exactly that.
+//
+// `loci://files/sales.csv` → `sales.csv`. The uri is what the recipe records;
+// the file name is what a reader recognises. Anything else comes back whole,
+// because a `file://` source has nowhere shorter to be.
+const srcFile = uri => String(uri||'').replace(/^loci:\/\/files\//,'');
+// The format from the extension, and never from a control: the three formats
+// the server reads map one-to-one onto extensions, so a second place to say it
+// would be a second place to be wrong. Unknown extensions ask as CSV, which is
+// what `read_csv`'s sniffer is for.
+const srcFormat = uri => (String(uri||'').toLowerCase().match(/\.(csv|parquet|json)$/)||[,'csv'])[1];
+
+// A drifted source's columns AS THEY ARE NOW, by object id — the actionable
+// half, and the half the recorded handle cannot know.
+//
+// One request per table rather than one per repaint: renderNotebook re-runs
+// every 2.5s while a flow is watched and calls renderMold once per cell, so the
+// key is written BEFORE the fetch and `id in SRCNOW` means "asked". A value of
+// null means the answer was no use — a source that is unreadable for a second
+// reason describes no better than it reads — and the block falls back to the
+// server's sentence, which names the columns in prose.
+const SRCNOW={};
+function askSourceNow(m){
+  const id=m.id;
+  if(id in SRCNOW) return;
+  SRCNOW[id]=null;
+  API.sourceDescribe({uri:m.source.uri, format:srcFormat(m.source.uri)}).then(d=>{
+    if(!d||!d.cols||!d.cols.length) return;
+    SRCNOW[id]=d.cols.map(c=>c.col);
+    // Patch every block drawn for THIS object — a notebook can show the same
+    // table in more than one cell — and rewire, because replacing the innerHTML
+    // discards the listeners renderDetail/renderNotebook attached to the
+    // buttons that were there.
+    document.querySelectorAll('.srcblock[data-src="'+id+'"]').forEach(el=>{
+      el.innerHTML=sourceHTML(m,SRCNOW[id]);
+      wireSourceButtons(el, panelIdx(el));
+    });
+  }).catch(()=>{});   // a network blip leaves the sentence standing — never a blank block
+}
+// A reclaimed table is permanent; a broken source is FIXABLE. That is the whole
+// reason this is not reclaimedHTML with different words — these are the only
+// table states in loci a person can repair, so the block ends in a button.
+//
+// The box is reclaimedHTML's on purpose: same `.reclaimed` frame, same `.sec-h`
+// heading, same column chips. Only the ending changes.
+//
+// Note the keys: clojure.data.json drops the namespace, so `:table/cols` arrives
+// as `cols` — reclaimedHTML reads it the same way.
+function sourceHTML(m, cur){
+  const s=m.source||{}, cols=m.cols||[], where=srcFile(s.uri);
+  const chips=cs=>cs.map(c=>'<span class="chip">'+esc(c)+'</span>').join(' ');
+  const act=(a,cls,label)=>'<button class="btn '+cls+'" data-a="'+a+'" data-id="'+esc(m.id)+'">'+label+'</button>';
+  const was=cols.length?'<p class="srcwas">It was connected as '+chips(cols)+'</p>':'';
+  if(s.state==='unavailable')
+    return '<div class="reclaimed"><div class="sec-h">source unreachable</div>'+
+      '<p>'+esc(m.unusable||('loci cannot read '+where))+'</p>'+was+
+      '<div class="actions">'+act('reconnect','sm','Reconnect…')+
+                              act('refresh','ghost sm','Try again')+'</div></div>';
+  if(s.state==='drift')
+    return '<div class="reclaimed"><div class="sec-h">the file’s columns changed</div>'+was+
+      // The chips come from /api/source/describe — a real dry run, committing
+      // nothing. `m.unusable` does name these columns, but only inside a
+      // sentence, and reading data back out of prose is the thing this design
+      // keeps refusing to do. It is the fallback and nothing more.
+      (cur&&cur.length ? '<p class="srcnow">'+esc(where)+' now has '+chips(cur)+'</p>'
+                       : '<p>'+esc(m.unusable||'')+'</p>')+
+      '<div class="actions">'+act('refresh','sm','Refresh — adopt the new columns')+
+                              act('reconnect','ghost sm','Reconnect…')+'</div></div>';
+  return '';
+}
+// The badge above a live table's rows — BESIDE them, never instead of them.
+// `:table/passthrough` says how a table is stored, never whether it is well, so
+// a live source renders its rows exactly as any other table does.
+//
+// No row count: `:table/total` rides the payload only on the degraded branch,
+// where the rows are gone and the count is the only thing left to say.
+// TIME is an event POSITION, not an instant (`{n,total,events}`), and it is
+// non-null at "now" too — paintTime's own comment says "read-only, at ANY
+// slider position". So `TIME.n<TIME.total` is the only correct test for "in
+// the past"; `!!TIME` would leave this badge lying at the "now" end of the
+// scrubber, exactly where a reader is most likely to trust it.
+//
+// A passthrough table's handle IS the recipe — every read inlines
+// `read_csv('…')` against whatever bytes sit on disk right now. `as-of`
+// rewinds loci's LOG, never the file, so scrubbed into the past there is no
+// other answer than today's file — this is the one place phase 2 has to say
+// something true rather than merely prettier.
+function liveBadge(m){
+  const s=m.source||{};
+  if(s.state!=='live') return '';
+  const past=TIME && TIME.n<TIME.total;
+  const cls=past?'badge past':'badge';
+  const label=past?'live source — showing current contents, not the contents at '+esc(timeCaption())
+                  :'live source';
+  return '<div class="livebadge"><span class="'+cls+'">'+label+'</span>'+
+    '<span class="muted">read from '+esc(srcFile(s.uri))+'</span>'+
+    '<button class="btn ghost sm" data-a="refresh" data-id="'+esc(m.id)+'">Refresh</button></div>';
+}
+// Which panel an element is in. The repairs need it because `startData` takes
+// a panel index, and a block patched in from askSourceNow's callback has no
+// index in hand.
+function panelIdx(el){ const p=el.closest('.panel'); return p?+p.dataset.i:focusIdx; }
+// The repairs, on both surfaces that draw a mold — the molder and a notebook
+// cell. Drawing a button on one of them and wiring only the other is a control
+// that does nothing, which is worse than no control.
+//
+// The id travels on the button rather than in `openId`: a cell's block is not
+// the open object, and in a notebook `openId` is null.
+function wireSourceButtons(root,i){
+  root.querySelectorAll('[data-a="refresh"]').forEach(el=>el.addEventListener('click',async ev=>{
+    ev.stopPropagation();
+    if(TIME){ showToast('time mode — ↩ now to refresh'); return; }
+    const id=el.dataset.id;
+    let r; try{ r=await API.sourceRefresh(id); }catch(e){ showToast('refresh: network error'); return; }
+    if(r.error){ showToast('refresh: '+r.error); return; }
+    if(TIME){ showToast('finished — ↩ now to see it'); return; }
+    delete SRCNOW[id];   // the recipe moved; what the file has now is what it is connected as
+    applyState(r.state); rebuild(); if(openId) openObject(openId);
+    showToast('Source re-read — reversible', undo);
+  }));
+  root.querySelectorAll('[data-a="reconnect"]').forEach(el=>el.addEventListener('click',ev=>{
+    ev.stopPropagation();
+    // The ＋ Data panel, on its file tab: picking a file is what it is for, and
+    // reconnecting IS picking a file. The same door, not a second one.
+    startData(i);
+  }));
 }
 function renderCards(rows){
   if(!rows||!rows.length) return '<i>empty</i>';

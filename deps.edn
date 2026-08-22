@@ -9,26 +9,54 @@
         datalevin/datalevin    {:mvn/version "1.0.0"}
         org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}}
 
+ ;; **`-Djava.io.tmpdir=.tmp` on every alias that RUNS loci, and it is RELATIVE.**
+ ;;
+ ;; /tmp on the machine this was built on is a 7.8 GB tmpfs on a 15 GB box, so
+ ;; everything written there is RAM. DuckDB's JDBC driver extracts a 58 MB native
+ ;; library into java.io.tmpdir on every JVM start, and the browser harness makes
+ ;; a temp directory per server. Both clean up on a GRACEFUL exit and neither
+ ;; gets one when a run is killed. Measured 2026-08-20: /tmp reached 100%
+ ;; mid-session and stopped the build, holding ~4 GB of leaked libraries and
+ ;; 9,918 fixture directories. It had already distorted two measurements — see
+ ;; the 2026-08-08 Datahike bench and phase 1's 10M-row gate, which reached for
+ ;; /var/tmp by hand.
+ ;;
+ ;; Relative because deps.edn cannot interpolate a path, and `clojure` always
+ ;; runs from the directory holding this file. **The consequence to know:**
+ ;; `(str (System/getProperty "java.io.tmpdir") "/x")` is now a relative
+ ;; path, which is fine as a path and NOT fine concatenated after `file://` — a
+ ;; file URI needs an absolute path or the first segment reads as a host. Build
+ ;; one with `(.getAbsolutePath (io/file tmp name))`. That caught
+ ;; `loci.source-test`'s parquet fixture on the day this landed. `locate` now
+ ;; refuses such a URI outright rather than resolving it — see `loci.sourcespec`.
+ ;;
+ ;; **`:build` is the exception, and wants to be.** Its JVM runs tools.build and
+ ;; never opens DuckDB, so nothing extracts the 58 MB native library there. The
+ ;; AOT compile that DOES load loci runs in a JVM `compile-clj` forks, which
+ ;; takes its flags from build.clj's `:java-opts` and inherits nothing from here.
+ ;; What the property would move is tools.build's own compile working directory,
+ ;; which it hands to that subprocess as a classpath entry and assumes absolute —
+ ;; so setting it here buys nothing and risks the paragraph above.
  :aliases
  ;; the loci shell — Clojure substrate served to a web frontend
  ;; run:  clojure -M:serve   then open http://localhost:7777
  {:serve {:main-opts ["-m" "loci.server"]
-          :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+          :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; headless demo of layers 1/2/4 — no server, no browser
   :demo  {:main-opts ["-m" "loci.demo"]
-          :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+          :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; run the unit tests:  clojure -M:test
   :test  {:extra-paths ["test"]
           :extra-deps  {io.github.cognitect-labs/test-runner
                         {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
           :main-opts   ["-m" "cognitect.test-runner"]
-          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; one-shot import of the old EDN log into Datalevin:  clojure -M:migrate
   :migrate {:main-opts ["-m" "loci.migrate"]
-            :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+            :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; re-measure the merge threshold after changing LOCI_EMBED_MODEL — a
   ;; threshold belongs to one embedding model and does not travel:
@@ -36,7 +64,7 @@
   ;; The path is required; there is no default, so this cannot be pointed at
   ;; your real memory by accident. It reads and never writes.
   :calibrate {:main-opts ["-m" "loci.calibrate"]
-              :jvm-opts  ["--enable-native-access=ALL-UNNAMED"]}
+              :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; an nREPL for editor/agent tooling (ClojureMCP starts this itself via
   ;; :start-nrepl-cmd). Deliberately WITHOUT :extra-paths ["dev"] — a REPL that
@@ -53,16 +81,16 @@
   :nrepl {:extra-paths ["test"]
           :extra-deps  {nrepl/nrepl {:mvn/version "1.3.1"}}
           :main-opts   ["-m" "nrepl.cmdline" "--port" "7888"]
-          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; Clerk notebook (the earlier render target). Both reach the substrate
   ;; through notebooks/loci.clj, so both need the native-access flag too.
   :dev   {:extra-paths ["dev" "notebooks"]
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
-          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]}
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
   :start {:extra-paths ["dev" "notebooks"]
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
-          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
+          :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]
           :exec-fn     user/start}
 
   ;; the uberjar:  clojure -T:build uber   ->  target/loci-standalone.jar

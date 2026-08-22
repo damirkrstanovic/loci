@@ -16,6 +16,7 @@
             [loci.content :as c]
             [loci.embed :as embed]
             [loci.entities :as ent]
+            [loci.files :as files]
             [loci.fnlib :as fnlib]
             [loci.lake :as lake]
             [loci.lakegc :as gc]
@@ -367,6 +368,50 @@
   (vec (concat (mapv (fn [[vid lbl]] [(kw->str vid) lbl]) (:alternatives (mold/mold (:value o))))
                (mapv (fn [v] [(:id v) (get-in v [:value :label])]) (dynamic-views st (:id o))))))
 
+(defn- source-block
+  "What the shell needs to draw a sourced table, as data rather than as prose.
+
+   **The state is structural on purpose.** `:unusable` carries a sentence and
+   the sentence names the failure, but reading a state back out of English is
+   exactly what `tablestore/hydrate` refuses to do — it asks the filesystem
+   through `sourcespec/unreadable-because` rather than matching on DuckDB's
+   words, because the driver's wording is not a contract. A shell branching on
+   `indexOf('unreachable')` would reintroduce that.
+
+   **The `cond` mirrors `tbl/unusable`'s precedence by construction, `reclaimed`
+   first for the same reason it is first there.** Both read the same markers off
+   the same hydrated object — two views of one `hydrate`, not two independent
+   judgments — so they must never be able to disagree. They did once: a
+   MATERIALISED source whose old lake version aged past the GC window reclaimed
+   like any other table, and this `cond` answered `stored` for it — live and
+   well — while `:unusable` said its rows were reclaimed. Reachable by ordinary
+   use: connect, refresh, wait out the window, browse with `?at=`.
+
+   Five states, not four. `stored` is still the one that is easy to leave out
+   on the happy path: a materialised source that has NOT been reclaimed is
+   neither live nor broken and still has a recipe, so it still refreshes —
+   refresh belongs to any table with a `:source`, the live badge belongs only
+   to `:passthrough`.
+
+   nil for a table nobody connected — absent rather than a block saying nothing,
+   so the shell's test is `if (m.source)` and not a comparison against a
+   sentinel."
+  [o]
+  (when-let [src (:source o)]
+    {:state (cond (:table/reclaimed o)    "reclaimed"
+                  (:table/unavailable o)  "unavailable"
+                  (:table/source-drift o) "drift"
+                  (:table/passthrough o)  "live"
+                  :else                   "stored")
+     :uri   (:uri src)
+     ;; Total rather than `(name …)`, which throws on nil and on anything not
+     ;; Named. `connect!`'s `mode-of` refuses those, so the sanctioned path
+     ;; cannot produce one — but a `:source` written by hand from a REPL can,
+     ;; and that is a path CLAUDE.md sanctions. A bad mode should cost this one
+     ;; key, not every `/api/mold` and `/api/object` read of the object.
+     :mode  (let [m (:mode src)]
+              (when (or (keyword? m) (string? m)) (name m)))}))
+
 (defn mold-payload
   "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
    every `:ref` cell of a notebook payload is built out of.
@@ -412,7 +457,7 @@
       ;; that key today and teaching it the other three is Phase 2.
       (tbl/unusable o)
       {:id id :title (:title o) :kind "table" :reclaimed (:table/reclaimed o)
-       :unusable (tbl/unusable o)
+       :unusable (tbl/unusable o) :source (source-block o)
        :table/total (:table/total o) :table/cols (:table/cols o)
        :rendered [] :alternatives []}
       ;; an ENTITY — no viewers, the shell draws the same page it draws before
@@ -451,13 +496,15 @@
       (let [vo (sub/object st view)]
         {:id id :title (:title o) :kind "applet" :view view
          :label (get-in vo [:value :label]) :code (get-in vo [:value :code])
-         :rendered (:value o) :alternatives (alternatives st o)})
+         :rendered (:value o) :alternatives (alternatives st o)
+         :source (source-block o)})
       ;; an agent-proposed view-spec — interpret it deterministically
       (and view (str/starts-with? view "view:"))
       (let [vo (sub/object st view)
             {:keys [kind rendered]} (vs/interpret (get-in vo [:value :spec]) (:value o))]
         {:id id :title (:title o) :kind (name kind) :view view
-         :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)})
+         :label (get-in vo [:value :label]) :rendered rendered :alternatives (alternatives st o)
+         :source (source-block o)})
       ;; a built-in viewer. `mv`, not `m`: `m` is this function's MEMORY, and
       ;; shadowing it here would be correct only for as long as this branch never
       ;; needs the memory — which is exactly the assumption the entity branch
@@ -465,7 +512,8 @@
       :else
       (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
         {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
-         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)}))))
+         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)
+         :source (source-block o)}))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -2067,22 +2115,6 @@
   (try (assoc (src/refresh! st id) :state (state-payload st))
        (catch Exception e {:error (.getMessage e)})))
 
-(defn- content-hash
-  "The first 16 hex characters of `text`'s SHA-256 — the whole name of the file
-   holding that text.
-
-   Sixteen because this IS the filename rather than a suffix on one: 64 bits,
-   so two different CSVs collide at around four billion files, and `data/files`
-   holds one entry per distinct import. The same digest `lake/table-name`
-   truncates for the same reason, kept longer here because there is no other
-   component to fall back on."
-  [text]
-  (->> (.getBytes (str text) "UTF-8")
-       (.digest (java.security.MessageDigest/getInstance "SHA-256"))
-       (take 8)
-       (map #(format "%02x" %))
-       (apply str)))
-
 (defn import-csv!
   "Posted CSV **text** → a table, through the same reader as every other source.
 
@@ -2114,8 +2146,8 @@
    `res.state` and `res.openId`, and those three keys are added there."
   [st title csv space]
   (let [written
-        (try (let [dir (io/file (sub/data-dir) "files")
-                   nm  (str (content-hash csv) ".csv")
+        (try (let [dir (files/dir)
+                   nm  (str (files/content-hash csv) ".csv")
                    f   (io/file dir nm)]
                (.mkdirs dir)
                ;; **The name IS the content, and nothing else is in it.**
@@ -2159,7 +2191,7 @@
              (catch Exception e {:error (.getMessage e)}))]
     (if (map? written)
       written
-      (let [uri  (str "loci://files/" written)
+      (let [uri  (files/uri written)
             ;; The table this exact file already made, if any. One pass over
             ;; the objects, which `mint-id` inside `connect!` is about to make
             ;; anyway. Reported rather than refused: two tables from one file
@@ -2172,6 +2204,67 @@
                                       :title (or (not-empty title) "Imported CSV")}
                                   space)]
         (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
+
+(defn source-files
+  "`GET /api/source/files` — `files/listing` under the key the shell reads.
+
+   All of the thinking is in `loci.files`, which owns the directory: where it
+   is, what in it counts as content, and how a file in it is spelled as a
+   location. What is left here is the envelope, and it is a real thing rather
+   than an alias — `{:files […]}` is the JSON contract `API.sourceFiles()`
+   destructures, and a bare vector would be a second answer shape among routes
+   that all answer maps."
+  []
+  {:files (files/listing)})
+
+(defn source-upload!
+  "`POST /api/source/upload` — one chunk of a file being uploaded from the
+   browser. Answers `{:id :seq :bytes}` while the file is still arriving, and
+   `{:file :uri :existed}` once `:final` lands it.
+
+   **It does not connect.** The panel takes the `:uri` and calls the shipped
+   `/api/source/describe` and `/api/source/connect` with it, so the preview a
+   person is looking at survives the upload and there is one connect path
+   rather than two — the same reason `import-csv!` goes through
+   `source-connect!` instead of `src/connect!`.
+
+   Chunked because http-kit buffers a whole request body in heap: measured
+   during this phase, one request per file puts the whole file there, and one
+   request per 4 MB slice never does. Everything after the buffer streams —
+   `files/append-chunk!` copies to disk and `files/content-hash` digests from
+   disk — so the completed file is never in memory at any size.
+
+   The envelope is all that is left here. The rules — the sequence, the
+   `.partial` working file, the hash, the discard-don't-rewrite — are
+   `loci.files`'s, which owns the directory they are about. Those throw, and
+   this is the `try`/`catch` that turns a throw into the `{:error …}` every
+   other route in this file answers with."
+  [{:keys [id final] s :seq nm :name} chunk]
+  (try
+    ;; `append-chunk!`'s own answer is passed through rather than rebuilt: its
+    ;; `:bytes` is the partial's length on disk, which is the one progress
+    ;; number the browser cannot compute — it knows what it SENT, not what
+    ;; landed.
+    (let [landed (files/append-chunk! id s chunk)]
+      (if final
+        (files/finish-upload! id nm)
+        landed))
+    (catch Exception e {:error (.getMessage e)})))
+
+(defn- upload-meta
+  "The `X-Loci-Upload` header — `{id, seq, name, final}` — as a map.
+
+   **The metadata rides in a header and the chunk IS the raw body.** The
+   alternative, a JSON envelope with the chunk base64'd into a field, inflates
+   every chunk by a third and re-buffers the whole of it to decode — on a route
+   whose entire purpose is that the file never sits in memory.
+
+   A missing or unparseable header answers `nil`, which `source-upload!` turns
+   into a sentence about the header rather than a stack trace about `nil`."
+  [req]
+  (try (let [m (json/read-str (get-in req [:headers "x-loci-upload"]) :key-fn keyword)]
+         (when (map? m) m))
+       (catch Exception _ nil)))
 
 (defn- next-id-in
   "`next-id` over an objects map already in hand.
@@ -3229,6 +3322,21 @@
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
       (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
+      (= uri "/api/source/files")(json-resp (source-files))
+      ;; `(:body req)` is handed STRAIGHT to `source-upload!` — no `slurp`, and
+      ;; that is load-bearing rather than a style choice. `slurp` decodes bytes
+      ;; to a String, and a chunk boundary falls at an arbitrary byte: measured
+      ;; 2026-08-21, splitting `region,café\nEMEA,€10\n` one byte into the two
+      ;; bytes of `é` and slurping each half turns 24 bytes into 28 — `c3 a9`
+      ;; comes back as `ef bf bd ef bf bd`, two replacement characters, one per
+      ;; half. The file is content-addressed, so the corruption would land under
+      ;; a hash OF the corrupt bytes and be indistinguishable from a good file
+      ;; forever after. The body streams to disk as bytes and is never a String.
+      (= uri "/api/source/upload")
+      (json-resp (if-let [m (upload-meta req)]
+                   (source-upload! m (:body req))
+                   {:error (str "POST /api/source/upload needs an X-Loci-Upload "
+                                "header carrying {id, seq, name, final}")}))
       (= uri "/api/notebook")(if (= :post (:request-method req))
                                (json-resp (notebook-op! st (body-json req)))
                                (json-resp (notebook-payload (store-at st (params "at")) (params "id"))))
@@ -3350,6 +3458,25 @@
   (.join thread 2000)
   (not (.isAlive thread)))
 
+(defn sweep-partials-at-boot!
+  "Clear abandoned upload partials, and say so only if there were any. Returns
+   the names removed.
+
+   Its own var rather than a line inside `-main`, for the reason
+   `start-chunk-sweep!` and `close-lake-at-exit!` are: `-main` ends in
+   `@(promise)` and can never be called by a test, so anything boot does that a
+   test should be able to see has to be a function boot calls.
+
+   At boot and nowhere else, because it needs no thread and no timer. The 24
+   hours `files/sweep-partials!` measures against is what makes an in-flight
+   upload safe from it, not the moment it runs — a restart mid-upload loses that
+   transfer anyway, since the browser is posting to a process that is gone."
+  []
+  (let [gone (files/sweep-partials!)]
+    (when (seq gone)
+      (println (str "  swept " (count gone) " abandoned upload partial(s)")))
+    gone))
+
 (defn- close-lake-at-exit!
   "Register the shutdown hook that closes `lk`, and return the thread.
 
@@ -3435,6 +3562,7 @@
     (reset! server (http/run-server #'handler {:port port}))
     (println (str "loci shell on http://localhost:" port
                   "  (substrate: " dir ", " (count (sub/history (store))) " events)"))
+    (sweep-partials-at-boot!)
     ;; The embedding backfill, started HERE and nowhere else. loci.memory spawns
     ;; nothing on require, so a test or a REPL that loads it leaves no thread
     ;; behind; a server process is the one place that wants a timer.

@@ -21,6 +21,21 @@
 - **A `"` inside a Clojure docstring must be `\"`** in the source, or you get a `defn` macroexpansion error. Script languages eat one backslash level.
 - **Never use an unanchored global find-and-replace on source.** One on this branch changed `(take 6)` → `(take 8)` for a hash width and silently broke an unrelated cap.
 - `:reload` does not drop vars for renamed-away tests — `(remove-ns 'the.ns)` first. Reloading `loci.tablestore` invalidates `reify`s in `loci.tablestore-test`.
+- **A client-side timeout does not stop DuckDB.** The REPL tool times out at 20 s; a native JDBC call
+  keeps running server-side and does not reliably honour an interrupt. Re-issuing `run-tests`
+  immediately then races the first run, and two concurrent `with-temp-lake` fixtures stomp the same
+  globally-`with-redefs`'d `lake/lake` var and close each other's connections — producing a wall of
+  unrelated `Connection was closed` failures across the whole namespace. Observed 2026-08-20. Wait for
+  the REPL to go idle before re-running, and treat a sudden broad connection failure as this before
+  treating it as a finding.
+- **Ask what the assertion looks like when the mechanism is absent.** The sabotage step catches a
+  broken fix, not a broken assertion — five assertions on these two phases could not have failed, and
+  running the sabotage found none of them. Task 2's `/takings/` check over the whole page is the
+  clearest: DuckDB's own error message in the fallback already contains the column names, so it
+  passed against a block that fetched nothing. **Print what the sabotaged output actually says and
+  read it.** Prefer a scoped element you created over a substring of the page, and a value only the
+  mechanism can produce over one the failure mode also produces. If a sabotage fails a *different*
+  assertion than you expected, that is a finding about the test.
 - **Prove every test bites.** Break the fix, re-run, confirm FAIL, restore. **If a sabotage reports 0 failures, that is a finding about your sabotage** — four tests on phase 1 could not fail, two of them written by the plan's author.
 - End every commit message with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 
@@ -136,7 +151,8 @@ In `src/loci/server.clj`, above `mold-payload`, add:
    sentinel."
   [o]
   (when-let [src (:source o)]
-    {:state (cond (:table/unavailable o)  "unavailable"
+    {:state (cond (:table/reclaimed o)    "reclaimed"
+                  (:table/unavailable o)  "unavailable"
                   (:table/source-drift o) "drift"
                   (:table/passthrough o)  "live"
                   :else                   "stored")
@@ -144,7 +160,14 @@ In `src/loci/server.clj`, above `mold-payload`, add:
      :mode  (name (:mode src))}))
 ```
 
-Then in `mold-payload`, add `:source (source-block o)` to **both** the degraded branch (the one testing `(tbl/unusable o)`) and the normal table branch. Find the normal branch by looking for where `:rendered` is built from `mold/mold`; add the key to the same map.
+Then add `:source (source-block o)` to **every branch of `mold-payload` that can render a table** — there are four, and an earlier draft of this plan said two:
+
+1. the degraded branch — the clause testing `(tbl/unusable o)`
+2. the normal viewer branch — the trailing `:else`, where `:rendered` comes from `mold/mold`
+3. the `app:` branch — `(and view (str/starts-with? view "app:"))`
+4. the `view:` branch — `(and view (str/starts-with? view "view:"))`
+
+Branches 3 and 4 are reachable with a hydrated table: `make-view!` and `describe!` each refuse a non-table and then call `mold-payload` with the minted id as `view`. Leaving them out means a broken passthrough source renders silently empty when opened through a code view — the defect phase 2 exists to remove, arriving through a different door. `source-block` is pure and cheap: a payload key present and not yet drawn costs nothing, a missing one forces a second server change later.
 
 - [ ] **Step 4: Run them, confirm they PASS**
 
@@ -424,16 +447,21 @@ test('scrubbed into the past, a live source says it is still showing now', async
 
 - [ ] **Step 3: Implement**
 
-In `liveBadge`, replace the badge span with:
+**Two facts to build on, both checked 2026-08-20 — an earlier draft of this step got both wrong:**
+
+1. **`TIME` is not an instant.** It is `{n, total, events}` — an event *position* (`index.html:625`). There is no `fmtTime`. The shell already has **`timeCaption()`** (`index.html:1880`) which renders exactly the phrase wanted: `event 12/40 · <label> · <localised date>`, or `the beginning — before the first event`. **Reuse it.**
+
+2. **`TIME` is non-null at *any* slider position, including "now".** `paintTime`'s own comment says so: *"time mode on ⇒ read-only, at ANY slider position"*, and `timeCaption` tests `TIME.n >= TIME.total` for the now case. So `!!TIME` is the **wrong** test for "in the past" — a badge built on it would claim the reader is not seeing current contents while the scrubber sits at now. The test is `TIME && TIME.n < TIME.total`.
+
+In `liveBadge`, make the label conditional on that:
 
 ```javascript
-  const past = !!TIME;
-  const label = past ? 'live source — showing current contents, not the contents at '+esc(fmtTime(TIME))
+  const past  = TIME && TIME.n < TIME.total;   // NOT !!TIME — see above
+  const label = past ? 'live source — showing current contents, not the contents at '+esc(timeCaption())
                      : 'live source';
-  return '<div class="livebadge"><span class="badge'+(past?' past':'')+'">'+label+'</span> '+ …
 ```
 
-Use whatever the shell already calls to format a scrub instant — `grep -a -n "toLocaleString" resources/public/index.html` and reuse it rather than adding a formatter.
+and give the span the `past` class when it applies, so the badge changes colour as well as wording.
 
 - [ ] **Step 4: Run it, confirm it PASSES.**
 
