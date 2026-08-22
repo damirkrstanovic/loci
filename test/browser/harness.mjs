@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 
@@ -273,13 +273,27 @@ async function bootServer(extra = '') {
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
   //
-  // -J-Djava.io.tmpdir: package.json's TMPDIR=.tmp moves node's own mkdtemp above,
-  // but a JVM ignores TMPDIR on Linux, and this spawn takes no alias — so every
-  // -Djava.io.tmpdir in deps.edn, which lives inside one, misses it. Each server
-  // here extracts DuckDB's ~58 MB native library, and deleteOnExit does not fire
-  // when we kill the group. Relative, so it resolves under cwd: REPO.
+  // -J-Djava.io.tmpdir: a JVM ignores TMPDIR on Linux, and this spawn takes no
+  // alias — so every -Djava.io.tmpdir in deps.edn, which lives inside one, misses
+  // it. This JVM extracts DuckDB's ~58 MB native library on first use, and
+  // deleteOnExit cannot fire because we kill the process group. Pointing it at
+  // `dir` — the per-server directory reap() and stop() already rm -rf — means the
+  // library is removed by whoever removes the server: no sweep to write, and no
+  // risk of deleting a library another JVM (the nREPL, a concurrent suite) still
+  // has mapped. Replaces `-Djava.io.tmpdir=.tmp`, which moved the leak off tmpfs
+  // without ending it: measured 2026-08-22, one run of sources.test.mjs left one
+  // more 58 MB .so in .tmp and this leaves none.
+  //
+  // `resolve` because `dir` is NOT absolute, contrary to how it reads: package.json
+  // sets TMPDIR=.tmp and node's os.tmpdir() hands that back verbatim, so mkdtemp
+  // returns the relative `.tmp/loci-browser-…`. Relative resolves fine as a path
+  // under cwd: REPO — but java.io.tmpdir is a property loci itself reads, and a
+  // relative one concatenated after `file://` reads its first segment as a host.
+  // That is the trap 5a11360 fixed and deps.edn documents at length; absolute
+  // here costs nothing and cannot spring it. Resolved against node's own cwd,
+  // which is where mkdtemp just made it.
   const proc = spawn('clojure',
-    ['-J--enable-native-access=ALL-UNNAMED', '-J-Djava.io.tmpdir=.tmp',
+    ['-J--enable-native-access=ALL-UNNAMED', `-J-Djava.io.tmpdir=${resolve(dir)}`,
      '-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
