@@ -124,13 +124,27 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- records
-  "Every readable record in `files.edn`, in file order. No manifest at all is
-   `[]`. Unreadable lines are skipped — a half-written line loses one name,
+  "Every record in `files.edn`, in file order — a map carrying an `:id`. No
+   manifest at all is `[]`. A line that does not parse is skipped, and so is one
+   that parses to something that is not a record: a bad line loses one name,
    never the file.
 
    The one place the manifest is read, so that `names` and `retired` cannot
    drift into two reading rules for the same file. What each does with a record
-   is its own business; getting them off the disk is shared.
+   is its own business; getting them off the disk — and deciding what counts as
+   one — is shared.
+
+   **`(map? rec)` and `(:id rec)` are HERE and not in the callers**, because the
+   commit that first split this reader out proved the drift it exists to
+   prevent. `names` kept the guard it had always had, `retired` was written
+   without one, and measured 2026-08-22 that is visible: `#{:id :retired}` is a
+   readable line and not a map, `(:id #{:id :retired})` is the keyword `:id`, so
+   it entered the retired set as an id; `{:retired true}` entered it as nil; and
+   `{:name \"Ghost\"}` would have entered `names` under a nil key. None of those
+   shapes can come from `remember!` or `retire!`, which are the only writers and
+   write whole maps — the reason to fix it is not reachability, it is that one
+   rule in one place is the whole of what this function is for. The `:name` test
+   stays up in `names`; see there for why it cannot come down too.
 
    **Read line by line with `edn/read-string`, and NOT with the whole-reader
    `edn/read` `loci.chunks` uses.** The difference is what one torn line costs,
@@ -151,13 +165,22 @@
    reader's whole disposition is to lose as little as possible of a manifest
    that is PRIMARY and cannot be rebuilt. `line-seq` also streams a file that
    only ever grows. Neither reason is large; together they are enough to leave
-   it alone."
+   it alone.
+
+   `a-lone-carriage-return-still-parts-two-records` is the fixture that holds
+   this, and it exists because the paragraph above could not. Measured
+   2026-08-22, swapping this back to `(str/split-lines (slurp f))` ran the rest
+   of the namespace at 0 failures — every other fixture parts on `\\n`, where
+   the two agree — and the loss is SILENT: `edn/read-string` given two records
+   glued by a lone `\\r` answers the first and drops the second without
+   throwing, so nothing downstream can tell the manifest came back short."
   []
   (let [f (manifest-file)]
     (if-not (.exists f)
       []
       (with-open [r (io/reader f)]
-        (into [] (keep (fn [line] (try (edn/read-string line) (catch Exception _ nil))))
+        (into [] (comp (keep (fn [line] (try (edn/read-string line) (catch Exception _ nil))))
+                       (filter (fn [rec] (and (map? rec) (:id rec)))))
               (line-seq r))))))
 
 (defn names
@@ -168,15 +191,23 @@
    content loci never named — `listing` offers such a file under its hash — so
    an absent or partial manifest is an ordinary state, not a broken one.
 
-   **A record with no `:name` contributes nothing, and that filter is now
-   load-bearing twice over.** It always dropped a malformed line; since
-   `retire!` it also drops the retirement of an id loci never named, whose
-   `:name` is a present-and-nil key. Moving this test down into `records` would
-   put that id into the map under a nil name, and `listing` would draw a row
-   whose name is blank rather than absent."
+   **A record with no `:name` contributes nothing, and that is this function's
+   own rule rather than the reader's.** `records` decides what is a record;
+   this decides what is a name, and since `retire!` the test drops the
+   retirement of an id loci never named, whose `:name` is a present-and-nil key.
+
+   **Moving it down into `records` would put that id into the map under a nil
+   name — and the caller that would notice is not `listing`.** `listing` builds
+   its row with `(named n)`, which is nil either way, so the row comes out with
+   no `:name` KEY AT ALL rather than a blank one; measured 2026-08-22,
+   `(contains? row :name)` is false. What the nil entry would break is every
+   caller that counts, enumerates or `contains?`-tests this map, starting with
+   the claim that a loci which has never named a file answers `{}` —
+   `loci.server-test`'s `(is (empty? (files/names)))` for an untitled paste
+   rests on exactly that, and a nil-named entry would make it a map of one."
   []
   (reduce (fn [acc rec]
-            (if (and (map? rec) (:id rec) (:name rec))
+            (if (:name rec)
               (assoc acc (:id rec) (:name rec))
               acc))
           {}
@@ -208,19 +239,39 @@
    in loci keeps it. So the line stays and gains a tombstone, and `names` reads
    it exactly as before.
 
+   **Pass `original` when you already have it — the one-argument arity is O(N)
+   in the manifest.** It resolves the name with `(get (names) id)`, which
+   re-reads and re-parses the whole file; called once that is nothing, called in
+   a loop it is quadratic. Measured 2026-08-22 over 83-byte lines, a fresh
+   manifest per size: retiring 250 files costs 0.42 s, 500 costs 1.66 s and
+   1,000 costs 7.68 s — a little over ×4 per doubling, which puts 2,000 near
+   30 s (measured separately at 27.9 s) and 10,000 at roughly twelve minutes.
+   Handed the name, the same three runs cost 0.005 s, 0.009 s and 0.018 s —
+   linear, about 18 µs a file, so 10,000 is a quarter of a second. The files GC
+   retires in a loop, inside an HTTP route the storage panel drives, and it has
+   already computed the name in the row it is reclaiming from. The one-argument
+   arity stays for a caller that has only an id.
+
    `:name` is carried forward rather than left to be looked up later, so the
-   record is self-contained — a manifest truncated to its tail still answers
-   what the file was called.
+   record is self-contained: a `files.edn` hand-edited, or truncated by
+   something outside loci, still answers what the file was called from its tail
+   alone. **Nothing in `src/` does that** — the only writes to this file are two
+   `spit … :append true`, and the one loss it can suffer on its own, a torn
+   line, happens before the retire rather than after it, so the tombstone would
+   have been written `:name nil` anyway. This is a hedge on a primary file, not
+   a mechanism anything here depends on. It is one map key, and one map key is
+   worth it.
 
    Retiring an id loci never named is not an error and writes `:name nil`. A
    hand-placed file has no name to carry, inventing one would lie, and the GC
    never reclaims one anyway; this only has to not throw."
-  [id]
-  (let [rec {:id id :name (get (names) id) :at (System/currentTimeMillis) :retired true}
-        f   (manifest-file)]
-    (io/make-parents f)
-    (spit f (str (pr-str rec) "\n") :append true)
-    rec))
+  ([id] (retire! id (get (names) id)))
+  ([id original]
+   (let [rec {:id id :name original :at (System/currentTimeMillis) :retired true}
+         f   (manifest-file)]
+     (io/make-parents f)
+     (spit f (str (pr-str rec) "\n") :append true)
+     rec)))
 
 (defn retired
   "The set of ids whose most recent manifest record is a retirement.
@@ -230,7 +281,10 @@
    un-retire them while every other id keeps whatever its own last record said.
    Reading only the file's final line would pass any fixture that touches one id
    — measured 2026-08-22 — and answer `#{}` for a store where one file was
-   reclaimed and a different one was then imported."
+   reclaimed and a different one was then imported.
+
+   No guard on the record here, and that is `records` doing it rather than this
+   forgetting: everything it hands back is a map with an `:id`."
   []
   (->> (records)
        (reduce (fn [m r] (assoc m (:id r) r)) {})

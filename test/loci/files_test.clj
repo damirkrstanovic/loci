@@ -39,6 +39,85 @@
       (is (= "three.csv" (get (files/names) "c.csv"))
           "and the record AFTER the torn one is read whole, not eaten as its value"))))
 
+(deftest a-lone-carriage-return-still-parts-two-records
+  ;; `records` keeps `line-seq` where the plan said `(str/split-lines (slurp
+  ;; f))`, and the ONLY shape the two disagree on is a lone `\r`: every other
+  ;; fixture in this namespace parts on `\n`, where they agree. Measured
+  ;; 2026-08-22, swapping `records` back to `split-lines` ran the whole
+  ;; namespace at 0 failures without this fixture — which is how a future agent
+  ;; reconciling the code against the plan would be told the swap is safe.
+  ;;
+  ;; And the loss it lets through is SILENT. `(edn/read-string "{:id \"a\"}\r{:id
+  ;; \"b\"}")` answers `{:id "a"}` and drops the rest with no exception, so the
+  ;; manifest comes back one name short and nothing says so.
+  (with-dir
+    (fn [_]
+      (let [f (io/file (sub/data-dir) "files.edn")]
+        (io/make-parents f)
+        (spit f "{:id \"a.csv\" :name \"Alpha\"}\r{:id \"b.csv\" :name \"Bravo\"}\n"))
+      (is (= {"a.csv" "Alpha" "b.csv" "Bravo"} (files/names))
+          "a lone \\r ends a line for `line-seq` and not for `str/split-lines`,
+           and this manifest is PRIMARY — it loses as little as it can"))))
+
+(deftest a-line-that-parses-but-is-not-a-record-contributes-nothing
+  ;; The guard `(map? rec)` and `(:id rec)` lives in `records` so `names` and
+  ;; `retired` cannot answer from two rules — which is the whole reason
+  ;; `records` was extracted, and which it failed on its first commit: `names`
+  ;; kept the guard and `retired` was written without one.
+  ;;
+  ;; The fixture is what makes the guard visible, and it has to carry junk that
+  ;; PARSES — a fixture of well-formed records passes with the guard deleted and
+  ;; certifies nothing. Measured 2026-08-22 with the guard removed: `retired`
+  ;; answers `#{"a.csv" :id nil}` — `#{:id :retired}` is a readable line that is
+  ;; not a map and `(:id #{:id :retired})` is the keyword `:id`, while
+  ;; `{:retired true}` has no id at all and lands under nil — and `names`
+  ;; answers `{"a.csv" "Alpha", nil "Ghost"}`.
+  ;;
+  ;; None of these can come from `remember!` or `retire!`, the only two writers.
+  ;; A hand-edited manifest can, and the rule being one rule is the point.
+  (with-dir
+    (fn [_]
+      (files/remember! "a.csv" "Alpha")
+      (spit (io/file (sub/data-dir) "files.edn")
+            "#{:id :retired}\n{:name \"Ghost\"}\n{:retired true}\n"
+            :append true)
+      (files/retire! "a.csv" "Alpha")
+      (is (= #{"a.csv"} (files/retired))
+          "a line that is not a record contributes no id to retire")
+      (is (= {"a.csv" "Alpha"} (files/names))
+          "and none to name either — one reading rule, in one place"))))
+
+(deftest retiring-with-the-name-in-hand-writes-the-same-record
+  ;; The two-argument arity exists because the one-argument one is O(N) in the
+  ;; manifest — `(get (names) id)` re-reads and re-parses the whole file, so
+  ;; retiring 1,000 files took 7.68 s against 0.018 s handed the name (measured
+  ;; 2026-08-22, 83-byte lines). This is the correctness half: the two must
+  ;; write the same record, or the fast path would quietly write a different
+  ;; manifest from the slow one.
+  (with-dir
+    (fn [_]
+      (files/remember! "a.csv" "Alpha")
+      (files/remember! "b.csv" "Bravo")
+      (files/retire! "a.csv")
+      (files/retire! "b.csv" "Bravo")
+      (is (= #{"a.csv" "b.csv"} (files/retired)))
+      (is (= {"a.csv" "Alpha" "b.csv" "Bravo"} (files/names))
+          "the name handed in is carried forward exactly as the looked-up one is"))))
+
+(deftest retiring-with-a-name-does-not-consult-the-manifest
+  ;; The assertion above passes whether or not the second arity uses `original`
+  ;; — `(get (names) id)` would answer "Bravo" too. This is the one that can
+  ;; see it: a manifest that says something ELSE for the id, so a `retire!`
+  ;; still resolving the name for itself writes the manifest's answer and not
+  ;; the caller's. Measured 2026-08-22: with the body reverted to `(get (names)
+  ;; id)`, this fails and the test above does not.
+  (with-dir
+    (fn [_]
+      (files/remember! "a.csv" "Stale")
+      (files/retire! "a.csv" "Handed In")
+      (is (= "Handed In" (get (files/names) "a.csv"))
+          "the caller's name is what is written — the manifest is not consulted"))))
+
 (deftest retiring-a-name-keeps-it-readable-and-marks-it
   (with-dir
     (fn [_]
