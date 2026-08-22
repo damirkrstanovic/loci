@@ -410,6 +410,15 @@
   ;; And the version half alone, for the same reason in the other direction.
   {:versions 1 :days -1})
 
+(def ^:private default-versions-only
+  ;; `default-window`'s OWN version half with the age half off — `{:versions 3
+  ;; :days -1}`, written as an `assoc` so it cannot drift from the shipped
+  ;; default. `classify-ranks-the-files-an-object-named-and-not-the-events`
+  ;; needs the real 3: the defect it pins is a table refreshed three times
+  ;; falling out of the very window loci ships, and quoting 3 by hand would let
+  ;; the default change underneath the claim.
+  (assoc files/default-window :days -1))
+
 (defn- put-source!
   "Commit `id` as a connected table over `uri`, materialised or passthrough.
 
@@ -423,6 +432,29 @@
                            :value (if (= mode :passthrough)
                                     {:store :source :uri uri :format :csv}
                                     {:store :lake :table (str "t_" id) :snapshot 1})}}))
+
+(defn- refresh!
+  "Re-run `id`'s recipe, the shape `loci.source/refresh!` actually commits.
+
+   A `:tx` of two `:assoc`s and never a `:put` — see that function's own note on
+   why. Only the first of the two yields a handle-walk entry: the `[:source]`
+   one carries a source map, which names no `:store`, so `tbl/event-handles`
+   does not recognise it as a handle at all.
+
+   **The mode is the whole point of this helper.** A passthrough refresh's new
+   handle is `{:store :source :uri …}` and NAMES the file; a materialised
+   refresh's is `{:store :lake :table …}` and names no location whatsoever. So
+   one mode gives the walk a second uri-bearing entry for a file it already had,
+   and the other gives it an entry with no uri at all — the two shapes every
+   fixture above this line is missing, and the two the ranking gets wrong."
+  [st id uri mode n]
+  (sub/commit! st {:op :tx
+                   :events [{:op :assoc :id id :path [:value]
+                             :value (if (= mode :passthrough)
+                                      {:store :source :uri uri :format :csv}
+                                      {:store :lake :table (str "t_" id "_" n) :snapshot n})}
+                            {:op :assoc :id id :path [:source]
+                             :value {:uri uri :mode mode :at (str n)}}]}))
 
 (deftest classify-keeps-a-file-a-live-table-still-names
   (with-dir
@@ -656,3 +688,225 @@
         (is (= :orphaned (:class (get (files/classify st nothing-retained) "back.csv")))
             "and re-uploading it through loci un-retires the id, so it is loci's
              file again — reclaimable in principle, which `:foreign` never is")))))
+
+;; ---------------------------------------------------------------------------
+;; the shapes every fixture above this line is missing
+;;
+;; Two independent reviews of `classify` measured it calling live,
+;; undo-reachable files `:reclaimable`, and the assertions above were not the
+;; hole — the FIXTURES were. Every one of them names one file per object and
+;; each file exactly once, which is the one arrangement in which ranking events
+;; and ranking files agree, in which a last-wins fold has nothing to overwrite,
+;; and in which no two objects can disagree about a uri. The four below are the
+;; arrangements that fall outside it, and each is ordinary: a refresh, a
+;; materialised refresh, two tables from one file, and a manifest line loci did
+;; not write.
+;; ---------------------------------------------------------------------------
+
+(deftest classify-ranks-the-files-an-object-named-and-not-the-events
+  ;; `:versions` is "the three most recent FILES per object" — `default-window`
+  ;; says so on its face. The shipped fold spent a rank on every walk entry and
+  ;; dropped the uri-less ones afterwards, so it counted EVENTS.
+  ;;
+  ;; A materialised `refresh!` is the event that has no uri: its `:assoc
+  ;; [:value]` carries `{:store :lake :table …}`, which names no location. So an
+  ;; object with exactly ONE file aged itself out by being refreshed. Measured
+  ;; 2026-08-22 against this fixture under `default-versions-only`:
+  ;;
+  ;;     refreshes = 0   ->  {:age-rank 0,  :class :in-window}
+  ;;     refreshes = 3   ->  {:age-rank 3,  :class :reclaimable}
+  ;;     refreshes = 10  ->  {:age-rank 10, :class :reclaimable}
+  ;;
+  ;; Three is not an arbitrary count: it is `default-window`'s own `:versions`,
+  ;; so the third refresh of a table is what pushed its source out of the window
+  ;; loci ships. Refreshing a table was the thing that made its source deletable.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "one.csv") "x\n")
+        (files/remember! "one.csv" "one")
+        (put-source! st "tbl:a" "loci://files/one.csv" :materialise)
+        (refresh! st "tbl:a" "loci://files/one.csv" :materialise 1)
+        (refresh! st "tbl:a" "loci://files/one.csv" :materialise 2)
+        (refresh! st "tbl:a" "loci://files/one.csv" :materialise 3)
+        (is (= "t_tbl:a_3" (:table (:value (sub/object st "tbl:a"))))
+            "the fixture's premise, asserted rather than assumed: three refreshes
+             landed and each replaced the handle, so the walk really does carry
+             four entries for one file")
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (let [row (get (files/classify st default-versions-only) "one.csv")]
+          (is (= 0 (:age-rank row))
+              "one file means rank 0 however many times the table was refreshed —
+               the rank is a position among the object's FILES")
+          (is (= :in-window (:class row))
+              "so `default-window`'s three versions still cover it, which is the
+               whole claim the count half makes"))
+        (is (= :reclaimable (:class (get (files/classify st nothing-retained) "one.csv")))
+            "and the pair, so the line above is an assertion about the count rather
+             than about `:in-window` being unreachable"))))) 
+
+(deftest classify-dates-a-file-by-the-newest-mention-and-not-the-first
+  ;; `handles-in-history` is newest-first per object and the shipped fold was
+  ;; `(into {} …)`, which is last-wins — so for a uri named more than once the
+  ;; OLDEST mention won, on both halves at once.
+  ;;
+  ;; A passthrough refresh is the shape that exposes it: its new handle is
+  ;; `{:store :source :uri …}` and DOES name the file, so the walk gets a second
+  ;; uri-bearing entry for a uri it already had. A passthrough table connected
+  ;; five weeks ago and refreshed this morning therefore read as five weeks
+  ;; stale, and `:age-rank` reported its distance from the object's newest event
+  ;; rather than 0.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "p.csv") "x\n")
+        (files/remember! "p.csv" "p")
+        (put-source! st "tbl:p" "loci://files/p.csv" :passthrough)
+        ;; A real clock and not a backdated event: `commit!` overwrites `:ts`,
+        ;; so the only way to put two mentions on either side of a line is to
+        ;; let time pass between them and take the line from the same clock.
+        (Thread/sleep 25)
+        (let [mid (System/currentTimeMillis)]
+          (refresh! st "tbl:p" "loci://files/p.csv" :passthrough 1)
+          (refresh! st "tbl:p" "loci://files/p.csv" :passthrough 2)
+          (sub/commit! st {:op :delete :id "tbl:p"})
+          (let [row (get (files/classify st count-only) "p.csv")]
+            (is (>= (:ts row) mid)
+                "the connect is before `mid` and both refreshes are after it, so this
+                 holds only if the NEWEST mention supplied `:ts` — a file is as
+                 recent as the last thing that named it")
+            (is (= 0 (:age-rank row))
+                "and rank 0, because it is still the only file this object has ever
+                 had — a repeat mention is not an older version")
+            (is (= :in-window (:class row))
+                "which is what it costs to get wrong: with the age half off, the
+                 shipped rank of 2 put a table refreshed moments ago outside a
+                 one-version window")))))))
+
+(deftest classify-merges-two-tables-on-one-file-toward-keeping-it
+  ;; Two tables from one file is the ordinary state this whole phase exists for
+  ;; — `:connectedAs` warns about it and `:duplicateOf` names it — and the
+  ;; shipped fold picked ONE of them arbitrarily. Measured 2026-08-22 over a
+  ;; fixture varying only in the number of UNRELATED objects, because `group-by`
+  ;; iterates in insertion order below 8 keys and hash order above:
+  ;;
+  ;;      4 objects in the walk  ->  attributed to tbl:new  ->  :in-window
+  ;;     14 objects in the walk  ->  attributed to tbl:old  ->  :reclaimable
+  ;;
+  ;; This fixture does not rely on that flip, because relying on it would make
+  ;; the test a hostage to Clojure's array-map threshold. It is arranged so the
+  ;; CORRECT answer is one no single entry carries: `tbl:new` has the better
+  ;; rank and the older clock, `tbl:old` the newer clock and the worse rank. A
+  ;; fold that takes the pair from whichever entry it happens to land on is
+  ;; wrong on one half or the other whichever one it lands on, which is the
+  ;; reason `keepier` merges the two halves independently.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (doseq [f ["shared.csv" "v1.csv" "v2.csv" "v3.csv"]]
+          (spit (io/file (files/dir) f) "x\n")
+          (files/remember! f f))
+        ;; `tbl:new` names shared.csv and nothing else: rank 0, and the OLDER clock.
+        (put-source! st "tbl:new" "loci://files/shared.csv" :materialise)
+        (Thread/sleep 25)
+        (let [mid (System/currentTimeMillis)]
+          ;; `tbl:old` names shared.csv and then three other files: rank 3, and
+          ;; the NEWER clock.
+          (put-source! st "tbl:old" "loci://files/shared.csv" :materialise)
+          (doseq [f ["v1.csv" "v2.csv" "v3.csv"]]
+            (put-source! st "tbl:old" (str "loci://files/" f) :materialise))
+          ;; Unrelated tables, deleted again, purely to push the walk's map over
+          ;; the array-map threshold — the axis the shipped answer moved along.
+          (dotimes [i 12]
+            (put-source! st (str "tbl:z" i) (str "loci://files/z" i ".csv") :materialise)
+            (sub/commit! st {:op :delete :id (str "tbl:z" i)}))
+          (sub/commit! st {:op :delete :id "tbl:new"})
+          (sub/commit! st {:op :delete :id "tbl:old"})
+          (let [row (get (files/classify st default-versions-only) "shared.csv")]
+            (is (= 0 (:age-rank row))
+                "the lowest rank any object gives the file, not the rank of whichever
+                 object the fold finished on — a file one table still counts among its
+                 three newest is inside the window whatever a second table thinks")
+            (is (= "tbl:new" (:object row))
+                "and it is attributed to that object, so a panel offering a reclaim
+                 names the table whose window is keeping the file")
+            (is (>= (:ts row) mid)
+                "while `:ts` comes from the OTHER object, whose mention is newer —
+                 the two halves are two independent reasons to keep a file, and
+                 taking the pair from one entry lets a stale rank cancel a fresh
+                 clock or the reverse")
+            (is (= :in-window (:class row))
+                "which is the outcome: `:reclaimable` here deletes the source of a
+                 table `undo!` can still reach, and the undo comes back
+                 `:table/unavailable`")))))))
+
+(deftest classify-keeps-a-manifest-record-whose-clock-it-cannot-read
+  ;; `files.edn` is PRIMARY, so a GC over it has a direction it must fail in.
+  ;; The shipped clause was `(>= (or at 0) cutoff)`, which reads a missing `:at`
+  ;; as the epoch — maximally old — and sends the record straight to
+  ;; `:orphaned`, the one class a reclaim deletes without an object to warn
+  ;; about. Measured 2026-08-22: `:orphaned` under `default-window`.
+  ;;
+  ;; `remember!` has written `:at` since `8f96895`, so reaching this needs a
+  ;; manifest loci did not write — which this namespace already fixtures
+  ;; elsewhere (`a-lone-carriage-return-still-parts-two-records`), `retire!`'s
+  ;; docstring reasons about at length, and a hand-edit or an older store
+  ;; produces for free.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)
+            f  (io/file (sub/data-dir) "files.edn")]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "noclock.csv") "x\n")
+        (spit (io/file (files/dir) "stamped.csv") "x\n")
+        (io/make-parents f)
+        (spit f "{:id \"noclock.csv\" :name \"No clock\"}\n" :append true)
+        (spit f "{:id \"stamped.csv\" :name \"Stamped\" :at 1}\n" :append true)
+        (let [cls (files/classify st files/default-window)]
+          (is (= :in-window (:class (get cls "noclock.csv")))
+              "an unreadable clock means KEEP — a GC over the one file in loci that
+               cannot be recomputed does not get to guess a file is old")
+          (is (= :orphaned (:class (get cls "stamped.csv")))
+              "and a record whose clock IS readable and says 1970 is an orphan, which
+               is the pair that makes the line above about the missing key rather
+               than about `:orphaned` being unreachable from a hand-edited line"))))))
+
+(deftest a-nameless-record-after-a-named-one-parts-mine-from-names
+  ;; `classify`'s `mine` filters `latest` on `:name`, and a comment here used to
+  ;; call that "`names`' own rule kept deliberately, so the two sets cannot
+  ;; drift". They are not the same rule and they do drift. `names` is *the last
+  ;; record that HAS a name* — `latest`'s docstring says folding it in would
+  ;; change its answer — while `mine` is *the last record, and does it have a
+  ;; name*. A nameless record following a named one is where they part, and
+  ;; before this fixture existed the whole clause could be deleted with the
+  ;; namespace still at 0 failures.
+  ;;
+  ;; Nothing in `src/` writes the shape: both `remember!` callers guard with
+  ;; `not-empty`, and `retire!`'s nameless record carries `:retired`, which
+  ;; `mine` drops before it ever reaches the `:name` test. A hand-edited or
+  ;; truncated `files.edn` writes it, which is the same reachability every other
+  ;; manifest fixture in this namespace has.
+  ;;
+  ;; The point is the DIRECTION. `:foreign` is the class no reclaim ever
+  ;; touches, so where the two rules disagree `classify` takes the never-delete
+  ;; side — which is the only defensible way for a GC over a primary file to be
+  ;; uncertain.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)
+            f  (io/file (sub/data-dir) "files.edn")]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "a.csv") "x\n")
+        (io/make-parents f)
+        (spit f "{:id \"a.csv\" :name \"Alpha\" :at 1}\n{:id \"a.csv\" :at 1}\n" :append true)
+        (is (= {"a.csv" "Alpha"} (files/names))
+            "the fixture's premise: `names` still names the file, because its rule
+             is the last record that HAS a name")
+        (is (= :foreign (:class (get (files/classify st files/default-window) "a.csv")))
+            "and `classify` does not claim it — the two rules part here, and this
+             one takes the side a reclaim can never act on. Drop the `:name` test
+             from `mine` and this file becomes `:orphaned`, which a reclaim
+             deletes")))))

@@ -456,6 +456,43 @@
    times in that afternoon."
   {:versions 3 :days 30})
 
+(defn- uri-of
+  "The file a handle-walk entry names, or nil.
+
+   `:source` as well as the handle, because a materialised handle is
+   `{:store :lake :table …}` and names no location at all — only the `:put` of
+   the whole object carries the uri, and a refresh's `:assoc [:value]` carries
+   none. `tbl/event-handles` explains at length why it hands back both.
+
+   **The nil answer is not an edge case, it is most of the walk.** Every
+   materialised refresh contributes one, and `classify` filters on this
+   *before* ranking for exactly that reason — see there."
+  [e]
+  (or (:uri (:source e)) (:uri (:handle e))))
+
+(defn- keepier
+  "Of two classifications for one uri, the one that retains more.
+
+   The window's two halves are independent reasons to keep a file, so they
+   merge independently: the lowest rank any object gives it, and the newest
+   moment any object named it. Taking the pair from one entry would let a stale
+   rank cancel a fresh timestamp.
+
+   `:object` follows the RANK rather than the clock, so that the object named
+   in the row is the one whose window is holding the file — which is what a
+   panel offering a reclaim has to say. When the two halves disagree there is no
+   single object the row is about, and this picks the one a reader would go
+   looking for.
+
+   Nil for `a` is a uri seen for the first time, so this doubles as the seed and
+   `update` needs no `fnil`."
+  [a b]
+  (if (nil? a)
+    b
+    {:object   (if (< (:age-rank b) (:age-rank a)) (:object b) (:object a))
+     :ts       (max (or (:ts a) 0) (or (:ts b) 0))
+     :age-rank (min (:age-rank a) (:age-rank b))}))
+
 (defn classify
   "`{filename {:class … :object … :ts …}}` for every file in `dir`.
 
@@ -482,6 +519,34 @@
    exceptions to carry in your head.) **`:current` before the window**,
    mirroring `lakegc` and `source-block`'s precedence lesson from phase 2: a
    live passthrough table's file is not a retention question at all.
+
+   ## `:current` before `:orphaned`, which is the other way round in `lakegc`
+
+   The pair above is *not* mirrored, and it needs saying because the sentence
+   before it says the order mirrors `lakegc`. `lakegc/classify` tests
+   `(nil? m)` **before** `(live table_name)`, and `reclaim!`'s docstring spends
+   a paragraph on why: a gap in `tbl/event-handles`' coverage — a new event
+   shape that can carry a handle — then surfaces as a *live* table classified
+   `:orphaned`, and `reclaim!`'s live-set guard refuses the **whole call** on
+   it rather than filtering it out. That inverted order is a tripwire, and the
+   refusal is what makes someone read the gap.
+
+   Here the order is `(live uri)` first, and for files that is the better
+   answer: a connected file is not an orphan by any reading, and `:orphaned`
+   here is an ordinary state — an upload waiting to be picked — rather than
+   evidence of anything. But it does convert `lakegc`'s tripwire into silent
+   absorption: the same walk gap, on a file a live object still names, comes
+   back `:current` and nothing anywhere says the walk missed a handle.
+
+   What partly covers it is that `live` is built from `connections`, which
+   reads the objects' own `:source` and never the walk — so the two disagree
+   independently, and a gap on a LIVE file is caught by `live` answering
+   correctly on its own. The hole that stays open is a gap on a file whose
+   table is deleted but still undo-reachable: no walk entry, not live, so it
+   falls to `:orphaned` and is aged by the manifest's `:at` — the moment the
+   file ARRIVED, not the moment it was last named. A file uploaded forty days
+   ago and disconnected yesterday would be reclaimed. That is the cost of the
+   order, written down rather than argued away.
 
    ## `:orphaned` respects the window here, and in `lakegc` it does not
 
@@ -519,23 +584,88 @@
    ~43 ms per parse is about **seven minutes** over 10,000 files.
 
    Everything this needs from the manifest comes from one `latest`: whether loci
-   wrote the file, whether it has since given it up, and when. Counted
-   2026-08-22 by instrumenting the vars, one `classify` costs **2 manifest
-   parses and 2 store walks** — its own `latest` and `connections`, plus the
-   `names` and `connections` inside `listing`. The `listing` pair stays:
-   duplicating `content?` and the sort to avoid them would put the directory's
-   rules in two places, which is the thing this namespace exists to prevent, and
-   the store axis is ~1 ms over a 10,000-object store — measured 2026-08-22 —
-   against ~43 ms for one manifest parse. **If you add a manifest consumer here,
-   take it off `recs` rather than calling `names` or `retired` again.**
+   wrote the file, whether it has since given it up, and when. One `classify`
+   costs **2 manifest parses and 3 store walks** — its own `latest`,
+   `connections` and `tbl/handles-in-history`, plus the `names` and
+   `connections` inside `listing`. **If you add a manifest consumer here, take
+   it off `recs` rather than calling `names` or `retired` again.**
+
+   The three walks are not the same size, and an earlier draft of this
+   paragraph said 2 and called the store axis ~1 ms. Both were wrong the same
+   way: the instrumentation sat on `connections`, and `handles-in-history` is
+   neither counted by that nor priced like it. Measured 2026-08-22 against a
+   store whose `history` and `objects` are plain derefs — the shape `loci.dlv`
+   has in production, not `EventStore`'s materialise-per-call — over 40,000
+   events and 20,000 objects, half of them connected tables:
+
+       connections           6 ms   (per call, and it is called twice)
+       handles-in-history   26 ms
+       one `names` parse    56 ms   over 10,000 lines of ~78 bytes — the
+                                    ~43 ms quoted above for `records`, plus
+                                    `names`' own fold over what it returns
+
+   So the third walk is the **same order as a manifest parse**, not the
+   rounding error the old figure implied. And it is the one term here that
+   grows with the **log**, which only ever grows: a file deleted from `dir`
+   stops costing anything on the two axes above it, and the events that named
+   it stay in `sub/history` forever.
+
+   The duplicated `names` parse stays anyway. Duplicating `content?` and the
+   sort to avoid it would put the directory's rules in two places, which is the
+   thing this namespace exists to prevent — and a review measured that parse at
+   ~18% of one `classify` at the stated scale, so the argument for keeping it
+   was never that it is free.
 
    (`sub/objects` is a protocol method, so `with-redefs` cannot count it. The
-   store walk is counted at `connections`, which is a plain var.)"
+   store walks are counted at `connections` and `tbl/handles-in-history`, both
+   plain vars — and counting only the first is how one of the three went
+   unnoticed.)
+
+   ## The rank is over FILES, and two objects on one file merge
+
+   `seen` was copied from `lakegc`'s and is the one thing in this namespace that
+   could not be transferred. A lake table name is minted fresh per write, so
+   there every entry is a distinct table, ranking entries ranks versions, and no
+   key ever repeats. **A file uri repeats, and entries that name no uri exist.**
+   Two independent reviews measured the copied expression classifying live,
+   undo-reachable files `:reclaimable`; the fixtures under \"the shapes every
+   fixture above this line is missing\" in `loci.files-test` are the arrangements
+   that show it, and each carries the shipped answer beside the corrected one.
+
+   So `filter uri-of` runs **before** `map-indexed`, because a rank is a
+   position among an object's FILES — `default-window` says \"the three most
+   recent FILES per object\" on its face, and ranking events instead let a
+   materialised `refresh!`, whose `:assoc [:value]` names no location, age out
+   its own source. And the fold is `keepier` rather than `into {}`, because
+   last-wins over a newest-first walk takes the OLDEST mention of a repeated
+   uri, and because two objects on one file — the ordinary state `:connectedAs`
+   and `:duplicateOf` exist for — otherwise get whichever one the fold happened
+   to finish on."
   [st {:keys [versions days] :as _window}]
   (let [recs   (latest)
         ;; `mine` is `(keys (names))` minus `retired`, read off the one map
-        ;; rather than from two more parses. The `:name` test is `names`' own
-        ;; rule kept deliberately, so the two sets cannot drift.
+        ;; rather than from two more parses.
+        ;;
+        ;; **The `:name` test is this function's rule and NOT `names`'.** An
+        ;; earlier comment here claimed it was `names`' own rule kept so the two
+        ;; sets could not drift; that is not what either one does. `names` is
+        ;; *the last record that HAS a name* — `latest`'s docstring is explicit
+        ;; that folding it in would change its answer — while this is *the last
+        ;; record, and does it have a name*. They part on a nameless record
+        ;; following a named one. Measured 2026-08-22 over a hand-written
+        ;; `{:id "a.csv" :name "Alpha"}` followed by `{:id "a.csv" :at 1}`:
+        ;; `names` answers `{"a.csv" "Alpha"}` and this file comes back
+        ;; `:foreign`.
+        ;;
+        ;; That shape is unreachable from `src/` — both `remember!` callers
+        ;; guard with `not-empty` (`server.clj`'s import route and
+        ;; `finish-upload!` below), and `retire!`'s nameless record carries
+        ;; `:retired`, which the clause above drops first. A hand-edited or
+        ;; truncated manifest reaches it, which is why the divergence is written
+        ;; down rather than removed: `:foreign` is the never-reclaimed side, so
+        ;; where the two rules part this one takes the direction a GC over a
+        ;; primary file must take. `a-nameless-record-after-a-named-one-parts-
+        ;; mine-from-names` is the fixture.
         ;;
         ;; **`remove :retired` is what makes a retirement mean loci gave the
         ;; file up.** Re-uploading the same bytes calls `remember!`, which
@@ -552,11 +682,12 @@
         ;; `(keep #(:uri (:source %)) (vals (sub/objects st)))` this replaces are
         ;; identical by construction — `keep` drops exactly the nils
         ;; `connections`' `if-let` skips — and this namespace already had that
-        ;; walk written once for `:connectedAs`. Not for speed: a scan is ~1 ms
-        ;; over a 10,000-object store and `objects` is an atom deref in
-        ;; production. For the reason `connected-as` gives about itself — which
-        ;; uri counts as connected is one rule, and two spellings of it are two
-        ;; things to keep in step.
+        ;; walk written once for `:connectedAs`. Not for speed: a scan is ~6 ms
+        ;; over a 20,000-object store (measured 2026-08-22, half of them
+        ;; connected tables) and `objects` is an atom deref in production. For
+        ;; the reason `connected-as` gives about itself — which uri counts as
+        ;; connected is one rule, and two spellings of it are two things to keep
+        ;; in step.
         ;;
         ;; **The keys, not the rows `listing` already carries.** A file's
         ;; `:connectedAs` is absent when the object holding the uri has no
@@ -565,11 +696,22 @@
         ;; the unsafe direction for both GCs; the key set has neither hole.
         live   (set (keys (connections st)))
         cutoff (- (System/currentTimeMillis) (* days 24 60 60 1000))
-        seen   (into {} (for [[o hs] (tbl/handles-in-history st)
-                              [i e]  (map-indexed vector hs)
-                              :let [u (or (:uri (:source e)) (:uri (:handle e)))]
-                              :when u]
-                          [u {:object o :ts (:ts e) :age-rank i}]))]
+        ;; **Rank among the object's URI-BEARING entries only, and merge per uri
+        ;; toward whichever answer retains more.** Both halves of that sentence
+        ;; are corrections to `lakegc`'s `seen`, which this was copied from and
+        ;; which is right there and wrong here — see the note in the docstring.
+        ;;
+        ;; `filter` before `map-indexed`, so a rank is a position among FILES.
+        ;; `keepier` rather than `into {}`, so a uri named twice does not take
+        ;; whichever mention the fold happened to finish on.
+        seen   (reduce (fn [acc [o hs]]
+                         (reduce (fn [a [i e]]
+                                   (update a (uri-of e) keepier
+                                           {:object o :ts (:ts e) :age-rank i}))
+                                 acc
+                                 (map-indexed vector (filter uri-of hs))))
+                       {}
+                       (tbl/handles-in-history st))]
     (into {}
           (for [{:keys [file uri]} (listing st)
                 :let [m (get seen uri)]]
@@ -578,7 +720,17 @@
                (not (mine file)) {:class :foreign :object nil :ts nil}
                (live uri)        (assoc (or m {}) :class :current)
                (nil? m)          (let [at (:at (get recs file))]
-                                   {:class  (if (>= (or at 0) cutoff) :in-window :orphaned)
+                                   ;; **A missing `:at` means KEEP.** `(or at 0)`
+                                   ;; would read an unreadable clock as the epoch —
+                                   ;; maximally old — and send the record straight to
+                                   ;; `:orphaned`, the one class a reclaim deletes with
+                                   ;; no object to warn about. `files.edn` is PRIMARY
+                                   ;; and cannot be recomputed, so a GC over it fails
+                                   ;; toward keeping. Measured 2026-08-22: under
+                                   ;; `default-window`, `{:id "x.csv" :name "X"}` came
+                                   ;; back `:orphaned`.
+                                   {:class  (if (or (nil? at) (>= at cutoff))
+                                              :in-window :orphaned)
                                     :object nil :ts nil :at at})
                (or (< (:age-rank m) versions)
                    (>= (or (:ts m) 0) cutoff)) (assoc m :class :in-window)
