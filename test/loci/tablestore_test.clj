@@ -275,3 +275,33 @@
     (sub/commit! st {:op :put :id "tbl:b" :value {:id "tbl:b" :value h :source {:uri "loci://files/live.csv"}}})
     (is (= "loci://files/live.csv" (:uri (:handle (first (get (tbl/handles-in-history st) "tbl:b")))))
         "a passthrough handle IS the recipe and names its own location")))
+
+(deftest handles-in-history-ignores-a-handle-that-is-not-at-the-object-s-value
+  ;; An entry asserts *this object's value IS this handle*, so a handle sitting
+  ;; at a deeper path produces a WRONG entry, not a missing one — and wrong is
+  ;; the worse of the two. `lakegc/classify` folds entries into
+  ;; `{table {:object :ts :age-rank}}`, last write wins per table name, so a
+  ;; spurious entry can *replace* the true owner's and flip a version `undo!`
+  ;; can still reach from `:in-window` to `:reclaimable`. `reclaim!`'s live-set
+  ;; guard does not catch it: that guard catches under-coverage (a live table
+  ;; called `:orphaned`), and this is over-coverage.
+  ;;
+  ;; Neither shape below is committed anywhere in `src/` today — checked
+  ;; 2026-08-22, every handle-carrying site is a `:put` or an `:assoc` at
+  ;; exactly `[:value]`. This pins the closed shape so the docstring stays true
+  ;; when a third writer appears.
+  (let [st   (sub/fresh-store)
+        real {:store :lake :table "t_real" :snapshot 1}
+        prev {:store :lake :table "t_prev" :snapshot 2}]
+    (sub/commit! st {:op :put :id "nb:1" :value {:id "nb:1" :value real}})
+    (sub/commit! st {:op :assoc :id "nb:1" :path [:value :preview] :value prev})
+    (sub/commit! st {:op :append :id "nb:1" :path [:value :cells] :value {:value prev}})
+    (is (= ["t_real"] (map #(:table (:handle %)) (get (tbl/handles-in-history st) "nb:1")))
+        ;; Two-sided on purpose: it fails if the gate lets the deeper paths
+        ;; through (ungated it reads ["t_prev" "t_prev" "t_real"], the newest of
+        ;; which is what displaces the true owner) AND it fails if the gate is
+        ;; too tight and drops the `:put` as well. `(is (empty? …))` over the
+        ;; deeper events alone would pass in the state where the walk finds
+        ;; nothing at all, which is the other way this can be broken.
+        "only a :put and an :assoc at exactly [:value] name the object's value — a handle
+         at [:value :preview] or inside an appended cell must yield no entry at all")))

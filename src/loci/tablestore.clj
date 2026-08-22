@@ -100,21 +100,59 @@
    can produce. Sub-events carry no `:ts` of their own, so they inherit the
    transaction's.
 
-   Two shapes carry a handle: a `:put` whose value is the whole object, and an
-   `:assoc` at `[:value]` whose value is the handle itself (that is how
-   `rerun!` refreshes a table).
+   Two shapes carry a handle, and an event yields an entry only if its `:path`
+   is one of theirs: a `:put`, which names the whole object and carries no
+   `:path` at all, and an `:assoc` at exactly `[:value]`, whose value is the
+   handle itself (that is how `rerun!` and `source/refresh!` replace a table).
+   A handle sitting at any deeper path — say an `:assoc` at `[:value :preview]`
+   — is skipped, because an entry built from it would claim the OBJECT's value
+   is that handle. That is a **wrong** entry, not a missing one.
+
+   The gate is what makes the sentence above true rather than aspirational, and
+   it had to choose a side, because the two GCs want opposite defaults.
+   `lakegc/classify` folds these entries into one `{table {:object :ts
+   :age-rank}}`, last write wins per table name, so a spurious entry can
+   *replace* the true owner's; landing with an older `:ts` or a higher age-rank
+   it flips a version `undo!` can still reach from `:in-window` to
+   `:reclaimable`. `reclaim!`'s live-set guard does not catch that — that guard
+   catches *under*-coverage, a live table classified `:orphaned`, and this is
+   over-coverage. Over-coverage is harmless to a files GC, which would merely
+   keep a file alive one round too long; under-coverage is unsafe for both. So
+   the walk yields only the shapes it documents, and skips what it does not
+   understand. Nothing in `src/` commits a handle at any other path today —
+   checked 2026-08-22 across `source`, `tablemigrate`, `tools`, `server` and
+   `content`, every one a `:put` or an `:assoc` at `[:value]` — so this closes
+   the shape, not a live defect.
 
    **`:source` is carried beside `:handle` and is not redundant.** A
    materialised source's handle is `{:store :lake :table …}` and names no
    location, so a refresh — an `:assoc` at `[:value]` — drops the uri
    entirely. Only the `:put` of the whole object has it. A caller walking
-   handles alone would find a live materialised table's file unreferenced."
+   handles alone would find a live materialised table's file unreferenced.
+
+   The log is not as silent as that last sentence reads. `source/refresh!`
+   commits a `:tx` of TWO sub-events, and the second is an `:assoc` at
+   `[:source]` carrying the freshly rebuilt source map — but no entry comes back
+   for it, because a source map names no `:store`, so it matches neither
+   `handle?` test, and it sits at a path the gate skips anyway. Only *these
+   entries* stop at the `:put`; the log does carry a later uri. Harmless while
+   `source-of` rebuilds the uri from the object's own `:source` and only `:at`
+   moves, so it cannot change across a refresh. The day re-pointing a connected
+   source at a new uri lands, a caller that learned \"fold back to the `:put`\"
+   reads the old file's name and reclaims the new one — read `[:source]` off the
+   object then, or teach this walk to carry it."
   [ev]
   (case (:op ev)
     :tx (mapcat #(event-handles (assoc % :ts (:ts ev))) (:events ev))
     (let [v (:value ev)
-          h (cond (handle? v)          v
-                  (handle? (:value v)) (:value v))]
+          ;; `contains?`, never `(#{nil [:value]} (:path ev))` — a set called as
+          ;; a function answers with the element it found, and the element here
+          ;; IS `nil`, so the set form is false for exactly the `:put` case it
+          ;; has to admit. Measured 2026-08-22: it silently emptied every entry
+          ;; in this namespace's tests and `lakegc`'s.
+          h (when (contains? #{nil [:value]} (:path ev))
+              (cond (handle? v)          v
+                    (handle? (:value v)) (:value v)))]
       (when h [{:handle h :source (:source v) :object (:id ev) :ts (:ts ev)}]))))
 
 (defn handles-in-history
@@ -124,10 +162,10 @@
    From `sub/history` rather than from current state, because `as-of` and undo
    can reach any of them — that is exactly what a GC window protects."
   [st]
-  (->> (sub/history st)
-       (mapcat event-handles)
-       (group-by :object)
-       (into {} (map (fn [[o hs]] [o (vec (reverse hs))])))))
+  (update-vals (->> (sub/history st)
+                    (mapcat event-handles)
+                    (group-by :object))
+               #(vec (reverse %))))
 
 (defn cols-of
   "The column order to preserve: every key any row has, in the order first seen.
