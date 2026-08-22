@@ -4380,6 +4380,56 @@
                       (:uri (:source (sub/object st (:openId r)))))
             "and the CSV is on disk as a source, so refresh! has something to re-run")))))
 
+(deftest import-csv-remembers-the-title-it-was-given
+  ;; A pasted CSV and an uploaded one land in the same content-addressed
+  ;; directory, but until now only the upload wrote `files.edn` — so a paste was
+  ;; indistinguishable from a file someone `rsync`'d in, and the picker drew it
+  ;; under its hash. `nm` is read from the LISTING rather than from the manifest
+  ;; deliberately: read from `names` it would be nil while the bug is present,
+  ;; and `re-matches` on nil throws — aborting the test instead of failing the
+  ;; assertion that is actually about the name.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "Q3 Takings" "region,revenue\nEMEA,10\n" nil)
+            nm (first (map :file (files/listing st)))]
+        (is (nil? (:error r)))
+        (is (re-matches #"[0-9a-f]{16}\.csv" nm)
+            "the file is still content-addressed — the title is metadata, not the name")
+        (is (= "Q3 Takings" (get (files/names) nm))
+            "and the manifest remembers what it was called, so the picker can show it")
+        (is (= "Q3 Takings" (:name (first (filter #(= nm (:file %)) (files/listing st)))))
+            "which is what makes a pasted CSV list under its title instead of its hash")))))
+
+(deftest import-csv-with-no-title-remembers-nothing-rather-than-a-blank
+  ;; Two pastes, because `nil` and `""` are guarded by different halves of the
+  ;; expression and only one of them can catch a regression. `when-let` alone
+  ;; already drops a nil title — a test that passed only nil would keep passing
+  ;; with the `not-empty` deleted. `""` is what `not-empty` is for, and it is
+  ;; what the shell posts when the title field is left blank.
+  ;;
+  ;; The manifest FILE is asserted on, not only `names`: `names` keeps a record
+  ;; whose `:name` is `""` (an empty string is truthy), so it does move — but
+  ;; the file is the direct statement that nothing was appended at all.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            a  (srv/import-csv! st "" "a,b\n1,2\n" nil)
+            b  (srv/import-csv! st nil "c,d\n3,4\n" nil)]
+        (is (every? nil? (map :error [a b])))
+        (is (not (.exists (io/file (sub/data-dir) "files.edn")))
+            "an untitled paste has no name to remember, and an empty string is not a name")
+        (is (empty? (files/names))
+            "so the manifest holds nothing for either of them")
+        ;; `contains?`, and NOT `(= [nil nil] (mapv :name …))`. `:name`'s
+        ;; contract is ABSENT rather than nil, and the old spelling answers the
+        ;; same for a missing key as for a present-and-nil one — a `listing`
+        ;; with its `(named n)` guard dropped assocs `:name nil` on every row
+        ;; and passes it. Measured 2026-08-22 with the guard actually dropped.
+        ;; The vector keeps its length, so this still says TWO rows.
+        (is (= [false false] (mapv #(contains? % :name) (files/listing st)))
+            "and the picker draws them under their hashes, which is the honest answer")))))
+
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
   ;; the other half of the same measurement: this path refuses upstream, so the
   ;; empty branch of `tbl/table-object` is unreachable from here — do not "fix"
@@ -4620,6 +4670,157 @@
           (is (= :no-object (:error r)) "a refusal, not a sweep of the orphans")
           (is (= 0 (:freed r)))
           (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))
+
+;; ---------------------------------------------------------------------------
+;; the files half of the storage panel
+;;
+;; `loci.files/report` and `reclaim!` have their own suite in `loci.files-test`.
+;; What is left here is the two things only this namespace can see: that the
+;; payload the panel draws carries them, and that the destructive half is
+;; reachable over HTTP under the window the SERVER ships rather than one a test
+;; invented.
+;; ---------------------------------------------------------------------------
+
+(deftest storage-payload-carries-what-the-files-directory-costs
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "0123456789")
+        (let [p (#'srv/storage-payload st)]
+          (is (= 10 (get-in p [:files :total-bytes]))
+              "the directory's real length in bytes, not a count of files")
+          (is (= 1 (get-in p [:files :count]))
+              "and how many files that is — a panel drawing no button still has to say
+               what the directory holds, and `report`'s own rows are not on the wire
+               to be counted")
+          (is (= 0 (get-in p [:files :reclaimable-bytes]))
+              "a hand-placed file costs bytes and frees none — the panel must not
+               offer to delete something loci did not write")
+          (is (= 0 (get-in p [:files :reclaimable-count]))
+              "and none of them by count, which is what the BUTTON gates on — the
+               bytes cannot, because nothing refuses an empty upload and a
+               zero-length reclaimable file makes them 0 while there is plainly
+               something to delete")
+          (is (= {:foreign 1} (get-in p [:files :classes]))
+              "and the classifier's own counts travel, which is the only thing that
+               can make the zero-state phrase name a REASON rather than assert
+               `nothing loci wrote is unreferenced` over an upload nobody has
+               connected yet"))))))
+
+(deftest storage-payload-carries-the-files-figures-through-rather-than-hard-coding-them
+  ;; The fixture above is one hand-placed `:foreign` file, so every figure it
+  ;; asserts is 0 or empty — and 0 and empty are also exactly what a payload
+  ;; that hard-codes them answers. Measured 2026-08-22: `(assoc … :reclaimable
+  ;; [])` passed both suites, and the `:doomed` rename emptied the panel's rows
+  ;; underneath a green test for the same reason.
+  ;;
+  ;; So: a `report` that answers non-zero on every key, and a payload that has
+  ;; to have read it. Stubbed rather than staged because what is under test is
+  ;; the transfer, and a fixture that produces four distinct non-zero classes
+  ;; needs a store, a lake and a backdated manifest to say what one map says.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)]
+        (with-redefs [files/report
+                      (constantly
+                       {:files [{:file "a.csv" :bytes 700 :class :reclaimable}
+                                {:file "b.csv" :bytes 200 :class :orphaned}
+                                {:file "c.csv" :bytes 100 :class :current}
+                                {:file "d.csv" :bytes 1   :class :in-window}]
+                        :doomed [{:file "a.csv" :bytes 700 :class :reclaimable}
+                                 {:file "b.csv" :bytes 200 :class :orphaned}]
+                        :reclaimable-bytes 900
+                        :total-bytes 1001})]
+          (let [f (:files (#'srv/storage-payload st))]
+            (is (= 4 (:count f)) "every row is counted, not only the doomed ones")
+            (is (= 1001 (:total-bytes f)))
+            (is (= 900 (:reclaimable-bytes f)) "over BOTH doomed classes")
+            (is (= 2 (:reclaimable-count f))
+                "the count of `:doomed` rows — and an integer, not the rows. Each row
+                 carries file/uri/bytes/name/connectedAs/class/object/ts/at, and
+                 `.length` is all the shell ever read off them")
+            (is (= {:reclaimable 1 :orphaned 1 :current 1 :in-window 1} (:classes f))
+                "and one count per class, which is what lets the panel say WHY nothing
+                 can be freed instead of guessing")
+            (is (nil? (:doomed f))
+                "the rows themselves do not travel — ~2 MB of JSON on every panel open
+                 at the scale these docstrings reason about, for one number")))))))
+
+(deftest the-files-reclaim-route-answers-through-the-URL
+  ;; `c/store` is rebound for its four siblings' reason: `handler` binds
+  ;; `(store)` before the `cond` for every route, so without it asking for a
+  ;; reclaim opens the user's real Datalevin store and seeds it.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "x\n")
+        (let [w    (atom ::never-called)
+              real files/reclaim!]
+          ;; Wrapped rather than stubbed — the route still runs the real reclaim
+          ;; against the real directory, and this additionally catches the window
+          ;; it was handed. Not a wiring detail: the plan for this task wrote the
+          ;; test constant `nothing-retained` into the route, and that window
+          ;; retains nothing, so the first POST after a table was deleted would
+          ;; take a file undo can still reach.
+          (with-redefs [files/reclaim! (fn [st win] (reset! w win) (real st win))]
+            (let [r (srv/handler {:request-method :post :uri "/api/storage/reclaim-files" :body nil})
+                  b (when (= 200 (:status r)) (json/read-str (:body r) :key-fn keyword))]
+              (is (= 200 (:status r)))
+              (is (= [] (:reclaimed b))
+                  "nothing was reclaimable, and the answer says so with an empty list")
+              (is (= 0 (:freed b))
+                  "and 0 bytes went, as a number the panel can draw rather than a key it
+                   has to sum for itself")
+              (is (= files/default-window @w)
+                  "under the window loci SHIPS, not one a caller or a test chose")))
+          (is (.exists (io/file (files/dir) "placed.csv"))
+              "and the hand-placed file survived, which is the one thing this route
+               may never get wrong")
+          (is (= 404 (:status (srv/handler {:request-method :get :uri "/api/storage/reclaim-files"})))
+              "a GET falls through to the 404 — method-gated because it deletes, exactly
+               as /api/storage/reclaim is and for its reason"))))))
+
+(deftest the-files-reclaim-route-answers-what-actually-went-and-not-what-it-tried
+  ;; `files/reclaim!` answers one row per CANDIDATE and a failed delete is
+  ;; shape-identical to a done one apart from `:error` — `:bytes` is on both,
+  ;; because the row describes the file and not the outcome. So the obvious sum
+  ;; at any caller reports files still on disk as freed.
+  ;;
+  ;; **That sum is no longer this namespace's to do.** It was, for one commit;
+  ;; `files/reclaim!` now answers `{:files … :freed …}` computed beside the
+  ;; deletes, as `lakegc/reclaim!` always has, and this route hands it through.
+  ;; So what is left to hold here is the ENVELOPE: `:freed` travels rather than
+  ;; being recomputed from `:reclaimed`, and every candidate row travels with it.
+  ;; The property itself — 140 summed against 100 actually freed — is pinned at
+  ;; the mechanism, in `loci.files-test`, against a real unwritable directory.
+  ;;
+  ;; Stubbed and not staged, because the failure this pins needs a delete that
+  ;; FAILS, and the only way to arrange one for real is an unwritable directory,
+  ;; which passes green under root.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))
+                    files/reclaim!
+                    (fn [_ _] {:freed 100
+                               :files [{:file "went.csv"  :bytes 100}
+                                       {:file "stuck.csv" :bytes 40
+                                        :error "loci could not delete stuck.csv from /files — AccessDeniedException"}]})]
+        (let [b (json/read-str (:body (srv/handler {:request-method :post
+                                                    :uri "/api/storage/reclaim-files"
+                                                    :body nil}))
+                               :key-fn keyword)]
+          (is (= 100 (:freed b))
+              "the number the mechanism computed travels — 140 is what the rows sum
+               to, and a route re-deriving it from `:reclaimed` puts 40 bytes that
+               are still on disk into a figure a person reads as freed")
+          (is (= 2 (count (:reclaimed b)))
+              "and the file it could not delete is still reported, not filtered out of
+               a shorter vector a caller would read as a completed sweep")
+          (is (= ["loci could not delete stuck.csv from /files — AccessDeniedException"]
+                 (mapv :error (filter :error (:reclaimed b))))
+              "carrying its own sentence, which is where *which and why* is answered"))))))
 
 (deftest mold-payload-says-why-a-table-cannot-be-read
   ;; `:unusable` is the sentence every reader shares; `:reclaimed` stays beside
@@ -5060,8 +5261,8 @@
 (deftest an-upload-arrives-in-chunks-and-lands-as-one-content-addressed-file
   (with-temp-data-dir
     (fn []
-      (let [a (srv/source-upload! {:id "up-1" :seq 0 :name "sales.csv"} "region,revenue\n")
-            b (srv/source-upload! {:id "up-1" :seq 1 :name "sales.csv" :final true} "EMEA,10\n")]
+      (let [a (srv/source-upload! (sub/fresh-store) {:id "up-1" :seq 0 :name "sales.csv"} "region,revenue\n")
+            b (srv/source-upload! (sub/fresh-store) {:id "up-1" :seq 1 :name "sales.csv" :final true} "EMEA,10\n")]
         (is (nil? (:error a)))
         (is (nil? (:uri a)) "no uri until the last chunk")
         (is (= 15 (:bytes a)) "and the caller is told how much of the file has landed")
@@ -5081,12 +5282,42 @@
         (is (empty? (.list (io/file (files/dir) ".partial")))
             "the partial is gone once it lands")))))
 
+(deftest an-upload-whose-bytes-are-already-a-table-says-which-one
+  ;; The upload door drew no duplicate note until 2026-08-22, and the picked-row
+  ;; door has drawn one since phase 2. Same panel, same preview, same Connect:
+  ;; upload `sales.csv`, connect it, drag the same file in again, and the hash
+  ;; matches — so `finish-upload!` keeps the file it has and `:existed` says so
+  ;; — while the preview said nothing and Connect made a second table from the
+  ;; same rows in silence. An upload IS an import.
+  (with-temp-data-dir
+    (fn []
+      (let [st   (sub/fresh-store)
+            rows "region,revenue\nEMEA,10\n"
+            a    (srv/source-upload! st {:id "dup-a" :seq 0 :name "sales.csv" :final true} rows)]
+        (is (not (contains? a :connectedAs))
+            "absent and not nil while nothing is connected to it — `listing`'s rule for
+             this key, so the shell has one shape to mean nothing")
+        (sub/commit! st {:op :put :id "tbl:sales"
+                         :value {:id "tbl:sales"
+                                 :source {:uri (:uri a) :mode :passthrough}
+                                 :value  {:store :source :uri (:uri a) :format :csv}}})
+        (let [b (srv/source-upload! st {:id "dup-b" :seq 0 :name "sales again.csv" :final true} rows)]
+          (is (:existed b)
+              "the premise: identical bytes, so nothing was written and this is the
+               moment a person is most likely to make a second table from one file")
+          (is (= "tbl:sales" (:connectedAs b))
+              "and the answer names the table those bytes already are")
+          (is (= (files/connected-as st (:uri b)) (:connectedAs b))
+              "through `files/connected-as`, which is the same rule the listing's rows
+               carry — a second scan here would be the duplicate question answered in
+               two places, which is what that function exists to prevent"))))))
+
 (deftest a-chunk-out-of-sequence-is-refused-rather-than-silently-misordered
   (with-temp-data-dir
     (fn []
-      (srv/source-upload! {:id "oos" :seq 0 :name "x.csv"} "a\n")
+      (srv/source-upload! (sub/fresh-store) {:id "oos" :seq 0 :name "x.csv"} "a\n")
       (let [part (io/file (files/dir) ".partial" "oos")
-            r    (srv/source-upload! {:id "oos" :seq 5 :name "x.csv"} "b\n")]
+            r    (srv/source-upload! (sub/fresh-store) {:id "oos" :seq 5 :name "x.csv"} "b\n")]
         ;; **First, and not last.** This is the assertion that separates
         ;; "refused" from "accepted in the wrong order" — both of which could
         ;; answer an `:error` — and putting it after the message checks would
@@ -5103,7 +5334,7 @@
         (is (re-find #"chunk 5 arrived out of sequence" (str (:error r))))
         (is (re-find #"expected 1" (str (:error r)))
             "and it says what would have been accepted, so a client can resume")
-        (let [ok (srv/source-upload! {:id "oos" :seq 1 :name "x.csv" :final true} "b\n")]
+        (let [ok (srv/source-upload! (sub/fresh-store) {:id "oos" :seq 1 :name "x.csv" :final true} "b\n")]
           (is (= "a\nb\n" (slurp (io/file (files/dir) (:file ok))))
               "and a refusal does not poison the upload: the chunk that was due still lands"))))))
 
@@ -5117,10 +5348,10 @@
   ;; front of the good file, under a hash OF the corrupt bytes.
   (with-temp-data-dir
     (fn []
-      (srv/source-upload! {:id "retry" :seq 0 :name "x.csv"} "DEAD")
-      (srv/source-upload! {:id "retry" :seq 1 :name "x.csv"} "ATTEMPT")
-      (let [a (srv/source-upload! {:id "retry" :seq 0 :name "x.csv"} "a,b\n")
-            r (srv/source-upload! {:id "retry" :seq 1 :name "x.csv" :final true} "1,2\n")]
+      (srv/source-upload! (sub/fresh-store) {:id "retry" :seq 0 :name "x.csv"} "DEAD")
+      (srv/source-upload! (sub/fresh-store) {:id "retry" :seq 1 :name "x.csv"} "ATTEMPT")
+      (let [a (srv/source-upload! (sub/fresh-store) {:id "retry" :seq 0 :name "x.csv"} "a,b\n")
+            r (srv/source-upload! (sub/fresh-store) {:id "retry" :seq 1 :name "x.csv" :final true} "1,2\n")]
         (is (nil? (:error a)) "beginning again is never out of sequence")
         (is (= 4 (:bytes a)) "and the working file holds only what the retry has sent")
         (is (= "a,b\n1,2\n" (slurp (io/file (files/dir) (:file r))))
@@ -5131,7 +5362,7 @@
 (deftest re-uploading-identical-bytes-is-discarded-rather-than-rewritten
   (with-temp-data-dir
     (fn []
-      (let [one (srv/source-upload! {:id "dup1" :seq 0 :name "a.csv" :final true} "a\n1\n")
+      (let [one (srv/source-upload! (sub/fresh-store) {:id "dup1" :seq 0 :name "a.csv" :final true} "a\n1\n")
             f   (io/file (files/dir) (:file one))
             ;; **The file count cannot tell "discarded" from "overwritten".**
             ;; One file remains either way and the uri is equal either way — and
@@ -5140,7 +5371,7 @@
             ;; sentinel is what makes the two outcomes different: if the second
             ;; upload rewrites the destination, this is gone.
             _   (spit f "SENTINEL\n")
-            two (srv/source-upload! {:id "dup2" :seq 0 :name "b.csv" :final true} "a\n1\n")]
+            two (srv/source-upload! (sub/fresh-store) {:id "dup2" :seq 0 :name "b.csv" :final true} "a\n1\n")]
         (is (= (:uri one) (:uri two)) "the same bytes are the same file")
         (is (false? (:existed one)))
         (is (true? (:existed two)) "and the second arrival knows it is not new")
@@ -5173,8 +5404,8 @@
             head  (java.util.Arrays/copyOfRange bs 0 cut)
             tail  (java.util.Arrays/copyOfRange bs cut (alength bs))
             hex   (fn [^bytes a] (apply str (map #(format "%02x" %) a)))]
-        (srv/source-upload! {:id "utf8" :seq 0 :name "c.csv"} head)
-        (let [r      (srv/source-upload! {:id "utf8" :seq 1 :name "c.csv" :final true} tail)
+        (srv/source-upload! (sub/fresh-store) {:id "utf8" :seq 0 :name "c.csv"} head)
+        (let [r      (srv/source-upload! (sub/fresh-store) {:id "utf8" :seq 1 :name "c.csv" :final true} tail)
               landed (.readAllBytes (io/input-stream (io/file (files/dir) (:file r))))]
           (is (java.util.Arrays/equals bs landed)
               (str "byte for byte what was sent: expected " (hex bs) " got " (hex landed)))
@@ -5213,9 +5444,9 @@
       ;; assertion below passes for a reason that has nothing to do with the
       ;; guard. Measured 2026-08-21 by dropping the guard: four of the five
       ;; assertions here failed and that one passed anyway.
-      (srv/source-upload! {:id "good" :seq 0 :name "ok.csv"} "a\n")
+      (srv/source-upload! (sub/fresh-store) {:id "good" :seq 0 :name "ok.csv"} "a\n")
       (doseq [bad ["../escaped.csv" "a/b" "" nil]]
-        (is (re-find #"unusable upload id" (str (:error (srv/source-upload! {:id bad :seq 0 :name "x.csv"} "a\n"))))
+        (is (re-find #"unusable upload id" (str (:error (srv/source-upload! (sub/fresh-store) {:id bad :seq 0 :name "x.csv"} "a\n"))))
             (str "refused: " (pr-str bad))))
       (is (not (.exists (io/file (files/dir) "escaped.csv")))
           "`.partial/../escaped.csv` resolves to `files/escaped.csv`, and the OS resolves it at write time whether or not Java normalised the path")

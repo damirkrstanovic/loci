@@ -212,6 +212,14 @@
   .filerow{display:flex;align-items:baseline;gap:10px;width:100%;text-align:left;cursor:pointer;font:inherit;
            font-size:13px;border:1px solid var(--line);background:var(--white);border-radius:9px;padding:8px 11px}
   .filerow:hover{border-color:var(--record)}
+  /* a file that is ALREADY a table, said on the row before you pick it and again
+     above the columns after you have. Muted and mono: it is a fact about what
+     loci holds, not a warning about what you are doing — Connect stays enabled,
+     because two tables from one file is a thing someone may well want and loci's
+     answer to a mistake is undo, not a veto. */
+  .filerow .dupe{font-family:var(--mono);font-size:10px;color:var(--muted);white-space:nowrap}
+  .dupe-note{font-size:12px;line-height:1.5;color:var(--muted);padding:0 0 8px}
+  .dupe-note b{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);font-weight:500}
   .filerow .fmeta{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
   /* the other door into the same directory. The listing can only offer what loci
      already holds; a file on YOUR machine is not in it yet, and this is what puts
@@ -518,6 +526,12 @@
     background:none;border:1px solid var(--line);border-radius:6px;padding:1px 7px;cursor:pointer;white-space:nowrap}
   .strow .st-reclaim:hover{color:var(--attn);border-color:var(--attn)}
   .strow .st-reclaim[disabled]{opacity:.5;cursor:default}
+  /* the files directory, under a rule of its own. NOT a fourth figure in the
+     grid above: those three are the lake's arithmetic and they add up, and a
+     directory total dropped among them would belong to neither sum. */
+  .stfiles{border-top:1px solid var(--line);margin-top:13px;padding-top:10px}
+  .stfiles .stfh{font-size:11.5px;color:var(--ink-2);margin-bottom:3px}
+  .stfiles .strow{border-top:0;padding:0}
   @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 
@@ -633,6 +647,31 @@ const API = {
   // that twice (method, then a missing id) and this spelling is the third.
   // Answers {object, tables, versions, files, freed} or a 200 with {error}.
   storageReclaim: id => POST('/api/storage/reclaim',{id}),
+  // The files directory's half of the same panel, and the same POST-never-GET
+  // rule for the same reason: it deletes bytes and undo reverts an event, not a
+  // file. It names no object because a file belongs to none — two tables may
+  // share one, an upload nobody picked belongs to nothing — so a files reclaim
+  // is the whole directory or it is nothing, and the empty body is the honest
+  // shape rather than a missing argument.
+  //
+  // Answers {reclaimed:[{file,bytes,error?}], freed}. One row per CANDIDATE,
+  // including the ones it could not delete — and `freed` is computed beside the
+  // deletes in `files/reclaim!`, because a failed row carries the same `bytes`
+  // as a done one and adding them up here would report files still on disk.
+  //
+  // **Its own fetch, because this is the one call where a 500 is not "nothing
+  // happened".** `POST` above is `.then(r=>r.json())` with no status check, and
+  // `handler` has no top-level catch — so a throw partway through a sweep
+  // (a read-only manifest, a full disk) answers a non-JSON 500, `r.json()`
+  // rejects, and the caller's catch says *could not reach the server — nothing
+  // was deleted* over four files that are gone. `reached` is what lets the
+  // caller tell a server that failed from a server that was never there.
+  reclaimFiles: async () => {
+    const r = await fetch('/api/storage/reclaim-files',
+                          {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){ const e=new Error('the server answered '+r.status); e.reached=true; throw e; }
+    return r.json();
+  },
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -1291,10 +1330,18 @@ function dataFileTab(i,sp,host){
       // one loci had rather than the one you just chose. They are the same
       // bytes; that is what a matching hash means.
       if(r&&r.existed) showToast('loci already had these exact bytes — connecting the file it holds');
-      // The same `{file,name,uri,bytes}` shape the listing answers with, handed
-      // to the same preview a picked row gets. An upload is a file ARRIVING in
-      // loci's directory, and there is one describe→preview→connect flow.
-      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size});
+      // The same `{file,name,uri,bytes,connectedAs}` shape the listing answers
+      // with, handed to the same preview a picked row gets. An upload is a file
+      // ARRIVING in loci's directory, and there is one describe→preview→connect
+      // flow.
+      //
+      // `connectedAs` is on it because an upload IS an import: drag in a file
+      // whose bytes are already a table and the hash matches, so nothing is
+      // written and `existed` says so — but without this key the preview drew no
+      // duplicate note and Connect made a second table from the same rows in
+      // silence, which is the one thing the picked-row door has warned about
+      // since phase 2.
+      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size,connectedAs:r.connectedAs});
     });
   };
   API.sourceFiles().then(r=>{
@@ -1317,6 +1364,11 @@ function dataFileTab(i,sp,host){
     host.innerHTML=up+'<div class="sec-h">or pick a file loci already has</div><div class="filelist">'+
       files.map(f=>'<button type="button" class="filerow" data-file="'+esc(f.file)+'">'+
         '<span class="fn">'+esc(f.name||f.file)+'</span>'+
+        // Beside the name and not after the size, because it is part of what
+        // this file IS. Absent — not a blank span — when the server sent no
+        // `connectedAs`, so an unconnected file carries no empty box where a
+        // note would be.
+        (f.connectedAs?'<span class="dupe">already '+esc(f.connectedAs)+'</span>':'')+
         '<span class="fmeta">'+esc(srcFormat(f.uri))+' · '+fmtBytes(f.bytes)+'</span></button>').join('')+
       '</div><div class="actions" style="margin-top:11px">'+back+'</div>';
     wireCancel(); wireUpload();
@@ -1367,7 +1419,16 @@ function dataPreview(i,sp,host,f){
     // back as a message quoting what was sent. Translating "copy in" here would
     // put loci's vocabulary in a second place and throw that away.
     const rn='dmode'+i;
-    host.innerHTML=head(d.cols.length)+
+    // The same fact the row carried, as a sentence: by the time you are reading
+    // columns the row is gone and the decision is one click away. It says what
+    // connecting again WOULD do rather than asking you not to — `import-csv!`
+    // settled that for the paste box and this is the same rule at the other
+    // door. Connect below is untouched.
+    const dupe=f.connectedAs
+      ? '<div class="dupe-note">loci already has this file as <b>'+esc(f.connectedAs)+
+        '</b>. Connecting again makes a second table from the same rows.</div>'
+      : '';
+    host.innerHTML=head(d.cols.length)+dupe+
       '<div class="srcpreview"><table class="mold"><thead><tr>'+
         '<th class="txt">header</th><th class="txt">column</th><th class="txt">type</th></tr></thead><tbody>'+
         d.cols.map(c=>'<tr><td class="txt">'+esc(c.raw)+'</td><td class="txt">'+esc(c.col)+'</td>'+
@@ -3180,12 +3241,65 @@ async function openStorage(){
          :'<span class="stnone">nothing older</span>')+
       '</div>';
   });
+  // ---- the other directory on disk, and the only other thing here that deletes
+  //
+  // The button exists ONLY where there is something for it to delete, and the
+  // zero state is a greyed phrase rather than a disabled button — the lake rows
+  // above answer "nothing older" the same way, because a disabled control
+  // invites a click that can never work. The phrase says WHY rather than "0 B":
+  // every file in there is either one a person put by hand, which loci never
+  // deletes, or one a live object still names.
+  //
+  // The total is `File.length` summed, so a symlinked file counts its TARGET's
+  // length — bytes a reclaim could never free. Left alone rather than engineered
+  // around: a hand-placed symlink has no manifest entry, so it is `:foreign` and
+  // never reclaimable, and the figure the button acts on is the other one.
+  //
+  // `reclaimable-count`, an integer, and NOT the rows. The rows carry
+  // file/uri/bytes/name/connectedAs/class/object/ts/at each, and `.length` was
+  // the only thing ever read off them — 2 MB of JSON on every panel open to
+  // draw one number, which is the shape the payload's own docstring rejects for
+  // the `:files` key one line above. The count is over BOTH classes a reclaim
+  // deletes, `:reclaimable` and `:orphaned`; `reclaimable-bytes` keeps its name
+  // because it is the right word for the BYTES, over that same widened set.
+  const fd=p.files||{}, fCount=+fd.count||0, fTotal=+fd['total-bytes']||0,
+        fRecl=+fd['reclaimable-bytes']||0, fN=+fd['reclaimable-count']||0,
+        fCls=fd.classes||{};
+  // The zero state names the REASON, from the classifier's own counts. The one
+  // sentence this used to have — "nothing loci wrote is unreferenced" — is
+  // false in the case this whole section exists for: an uploaded file nobody
+  // connected IS loci-written and IS unreferenced, and is held back only by the
+  // window the orphan grace gives it, so the person who just uploaded 200 MiB
+  // was told the opposite of why it cannot go. It was also vacuously true over
+  // a directory of rsync'd files, which loci wrote none of.
+  const fWhy = !fCount ? 'nothing in it yet'
+    : fCls['in-window'] ? 'nothing old enough yet — a file loci wrote is kept while the window still reaches it'
+    : fCls.current      ? 'every file loci wrote is still in use'
+    : 'nothing in here was written by loci';
+  h+='<div class="stfiles"><div class="stfh">loci’s files directory</div><div class="strow">'+
+    '<div class="stmain"><div class="stmeta">'+fCount+' file'+(fCount===1?'':'s')+' · '+fmtBytes(fTotal)+
+      ' — what an upload or a pasted CSV lands in</div>'+
+      (fN?'<div class="stmeta">'+fN+' of them, '+fmtBytes(fRecl)+', loci wrote and '+
+          'nothing names any more</div>':'')+
+    '</div>'+
+    // Gated on the COUNT and not on the bytes, as the lake rows above are
+    // (`rv`, a count of versions). Nothing refuses an empty upload, so a
+    // zero-length reclaimable file makes the bytes 0 while there is plainly
+    // something to delete — and the section would say "nothing loci wrote is
+    // unreferenced" over files that are, with no way to remove them.
+    (fN?'<button type="button" class="st-reclaim" id="stReclaimFiles" data-bytes="'+fRecl+
+        '" data-files="'+fN+'">reclaim '+fN+' file'+(fN===1?'':'s')+'</button>'
+       :'<span class="stnone">'+fWhy+'</span>')+
+    '</div></div>';
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
     '<span style="font-size:11.5px;color:var(--muted)">keeps the last '+(win.versions||0)+
     ' versions or '+(win.days||0)+' days, whichever keeps more — reclaiming is permanent</span></div></div>';
   modal.innerHTML=h; modal.classList.add('on');
   modal.querySelector('#closeModal').addEventListener('click',closeModal);
-  modal.querySelectorAll('.st-reclaim').forEach(el=>el.addEventListener('click',async ()=>{
+  // `[data-reclaim]` and not every `.st-reclaim`: the files button below wears
+  // the same class because it is the same control, and it names no object — this
+  // handler would hand `undefined` to a route whose whole guard is a missing id.
+  modal.querySelectorAll('.st-reclaim[data-reclaim]').forEach(el=>el.addEventListener('click',async ()=>{
     const id=el.dataset.reclaim, n=+el.dataset.versions, b=+el.dataset.bytes;
     // The sentence before the act, and the only one there is. The memory pane's
     // `forget` deliberately has no dialog, because its toast carries the text
@@ -3207,6 +3321,49 @@ async function openStorage(){
     showToast('reclaimed '+res.versions+' version'+(res.versions===1?'':'s')+' of '+id+
               ' — '+fmtBytes(res.freed)+' freed, '+res.files+' file'+(res.files===1?'':'s')+' deleted');
   }));
+  // The files half. One button for the whole directory, because a files reclaim
+  // names no object — the route takes no id and there is nothing here to pick.
+  const fbtn=modal.querySelector('#stReclaimFiles');
+  if(fbtn) fbtn.addEventListener('click',async ()=>{
+    const n=+fbtn.dataset.files, b=+fbtn.dataset.bytes;
+    if(!confirm('Delete '+n+' file'+(n===1?'':'s')+' from loci’s files directory?\n\n'+
+                'This frees '+fmtBytes(b)+' permanently. It cannot be undone: undo reverts an '+
+                'event, not a file, so scrubbing back to a moment when one of these was a live '+
+                'source will find it gone.\n\n'+
+                'Files you put in that directory yourself are never touched, and neither is any '+
+                'file a table still reads.')) return;
+    fbtn.disabled=true;                      // one sweep, not a double-click's two
+    let res;
+    try{ res=await API.reclaimFiles(); }
+    catch(e){
+      // Two different failures, and only one of them deleted nothing. A request
+      // that never got an answer deleted nothing. A request the SERVER failed
+      // may have deleted every file before the one it threw on — `reclaim!`
+      // deletes in a loop and a manifest write that throws aborts it — so the
+      // panel is redrawn from what is actually on disk rather than told it is
+      // unchanged. Everything else in this control refuses to overstate a
+      // success; this is the path that used to understate a deletion.
+      if(e&&e.reached){ await openStorage(); showToast('the sweep stopped partway — the panel is redrawn from what is actually there'); }
+      else { fbtn.disabled=false; showToast('could not reach the server — nothing was deleted'); }
+      return;
+    }
+    const rows=res.reclaimed||[], bad=rows.filter(r=>r.error);
+    await openStorage();
+    // `res.freed`, NEVER a sum over `rows`. Every candidate gets a row and a
+    // failed delete is shape-identical to a done one apart from `:error` — the
+    // bytes are on both, because the row describes the file and not the outcome
+    // — so the obvious arithmetic here reports files that are still on disk as
+    // freed. The server sums the rows with no error.
+    //
+    // And a failure is SAID rather than subtracted. A sweep that deleted nothing
+    // because the directory is not writable would otherwise read as a quiet
+    // success with a small number in it, which is the one outcome this control
+    // must not produce.
+    showToast(bad.length
+      ? bad.length+' of '+rows.length+' could not be deleted — '+bad[0].error+
+        (rows.length>bad.length?' ('+fmtBytes(res.freed)+' freed)':'')
+      : 'reclaimed '+rows.length+' file'+(rows.length===1?'':'s')+' — '+fmtBytes(res.freed)+' freed');
+  });
 }
 document.getElementById('flowBtn').addEventListener('click',openFlows);
 document.getElementById('memBtn').addEventListener('click',()=>openMemory(''));

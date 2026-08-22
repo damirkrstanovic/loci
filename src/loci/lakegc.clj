@@ -29,38 +29,9 @@
    it goes quiet."
   {:versions 3 :days 30})
 
-(defn- event-handles
-  "Every `{:table … :object … :ts …}` one event names, **including inside a `:tx`**.
-
-   A `:tx` is several sub-events committed as one undoable step, and
-   `tools/save-table!` commits one whenever it also appends a notebook cell. A
-   classifier that walked only top-level events would find no handle for those
-   tables, call them orphaned, and reclaim rows a live object is still using —
-   the worst outcome this namespace can produce. Sub-events carry no `:ts` of
-   their own, so they inherit the transaction's.
-
-   Two shapes carry a handle: a `:put` whose value is the whole object, and an
-   `:assoc` at `[:value]` whose value is the handle itself (that is how
-   `rerun!` refreshes a table)."
-  [ev]
-  (case (:op ev)
-    :tx (mapcat #(event-handles (assoc % :ts (:ts ev))) (:events ev))
-    (let [v (:value ev)
-          h (cond (tbl/handle? v)          v
-                  (tbl/handle? (:value v)) (:value v))]
-      (when h [{:table (:table h) :object (:id ev) :ts (:ts ev)}]))))
-
-(defn- handles-in-history
-  "Every `{:table … :object … :ts …}` the log has ever named, newest first per
-   object.
-
-   From `sub/history` rather than from current state, because `as-of` and undo
-   can reach any of them — that is exactly what the window protects."
-  [st]
-  (->> (sub/history st)
-       (mapcat event-handles)
-       (group-by :object)
-       (into {} (map (fn [[o hs]] [o (vec (reverse hs))])))))
+;; The `:tx`-aware handle walk moved to `loci.tablestore` on 2026-08-22 — `tbl/event-handles`
+;; and `tbl/handles-in-history` — because the files GC needs the same walk, and a second copy
+;; is a second chance to miss a sub-event and reclaim rows a live object is still using.
 
 (defn classify
   "`{lake-table {:class … :object … :ts …}}` for every table in the lake.
@@ -74,11 +45,11 @@
    reference them again."
   [st lk {:keys [versions days] :as _window}]
   (let [live    (set (keep #(:table (:value %)) (vals (sub/objects st))))
-        by-obj  (handles-in-history st)
+        by-obj  (tbl/handles-in-history st)
         cutoff  (- (System/currentTimeMillis) (* days 24 60 60 1000))
         seen    (into {} (for [[o hs] by-obj
-                               [i {:keys [table ts]}] (map-indexed vector hs)]
-                           [table {:object o :ts ts :age-rank i}]))]
+                               [i {:keys [handle ts]}] (map-indexed vector hs)]
+                           [(:table handle) {:object o :ts ts :age-rank i}]))]
     (into {}
           (for [{:keys [table_name]} (lake/live-tables lk)
                 :let [m (get seen table_name)]]
@@ -164,7 +135,7 @@
    about to delete is checked against the tables live objects are reading, and
    any overlap aborts the whole call. That is not defence in depth against
    nothing: `classify`'s `cond` tests `(nil? m)` before `(live table_name)` on
-   purpose, so a gap in `event-handles`' coverage — a new event shape that can
+   purpose, so a gap in `tbl/event-handles`' coverage — a new event shape that can
    carry a handle — surfaces as a live table classified `:orphaned`, and orphans
    ignore the window. Deleting the rest and skipping the overlap would free the
    bytes and leave the gap unlooked-at; the only useful outcome of the

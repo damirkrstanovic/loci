@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 
@@ -266,20 +266,33 @@ function installCleanup() {
 
 async function bootServer(extra = '') {
   installCleanup();
-  const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
+  // resolve(tmpdir()) so `dir` is absolute at birth: package.json sets TMPDIR=.tmp
+  // and node's os.tmpdir() hands that back verbatim, so a bare mkdtemp here returns
+  // the RELATIVE `.tmp/loci-browser-…` — which node resolves against its own cwd
+  // and the JVM below against `cwd: REPO`, two answers that agree only when node
+  // was launched from the repo root. Absolute once, here, and LOCI_DATA,
+  // java.io.tmpdir and rec.dir are three names for one directory.
+  const dir = await mkdtemp(join(resolve(tmpdir()), 'loci-browser-'));
   const rec = { pid: null, dir };
   LIVE.add(rec);
 
   // detached: the `clojure` wrapper may still be a bash script when we kill it,
   // so signal the whole process group — never orphan a JVM holding the port.
   //
-  // -J-Djava.io.tmpdir: package.json's TMPDIR=.tmp moves node's own mkdtemp above,
-  // but a JVM ignores TMPDIR on Linux, and this spawn takes no alias — so every
-  // -Djava.io.tmpdir in deps.edn, which lives inside one, misses it. Each server
-  // here extracts DuckDB's ~58 MB native library, and deleteOnExit does not fire
-  // when we kill the group. Relative, so it resolves under cwd: REPO.
+  // -J-Djava.io.tmpdir: a JVM ignores TMPDIR on Linux, and this spawn takes no
+  // alias — so every -Djava.io.tmpdir in deps.edn, which lives inside one, misses
+  // it. This JVM extracts DuckDB's ~58 MB native library on first use, and
+  // deleteOnExit cannot fire because we kill the process group. Pointing it at
+  // `dir` — the per-server directory reap() and stop() already rm -rf — means the
+  // library is removed by whoever removes the server: no sweep to write, and no
+  // risk of deleting a library another JVM (the nREPL, a concurrent suite) still
+  // has mapped. Replaces `-Djava.io.tmpdir=.tmp`, which moved the leak off tmpfs
+  // without ending it: measured 2026-08-22, one run of sources.test.mjs left one
+  // more 58 MB .so in .tmp and this leaves none. Absolute, per `dir` above, because
+  // loci itself reads java.io.tmpdir and a relative one concatenated after `file://`
+  // reads its first segment as a host — the trap 5a11360 fixed.
   const proc = spawn('clojure',
-    ['-J--enable-native-access=ALL-UNNAMED', '-J-Djava.io.tmpdir=.tmp',
+    ['-J--enable-native-access=ALL-UNNAMED', `-J-Djava.io.tmpdir=${dir}`,
      '-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
@@ -304,6 +317,10 @@ async function bootServer(extra = '') {
   }
   return {
     url: `http://127.0.0.1:${port}`,
+    // `dir` is this server's whole footprint — its LOCI_DATA and its java.io.tmpdir.
+    // Exposed so a `fresh: true` caller can assert on what the JVM put in there;
+    // sources.test.mjs uses it to pin the DuckDB library inside it.
+    dir,
     async stop() { LIVE.delete(rec); kill(); await exited; await rm(dir, { recursive: true, force: true }); },
     serverLog: () => log,
   };

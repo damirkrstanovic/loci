@@ -2191,19 +2191,45 @@
              (catch Exception e {:error (.getMessage e)}))]
     (if (map? written)
       written
-      (let [uri  (files/uri written)
-            ;; The table this exact file already made, if any. One pass over
-            ;; the objects, which `mint-id` inside `connect!` is about to make
-            ;; anyway. Reported rather than refused: two tables from one file
-            ;; is a thing someone may well want, and loci's answer to a mistake
-            ;; is `undo!`, not a veto.
-            seen (->> (sub/objects st) vals
-                      (filter #(= uri (:uri (:source %))))
-                      (map :id) sort first)
-            r    (source-connect! st {:uri uri :format :csv :mode :materialise
-                                      :title (or (not-empty title) "Imported CSV")}
-                                  space)]
-        (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
+      (do
+        ;; **What it was called, remembered — the only record of it there is.**
+        ;; The file is named by its content, so nothing on disk carries the
+        ;; title; without this line a pasted CSV is indistinguishable from one
+        ;; someone `rsync`'d into `files/`, and the picker can only draw it
+        ;; under its hash. The upload route has always called `remember!`; this
+        ;; was the door that did not.
+        ;;
+        ;; **`not-empty`, because `""` is not a name.** The title arrives from
+        ;; `body-json` and the shell posts an empty string for a blank field.
+        ;; `when-let` alone drops a nil and would keep an empty one, and a
+        ;; remembered `""` is worse than no memory at all: `names` and
+        ;; `listing` both treat a present `:name` as a name, so the picker
+        ;; would draw a blank row where the hash belongs.
+        ;;
+        ;; **Unconditional, not only when the file was newly written.** The
+        ;; same bytes pasted again under a new title must take the new title —
+        ;; the manifest is append-only and last-wins by `:id`, which is exactly
+        ;; what last-wins is for.
+        (when-let [t (not-empty title)]
+          (files/remember! written t))
+        (let [uri  (files/uri written)
+              ;; The table this exact file already made, if any. One pass over
+              ;; the objects, which `mint-id` inside `connect!` is about to make
+              ;; anyway. Reported rather than refused: two tables from one file
+              ;; is a thing someone may well want, and loci's answer to a
+              ;; mistake is `undo!`, not a veto.
+              ;;
+              ;; **`files/connected-as` and not the scan that used to be
+              ;; written out here.** `files/listing` now answers the same
+              ;; question per file, so that the picker can warn BEFORE you
+              ;; connect rather than after; two spellings of "which duplicate
+              ;; do we mean" would let the panel and this box name different
+              ;; tables for the same file.
+              seen (files/connected-as st uri)
+              r    (source-connect! st {:uri uri :format :csv :mode :materialise
+                                        :title (or (not-empty title) "Imported CSV")}
+                                    space)]
+          (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen)))))))
 
 (defn source-files
   "`GET /api/source/files` — `files/listing` under the key the shell reads.
@@ -2213,14 +2239,33 @@
    location. What is left here is the envelope, and it is a real thing rather
    than an alias — `{:files […]}` is the JSON contract `API.sourceFiles()`
    destructures, and a bare vector would be a second answer shape among routes
-   that all answer maps."
-  []
-  {:files (files/listing)})
+   that all answer maps.
+
+   The store is passed straight through: `listing` needs it to say which files
+   are already tables, and the alternative — this route asking `connected-as`
+   per row itself — would put the duplicate rule back in two places, which is
+   the thing `connected-as` exists to prevent."
+  [st]
+  {:files (files/listing st)})
 
 (defn source-upload!
   "`POST /api/source/upload` — one chunk of a file being uploaded from the
    browser. Answers `{:id :seq :bytes}` while the file is still arriving, and
-   `{:file :uri :existed}` once `:final` lands it.
+   `{:file :uri :existed :connectedAs}` once `:final` lands it.
+
+   **`:connectedAs` is why this takes a store**, and it is the same key
+   `files/listing` puts on a picked row, from the same `files/connected-as`, so
+   the two doors of the ＋ Data panel answer the duplicate question once. Upload
+   `sales.csv`, connect it, drag the same file in a week later: the bytes match,
+   so `finish-upload!` keeps the file it already has and `:existed` says so —
+   but without this the preview drew no duplicate note and Connect made a second
+   table from the same rows in silence. The picked-row door has warned since
+   phase 2; an upload IS an import, and *warn them that we already have this
+   file before import* is the sentence this phase started from.
+
+   Absent rather than nil when there is none, which is `listing`'s rule for the
+   same key: the shell tests it for truthiness and an explicit null is one more
+   shape to mean nothing.
 
    **It does not connect.** The panel takes the `:uri` and calls the shipped
    `/api/source/describe` and `/api/source/connect` with it, so the preview a
@@ -2239,7 +2284,7 @@
    `loci.files`'s, which owns the directory they are about. Those throw, and
    this is the `try`/`catch` that turns a throw into the `{:error …}` every
    other route in this file answers with."
-  [{:keys [id final] s :seq nm :name} chunk]
+  [st {:keys [id final] s :seq nm :name} chunk]
   (try
     ;; `append-chunk!`'s own answer is passed through rather than rebuilt: its
     ;; `:bytes` is the partial's length on disk, which is the one progress
@@ -2247,7 +2292,10 @@
     ;; landed.
     (let [landed (files/append-chunk! id s chunk)]
       (if final
-        (files/finish-upload! id nm)
+        (let [r (files/finish-upload! id nm)]
+          (cond-> r
+            (files/connected-as st (:uri r))
+            (assoc :connectedAs (files/connected-as st (:uri r)))))
         landed))
     (catch Exception e {:error (.getMessage e)})))
 
@@ -3227,9 +3275,49 @@
 
    `(force lake/lake)` rather than `@lake/lake` only to read the same way the
    rest of this namespace does; the route is a read and forces the singleton the
-   first time a panel is opened, which is the intended moment."
+   first time a panel is opened, which is the intended moment.
+
+   **`:files` is the files DIRECTORY and `:lake :files` is Parquet.** Two keys
+   spelled the same at two depths, which is worth stating once here rather than
+   leaving to whoever reads the panel: `lakegc` has answered `{:lake {:files
+   … :catalog …}}` since August and renaming half of it to make this one
+   unambiguous would move a key three readers already know. The panel names its
+   local after the depth for the same reason.
+
+   **No rows travel at all — five integers and a map of counts do.** `report`
+   carries one row per file because a caller may want them, and the paragraph
+   this replaces shipped the doomed ones while rejecting the same shape for
+   `:files` in the same breath: *shipping 10,000 rows to draw two figures is the
+   shape `lakegc/report` avoids*. That was the right rule applied to one key and
+   not the other. Each row carries `:file :uri :bytes :name :connectedAs :class
+   :object :ts :at`, so a mostly-reclaimable directory at the scale these
+   docstrings reason about is ~2 MB of JSON on every panel open — to draw one
+   number, because `.length` is all the shell ever read off them.
+   `lakegc/report` answers `:orphaned` as `{:tables n :bytes b}` for this reason.
+
+   So `:reclaimable-count` is the count of `report`'s `:doomed` rows — the set a
+   reclaim deletes, which is `:reclaimable` AND `:orphaned`; naming that set
+   after one of its two members is how the other got left out of
+   `files/reclaim!`. The bytes figure keeps the name `:reclaimable-bytes` over
+   the same widened set, because that is the right word for the bytes.
+
+   **`:classes` is `frequencies` over the classes, and it is what makes the
+   panel's zero state honest.** With `:count` alone the only sentence available
+   for *nothing can be freed* was \"nothing loci wrote is unreferenced\" — false
+   in exactly the case this phase exists for: an uploaded-and-never-connected
+   file IS loci-written and unreferenced, and is held back only by the orphan
+   grace, so the person who has just uploaded 200 MiB was told the opposite of
+   why it cannot go. Four integers the classifier has already computed let the
+   phrase name the actual reason, which is this codebase's voice everywhere
+   else."
   [st]
-  (gc/report st (force lake/lake) gc/default-window))
+  (assoc (gc/report st (force lake/lake) gc/default-window)
+         :files (let [r (files/report st files/default-window)]
+                  {:count             (count (:files r))
+                   :classes           (frequencies (map :class (:files r)))
+                   :total-bytes       (:total-bytes r)
+                   :reclaimable-bytes (:reclaimable-bytes r)
+                   :reclaimable-count (count (:doomed r))})))
 
 (defn- storage-reclaim!
   "Reclaim one object's out-of-window versions. Irreversible, so it refuses a
@@ -3261,6 +3349,33 @@
                "which is what a nil id means to lakegc/reclaim! and is not what "
                "a request with no :id is asking for")}
     (gc/reclaim! st (force lake/lake) id (or window gc/default-window))))
+
+(defn- files-reclaim!
+  "Reclaim what the window releases from the files directory, and say what
+   actually went.
+
+   **`:freed` comes from `files/reclaim!` and is not computed here.** It was,
+   for one commit, and the docstring then said it should move as soon as the
+   function offered one: `files/reclaim!` answers a row per CANDIDATE, and a
+   failed delete is shape-identical to a done one apart from `:error` — `:bytes`
+   is on both, because the row describes the file and not the outcome — so
+   `(reduce + (map :bytes rows))` at any caller reports as freed the bytes of
+   every file still on disk. `lakegc/reclaim!` has always answered its own
+   `:freed` for that reason; `files/reclaim!` now does too, so the sum has one
+   implementation next to the deletes it is about rather than one per caller.
+
+   All that is left here is the envelope's spelling: `:reclaimed` on the wire
+   for `:files` in the answer, because the panel reads `res.reclaimed` and
+   `:files` at this depth would sit beside `storage-payload`'s `:files` meaning
+   the whole directory.
+
+   The failures themselves are not summarised: they stay in `:reclaimed` with
+   their own sentences, which is what makes *a reclaim that cannot delete a file
+   reports which and why* true at the only place a person reads it. A count of
+   them is `(filter :error …)` and needs no second key to be wrong in."
+  [st]
+  (let [{:keys [files freed]} (files/reclaim! st files/default-window)]
+    {:reclaimed files :freed freed}))
 
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
@@ -3322,7 +3437,7 @@
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
       (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
-      (= uri "/api/source/files")(json-resp (source-files))
+      (= uri "/api/source/files")(json-resp (source-files st))
       ;; `(:body req)` is handed STRAIGHT to `source-upload!` — no `slurp`, and
       ;; that is load-bearing rather than a style choice. `slurp` decodes bytes
       ;; to a String, and a chunk boundary falls at an arbitrary byte: measured
@@ -3334,7 +3449,7 @@
       ;; forever after. The body streams to disk as bytes and is never a String.
       (= uri "/api/source/upload")
       (json-resp (if-let [m (upload-meta req)]
-                   (source-upload! m (:body req))
+                   (source-upload! st m (:body req))
                    {:error (str "POST /api/source/upload needs an X-Loci-Upload "
                                 "header carrying {id, seq, name, final}")}))
       (= uri "/api/notebook")(if (= :post (:request-method req))
@@ -3387,6 +3502,21 @@
       ;; falls through to the 404 rather than to a reclaim.
       (and (= :post (:request-method req)) (= uri "/api/storage/reclaim"))
       (json-resp (storage-reclaim! st (:id (body-json req)) nil))
+      ;; The files directory's half of the same panel, method-gated for the same
+      ;; reason: it deletes bytes, and undo reverts an event and not a file.
+      ;;
+      ;; It names no object, and the route above's missing-`:id` guard therefore
+      ;; has nothing to guard here — a file belongs to no object. Two tables may
+      ;; share one (`:connectedAs` and `:duplicateOf` are that state), and an
+      ;; upload nothing has picked belongs to none. The unit of a files reclaim
+      ;; is the directory, so the method is the whole gate.
+      ;;
+      ;; `files-reclaim!` fixes the window and this route never reads one off the
+      ;; request. The caller is a browser, and how far back undo still reaches
+      ;; is not a decision a page may take — `/api/storage/reclaim` passes `nil`
+      ;; and lets the callee default for the same reason.
+      (and (= :post (:request-method req)) (= uri "/api/storage/reclaim-files"))
+      (json-resp (files-reclaim! st))
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))

@@ -501,11 +501,18 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 
 - [ ] **Step 1: Write the failing test**
 
-```clojure
-(def ^:private day (* 24 60 60 1000))
+**Do not backdate an event to age it out.** `EventStore/commit!` does `(assoc event :ts (System/currentTimeMillis))` (`substrate.clj:133`) — it **overwrites** any `:ts` a caller supplies, silently, so a test that commits with a 90-day-old `:ts` gets one stamped *now* and its window assertion becomes vacuous. `loci.lakegc`'s own tests never backdate; they pass a **shrunken window** instead (`{:versions 3 :days 0}`, `lakegc_test.clj:38`). Do the same.
 
-(defn- put-source! [st id uri mode ts]
-  (sub/commit! st {:op :put :id id :ts ts
+`nothing-retained` below is `{:versions 0 :days -1}`, not `{:versions 0 :days 0}`. With `:days 0` the cutoff is *now*, and an event committed in the same millisecond satisfies `(>= ts cutoff)` and comes back `:in-window` — a rare flake that would look like a real failure. A negative day puts the cutoff in the future, so the age half is off deterministically.
+
+```clojure
+(def ^:private nothing-retained
+  ;; retain nothing: no versions, and a cutoff in the FUTURE so no event can be
+  ;; inside the age half. See the note above on why not `:days 0`.
+  {:versions 0 :days -1})
+
+(defn- put-source! [st id uri mode]
+  (sub/commit! st {:op :put :id id
                    :value {:id id :source {:uri uri :mode mode}
                            :value (if (= mode :passthrough)
                                     {:store :source :uri uri :format :csv}
@@ -518,8 +525,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "a.csv") "x\n")
         (files/remember! "a.csv" "kept")
-        (put-source! st "tbl:a" "loci://files/a.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
-        (is (= :current (:class (get (files/classify st files/default-window) "a.csv")))
+        (put-source! st "tbl:a" "loci://files/a.csv" :materialise)
+        (is (= :current (:class (get (files/classify st nothing-retained) "a.csv")))
             "current beats the window — a live object's file is never reclaimable however old")))))
 
 (deftest classify-reclaims-a-file-loci-wrote-that-nothing-names-any-more
@@ -529,9 +536,9 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "x\n")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (is (= :reclaimable (:class (get (files/classify st files/default-window) "old.csv")))
+        (is (= :reclaimable (:class (get (files/classify st nothing-retained) "old.csv")))
             "no live object names it and its only mention is 90 days old")))))
 
 (deftest classify-never-reclaims-a-file-loci-did-not-write
@@ -540,7 +547,7 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
       (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "placed.csv") "x\n")
-        (is (= :foreign (:class (get (files/classify st files/default-window) "placed.csv")))
+        (is (= :foreign (:class (get (files/classify st nothing-retained) "placed.csv")))
             "no manifest entry means a person put it there — rsync, a mount, a volume —
              and deleting it would destroy data loci never created")))))
 
@@ -551,8 +558,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "live.csv") "x\n")
         (files/remember! "live.csv" "live")
-        (put-source! st "tbl:p" "loci://files/live.csv" :passthrough (- (System/currentTimeMillis) (* 90 day)))
-        (is (= :current (:class (get (files/classify st files/default-window) "live.csv")))
+        (put-source! st "tbl:p" "loci://files/live.csv" :passthrough)
+        (is (= :current (:class (get (files/classify st nothing-retained) "live.csv")))
             "it is re-read on every query — reclaiming it turns a working table
              into :table/unavailable, and no window makes that acceptable")))))
 
@@ -563,7 +570,7 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "recent.csv") "x\n")
         (files/remember! "recent.csv" "recent")
-        (put-source! st "tbl:a" "loci://files/recent.csv" :materialise (- (System/currentTimeMillis) day))
+        (put-source! st "tbl:a" "loci://files/recent.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
         (is (= :in-window (:class (get (files/classify st files/default-window) "recent.csv")))
             "deleted yesterday — undo and as-of can still reach it, which is what
@@ -572,17 +579,16 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 (deftest classify-finds-a-file-named-only-inside-a-tx
   (with-dir
     (fn [_]
-      (let [st (sub/fresh-store)
-            ts (- (System/currentTimeMillis) (* 90 day))]
+      (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "txd.csv") "x\n")
         (files/remember! "txd.csv" "in a tx")
-        (sub/commit! st {:op :tx :ts ts
+        (sub/commit! st {:op :tx
                          :events [{:op :put :id "tbl:t"
                                    :value {:id "tbl:t" :source {:uri "loci://files/txd.csv"}
                                            :value {:store :lake :table "t_t" :snapshot 1}}}
                                   {:op :put :id "note:t" :value {:id "note:t" :value "x"}}]})
-        (is (= :current (:class (get (files/classify st files/default-window) "txd.csv")))
+        (is (= :current (:class (get (files/classify st nothing-retained) "txd.csv")))
             "THE test the lifted walk exists for — a top-level-only walk finds no
              handle here, calls the file unreferenced, and reclaims a live table's source")))))
 ```
@@ -619,15 +625,23 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
    materialised source's handle names no location, so a refresh drops the uri
    and only the original `:put` carries it."
   [st {:keys [versions days] :as _window}]
-  (let [mine    (set (keep #(when-not ((retired) %) %) (keys (names))))
+  (let [gone    (retired)                       ; ONE manifest read, see below
+        mine    (into #{} (remove gone) (keys (names)))
         live    (set (keep #(:uri (:source %)) (vals (sub/objects st))))
         cutoff  (- (System/currentTimeMillis) (* days 24 60 60 1000))
         by-obj  (tbl/handles-in-history st)
-        seen    (into {} (for [[o hs] by-obj
-                               [i e]  (map-indexed vector hs)
-                               :let [u (or (:uri (:source e)) (:uri (:handle e)))]
-                               :when u]
-                           [u {:object o :ts (:ts e) :age-rank i}]))]
+        ;; Rank among the object's URI-BEARING entries only, and merge per uri
+        ;; toward whichever answer RETAINS more. Both corrections are load-bearing;
+        ;; see the note below on why the lakegc shape is wrong here.
+        seen    (reduce
+                  (fn [acc [o hs]]
+                    (reduce-kv
+                      (fn [a i e]
+                        (let [u (uri-of e)]
+                          (update a u keepier {:object o :ts (:ts e) :age-rank i})))
+                      acc
+                      (vec (filter uri-of hs))))
+                  {} by-obj)]
     (into {}
           (for [{:keys [file uri]} (listing st)
                 :let [m (get seen uri)]]
@@ -642,6 +656,34 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 ```
 
 Note the `cond` order: **`:foreign` first**, so a hand-placed file can never fall through to any other class, and **`:current` before the window**, mirroring `lakegc` and mirroring `source-block`'s precedence lesson from phase 2.
+
+**Why `seen` is not `lakegc`'s shape.** Corrected 2026-08-22 after two independent reviews measured it deleting live data. `lakegc`'s `seen` is right there and wrong here, because a lake table name is minted fresh per write — every entry is a *distinct* table, so ranking entries ranks versions and no key ever repeats. A **file uri repeats**, and entries that name no uri still exist. Three consequences, all measured against the shipped code:
+
+- **`:versions` counted events, not files.** `map-indexed` spent a rank on every entry and `:when u` dropped the nil-uri ones *afterwards* — and a materialised `refresh!` commits an `:assoc [:value]` carrying `{:store :lake …}`, which names no location. So an object with **one** file, refreshed ten times, came back `:age-rank 10` and `:reclaimable`. Refreshing a table was what aged its own source out. The spec says "the three most recent **files** per object"; filter first, then rank.
+- **`(into {} …)` is last-wins and `handles-in-history` is newest-first, so the *oldest* mention won.** `:ts` reported the original connect, and a passthrough table refreshed yesterday looked thirty days stale.
+- **Two tables on one file were attributed to an arbitrary one.** `group-by`'s map iterates in insertion order below 8 keys and hash order above, so the answer flipped — measured — when an unrelated tenth object entered the store. `:reclaimable` on one run, `:in-window` on the next, same fixture.
+
+`uri-of` is `#(or (:uri (:source %)) (:uri (:handle %)))`. `keepier` merges two answers for one uri toward retention, taking the halves **independently** — `min` of `:age-rank`, `max` of `:ts` — because they are two different reasons to keep a file and neither should be able to veto the other:
+
+```clojure
+(defn- keepier
+  "Of two classifications for one uri, the one that retains more.
+
+   The window's two halves are independent reasons to keep a file, so they
+   merge independently: the lowest rank any object gives it, and the newest
+   moment any object named it. Taking the pair from one entry would let a
+   stale rank cancel a fresh timestamp."
+  [a b]
+  (if (nil? a)
+    b
+    {:object   (if (< (:age-rank b) (:age-rank a)) (:object b) (:object a))
+     :ts       (max (or (:ts a) 0) (or (:ts b) 0))
+     :age-rank (min (:age-rank a) (:age-rank b))}))
+```
+
+**A manifest record with no `:at` must be kept, not reclaimed.** `(or at 0)` reads a missing clock as the epoch — maximally old — which sends a hand-edited or older manifest line straight to `:orphaned`. `(if at (>= at cutoff) true)` costs nothing and makes an unreadable clock mean *keep it*, which is the direction a GC over a primary file must fail in.
+
+**Read the manifest once.** An earlier draft of this `let` called `(retired)` inside a `keep` over `(keys (names))` — one full parse of `files.edn` per manifest entry. Measured 2026-08-22 during Task 4's review: `records` costs ~43 ms over 10,000 lines, so that shape is ~10,000 × 43 ms ≈ **7 minutes for one `classify`** — and `classify` is what `report` calls, which Task 9 asks to be cheap enough to sit in a panel that draws on open. Both `(retired)` and `(names)` are hoisted into the `let` and each reads the file once. If you add another manifest consumer here, hoist it too.
 
 - [ ] **Step 4: Run, confirm PASS.** All six.
 
@@ -678,9 +720,9 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "0123456789")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (let [r (files/report st files/default-window)]
+        (let [r (files/report st nothing-retained)]
           (is (= 10 (:reclaimable-bytes r)) "the file's actual length, not a count")
           (is (= ["old.csv"] (map :file (:reclaimable r))))
           (is (.exists (io/file (files/dir) "old.csv"))
@@ -694,10 +736,10 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (spit (io/file (files/dir) "old.csv") "x\n")
         (spit (io/file (files/dir) "keep.csv") "y\n")
         (files/remember! "old.csv" "gone") (files/remember! "keep.csv" "kept")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
-        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise (System/currentTimeMillis))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (let [r (files/reclaim! st files/default-window)]
+        (let [r (files/reclaim! st nothing-retained)]
           (is (= ["old.csv"] (map :file r)))
           (is (not (.exists (io/file (files/dir) "old.csv"))))
           (is (.exists (io/file (files/dir) "keep.csv")) "a live table's file is untouched")
@@ -712,7 +754,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "x\n")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
         ;; The file must stay a FILE — `listing` filters directories out via
         ;; `content?`, so a directory named `old.csv` never becomes a candidate
@@ -720,7 +762,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         ;; property of the containing directory, so make that unwritable.
         (.setWritable (files/dir) false)
         (try
-          (let [r (files/reclaim! st files/default-window)]
+          (let [r (files/reclaim! st nothing-retained)]
             ;; Running as root ignores the permission bit. Say so loudly rather
             ;; than passing green on a mechanism that never ran — a silent skip
             ;; here is a test that certifies.
@@ -738,7 +780,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
       (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "placed.csv") "x\n")
-        (is (= [] (files/reclaim! st files/default-window)))
+        (is (= [] (files/reclaim! st nothing-retained)))
         (is (.exists (io/file (files/dir) "placed.csv"))
             "a hand-placed file survives a reclaim that had no other candidates —
              the class that protects it is not a special case of having something else to do")))))
@@ -759,9 +801,14 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         rows (for [{:keys [file bytes]} (listing st)]
                (assoc (get cls file) :file file :bytes bytes))]
     {:files (vec rows)
-     :reclaimable (vec (filter #(= :reclaimable (:class %)) rows))
-     :reclaimable-bytes (reduce + 0 (map :bytes (filter #(= :reclaimable (:class %)) rows)))
+     ;; `:doomed`, not `:reclaimable` — the set a reclaim would delete is BOTH
+     ;; `:reclaimable` and `:orphaned`, and naming it after one of its two
+     ;; members is how the other got left out of `reclaim!` in the first place.
+     :doomed (vec (filter #(#{:reclaimable :orphaned} (:class %)) rows))
+     :reclaimable-bytes (reduce + 0 (map :bytes (filter #(#{:reclaimable :orphaned} (:class %)) rows)))
      :total-bytes (reduce + 0 (map :bytes rows))}))
+
+**`retire!` takes the name, it does not look it up.** Task 4's `retire!` is `[id]` and resolves the name with `(get (names) id)` — a full manifest parse. Called once per reclaimed file, that is O(N²): measured 2026-08-22, reclaiming 2,000 files costs **27.9 s** against **0.040 s** when the name is resolved once. Give `retire!` a second arity `[id name]` and have `reclaim!` pass the name it already has from the `report` row, or hoist one `(names)` out of the loop. 700× at N=2,000, measured.
 
 (defn reclaim!
   "Delete every `:reclaimable` file and retire its manifest line. Irreversible.
@@ -771,7 +818,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
    between `report` and here is not an error; it is the outcome the caller
    asked for."
   [st window]
-  (vec (for [{:keys [file bytes]} (:reclaimable (report st window))
+  (vec (for [{:keys [file bytes]} (:doomed (report st window))
              :let [f    (io/file (dir) file)
                    gone (or (.delete f) (not (.exists f)))]]
          (if gone
@@ -779,6 +826,12 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
            {:file file :bytes bytes :error (str "loci could not delete " file
                                                 " — it is still in " (.getPath (dir)))}))))
 ```
+
+**`reclaim!` deletes `:orphaned` as well as `:reclaimable`, and `report` names that set `:doomed`.** Corrected 2026-08-22 after a spec review found the classifier producing a class nothing acted on. An earlier draft of this snippet took `(:reclaimable (report …))` alone — so a file loci wrote that **nothing ever named**, which is the ordinary state of an upload that was never connected and of a connect that was undone, contributed 0 to `:reclaimable-bytes` and was never deleted. Measured: a 200-byte file remembered 40 days ago and never connected classifies `:orphaned`, and `reclaim!` returns `[]` with the file still on disk. At the spec's stated scale — 200 MiB uploads, ten stale ones is 2 GB — that is precisely the complaint this phase opens with, and the storage panel would not have offered those bytes at all.
+
+`lakegc/reclaim!` has always taken `#{:reclaimable :orphaned}` (`lakegc.clj:151`), and this GC's own docstrings already assumed it: `classify` calls `:orphaned` *"the one class a reclaim deletes with no object to warn about"*, and its `:current`-before-`:orphaned` section says a file uploaded forty days ago and disconnected yesterday *"would be reclaimed"*. Both were false against the narrowed snippet.
+
+The orphan **age grace** added in Task 6 is what makes this safe: an orphan younger than the cutoff is `:in-window`, so an upload waiting in the panel to be picked is never a candidate. Without that grace this change would delete live uploads; with it, an orphan past the window is a file loci wrote, nobody ever connected, and nothing can reach.
 
 **Every candidate gets a row, and a failure carries `:error` rather than vanishing from the result.** The spec asks for this by name: *"A reclaim that cannot delete a file reports which and why."* A `:when` filter would silently return a shorter vector, and a caller comparing counts would read that as success. Note the name is **not** retired when the delete failed — the bytes are still there.
 
@@ -831,7 +884,7 @@ The `with-redefs [c/store …]` is not optional — `handler` binds `st (store)`
 Add to `storage-payload`, beside the lake numbers:
 
 ```clojure
-   :files (let [r (files/report st files/default-window)]
+   :files (let [r (files/report st nothing-retained)]
             (select-keys r [:total-bytes :reclaimable-bytes :reclaimable]))
 ```
 
@@ -839,7 +892,7 @@ and a route beside `/api/storage/reclaim`:
 
 ```clojure
       (and (= :post (:request-method req)) (= uri "/api/storage/reclaim-files"))
-      (json-resp {:reclaimed (files/reclaim! st files/default-window)})
+      (json-resp {:reclaimed (files/reclaim! st nothing-retained)})
 ```
 
 Method-gated because it deletes, exactly as `/api/storage/reclaim` is and for the same reason its comment gives.

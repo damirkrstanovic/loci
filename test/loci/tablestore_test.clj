@@ -233,3 +233,75 @@
                (catch clojure.lang.ExceptionInfo e e))]
     (is (= :a_b (:column (ex-data e)))
         "normalize-rows must keep throwing exactly as it did, through the same check")))
+
+(deftest handles-in-history-finds-a-handle-inside-a-tx
+  (let [st (sub/fresh-store)
+        h  {:store :lake :table "t_one" :snapshot 1}]
+    (sub/commit! st {:op :tx :events [{:op :put :id "tbl:a" :value {:id "tbl:a" :value h}}
+                                      {:op :put :id "note:a" :value {:id "note:a" :value "x"}}]})
+    (let [by-obj (tbl/handles-in-history st)]
+      (is (= ["t_one"] (map #(:table (:handle %)) (get by-obj "tbl:a")))
+          "a sub-event's handle is found — a walk that saw only top-level events would call
+           this orphaned and reclaim rows a live object is still using")
+      (is (= [(:ts (first (sub/history st)))] (mapv :ts (get by-obj "tbl:a")))
+          ;; Not `(every? :ts …)`, which the plan spelled and which CANNOT FAIL:
+          ;; `every?` over an empty seq is true, so it passes in precisely the
+          ;; state the assertion above exists to catch — the walk finding no
+          ;; sub-event at all. Measured 2026-08-22 by breaking the `:tx` branch:
+          ;; the first assertion failed, this one did not. Comparing against the
+          ;; transaction's own committed stamp cannot pass vacuously, and pins
+          ;; *inherits the transaction's* rather than merely *has one*. Read from
+          ;; the log, not written by the test, because `commit!` overwrites any
+          ;; `:ts` a caller supplies.
+          "and inherits the transaction's :ts, because a sub-event carries none of its own"))))
+
+(deftest handles-in-history-carries-the-source-a-materialised-refresh-drops
+  (let [st  (sub/fresh-store)
+        src {:uri "loci://files/abc.csv" :format :csv :mode :materialise}
+        v1  {:store :lake :table "t_one" :snapshot 1}
+        v2  {:store :lake :table "t_two" :snapshot 2}]
+    (sub/commit! st {:op :put :id "tbl:a" :value {:id "tbl:a" :value v1 :source src}})
+    (sub/commit! st {:op :assoc :id "tbl:a" :path [:value] :value v2})
+    (let [hs (get (tbl/handles-in-history st) "tbl:a")]
+      (is (= ["t_two" "t_one"] (map #(:table (:handle %)) hs))
+          "newest first, both versions")
+      (is (= [nil "loci://files/abc.csv"] (map #(:uri (:source %)) hs))
+          "the refresh names no uri — only the :put does. A files GC reading handles alone
+           would find this file unreferenced and reclaim a live table's source."))))
+
+(deftest handles-in-history-finds-a-passthrough-uri-on-the-handle-itself
+  (let [st (sub/fresh-store)
+        h  {:store :source :uri "loci://files/live.csv" :format :csv}]
+    (sub/commit! st {:op :put :id "tbl:b" :value {:id "tbl:b" :value h :source {:uri "loci://files/live.csv"}}})
+    (is (= "loci://files/live.csv" (:uri (:handle (first (get (tbl/handles-in-history st) "tbl:b")))))
+        "a passthrough handle IS the recipe and names its own location")))
+
+(deftest handles-in-history-ignores-a-handle-that-is-not-at-the-object-s-value
+  ;; An entry asserts *this object's value IS this handle*, so a handle sitting
+  ;; at a deeper path produces a WRONG entry, not a missing one — and wrong is
+  ;; the worse of the two. `lakegc/classify` folds entries into
+  ;; `{table {:object :ts :age-rank}}`, last write wins per table name, so a
+  ;; spurious entry can *replace* the true owner's and flip a version `undo!`
+  ;; can still reach from `:in-window` to `:reclaimable`. `reclaim!`'s live-set
+  ;; guard does not catch it: that guard catches under-coverage (a live table
+  ;; called `:orphaned`), and this is over-coverage.
+  ;;
+  ;; Neither shape below is committed anywhere in `src/` today — checked
+  ;; 2026-08-22, every handle-carrying site is a `:put` or an `:assoc` at
+  ;; exactly `[:value]`. This pins the closed shape so the docstring stays true
+  ;; when a third writer appears.
+  (let [st   (sub/fresh-store)
+        real {:store :lake :table "t_real" :snapshot 1}
+        prev {:store :lake :table "t_prev" :snapshot 2}]
+    (sub/commit! st {:op :put :id "nb:1" :value {:id "nb:1" :value real}})
+    (sub/commit! st {:op :assoc :id "nb:1" :path [:value :preview] :value prev})
+    (sub/commit! st {:op :append :id "nb:1" :path [:value :cells] :value {:value prev}})
+    (is (= ["t_real"] (map #(:table (:handle %)) (get (tbl/handles-in-history st) "nb:1")))
+        ;; Two-sided on purpose: it fails if the gate lets the deeper paths
+        ;; through (ungated it reads ["t_prev" "t_prev" "t_real"], the newest of
+        ;; which is what displaces the true owner) AND it fails if the gate is
+        ;; too tight and drops the `:put` as well. `(is (empty? …))` over the
+        ;; deeper events alone would pass in the state where the walk finds
+        ;; nothing at all, which is the other way this can be broken.
+        "only a :put and an :assoc at exactly [:value] name the object's value — a handle
+         at [:value :preview] or inside an appended cell must yield no entry at all")))
