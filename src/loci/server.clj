@@ -2191,19 +2191,40 @@
              (catch Exception e {:error (.getMessage e)}))]
     (if (map? written)
       written
-      (let [uri  (files/uri written)
-            ;; The table this exact file already made, if any. One pass over
-            ;; the objects, which `mint-id` inside `connect!` is about to make
-            ;; anyway. Reported rather than refused: two tables from one file
-            ;; is a thing someone may well want, and loci's answer to a mistake
-            ;; is `undo!`, not a veto.
-            seen (->> (sub/objects st) vals
-                      (filter #(= uri (:uri (:source %))))
-                      (map :id) sort first)
-            r    (source-connect! st {:uri uri :format :csv :mode :materialise
-                                      :title (or (not-empty title) "Imported CSV")}
-                                  space)]
-        (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen))))))
+      (do
+        ;; **What it was called, remembered — the only record of it there is.**
+        ;; The file is named by its content, so nothing on disk carries the
+        ;; title; without this line a pasted CSV is indistinguishable from one
+        ;; someone `rsync`'d into `files/`, and the picker can only draw it
+        ;; under its hash. The upload route has always called `remember!`; this
+        ;; was the door that did not.
+        ;;
+        ;; **`not-empty`, because `""` is not a name.** The title arrives from
+        ;; `body-json` and the shell posts an empty string for a blank field.
+        ;; `when-let` alone drops a nil and would keep an empty one, and a
+        ;; remembered `""` is worse than no memory at all: `names` and
+        ;; `listing` both treat a present `:name` as a name, so the picker
+        ;; would draw a blank row where the hash belongs.
+        ;;
+        ;; **Unconditional, not only when the file was newly written.** The
+        ;; same bytes pasted again under a new title must take the new title —
+        ;; the manifest is append-only and last-wins by `:id`, which is exactly
+        ;; what last-wins is for.
+        (when-let [t (not-empty title)]
+          (files/remember! written t))
+        (let [uri  (files/uri written)
+              ;; The table this exact file already made, if any. One pass over
+              ;; the objects, which `mint-id` inside `connect!` is about to make
+              ;; anyway. Reported rather than refused: two tables from one file
+              ;; is a thing someone may well want, and loci's answer to a
+              ;; mistake is `undo!`, not a veto.
+              seen (->> (sub/objects st) vals
+                        (filter #(= uri (:uri (:source %))))
+                        (map :id) sort first)
+              r    (source-connect! st {:uri uri :format :csv :mode :materialise
+                                        :title (or (not-empty title) "Imported CSV")}
+                                    space)]
+          (cond-> r (and seen (not (:error r))) (assoc :duplicateOf seen)))))))
 
 (defn source-files
   "`GET /api/source/files` — `files/listing` under the key the shell reads.

@@ -4380,6 +4380,50 @@
                       (:uri (:source (sub/object st (:openId r)))))
             "and the CSV is on disk as a source, so refresh! has something to re-run")))))
 
+(deftest import-csv-remembers-the-title-it-was-given
+  ;; A pasted CSV and an uploaded one land in the same content-addressed
+  ;; directory, but until now only the upload wrote `files.edn` — so a paste was
+  ;; indistinguishable from a file someone `rsync`'d in, and the picker drew it
+  ;; under its hash. `nm` is read from the LISTING rather than from the manifest
+  ;; deliberately: read from `names` it would be nil while the bug is present,
+  ;; and `re-matches` on nil throws — aborting the test instead of failing the
+  ;; assertion that is actually about the name.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            r  (srv/import-csv! st "Q3 Takings" "region,revenue\nEMEA,10\n" nil)
+            nm (first (map :file (files/listing)))]
+        (is (nil? (:error r)))
+        (is (re-matches #"[0-9a-f]{16}\.csv" nm)
+            "the file is still content-addressed — the title is metadata, not the name")
+        (is (= "Q3 Takings" (get (files/names) nm))
+            "and the manifest remembers what it was called, so the picker can show it")
+        (is (= "Q3 Takings" (:name (first (filter #(= nm (:file %)) (files/listing)))))
+            "which is what makes a pasted CSV list under its title instead of its hash")))))
+
+(deftest import-csv-with-no-title-remembers-nothing-rather-than-a-blank
+  ;; Two pastes, because `nil` and `""` are guarded by different halves of the
+  ;; expression and only one of them can catch a regression. `when-let` alone
+  ;; already drops a nil title — a test that passed only nil would keep passing
+  ;; with the `not-empty` deleted. `""` is what `not-empty` is for, and it is
+  ;; what the shell posts when the title field is left blank.
+  ;;
+  ;; The manifest FILE is asserted on, not only `names`: `names` keeps a record
+  ;; whose `:name` is `""` (an empty string is truthy), so it does move — but
+  ;; the file is the direct statement that nothing was appended at all.
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)
+            a  (srv/import-csv! st "" "a,b\n1,2\n" nil)
+            b  (srv/import-csv! st nil "c,d\n3,4\n" nil)]
+        (is (every? nil? (map :error [a b])))
+        (is (not (.exists (io/file (sub/data-dir) "files.edn")))
+            "an untitled paste has no name to remember, and an empty string is not a name")
+        (is (empty? (files/names))
+            "so the manifest holds nothing for either of them")
+        (is (= [nil nil] (mapv :name (files/listing)))
+            "and the picker draws them under their hashes, which is the honest answer")))))
+
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
   ;; the other half of the same measurement: this path refuses upstream, so the
   ;; empty branch of `tbl/table-object` is unreachable from here — do not "fix"
