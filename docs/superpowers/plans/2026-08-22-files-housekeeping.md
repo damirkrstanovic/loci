@@ -625,7 +625,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
    materialised source's handle names no location, so a refresh drops the uri
    and only the original `:put` carries it."
   [st {:keys [versions days] :as _window}]
-  (let [mine    (set (keep #(when-not ((retired) %) %) (keys (names))))
+  (let [gone    (retired)                       ; ONE manifest read, see below
+        mine    (into #{} (remove gone) (keys (names)))
         live    (set (keep #(:uri (:source %)) (vals (sub/objects st))))
         cutoff  (- (System/currentTimeMillis) (* days 24 60 60 1000))
         by-obj  (tbl/handles-in-history st)
@@ -648,6 +649,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 ```
 
 Note the `cond` order: **`:foreign` first**, so a hand-placed file can never fall through to any other class, and **`:current` before the window**, mirroring `lakegc` and mirroring `source-block`'s precedence lesson from phase 2.
+
+**Read the manifest once.** An earlier draft of this `let` called `(retired)` inside a `keep` over `(keys (names))` — one full parse of `files.edn` per manifest entry. Measured 2026-08-22 during Task 4's review: `records` costs ~43 ms over 10,000 lines, so that shape is ~10,000 × 43 ms ≈ **7 minutes for one `classify`** — and `classify` is what `report` calls, which Task 9 asks to be cheap enough to sit in a panel that draws on open. Both `(retired)` and `(names)` are hoisted into the `let` and each reads the file once. If you add another manifest consumer here, hoist it too.
 
 - [ ] **Step 4: Run, confirm PASS.** All six.
 
@@ -768,6 +771,8 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
      :reclaimable (vec (filter #(= :reclaimable (:class %)) rows))
      :reclaimable-bytes (reduce + 0 (map :bytes (filter #(= :reclaimable (:class %)) rows)))
      :total-bytes (reduce + 0 (map :bytes rows))}))
+
+**`retire!` takes the name, it does not look it up.** Task 4's `retire!` is `[id]` and resolves the name with `(get (names) id)` — a full manifest parse. Called once per reclaimed file, that is O(N²): measured 2026-08-22, reclaiming 2,000 files costs **27.9 s** against **0.040 s** when the name is resolved once. Give `retire!` a second arity `[id name]` and have `reclaim!` pass the name it already has from the `report` row, or hoist one `(names)` out of the loop. 700× at N=2,000, measured.
 
 (defn reclaim!
   "Delete every `:reclaimable` file and retire its manifest line. Irreversible.
