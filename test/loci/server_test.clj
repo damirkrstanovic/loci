@@ -4671,6 +4671,104 @@
           (is (= 0 (:freed r)))
           (is (= 1 (count (lake/live-tables @lake/lake))) "and the orphan is still there"))))))
 
+;; ---------------------------------------------------------------------------
+;; the files half of the storage panel
+;;
+;; `loci.files/report` and `reclaim!` have their own suite in `loci.files-test`.
+;; What is left here is the two things only this namespace can see: that the
+;; payload the panel draws carries them, and that the destructive half is
+;; reachable over HTTP under the window the SERVER ships rather than one a test
+;; invented.
+;; ---------------------------------------------------------------------------
+
+(deftest storage-payload-carries-what-the-files-directory-costs
+  (with-temp-data-dir
+    (fn []
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "0123456789")
+        (let [p (#'srv/storage-payload st)]
+          (is (= 10 (get-in p [:files :total-bytes]))
+              "the directory's real length in bytes, not a count of files")
+          (is (= 1 (get-in p [:files :count]))
+              "and how many files that is — a panel drawing no button still has to say
+               what the directory holds, and `report`'s own rows are not on the wire
+               to be counted")
+          (is (= 0 (get-in p [:files :reclaimable-bytes]))
+              "a hand-placed file costs bytes and frees none — the panel must not
+               offer to delete something loci did not write")
+          (is (= [] (get-in p [:files :reclaimable]))
+              "and names none of them, which is what the button would count"))))))
+
+(deftest the-files-reclaim-route-answers-through-the-URL
+  ;; `c/store` is rebound for its four siblings' reason: `handler` binds
+  ;; `(store)` before the `cond` for every route, so without it asking for a
+  ;; reclaim opens the user's real Datalevin store and seeds it.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "x\n")
+        (let [w    (atom ::never-called)
+              real files/reclaim!]
+          ;; Wrapped rather than stubbed — the route still runs the real reclaim
+          ;; against the real directory, and this additionally catches the window
+          ;; it was handed. Not a wiring detail: the plan for this task wrote the
+          ;; test constant `nothing-retained` into the route, and that window
+          ;; retains nothing, so the first POST after a table was deleted would
+          ;; take a file undo can still reach.
+          (with-redefs [files/reclaim! (fn [st win] (reset! w win) (real st win))]
+            (let [r (srv/handler {:request-method :post :uri "/api/storage/reclaim-files" :body nil})
+                  b (when (= 200 (:status r)) (json/read-str (:body r) :key-fn keyword))]
+              (is (= 200 (:status r)))
+              (is (= [] (:reclaimed b))
+                  "nothing was reclaimable, and the answer says so with an empty list")
+              (is (= 0 (:freed b))
+                  "and 0 bytes went, as a number the panel can draw rather than a key it
+                   has to sum for itself")
+              (is (= files/default-window @w)
+                  "under the window loci SHIPS, not one a caller or a test chose")))
+          (is (.exists (io/file (files/dir) "placed.csv"))
+              "and the hand-placed file survived, which is the one thing this route
+               may never get wrong")
+          (is (= 404 (:status (srv/handler {:request-method :get :uri "/api/storage/reclaim-files"})))
+              "a GET falls through to the 404 — method-gated because it deletes, exactly
+               as /api/storage/reclaim is and for its reason"))))))
+
+(deftest the-files-reclaim-route-answers-what-actually-went-and-not-what-it-tried
+  ;; `files/reclaim!` answers one row per CANDIDATE and a failed delete is
+  ;; shape-identical to a done one apart from `:error` — `:bytes` is on both,
+  ;; because the row describes the file and not the outcome. So the obvious sum
+  ;; at any caller reports files still on disk as freed: against a directory the
+  ;; process cannot write to, which is a real fixture in `loci.files-test`, every
+  ;; delete fails and the answer is the total it hoped for while nothing moved.
+  ;;
+  ;; Stubbed and not staged, because the failure this pins needs a delete that
+  ;; FAILS — and the only way to arrange one for real is an unwritable directory,
+  ;; which `loci.files-test` already owns and which passes green under root. What
+  ;; is being tested here is the server's arithmetic over a shape, so the shape
+  ;; is what the test supplies.
+  (with-temp-data-dir
+    (fn []
+      (with-redefs [c/store (delay (sub/fresh-store))
+                    files/reclaim!
+                    (fn [_ _] [{:file "went.csv"  :bytes 100}
+                               {:file "stuck.csv" :bytes 40
+                                :error "loci could not delete stuck.csv — it is still in /files"}])]
+        (let [b (json/read-str (:body (srv/handler {:request-method :post
+                                                    :uri "/api/storage/reclaim-files"
+                                                    :body nil}))
+                               :key-fn keyword)]
+          (is (= 100 (:freed b))
+              "140 is what the vector sums to and 40 of it is still on disk — a sweep
+               that failed entirely would otherwise answer with the total it hoped for")
+          (is (= 2 (count (:reclaimed b)))
+              "and the file it could not delete is still reported, not filtered out of
+               a shorter vector a caller would read as a completed sweep")
+          (is (= ["loci could not delete stuck.csv — it is still in /files"]
+                 (mapv :error (filter :error (:reclaimed b))))
+              "carrying its own sentence, which is where *which and why* is answered"))))))
+
 (deftest mold-payload-says-why-a-table-cannot-be-read
   ;; `:unusable` is the sentence every reader shares; `:reclaimed` stays beside
   ;; it because the shell formats that instant itself (`toLocaleString`) and a

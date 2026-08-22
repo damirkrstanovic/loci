@@ -3258,9 +3258,26 @@
 
    `(force lake/lake)` rather than `@lake/lake` only to read the same way the
    rest of this namespace does; the route is a read and forces the singleton the
-   first time a panel is opened, which is the intended moment."
+   first time a panel is opened, which is the intended moment.
+
+   **`:files` is the files DIRECTORY and `:lake :files` is Parquet.** Two keys
+   spelled the same at two depths, which is worth stating once here rather than
+   leaving to whoever reads the panel: `lakegc` has answered `{:lake {:files
+   … :catalog …}}` since August and renaming half of it to make this one
+   unambiguous would move a key three readers already know. The panel names its
+   local after the depth for the same reason.
+
+   The report's `:files` ROWS do not travel. `report` carries one row per file
+   because a caller may want them; a panel needs how many there are and what
+   they cost, and shipping 10,000 rows to draw two figures is the shape
+   `lakegc/report` avoids by reporting `:orphaned` as a count and a total. The
+   `:reclaimable` rows DO travel — they are the files a button is about to
+   delete, and there are as many of them as there is something to say."
   [st]
-  (gc/report st (force lake/lake) gc/default-window))
+  (assoc (gc/report st (force lake/lake) gc/default-window)
+         :files (let [r (files/report st files/default-window)]
+                  (assoc (select-keys r [:total-bytes :reclaimable-bytes :reclaimable])
+                         :count (count (:files r))))))
 
 (defn- storage-reclaim!
   "Reclaim one object's out-of-window versions. Irreversible, so it refuses a
@@ -3292,6 +3309,30 @@
                "which is what a nil id means to lakegc/reclaim! and is not what "
                "a request with no :id is asking for")}
     (gc/reclaim! st (force lake/lake) id (or window gc/default-window))))
+
+(defn- files-reclaim!
+  "Reclaim what the window releases from the files directory, and say what
+   actually went.
+
+   **`:freed` sums only the rows with no `:error`.** `files/reclaim!` answers one
+   row per CANDIDATE, and a failed delete is shape-identical to a done one apart
+   from that key — `:bytes` is on both, because the row describes the file and
+   not the outcome. So the arithmetic that looks obvious at any caller,
+   `(reduce + (map :bytes rows))`, reports as freed the bytes of every file that
+   is still on disk: against a directory the process cannot write to — which is
+   a real fixture in `loci.files-test` — every delete fails and the answer is
+   the total it hoped for, while nothing moved. `lakegc/reclaim!` computes its
+   own `:freed` inside the function for exactly this reason; `files/reclaim!`
+   does not, so it is computed here, once, rather than in the panel.
+
+   The failures themselves are not summarised: they stay in `:reclaimed` with
+   their own sentences, which is what makes *a reclaim that cannot delete a file
+   reports which and why* true at the only place a person reads it. A count of
+   them is `(filter :error …)` and needs no second key to be wrong in."
+  [st]
+  (let [rows (files/reclaim! st files/default-window)]
+    {:reclaimed rows
+     :freed     (reduce + 0 (map :bytes (remove :error rows)))}))
 
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
@@ -3418,6 +3459,21 @@
       ;; falls through to the 404 rather than to a reclaim.
       (and (= :post (:request-method req)) (= uri "/api/storage/reclaim"))
       (json-resp (storage-reclaim! st (:id (body-json req)) nil))
+      ;; The files directory's half of the same panel, method-gated for the same
+      ;; reason: it deletes bytes, and undo reverts an event and not a file.
+      ;;
+      ;; It names no object, and the route above's missing-`:id` guard therefore
+      ;; has nothing to guard here — a file belongs to no object. Two tables may
+      ;; share one (`:connectedAs` and `:duplicateOf` are that state), and an
+      ;; upload nothing has picked belongs to none. The unit of a files reclaim
+      ;; is the directory, so the method is the whole gate.
+      ;;
+      ;; `files-reclaim!` fixes the window and this route never reads one off the
+      ;; request. The caller is a browser, and how far back undo still reaches
+      ;; is not a decision a page may take — `/api/storage/reclaim` passes `nil`
+      ;; and lets the callee default for the same reason.
+      (and (= :post (:request-method req)) (= uri "/api/storage/reclaim-files"))
+      (json-resp (files-reclaim! st))
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))

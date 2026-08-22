@@ -823,3 +823,143 @@ test('the panel counts the chunks while they go', async () => {
       `the counter does not say which file is going up: ${JSON.stringify(seen)}`);
   });
 });
+
+// ---------------- the duplicate note ----------------------------------------
+//
+// `files/listing` carries `:connectedAs` — the id of a table already bound to
+// that file's uri — and this is the half of it a person can see. Two halves make
+// it a test and neither alone does:
+//
+// · a note drawn UNCONDITIONALLY satisfies every assertion about the connected
+//   file, so the unconnected one has to be checked in the same breath;
+// · a note whose Connect was disabled would satisfy every assertion about the
+//   note while breaking the rule it exists under. `import-csv!` settled that in
+//   August and its comment is the spec: "two tables from one file is a thing
+//   someone may well want, and loci's answer to a mistake is `undo!`, not a
+//   veto." Warn, never refuse.
+//
+// Real state and not a stub. live.csv is connected by SOURCES_FIXTURE; the
+// unconnected half is uploaded here under a random token, so no file an earlier
+// test left behind can stand in for it.
+test('the file tab says a file is already a table, and connects it anyway', async () => {
+  await withPage(browser, 'sources-dupe', async (page) => {
+    const tok = 'd' + Math.random().toString(36).slice(2, 9);
+    const i = await enterCosmos(page);
+    const at = `#body${i} `;
+
+    // Through the route rather than the upload control: this file exists to be
+    // the unconnected half of a pair, and the control would carry it straight
+    // into the preview.
+    await page.evaluate(async (t) => {
+      await fetch('/api/source/upload', {
+        method: 'POST',
+        headers: { 'X-Loci-Upload': JSON.stringify({ id: 'dupe-' + t, seq: 0, name: 'free-' + t + '.csv', final: true }) },
+        body: 'region,revenue,token\nAPAC,20,' + t + '\n' });
+    }, tok);
+
+    // The server's own answer first, so every assertion below is about what the
+    // SHELL did with it rather than about what it is.
+    const listed = await listedFiles(page);
+    const taken = listed.find(f => f.file === 'live.csv');
+    const free = listed.find(f => f.name === `free-${tok}.csv`);
+    assert.ok(taken && taken.connectedAs,
+      `live.csv is connected to nothing, so there is no duplicate to draw: ${JSON.stringify(taken)}`);
+    assert.ok(free, `the uploaded file never reached the listing: ${JSON.stringify(listed.map(f => f.file))}`);
+    assert.equal(free.connectedAs, undefined,
+      'the uploaded file is already a table — it is meant to be the unconnected half');
+
+    await page.click(`${at}#dataBtn`);
+    await page.waitForSelector(`${at}[data-file="live.csv"]`, { timeout: 8000 });
+
+    // Scoped to the row's own `.dupe`, never a substring of the panel: phase 2
+    // shipped a check over the whole page that passed against a block which
+    // fetched nothing, because the fallback's error text already contained the
+    // string it was looking for.
+    const noteOn = f => page.evaluate(sel => {
+      const row = document.querySelector(sel), d = row && row.querySelector('.dupe');
+      return d ? d.textContent.trim() : null;
+    }, `${at}[data-file="${f}"]`);
+    const tnote = await noteOn('live.csv'), fnote = await noteOn(free.file);
+    assert.ok(tnote && tnote.includes(taken.connectedAs),
+      `the connected file's row does not name the table it already is (${taken.connectedAs}): ${JSON.stringify(tnote)}`);
+    assert.equal(fnote, null,
+      'the unconnected file carries a note as well — one drawn on every row says nothing');
+
+    // …and again above the columns, where the decision is actually taken.
+    await page.click(`${at}[data-file="live.csv"]`);
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+    assert.equal(await page.locator(`${at}.dupe-note`).count(), 1,
+      'the preview of a file that is already a table says nothing about it');
+    assert.match(await page.textContent(`${at}.dupe-note`), new RegExp(taken.connectedAs),
+      'the preview warns about a duplicate without naming which table it duplicates');
+    // The rule, made testable. A veto would pass every assertion above.
+    assert.equal(await page.locator(`${at}[data-a="connect"]:not([disabled])`).count(), 1,
+      'Connect is disabled on a duplicate — loci warns, it does not refuse');
+
+    // The other side of the same assertion at the preview level: a `.dupe-note`
+    // rendered unconditionally would have passed the count above.
+    await page.click(`${at}[data-a="dback"]`);
+    await page.waitForSelector(`${at}[data-file="${free.file}"]`, { timeout: 8000 });
+    await page.click(`${at}[data-file="${free.file}"]`);
+    await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+    assert.equal(await page.locator(`${at}.dupe-note`).count(), 0,
+      'a file connected to nothing is previewed with a duplicate warning on it');
+  });
+});
+
+// ---------------- the storage panel's files section -------------------------
+//
+// Both branches, because each one alone is unfalsifiable. "No button when
+// nothing can go" passes just as well against a section that never rendered, and
+// "a button when something can" says nothing about the state a real directory is
+// almost always in. So: the real payload for the zero state, and a stubbed one
+// for the other — nothing in this server's directory can ever be reclaimable,
+// since every file in it was either written by the fixture (no manifest entry,
+// so `:foreign`) or uploaded minutes ago (inside the 30-day window).
+test('the storage panel counts loci’s files, and draws a button only when one can do something', async () => {
+  await withPage(browser, 'sources-storage-files', async (page) => {
+    await bootedShell(page, server.url);
+
+    // Asked of the server, so the zero below is a zero it REPORTED rather than
+    // one the panel failed to draw.
+    const p = await page.evaluate(() => API.storage());
+    assert.ok(p.files, `/api/storage carries no files figure at all: ${JSON.stringify(Object.keys(p))}`);
+    assert.ok(p.files.count > 0 && p.files['total-bytes'] > 0,
+      `this server's files directory is empty, so the section has nothing to say: ${JSON.stringify(p.files)}`);
+    assert.equal(p.files['reclaimable-bytes'], 0,
+      `something here is reclaimable, and the zero state below is not the state under test: ${JSON.stringify(p.files)}`);
+
+    await page.click('#storageBtn');
+    await page.waitForSelector('.storage-panel .stfiles', { timeout: 8000 });
+    const t = (await page.textContent('.storage-panel .stfiles')).trim();
+    assert.match(t, new RegExp(`${p.files.count} files?\\b`),
+      `the section does not say how many files the directory holds (${p.files.count}): ${JSON.stringify(t)}`);
+    assert.match(t, /nothing loci wrote is unreferenced/,
+      `the zero state does not say WHY there is nothing to reclaim: ${JSON.stringify(t)}`);
+    assert.equal(await page.locator('.stfiles #stReclaimFiles').count(), 0,
+      'a reclaim button was drawn over a directory with nothing reclaimable in it');
+    // A disabled control invites a click that can never work, which is the thing
+    // the assertion above is really about — absent, not greyed.
+    assert.equal(await page.locator('.stfiles button[disabled]').count(), 0,
+      'the zero state drew a disabled button rather than no button');
+
+    // The other branch. Only `files` is replaced; the lake half of the payload is
+    // the server's own, so this is the same panel drawing a different directory.
+    await page.route('**/api/storage', async route => {
+      const j = await (await route.fetch()).json();
+      j.files = { count: 9, 'total-bytes': 3000,
+                  'reclaimable-bytes': 2048,
+                  reclaimable: [{ file: 'a.csv', bytes: 1024 }, { file: 'b.csv', bytes: 1024 }] };
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(j) });
+    });
+    await page.click('#closeModal');
+    await page.click('#storageBtn');
+    await page.waitForSelector('.stfiles #stReclaimFiles', { timeout: 8000 });
+    const btn = (await page.textContent('.stfiles #stReclaimFiles')).trim();
+    assert.match(btn, /2 files/,
+      `the button does not say how many files it would delete: ${JSON.stringify(btn)}`);
+    assert.match((await page.textContent('.storage-panel .stfiles')).trim(), /2\.0 KB/,
+      'the section does not say what a reclaim would free');
+    await page.unroute('**/api/storage');
+  });
+});
