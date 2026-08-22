@@ -801,8 +801,11 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         rows (for [{:keys [file bytes]} (listing st)]
                (assoc (get cls file) :file file :bytes bytes))]
     {:files (vec rows)
-     :reclaimable (vec (filter #(= :reclaimable (:class %)) rows))
-     :reclaimable-bytes (reduce + 0 (map :bytes (filter #(= :reclaimable (:class %)) rows)))
+     ;; `:doomed`, not `:reclaimable` — the set a reclaim would delete is BOTH
+     ;; `:reclaimable` and `:orphaned`, and naming it after one of its two
+     ;; members is how the other got left out of `reclaim!` in the first place.
+     :doomed (vec (filter #(#{:reclaimable :orphaned} (:class %)) rows))
+     :reclaimable-bytes (reduce + 0 (map :bytes (filter #(#{:reclaimable :orphaned} (:class %)) rows)))
      :total-bytes (reduce + 0 (map :bytes rows))}))
 
 **`retire!` takes the name, it does not look it up.** Task 4's `retire!` is `[id]` and resolves the name with `(get (names) id)` — a full manifest parse. Called once per reclaimed file, that is O(N²): measured 2026-08-22, reclaiming 2,000 files costs **27.9 s** against **0.040 s** when the name is resolved once. Give `retire!` a second arity `[id name]` and have `reclaim!` pass the name it already has from the `report` row, or hoist one `(names)` out of the loop. 700× at N=2,000, measured.
@@ -815,7 +818,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
    between `report` and here is not an error; it is the outcome the caller
    asked for."
   [st window]
-  (vec (for [{:keys [file bytes]} (:reclaimable (report st window))
+  (vec (for [{:keys [file bytes]} (:doomed (report st window))
              :let [f    (io/file (dir) file)
                    gone (or (.delete f) (not (.exists f)))]]
          (if gone
@@ -823,6 +826,12 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
            {:file file :bytes bytes :error (str "loci could not delete " file
                                                 " — it is still in " (.getPath (dir)))}))))
 ```
+
+**`reclaim!` deletes `:orphaned` as well as `:reclaimable`, and `report` names that set `:doomed`.** Corrected 2026-08-22 after a spec review found the classifier producing a class nothing acted on. An earlier draft of this snippet took `(:reclaimable (report …))` alone — so a file loci wrote that **nothing ever named**, which is the ordinary state of an upload that was never connected and of a connect that was undone, contributed 0 to `:reclaimable-bytes` and was never deleted. Measured: a 200-byte file remembered 40 days ago and never connected classifies `:orphaned`, and `reclaim!` returns `[]` with the file still on disk. At the spec's stated scale — 200 MiB uploads, ten stale ones is 2 GB — that is precisely the complaint this phase opens with, and the storage panel would not have offered those bytes at all.
+
+`lakegc/reclaim!` has always taken `#{:reclaimable :orphaned}` (`lakegc.clj:151`), and this GC's own docstrings already assumed it: `classify` calls `:orphaned` *"the one class a reclaim deletes with no object to warn about"*, and its `:current`-before-`:orphaned` section says a file uploaded forty days ago and disconnected yesterday *"would be reclaimed"*. Both were false against the narrowed snippet.
+
+The orphan **age grace** added in Task 6 is what makes this safe: an orphan younger than the cutoff is `:in-window`, so an upload waiting in the panel to be picked is never a candidate. Without that grace this change would delete live uploads; with it, an orphan past the window is a file loci wrote, nobody ever connected, and nothing can reach.
 
 **Every candidate gets a row, and a failure carries `:error` rather than vanishing from the result.** The spec asks for this by name: *"A reclaim that cannot delete a file reports which and why."* A `:when` filter would silently return a shorter vector, and a caller comparing counts would read that as success. Note the name is **not** retired when the delete failed — the bytes are still there.
 
