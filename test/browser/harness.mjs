@@ -266,7 +266,13 @@ function installCleanup() {
 
 async function bootServer(extra = '') {
   installCleanup();
-  const dir = await mkdtemp(join(tmpdir(), 'loci-browser-'));
+  // resolve(tmpdir()) so `dir` is absolute at birth: package.json sets TMPDIR=.tmp
+  // and node's os.tmpdir() hands that back verbatim, so a bare mkdtemp here returns
+  // the RELATIVE `.tmp/loci-browser-…` — which node resolves against its own cwd
+  // and the JVM below against `cwd: REPO`, two answers that agree only when node
+  // was launched from the repo root. Absolute once, here, and LOCI_DATA,
+  // java.io.tmpdir and rec.dir are three names for one directory.
+  const dir = await mkdtemp(join(resolve(tmpdir()), 'loci-browser-'));
   const rec = { pid: null, dir };
   LIVE.add(rec);
 
@@ -282,18 +288,11 @@ async function bootServer(extra = '') {
   // risk of deleting a library another JVM (the nREPL, a concurrent suite) still
   // has mapped. Replaces `-Djava.io.tmpdir=.tmp`, which moved the leak off tmpfs
   // without ending it: measured 2026-08-22, one run of sources.test.mjs left one
-  // more 58 MB .so in .tmp and this leaves none.
-  //
-  // `resolve` because `dir` is NOT absolute, contrary to how it reads: package.json
-  // sets TMPDIR=.tmp and node's os.tmpdir() hands that back verbatim, so mkdtemp
-  // returns the relative `.tmp/loci-browser-…`. Relative resolves fine as a path
-  // under cwd: REPO — but java.io.tmpdir is a property loci itself reads, and a
-  // relative one concatenated after `file://` reads its first segment as a host.
-  // That is the trap 5a11360 fixed and deps.edn documents at length; absolute
-  // here costs nothing and cannot spring it. Resolved against node's own cwd,
-  // which is where mkdtemp just made it.
+  // more 58 MB .so in .tmp and this leaves none. Absolute, per `dir` above, because
+  // loci itself reads java.io.tmpdir and a relative one concatenated after `file://`
+  // reads its first segment as a host — the trap 5a11360 fixed.
   const proc = spawn('clojure',
-    ['-J--enable-native-access=ALL-UNNAMED', `-J-Djava.io.tmpdir=${resolve(dir)}`,
+    ['-J--enable-native-access=ALL-UNNAMED', `-J-Djava.io.tmpdir=${dir}`,
      '-M', '-e', serverMain(extra)],
     { cwd: REPO, env: { ...process.env, LOCI_DATA: dir }, detached: true });
   rec.pid = proc.pid;
@@ -318,6 +317,10 @@ async function bootServer(extra = '') {
   }
   return {
     url: `http://127.0.0.1:${port}`,
+    // `dir` is this server's whole footprint — its LOCI_DATA and its java.io.tmpdir.
+    // Exposed so a `fresh: true` caller can assert on what the JVM put in there;
+    // sources.test.mjs uses it to pin the DuckDB library inside it.
+    dir,
     async stop() { LIVE.delete(rec); kill(); await exited; await rm(dir, { recursive: true, force: true }); },
     serverLog: () => log,
   };

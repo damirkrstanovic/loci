@@ -12,7 +12,7 @@
 // Its own server and its own substrate — see SOURCES_FIXTURE in harness.mjs.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,26 @@ const fixture = async (name, text) => {
 after(async () => {
   for (const p of written) await rm(p, { force: true });
   await browser?.close(); await server?.stop();
+});
+
+// Every browser JVM extracts DuckDB's ~58 MB libduckdb_java*.so into java.io.tmpdir
+// and cannot delete it, because the harness kills the process group before
+// deleteOnExit runs. b64c532 pointed that tmpdir at the server's own directory, which
+// reap() and stop() already rm -rf, so the library dies with the server that made it.
+// That line has been changed once before (ed06822) in a way that broke exactly this.
+//
+// This file's server is `fresh: true` and SOURCES_FIXTURE opens the lake at boot, so
+// the library is on disk before any test here runs. Asserting inside server.dir rather
+// than counting .so files in .tmp before and after: a concurrent suite or the nREPL
+// cannot perturb a directory only this JVM writes to, and 1-in-here is the mechanism
+// itself — this JVM's tmpdir IS this server's directory — not a symptom of it.
+test('the server keeps its DuckDB library inside its own directory', async () => {
+  const names = await readdir(server.dir);
+  const libs = names.filter(n => n.startsWith('libduckdb_java'));
+  assert.equal(libs.length, 1,
+    `the server's own directory holds ${libs.length} DuckDB libraries, not 1 — ` +
+    `if 0, java.io.tmpdir is pointing somewhere else and the library is leaking ` +
+    `there: ${names.join(', ')}`);
 });
 
 // By title and not by a hard-coded `tbl:live_source`: `mint-id` slugs the title
