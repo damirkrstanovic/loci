@@ -38,7 +38,8 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.tablestore :as tbl]))
 
 ;; ---------------------------------------------------------------------------
 ;; where it is, and what is in it
@@ -183,6 +184,31 @@
                        (filter (fn [rec] (and (map? rec) (:id rec)))))
               (line-seq r))))))
 
+(defn- latest
+  "`{id record}` — the last record `files.edn` carries for each `:id`, from ONE
+   read of the file.
+
+   **Last-wins per id, which is not the same as the last record in the file.**
+   That distinction is the whole of `retired`'s correctness and it now has one
+   implementation; `retirement-is-last-wins-per-id-and-not-per-file` is the
+   fixture that can see the difference.
+
+   It exists because a reader that wants more than one thing about an id should
+   not pay for the file twice. `records` costs ~43 ms over 10,000 lines
+   (measured 2026-08-22), and `classify` needs three facts per id — is it in the
+   manifest, is it retired, and when was it written. Asking `names`, `retired`
+   and a third reader for those is three parses of the same file for one panel
+   that draws on open.
+
+   **`names` deliberately does not read through this**, and that is not an
+   oversight to tidy up later. `names`' rule is *the last record that HAS a
+   name*, not *the name on the last record* — see its docstring — so folding it
+   in here would change what it answers for a record with no `:name` following
+   one that had one. Nothing in `src/` writes that shape, which is exactly why
+   the difference would go unnoticed."
+  []
+  (reduce (fn [m r] (assoc m (:id r) r)) {} (records)))
+
 (defn names
   "`{id name}` for every file the manifest remembers. Last-wins by `:id`.
 
@@ -286,12 +312,7 @@
    No guard on the record here, and that is `records` doing it rather than this
    forgetting: everything it hands back is a map with an `:id`."
   []
-  (->> (records)
-       (reduce (fn [m r] (assoc m (:id r) r)) {})
-       vals
-       (filter :retired)
-       (map :id)
-       set))
+  (->> (latest) vals (filter :retired) (map :id) set))
 
 ;; ---------------------------------------------------------------------------
 ;; the listing the picker draws
@@ -391,6 +412,152 @@
                    (cond-> {:file n :uri u :bytes (.length f)}
                      (named n) (assoc :name (named n))
                      (conn u)  (assoc :connectedAs (conn u)))))))))
+
+;; ---------------------------------------------------------------------------
+;; the GC — which files could go, mirroring `loci.lakegc`
+;; ---------------------------------------------------------------------------
+
+(def default-window
+  "How much history a reclaim keeps: whichever of these keeps more.
+
+   `:days` transfers from `loci.lakegc/default-window` unchanged — a file named
+   by any handle in the last 30 days stays. **`:versions` needed reinterpreting,
+   because a file has no versions.** Here it is the three most recent FILES per
+   object: an object re-uploaded or reconnected names a different content hash
+   each time, and those are its versions.
+
+   Whichever keeps more wins, for `lakegc`'s reason: a count alone drops a busy
+   afternoon's work, an age alone puts no ceiling on a table reconnected forty
+   times in that afternoon."
+  {:versions 3 :days 30})
+
+(defn classify
+  "`{filename {:class … :object … :ts …}}` for every file in `dir`.
+
+   Five classes. **`:foreign`** — no manifest entry, so a person put it there
+   and loci never touches it. **`:current`** — named by a live object, including
+   every live passthrough table, whose file is re-read on every query.
+   **`:in-window`** — inside `window`, so undo and `as-of` stay exact.
+   **`:reclaimable`** — named only by history, outside it. **`:orphaned`** —
+   remembered by the manifest, named by nothing at all, and old enough that
+   nothing is about to.
+
+   Walks `sub/history` through `tbl/handles-in-history` rather than current
+   state, and takes the uri from `:source` as well as from the handle: a
+   materialised source's handle is `{:store :lake :table …}` and names no
+   location, so a refresh drops the uri and only the original `:put` carries it.
+
+   The `cond` order is load-bearing twice. **`:foreign` first**, so a file with
+   no manifest entry can never reach another class by any route — that is the
+   one rule this GC cannot get wrong, because deleting a hand-placed file
+   destroys data loci never created and no storage panel can undo it. (A
+   hand-placed file that IS connected therefore reports `:foreign` rather than
+   `:current`. Both answers are safe — neither is ever reclaimed — and the order
+   is chosen so `:foreign` means exactly *no manifest entry*, with no
+   exceptions to carry in your head.) **`:current` before the window**,
+   mirroring `lakegc` and `source-block`'s precedence lesson from phase 2: a
+   live passthrough table's file is not a retention question at all.
+
+   ## `:orphaned` respects the window here, and in `lakegc` it does not
+
+   A deliberate divergence, stated because being quietly different from the
+   namespace this one mirrors is how the difference gets refactored away.
+   `lakegc/classify` says orphans *\"ignore the window because nothing can ever
+   reference them again\"*, and for a lake table that is true: the only way one
+   comes into being is loci minting it and committing a handle, so no handle
+   means the commit never landed or was undone.
+
+   **For a file it is false, and not by a narrow margin.** `finish-upload!`
+   calls `remember!` and does not connect — the shell says so itself: *\"an
+   upload is a file ARRIVING in loci's directory and not a second way to connect
+   one\"* — so the panel connects it in a LATER request, which may come minutes
+   afterwards or never. Between the two, the file is in the manifest and named
+   by nothing in history, which is precisely `:orphaned`. That is not a race; it
+   is the ordinary state of an uploaded file waiting to be picked, and a reclaim
+   that ignored the window would delete the 200 MiB somebody just uploaded.
+   `import-csv!` has the same shape one request wide: it `remember!`s before
+   `source-connect!` commits, and http-kit answers from a worker pool, so two
+   handlers do interleave.
+
+   So an orphan younger than the cutoff is `:in-window`. One clause and no new
+   mechanism: it is aged by its own manifest record's `:at`, which `remember!`
+   already writes and which is the right clock for *loci wrote this file at T*.
+   Those rows carry `:at` and a nil `:ts` rather than putting the manifest's
+   clock in `:ts` — `:ts` is a log timestamp everywhere else in this map, and a
+   file nothing names has no log entry to take one from.
+
+   ## One read of the manifest
+
+   `classify` is what `report` calls, and the storage panel draws `report` on
+   open. An earlier draft called `(retired)` inside a `keep` over
+   `(keys (names))` — one full parse of `files.edn` per manifest entry, which at
+   ~43 ms per parse is about **seven minutes** over 10,000 files.
+
+   Everything this needs from the manifest comes from one `latest`: whether loci
+   wrote the file, whether it has since given it up, and when. Counted
+   2026-08-22 by instrumenting the vars, one `classify` costs **2 manifest
+   parses and 2 store walks** — its own `latest` and `connections`, plus the
+   `names` and `connections` inside `listing`. The `listing` pair stays:
+   duplicating `content?` and the sort to avoid them would put the directory's
+   rules in two places, which is the thing this namespace exists to prevent, and
+   the store axis is ~1 ms over a 10,000-object store — measured 2026-08-22 —
+   against ~43 ms for one manifest parse. **If you add a manifest consumer here,
+   take it off `recs` rather than calling `names` or `retired` again.**
+
+   (`sub/objects` is a protocol method, so `with-redefs` cannot count it. The
+   store walk is counted at `connections`, which is a plain var.)"
+  [st {:keys [versions days] :as _window}]
+  (let [recs   (latest)
+        ;; `mine` is `(keys (names))` minus `retired`, read off the one map
+        ;; rather than from two more parses. The `:name` test is `names`' own
+        ;; rule kept deliberately, so the two sets cannot drift.
+        ;;
+        ;; **`remove :retired` is what makes a retirement mean loci gave the
+        ;; file up.** Re-uploading the same bytes calls `remember!`, which
+        ;; un-retires the id and puts it straight back in `mine`. Bytes that
+        ;; reappear WITHOUT loci — a restore, an rsync, a re-mounted volume —
+        ;; are a file loci did not write, and this is what returns them to
+        ;; `:foreign` so a second reclaim cannot delete them.
+        mine   (into #{} (comp (remove #(:retired (val %)))
+                               (filter #(:name (val %)))
+                               (map key))
+                     recs)
+        ;; **`connections` and not a third spelling of the same store walk.**
+        ;; Measured 2026-08-22, `(set (keys (connections st)))` and the
+        ;; `(keep #(:uri (:source %)) (vals (sub/objects st)))` this replaces are
+        ;; identical by construction — `keep` drops exactly the nils
+        ;; `connections`' `if-let` skips — and this namespace already had that
+        ;; walk written once for `:connectedAs`. Not for speed: a scan is ~1 ms
+        ;; over a 10,000-object store and `objects` is an atom deref in
+        ;; production. For the reason `connected-as` gives about itself — which
+        ;; uri counts as connected is one rule, and two spellings of it are two
+        ;; things to keep in step.
+        ;;
+        ;; **The keys, not the rows `listing` already carries.** A file's
+        ;; `:connectedAs` is absent when the object holding the uri has no
+        ;; `:id`, and reading liveness off that key would call such a file
+        ;; unreferenced while an object is still reading it. Under-coverage is
+        ;; the unsafe direction for both GCs; the key set has neither hole.
+        live   (set (keys (connections st)))
+        cutoff (- (System/currentTimeMillis) (* days 24 60 60 1000))
+        seen   (into {} (for [[o hs] (tbl/handles-in-history st)
+                              [i e]  (map-indexed vector hs)
+                              :let [u (or (:uri (:source e)) (:uri (:handle e)))]
+                              :when u]
+                          [u {:object o :ts (:ts e) :age-rank i}]))]
+    (into {}
+          (for [{:keys [file uri]} (listing st)
+                :let [m (get seen uri)]]
+            [file
+             (cond
+               (not (mine file)) {:class :foreign :object nil :ts nil}
+               (live uri)        (assoc (or m {}) :class :current)
+               (nil? m)          (let [at (:at (get recs file))]
+                                   {:class  (if (>= (or at 0) cutoff) :in-window :orphaned)
+                                    :object nil :ts nil :at at})
+               (or (< (:age-rank m) versions)
+                   (>= (or (:ts m) 0) cutoff)) (assoc m :class :in-window)
+               :else             (assoc m :class :reclaimable))]))))
 
 ;; ---------------------------------------------------------------------------
 ;; the chunked upload — the `.partial` working file, and the sequence that

@@ -346,3 +346,283 @@
           (is (not (contains? (get by-file "b.csv") :connectedAs))
               "said directly as well, so the reason this test is written with whole
                maps does not get lost in a later edit"))))))
+
+;; ---------------------------------------------------------------------------
+;; the GC classifier
+;;
+;; **Do not backdate an event to age it out.** `EventStore/commit!` does
+;; `(assoc event :ts (System/currentTimeMillis))` (`substrate.clj:133`) — it
+;; OVERWRITES any `:ts` a caller supplies, silently, so a test that commits a
+;; 90-day-old event gets one stamped now and its window assertion becomes
+;; vacuous. `loci.lakegc`'s own tests never backdate either; they shrink the
+;; window (`lakegc_test.clj:38`). These do the same, and go one further: every
+;; window assertion below is a PAIR over one fixture, differing only in the
+;; window, because a single `:in-window` assertion against an event stamped now
+;; is true whatever the arithmetic does.
+;; ---------------------------------------------------------------------------
+
+(def ^:private nothing-retained
+  ;; Retain nothing: no versions, and a cutoff in the FUTURE so no event can be
+  ;; inside the age half either. `:days 0` would put the cutoff at now, and an
+  ;; event committed in the same millisecond satisfies `(>= ts cutoff)` and
+  ;; comes back `:in-window` — a rare flake that reads as a real failure.
+  {:versions 0 :days -1})
+
+(def ^:private age-only
+  ;; The age half alone: `default-window`'s 30 days with the version count off,
+  ;; so an `:in-window` answer can only have come from the cutoff arithmetic.
+  ;; `default-window` itself cannot say that — with `:versions 3`, an object's
+  ;; newest file is age-rank 0 and `(< 0 3)` short-circuits the `or` before the
+  ;; cutoff is ever compared, so the sign of `cutoff` is invisible to it.
+  {:versions 0 :days 30})
+
+(def ^:private count-only
+  ;; And the version half alone, for the same reason in the other direction.
+  {:versions 1 :days -1})
+
+(defn- put-source!
+  "Commit `id` as a connected table over `uri`, materialised or passthrough.
+
+   A `:put` of the whole object, which is the shape `loci.source/connect!`
+   commits and the shape `tbl/event-handles` reads a `:source` off — the uri
+   lives on the object, and for a materialised table the handle beside it names
+   a lake table and no location at all."
+  [st id uri mode]
+  (sub/commit! st {:op :put :id id
+                   :value {:id id :source {:uri uri :mode mode}
+                           :value (if (= mode :passthrough)
+                                    {:store :source :uri uri :format :csv}
+                                    {:store :lake :table (str "t_" id) :snapshot 1})}}))
+
+(deftest classify-keeps-a-file-a-live-table-still-names
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "a.csv") "x\n")
+        (files/remember! "a.csv" "kept")
+        (put-source! st "tbl:a" "loci://files/a.csv" :materialise)
+        (is (= :current (:class (get (files/classify st nothing-retained) "a.csv")))
+            "a live object's file is never reclaimable however old — under a window
+             that retains nothing, `:current` is the only thing that can save it")
+        ;; **And under a window that WOULD keep it, which is the assertion that
+        ;; sees the `cond` order.** Measured 2026-08-22: moving `(live uri)`
+        ;; below the window check fails nothing under `nothing-retained`,
+        ;; because there the window branch is false and `live` is still reached.
+        ;; Precedence between two branches is only visible where BOTH would
+        ;; fire, so it takes a window that retains — here `default-window`,
+        ;; under which this file is also age-rank 0 and stamped now.
+        (is (= :current (:class (get (files/classify st files/default-window) "a.csv")))
+            "and `:current` rather than `:in-window` when the window would have kept
+             it too — a live table's file is not a retention question, and the panel
+             must not offer a countdown on a file that can never expire")))))
+
+(deftest classify-reclaims-a-file-loci-wrote-that-nothing-names-any-more
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "old.csv") "x\n")
+        (files/remember! "old.csv" "gone")
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (let [row (get (files/classify st nothing-retained) "old.csv")]
+          (is (= :reclaimable (:class row))
+              "no live object names it and its only mention is outside the window")
+          ;; This is also the one test that can see the uri being taken from
+          ;; `:source` rather than off the handle. `put-source!` commits a
+          ;; MATERIALISED table, whose handle is `{:store :lake :table …}` and
+          ;; names no location — so a classify reading `(:uri (:handle e))` only
+          ;; finds no entry for this uri, and the file comes back `:orphaned`
+          ;; with no `:object` instead. Measured 2026-08-22 by making exactly
+          ;; that edit. The live case above CANNOT see it: `live` is built from
+          ;; the objects' own `:source`, so it answers `:current` either way.
+          (is (= "tbl:a" (:object row))
+              "and it is attributed to the table that named it — which only the
+               `:source` half of the walk can supply for a materialised table"))))))
+
+(deftest classify-never-reclaims-a-file-loci-did-not-write
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "x\n")
+        (spit (io/file (files/dir) "connected.csv") "x\n")
+        (put-source! st "tbl:c" "loci://files/connected.csv" :passthrough)
+        (let [cls (files/classify st nothing-retained)]
+          (is (= :foreign (:class (get cls "placed.csv")))
+              "no manifest entry means a person put it there — rsync, a mount, a
+               volume — and deleting it would destroy data loci never created")
+          ;; The precedence pin. `:foreign` is FIRST in the `cond`, so a
+          ;; hand-placed file that is also connected stays `:foreign` rather
+          ;; than becoming `:current`. Both answers are safe — neither class is
+          ;; ever reclaimed — and the order is what makes `:foreign` mean
+          ;; exactly "no manifest entry" with no exception to remember.
+          (is (= :foreign (:class (get cls "connected.csv")))
+              "and a hand-placed file that IS connected is still `:foreign`, because
+               `:foreign` is tested before `:current` and means one thing only"))))))
+
+(deftest classify-never-reclaims-a-live-passthrough-tables-file
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "live.csv") "x\n")
+        (files/remember! "live.csv" "live")
+        (put-source! st "tbl:p" "loci://files/live.csv" :passthrough)
+        (is (= :current (:class (get (files/classify st nothing-retained) "live.csv")))
+            "it is re-read on every query — reclaiming it turns a working table
+             into :table/unavailable, and no window makes that acceptable")
+        (is (= :current (:class (get (files/classify st files/default-window) "live.csv")))
+            "and `:current` under a window that would also have kept it, which is
+             what pins `live` ABOVE the window in the `cond` — see the note in
+             `classify-keeps-a-file-a-live-table-still-names`")))))
+
+(deftest classify-keeps-a-file-inside-the-window-and-reclaims-it-outside
+  ;; ONE fixture, two windows, and that is the whole design of this test. The
+  ;; event is stamped now — `commit!` sees to that — so a lone `:in-window`
+  ;; assertion under `default-window` is true whatever `cutoff` computes, and
+  ;; true even with the version half doing all the work. Measured 2026-08-22:
+  ;; against `default-window` a flipped `cutoff` sign changes nothing here,
+  ;; because age-rank 0 satisfies `(< 0 3)` and the `or` never reaches the age
+  ;; comparison. `age-only` turns the version half off, so the two answers below
+  ;; differ ONLY in the sign and size of the cutoff, and a sign flip fails both.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "recent.csv") "x\n")
+        (files/remember! "recent.csv" "recent")
+        (put-source! st "tbl:a" "loci://files/recent.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (is (= :in-window (:class (get (files/classify st age-only) "recent.csv")))
+            "deleted a moment ago — undo and as-of can still reach it, which is what
+             the 30 days are for")
+        (is (= :reclaimable (:class (get (files/classify st nothing-retained) "recent.csv")))
+            "and the same file with the cutoff moved past it is reclaimable — the
+             pair is what makes the line above an assertion about the cutoff")))))
+
+(deftest classify-keeps-the-newest-file-an-object-named-and-not-the-one-before-it
+  ;; The version half, which nothing else here can see: every other fixture
+  ;; names one file per object, so `age-rank` is always 0 and `(< 0 versions)`
+  ;; is true for any positive count. Two files for one object — a reconnect,
+  ;; which is how an object comes to have file versions at all — is what makes
+  ;; the rank load-bearing, and the window keeps by count alone.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "v1.csv") "x\n")
+        (spit (io/file (files/dir) "v2.csv") "x\n")
+        (files/remember! "v1.csv" "first") (files/remember! "v2.csv" "second")
+        (put-source! st "tbl:a" "loci://files/v1.csv" :materialise)
+        (put-source! st "tbl:a" "loci://files/v2.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (let [cls (files/classify st count-only)]
+          (is (= 0 (:age-rank (get cls "v2.csv")))
+              "newest first — the fixture's premise, asserted rather than assumed,
+               because a walk that answered oldest-first would keep the wrong file
+               and every class below would still read correctly")
+          (is (= :in-window (:class (get cls "v2.csv")))
+              "the one most recent file is kept by count with the age half switched off")
+          (is (= :reclaimable (:class (get cls "v1.csv")))
+              "and the one before it is not, which is the only thing that says the
+               count is being compared to anything"))))))
+
+(deftest classify-finds-a-file-named-only-inside-a-tx
+  ;; THE test the lifted walk exists for — and the version of it that can fail.
+  ;;
+  ;; Asserting `:current` alone proves nothing. Measured 2026-08-22: with the
+  ;; `:tx` branch of `tbl/event-handles` replaced by nil, this file still comes
+  ;; back `:current`, because `live` is built from `(sub/objects st)` and the
+  ;; store applies a `:tx`'s sub-events whatever the walk does. The walk's
+  ;; contribution is the ATTRIBUTION — `:object` and `:age-rank` — which a
+  ;; top-level-only walk cannot supply, so `(or m {})` leaves the row with the
+  ;; `:class` key and nothing else.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "txd.csv") "x\n")
+        (files/remember! "txd.csv" "in a tx")
+        (sub/commit! st {:op :tx
+                         :events [{:op :put :id "tbl:t"
+                                   :value {:id "tbl:t" :source {:uri "loci://files/txd.csv"}
+                                           :value {:store :lake :table "t_t" :snapshot 1}}}
+                                  {:op :put :id "note:t" :value {:id "note:t" :value "x"}}]})
+        (is (= {:class :current :object "tbl:t" :age-rank 0}
+               (select-keys (get (files/classify st nothing-retained) "txd.csv")
+                            [:class :object :age-rank]))
+            "a live table committed inside a `:tx` keeps its file, and the walk is
+             what says WHOSE file it is — `tools/save-table!` commits a `:tx`
+             whenever it also appends a notebook cell")
+        (sub/commit! st {:op :delete :id "tbl:t"})
+        (is (= {:class :reclaimable :object "tbl:t" :age-rank 0}
+               (select-keys (get (files/classify st nothing-retained) "txd.csv")
+                            [:class :object :age-rank]))
+            "and once the table is gone the file is reclaimable AS ITS FILE — a
+             top-level-only walk calls it `:orphaned` with no object, which is the
+             shape that would let a reclaim run against a live table's source")))))
+
+(deftest classify-gives-a-just-uploaded-file-the-window-lakegc-denies-an-orphan
+  ;; The deliberate divergence from `loci.lakegc`, which says orphans "ignore
+  ;; the window because nothing can ever reference them again". True of a lake
+  ;; table; false of a file, and not narrowly.
+  ;;
+  ;; `finish-upload!` calls `remember!` and does NOT connect — the shell says so
+  ;; itself: "an upload is a file ARRIVING in loci's directory and not a second
+  ;; way to connect one" — so between the last chunk landing and the Connect
+  ;; click there is a file in the manifest that nothing in history names. That
+  ;; is `:orphaned` by the letter of it, and it may last minutes or forever.
+  ;; This fixture IS that state: `remember!` and nothing else.
+  (with-dir
+    (fn [_]
+      (let [st  (sub/fresh-store)
+            _   (.mkdirs (files/dir))
+            _   (spit (io/file (files/dir) "fresh.csv") "x\n")
+            rec (files/remember! "fresh.csv" "just uploaded")
+            row (get (files/classify st files/default-window) "fresh.csv")]
+        (is (= :in-window (:class row))
+            "an upload nobody has connected yet is inside the window, not an orphan
+             a reclaim may delete out from under the panel about to connect it")
+        (is (= (:at rec) (:at row))
+            "and it is aged by the manifest record's own `:at` — the clock
+             `remember!` already writes, which is the only one a file nothing names
+             has. Asserting the exact value rather than `some?` is what stops a
+             hard-coded `:at` or a `(System/currentTimeMillis)` recomputed here
+             from passing")
+        (is (nil? (:ts row))
+            "`:ts` stays nil, because `:ts` is a LOG timestamp everywhere else in
+             this map and there is no log entry to take one from")
+        (is (= :orphaned (:class (get (files/classify st nothing-retained) "fresh.csv")))
+            "and with the cutoff moved past it, the same file IS an orphan — the
+             pair is what makes the first assertion about the window rather than
+             about `:orphaned` being unreachable")))))
+
+(deftest a-retired-file-whose-bytes-come-back-is-foreign-again
+  ;; What `mine`'s `remove :retired` actually buys, which is not what it looks
+  ;; like. A reclaimed file that comes back THROUGH LOCI needs no code at all:
+  ;; `remember!` appends, `retired` is last-wins per id, so the id un-retires
+  ;; itself and `(keys (names))` alone would have answered correctly. Measured
+  ;; 2026-08-22 — a `mine` that ignores `retired` passes that scenario.
+  ;;
+  ;; The case it is for is bytes returning from OUTSIDE loci: a restore from
+  ;; backup, an rsync, a re-mounted volume. loci's own record says it gave that
+  ;; file up, so whatever is at that name now, loci did not write it — and
+  ;; `:foreign` is what stops a second reclaim deleting somebody's restore.
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "back.csv") "x\n")
+        (files/remember! "back.csv" "Backup")
+        (files/retire! "back.csv")
+        (is (= :foreign (:class (get (files/classify st nothing-retained) "back.csv")))
+            "retired, and the bytes are there again by some route that was not loci —
+             so it is a hand-placed file now, and never reclaimable")
+        (is (= "Backup" (get (files/names) "back.csv"))
+            "the name outlives the retirement either way — files.edn is primary")
+        (files/remember! "back.csv" "Backup")
+        (is (= :orphaned (:class (get (files/classify st nothing-retained) "back.csv")))
+            "and re-uploading it through loci un-retires the id, so it is loci's
+             file again — reclaimable in principle, which `:foreign` never is")))))
