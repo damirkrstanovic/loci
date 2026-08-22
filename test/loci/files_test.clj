@@ -1,5 +1,6 @@
 (ns loci.files-test
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.files :as files]
             [loci.lake-fixture :as lf]
@@ -37,6 +38,71 @@
           "a half-written line loses one name, never the file")
       (is (= "three.csv" (get (files/names) "c.csv"))
           "and the record AFTER the torn one is read whole, not eaten as its value"))))
+
+(deftest retiring-a-name-keeps-it-readable-and-marks-it
+  (with-dir
+    (fn [_]
+      (files/remember! "abc.csv" "Q3 Takings")
+      (is (= #{} (files/retired)) "nothing is retired before anything is")
+      (files/retire! "abc.csv")
+      (is (= "Q3 Takings" (get (files/names) "abc.csv"))
+          "the name survives the file — files.edn is primary, and a reclaim that lost
+           a name would be the one operation in loci that cannot be undone")
+      (is (= #{"abc.csv"} (files/retired)))
+      (files/remember! "abc.csv" "Q3 Takings")
+      (is (= #{} (files/retired))
+          "and re-uploading the same bytes un-retires it — last-wins, the whole point"))))
+
+(deftest retiring-a-name-loci-never-knew-is-not-an-error
+  (with-dir
+    (fn [_]
+      (files/retire! "never-seen.csv")
+      (is (= #{"never-seen.csv"} (files/retired)))
+      ;; `(nil? (get (files/names) "never-seen.csv"))` was the obvious way to
+      ;; write this and it cannot fail: the thing it guards against is the id
+      ;; entering the map under a NIL NAME, and `get` answers nil for that
+      ;; exactly as it does for absent. `= {}` is the assertion that can see it.
+      (is (= {} (files/names))
+          "a hand-placed file has no name to carry forward, and inventing one would
+           lie — so the tombstone's nil `:name` keeps it out of the map entirely,
+           rather than putting it in under a blank one"))))
+
+(deftest a-tombstone-carries-the-name-and-so-stands-alone
+  ;; With an intact manifest the `:name` on a tombstone is invisible: the
+  ;; `remember!` line before it says the same thing, so `names` answers
+  ;; correctly whether or not the tombstone carries one. Measured 2026-08-22,
+  ;; twice — a `retire!` writing no `:name` at all ran 0 failures against the
+  ;; tests above, and so did a `names` that skipped every `:retired` record.
+  ;; Both are caught here, by the one way this file already loses a line: with
+  ;; the earlier line gone, the tombstone is the only record of the name, and
+  ;; `names` must read it like any other.
+  (with-dir
+    (fn [_]
+      (let [f (io/file (sub/data-dir) "files.edn")]
+        (files/remember! "abc.csv" "Q3 Takings")
+        (files/retire! "abc.csv")
+        (spit f (str (last (str/split-lines (slurp f))) "\n"))
+        (is (= {"abc.csv" "Q3 Takings"} (files/names))
+            "the tombstone is self-contained — losing the line before it does not
+             lose the name, and `names` needs no special case to read it")
+        (is (= #{"abc.csv"} (files/retired)))))))
+
+(deftest retirement-is-last-wins-per-id-and-not-per-file
+  ;; The two tests above touch ONE id each, so in both of them the last record
+  ;; in the file is also the last record for the id under test — a `retired`
+  ;; that read only the file's final line would pass every assertion they make.
+  ;; Measured 2026-08-22 by writing exactly that: 0 failures. Two ids, with the
+  ;; file ending on the one that is NOT retired, is what makes the per-id
+  ;; reduction load-bearing.
+  (with-dir
+    (fn [_]
+      (files/remember! "a.csv" "Alpha")
+      (files/retire! "a.csv")
+      (files/remember! "b.csv" "Bravo")
+      (is (= #{"a.csv"} (files/retired))
+          "the file's last record belongs to b, and a is still retired")
+      (is (= {"a.csv" "Alpha" "b.csv" "Bravo"} (files/names))
+          "and both names are still readable — retiring a is not forgetting it"))))
 
 (deftest sweeping-partials-removes-the-abandoned-and-keeps-the-fresh
   (with-dir

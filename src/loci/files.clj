@@ -123,13 +123,14 @@
 ;; the manifest — append-only EDN lines, last-wins by :id
 ;; ---------------------------------------------------------------------------
 
-(defn names
-  "`{id name}` for every file the manifest remembers. Last-wins by `:id`.
+(defn- records
+  "Every readable record in `files.edn`, in file order. No manifest at all is
+   `[]`. Unreadable lines are skipped — a half-written line loses one name,
+   never the file.
 
-   No manifest at all is `{}` and not an error. A file placed by hand, by
-   `rsync`, or by a mounted directory is a legitimate way for `dir` to hold
-   content loci never named — `listing` offers such a file under its hash — so
-   an absent or partial manifest is an ordinary state, not a broken one.
+   The one place the manifest is read, so that `names` and `retired` cannot
+   drift into two reading rules for the same file. What each does with a record
+   is its own business; getting them off the disk is shared.
 
    **Read line by line with `edn/read-string`, and NOT with the whole-reader
    `edn/read` `loci.chunks` uses.** The difference is what one torn line costs,
@@ -139,19 +140,47 @@
    would close the outer map. Measured 2026-08-21 against exactly that file: the
    torn record AND the good record after it are both lost, and so is everything
    appended later. Reading one line at a time and dropping the ones that do not
-   parse loses exactly the line that was torn."
+   parse loses exactly the line that was torn.
+
+   **`line-seq` over a reader rather than `str/split-lines` over a `slurp`.**
+   Measured 2026-08-22, the two agree on every shape this file actually takes —
+   the torn fixture, a last line with no trailing newline, CRLF, a blank line in
+   the middle — and part on two. An empty file is `[]` against `[\"\"]`, which
+   is invisible downstream because `edn/read-string` answers nil for both. A
+   lone `\\r` is not. `line-seq` splits on it, `split-lines` does not, and this
+   reader's whole disposition is to lose as little as possible of a manifest
+   that is PRIMARY and cannot be rebuilt. `line-seq` also streams a file that
+   only ever grows. Neither reason is large; together they are enough to leave
+   it alone."
   []
   (let [f (manifest-file)]
-    (if (.exists f)
+    (if-not (.exists f)
+      []
       (with-open [r (io/reader f)]
-        (reduce (fn [acc line]
-                  (let [rec (try (edn/read-string line) (catch Exception _ nil))]
-                    (if (and (map? rec) (:id rec) (:name rec))
-                      (assoc acc (:id rec) (:name rec))
-                      acc)))
-                {}
-                (line-seq r)))
-      {})))
+        (into [] (keep (fn [line] (try (edn/read-string line) (catch Exception _ nil))))
+              (line-seq r))))))
+
+(defn names
+  "`{id name}` for every file the manifest remembers. Last-wins by `:id`.
+
+   No manifest at all is `{}` and not an error. A file placed by hand, by
+   `rsync`, or by a mounted directory is a legitimate way for `dir` to hold
+   content loci never named — `listing` offers such a file under its hash — so
+   an absent or partial manifest is an ordinary state, not a broken one.
+
+   **A record with no `:name` contributes nothing, and that filter is now
+   load-bearing twice over.** It always dropped a malformed line; since
+   `retire!` it also drops the retirement of an id loci never named, whose
+   `:name` is a present-and-nil key. Moving this test down into `records` would
+   put that id into the map under a nil name, and `listing` would draw a row
+   whose name is blank rather than absent."
+  []
+  (reduce (fn [acc rec]
+            (if (and (map? rec) (:id rec) (:name rec))
+              (assoc acc (:id rec) (:name rec))
+              acc))
+          {}
+          (records)))
 
 (defn remember!
   "Record that the file `id` — a content-addressed name like
@@ -167,6 +196,48 @@
     (io/make-parents f)
     (spit f (str (pr-str rec) "\n") :append true)
     rec))
+
+(defn retire!
+  "Mark `id`'s file as reclaimed, keeping its name. Returns the record written.
+
+   An appended `{:id :name :at :retired true}` line — `remember!`'s idiom with
+   one more key, and appended for the reason the whole manifest is append-only.
+   **`files.edn` is PRIMARY.** A reclaim that rewrote the file to drop the id's
+   line would be the one operation in loci that can lose a name for good: the
+   bytes are gone by then, the hash never carried the name, and no other record
+   in loci keeps it. So the line stays and gains a tombstone, and `names` reads
+   it exactly as before.
+
+   `:name` is carried forward rather than left to be looked up later, so the
+   record is self-contained — a manifest truncated to its tail still answers
+   what the file was called.
+
+   Retiring an id loci never named is not an error and writes `:name nil`. A
+   hand-placed file has no name to carry, inventing one would lie, and the GC
+   never reclaims one anyway; this only has to not throw."
+  [id]
+  (let [rec {:id id :name (get (names) id) :at (System/currentTimeMillis) :retired true}
+        f   (manifest-file)]
+    (io/make-parents f)
+    (spit f (str (pr-str rec) "\n") :append true)
+    rec))
+
+(defn retired
+  "The set of ids whose most recent manifest record is a retirement.
+
+   **Last-wins per id, which is not the same as the last record in the file.**
+   Reducing into a map keyed by `:id` is what makes re-uploading the same bytes
+   un-retire them while every other id keeps whatever its own last record said.
+   Reading only the file's final line would pass any fixture that touches one id
+   — measured 2026-08-22 — and answer `#{}` for a store where one file was
+   reclaimed and a different one was then imported."
+  []
+  (->> (records)
+       (reduce (fn [m r] (assoc m (:id r) r)) {})
+       vals
+       (filter :retired)
+       (map :id)
+       set))
 
 ;; ---------------------------------------------------------------------------
 ;; the listing the picker draws
