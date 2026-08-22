@@ -334,7 +334,27 @@
    than sorting each group: same answer, no intermediate seq per uri. An object
    with no `:id` sorts before every string exactly as `sort` puts nil first, so
    it answers nil and `listing` adds no key — which is what the filter-and-sort
-   this replaces already did."
+   this replaces already did.
+
+   **The accumulator is tested with `contains?` and not with `get`, and that is
+   load-bearing.** A winner already found may itself be nil — it is the
+   no-`:id` object above — and `get` cannot tell that from a uri seen for the
+   first time. The two tidier spellings both break exactly that case:
+   `(if-let [prev (get m u)] …)` and `(update m u (fnil …))` treat the nil
+   winner as no winner, so whichever object was committed second overwrites it.
+   Measured 2026-08-22 over a nil-`:id` object and `tbl:a` sharing one uri: the
+   `get` spelling answers `\"tbl:a\"` with the nil committed first and nil with it
+   committed second, while this one answers nil in both orders, which is what
+   `(map :id) sort first` did.
+
+   **\"Same answer\" has one measured exception.** Because the whole map is
+   built, a single incomparable pair of ids ANYWHERE in the store makes this
+   throw `ClassCastException`, where the per-uri scan it replaced threw only
+   when asked about that uri. Measured 2026-08-22 with a numeric `:id` beside a
+   string one on `x.csv`: asked about `y.csv`, the old scan answers `tbl:ok`
+   and this throws. Reaching it needs a hand-crafted `commit!` — `loci.source`'s
+   `mint-id` only ever makes `tbl:<slug>` strings — so it is not worth
+   defending against, only worth not claiming immunity from."
   [st]
   (reduce (fn [m o]
             (if-let [u (:uri (:source o))]
@@ -350,10 +370,15 @@
   "The id of the table already bound to `uri`, or nil.
 
    **First in sort order, not oldest.** That is what `loci.server/import-csv!`'s
-   `:duplicateOf` has always answered — ids are strings like `tbl:sales` rather
-   than numbers — and this exists so both call sites give one answer. Making
-   this one 'better' would mean the panel and the paste box disagreeing about
-   which duplicate they mean.
+   `:duplicateOf` has always answered, and this exists so both call sites give
+   one answer. Sort order over `tbl:` strings is not age, not relevance and not
+   anything a person would have picked — it is arbitrary, and it stays that way
+   because **one call site changing the meaning is worse than the answer being
+   arbitrary**: the panel would name one duplicate before the click and the
+   paste box a different one after it, for the same file, and a person would
+   read that as loci having lost track of which table it meant. So making this
+   one 'better' on its own is the failure and not the improvement. A better rule
+   is welcome — here, once, for both.
 
    Reported so the panel can warn, never so it can refuse: two tables from one
    file is a thing someone may well want, and loci's answer to a mistake is

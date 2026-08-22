@@ -285,8 +285,18 @@
         (let [by-file (into {} (map (juxt :file identity)) (files/listing (sub/fresh-store)))]
           (is (= "sales-2026.csv" (:name (by-file "72b441a9c3e05f18.csv")))
               "the listing reads the real manifest")
-          (is (nil? (:name (by-file "hand-placed.csv")))
-              "and a file loci never named has no name, rather than borrowing one"))))))
+          ;; The whole row, and NOT `(nil? (:name …))`. `:name`'s contract is
+          ;; ABSENT, not nil — it is the precedent `:connectedAs` cites for its
+          ;; own shape — and `(nil? (:name …))` answers the same for a missing key
+          ;; as for a present-and-nil one, so a `listing` that always assoc'd
+          ;; would pass it. Measured 2026-08-22 with the `(named n)` guard
+          ;; dropped: the old spelling failed nothing, and both of these fail.
+          (is (= {:file "hand-placed.csv" :uri "loci://files/hand-placed.csv" :bytes 4}
+                 (by-file "hand-placed.csv"))
+              "and a file loci never named has no name, rather than borrowing one")
+          (is (not (contains? (by-file "hand-placed.csv") :name))
+              "said directly as well, so the reason this is a whole-map comparison
+               does not get lost in a later edit"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; `:connectedAs` — which file is already a table, said on the LISTING, which
@@ -300,22 +310,42 @@
       (let [st (sub/fresh-store)]
         (is (nil? (files/connected-as st "loci://files/a.csv"))
             "nothing connected is nil, not a blank string")
-        ;; `tbl:sales` FIRST and `tbl:again` second, on purpose. `fresh-store`
-        ;; answers `objects` as a small array-map, which iterates in insertion
-        ;; order — measured 2026-08-22 — so committing them the other way round
-        ;; would make the unsorted answer and the sorted answer the same string
-        ;; and the assertion below could not see the `compare` at all. Phase 2
-        ;; hit this on `listing`'s own sort and had to write its fixture in
-        ;; reverse lexical order for the same reason.
-        (sub/commit! st {:op :put :id "tbl:sales"
-                         :value {:id "tbl:sales" :source {:uri "loci://files/a.csv"}}})
-        (sub/commit! st {:op :put :id "tbl:again"
-                         :value {:id "tbl:again" :source {:uri "loci://files/a.csv"}}})
-        (is (= ["tbl:sales" "tbl:again"] (mapv :id (vals (sub/objects st))))
-            "the fixture's premise, asserted rather than assumed: iteration order is
-             NOT sort order here, which is the only thing that makes the next line
-             an assertion about sorting")
-        (is (= "tbl:again" (files/connected-as st "loci://files/a.csv"))
+        ;; THREE tables on one uri, in the order mike, alpha, zulu, and that is
+        ;; the whole fixture. `fresh-store` answers `objects` as a small
+        ;; array-map — measured 2026-08-22, and three entries is well under the
+        ;; 8-entry boundary where it becomes a hash-map — so iteration is
+        ;; insertion order and the three candidate rules give three different
+        ;; strings: sorted-minimum `tbl:alpha`, first-committed `tbl:mike`,
+        ;; last-committed `tbl:zulu`.
+        ;;
+        ;; TWO tables would not do it. With `tbl:sales` then `tbl:again` the
+        ;; sorted minimum is also the LAST write, so `connections` simplified to
+        ;; an unconditional `(assoc m u id)` — the obvious "this is just a
+        ;; group-by" cleanup, which silently makes the rule last-connected-wins
+        ;; — answers `tbl:again` and passes. A third id in the middle of sort
+        ;; order is what makes both accidents visible at once, and this is the
+        ;; only place the ordering rule is pinned:
+        ;; `importing-one-file-twice-writes-it-once-and-says-so` has one prior
+        ;; table and exercises no ordering at all.
+        (doseq [id ["tbl:mike" "tbl:alpha" "tbl:zulu"]]
+          (sub/commit! st {:op :put :id id
+                           :value {:id id :source {:uri "loci://files/a.csv"}}}))
+        (let [ids  (mapv :id (vals (sub/objects st)))
+              best (first (sort ids))]
+          ;; The fixture's premise as the PROPERTY, not as the ids. The earlier
+          ;; spelling — `(is (= ["tbl:sales" "tbl:again"] ids))` — protects the
+          ;; store's iteration order but not the fixture: rename the ids so that
+          ;; insertion order happens to equal sort order and this line gets
+          ;; updated in the same edit, both lines pass, and the assertion below
+          ;; is vacuous again, which is the exact state it exists to prevent.
+          ;; Said this way it survives a rename, or fails and says why.
+          (is (not= best (first ids))
+              "the sorted minimum is not the first thing iteration hands back, so
+               first-committed-wins gives a different answer than the line below")
+          (is (not= best (last ids))
+              "nor the last, so last-committed-wins — an unconditional assoc — gives
+               a different answer too"))
+        (is (= "tbl:alpha" (files/connected-as st "loci://files/a.csv"))
             "first in sort order — the same answer import-csv! already gives, and one
              call site changing the meaning is worse than the answer being arbitrary")
         (is (nil? (files/connected-as st "loci://files/b.csv"))

@@ -4421,7 +4421,13 @@
             "an untitled paste has no name to remember, and an empty string is not a name")
         (is (empty? (files/names))
             "so the manifest holds nothing for either of them")
-        (is (= [nil nil] (mapv :name (files/listing st)))
+        ;; `contains?`, and NOT `(= [nil nil] (mapv :name …))`. `:name`'s
+        ;; contract is ABSENT rather than nil, and the old spelling answers the
+        ;; same for a missing key as for a present-and-nil one — a `listing`
+        ;; with its `(named n)` guard dropped assocs `:name nil` on every row
+        ;; and passes it. Measured 2026-08-22 with the guard actually dropped.
+        ;; The vector keeps its length, so this still says TWO rows.
+        (is (= [false false] (mapv #(contains? % :name) (files/listing st)))
             "and the picker draws them under their hashes, which is the honest answer")))))
 
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer
