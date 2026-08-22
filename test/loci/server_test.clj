@@ -4392,13 +4392,13 @@
     (fn []
       (let [st (sub/fresh-store)
             r  (srv/import-csv! st "Q3 Takings" "region,revenue\nEMEA,10\n" nil)
-            nm (first (map :file (files/listing)))]
+            nm (first (map :file (files/listing st)))]
         (is (nil? (:error r)))
         (is (re-matches #"[0-9a-f]{16}\.csv" nm)
             "the file is still content-addressed — the title is metadata, not the name")
         (is (= "Q3 Takings" (get (files/names) nm))
             "and the manifest remembers what it was called, so the picker can show it")
-        (is (= "Q3 Takings" (:name (first (filter #(= nm (:file %)) (files/listing)))))
+        (is (= "Q3 Takings" (:name (first (filter #(= nm (:file %)) (files/listing st)))))
             "which is what makes a pasted CSV list under its title instead of its hash")))))
 
 (deftest import-csv-with-no-title-remembers-nothing-rather-than-a-blank
@@ -4421,7 +4421,7 @@
             "an untitled paste has no name to remember, and an empty string is not a name")
         (is (empty? (files/names))
             "so the manifest holds nothing for either of them")
-        (is (= [nil nil] (mapv :name (files/listing)))
+        (is (= [nil nil] (mapv :name (files/listing st)))
             "and the picker draws them under their hashes, which is the honest answer")))))
 
 (deftest a-transform-that-keeps-nothing-never-reaches-the-writer

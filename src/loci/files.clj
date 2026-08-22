@@ -243,8 +243,58 @@
 ;; the listing the picker draws
 ;; ---------------------------------------------------------------------------
 
+(defn- connections
+  "`{uri -> table-id}` over every object in `st` that names a source uri, the id
+   being the first in sort order among the tables sharing one uri.
+
+   **One pass, because `listing` needs an answer per file.** `connected-as`
+   below is the single-uri question and is what `loci.server/import-csv!` asks;
+   asking it once per file would make `listing` O(files × objects), and the
+   files GC's `report` walks the listing twice. A directory of 10,000 files
+   against a store of 10,000 objects is a hundred million comparisons for a
+   panel that draws on open. The store is scanned once and the listing does
+   lookups.
+
+   The `compare` is `sort`'s own comparator, kept as a running minimum rather
+   than sorting each group: same answer, no intermediate seq per uri. An object
+   with no `:id` sorts before every string exactly as `sort` puts nil first, so
+   it answers nil and `listing` adds no key — which is what the filter-and-sort
+   this replaces already did."
+  [st]
+  (reduce (fn [m o]
+            (if-let [u (:uri (:source o))]
+              (let [id (:id o)]
+                (if (and (contains? m u) (not (neg? (compare id (get m u)))))
+                  m
+                  (assoc m u id)))
+              m))
+          {}
+          (vals (sub/objects st))))
+
+(defn connected-as
+  "The id of the table already bound to `uri`, or nil.
+
+   **First in sort order, not oldest.** That is what `loci.server/import-csv!`'s
+   `:duplicateOf` has always answered — ids are strings like `tbl:sales` rather
+   than numbers — and this exists so both call sites give one answer. Making
+   this one 'better' would mean the panel and the paste box disagreeing about
+   which duplicate they mean.
+
+   Reported so the panel can warn, never so it can refuse: two tables from one
+   file is a thing someone may well want, and loci's answer to a mistake is
+   `undo!`, not a veto.
+
+   A lookup into `connections` rather than its own scan, so that the rule for
+   which duplicate is meant has exactly one implementation. Building the whole
+   map to answer one uri costs one pass either way — the filter this replaced
+   was also a pass over every object — and the alternative is the panel and the
+   paste box each carrying their own copy of the rule."
+  [st uri]
+  (get (connections st) uri))
+
 (defn listing
-  "What is in `dir`, as `[{:file :uri :bytes :name} …]` **sorted by `:file`**.
+  "What is in `dir`, as `[{:file :uri :bytes :name :connectedAs} …]` **sorted by
+   `:file`**.
 
    Two mechanisms write this directory, both content-addressed:
    `loci.server/import-csv!` for a pasted CSV, and `POST /api/source/upload` for
@@ -257,6 +307,14 @@
    for anything loci never named — absent rather than defaulted to `:file`, so
    the shell can tell a remembered name from a hash and draw them differently.
 
+   `:connectedAs` is the id of a table this file is ALREADY the source of, and
+   is absent when there is none — absent rather than nil or false, for the same
+   reason `:name` is. **It is why this takes a store**, and why the answer lands
+   here rather than on `describe`: the panel fetches the listing before you pick,
+   so a duplicate can be named before the click instead of after it, and
+   `describe` stays one thing — a file read that answers with columns. A warning,
+   never a veto: two tables from one file is a thing someone may well want.
+
    **Sorted, and that is not cosmetic.** `File.listFiles` promises no order at
    all; measured 2026-08-21 it answers creation order here and the docs allow
    hash order elsewhere. Unsorted, the picker reshuffles its rows between two
@@ -267,15 +325,18 @@
    `append-chunk!` writes it, `finish-upload!` empties it and `sweep-partials!`
    clears what neither did — and a half-arrived file is not something the picker
    may offer."
-  []
-  (let [named (names)]
+  [st]
+  (let [named (names)
+        conn  (connections st)]
     (->> (.listFiles (dir))
          (filter content?)
          (sort-by (fn [^java.io.File f] (.getName f)))
          (mapv (fn [^java.io.File f]
-                 (let [n (.getName f)]
-                   (cond-> {:file n :uri (uri n) :bytes (.length f)}
-                     (named n) (assoc :name (named n)))))))))
+                 (let [n (.getName f)
+                       u (uri n)]
+                   (cond-> {:file n :uri u :bytes (.length f)}
+                     (named n) (assoc :name (named n))
+                     (conn u)  (assoc :connectedAs (conn u)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; the chunked upload — the `.partial` working file, and the sequence that

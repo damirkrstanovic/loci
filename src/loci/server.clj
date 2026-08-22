@@ -2218,9 +2218,14 @@
               ;; anyway. Reported rather than refused: two tables from one file
               ;; is a thing someone may well want, and loci's answer to a
               ;; mistake is `undo!`, not a veto.
-              seen (->> (sub/objects st) vals
-                        (filter #(= uri (:uri (:source %))))
-                        (map :id) sort first)
+              ;;
+              ;; **`files/connected-as` and not the scan that used to be
+              ;; written out here.** `files/listing` now answers the same
+              ;; question per file, so that the picker can warn BEFORE you
+              ;; connect rather than after; two spellings of "which duplicate
+              ;; do we mean" would let the panel and this box name different
+              ;; tables for the same file.
+              seen (files/connected-as st uri)
               r    (source-connect! st {:uri uri :format :csv :mode :materialise
                                         :title (or (not-empty title) "Imported CSV")}
                                     space)]
@@ -2234,9 +2239,14 @@
    location. What is left here is the envelope, and it is a real thing rather
    than an alias — `{:files […]}` is the JSON contract `API.sourceFiles()`
    destructures, and a bare vector would be a second answer shape among routes
-   that all answer maps."
-  []
-  {:files (files/listing)})
+   that all answer maps.
+
+   The store is passed straight through: `listing` needs it to say which files
+   are already tables, and the alternative — this route asking `connected-as`
+   per row itself — would put the duplicate rule back in two places, which is
+   the thing `connected-as` exists to prevent."
+  [st]
+  {:files (files/listing st)})
 
 (defn source-upload!
   "`POST /api/source/upload` — one chunk of a file being uploaded from the
@@ -3343,7 +3353,7 @@
       (= uri "/api/source/connect")(let [b (body-json req)]
                                      (json-resp (source-connect! st (dissoc b :space) (:space b))))
       (= uri "/api/source/refresh")(let [{:keys [id]} (body-json req)] (json-resp (source-refresh! st id)))
-      (= uri "/api/source/files")(json-resp (source-files))
+      (= uri "/api/source/files")(json-resp (source-files st))
       ;; `(:body req)` is handed STRAIGHT to `source-upload!` — no `slurp`, and
       ;; that is load-bearing rather than a style choice. `slurp` decodes bytes
       ;; to a String, and a chunk boundary falls at an arbitrary byte: measured

@@ -140,7 +140,7 @@
         (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
         (.mkdirs (io/file dir ".partial"))
         (spit (io/file dir ".partial" "half") "not done")
-        (let [r (files/listing)]
+        (let [r (files/listing (sub/fresh-store))]
           (is (= #{"72b441a9c3e05f18.csv" "hand-placed.csv"} (set (map :file r)))
               "both files, and never the .partial working directory")
           (is (= 4 (:bytes (first (filter #(= "72b441a9c3e05f18.csv" (:file %)) r))))
@@ -161,12 +161,13 @@
       (let [dir (doto (files/dir) .mkdirs)]
         (doseq [n ["zulu.csv" "mike.csv" "kilo.csv" "alpha.csv"]]
           (spit (io/file dir n) "x"))
-        (is (= ["alpha.csv" "kilo.csv" "mike.csv" "zulu.csv"] (mapv :file (files/listing)))
+        (is (= ["alpha.csv" "kilo.csv" "mike.csv" "zulu.csv"]
+               (mapv :file (files/listing (sub/fresh-store))))
             "a picker that reshuffles between two opens reads as something having happened")))))
 
 (deftest listing-is-empty-and-not-an-error-before-anything-is-imported
   (with-dir
-    (fn [_] (is (= [] (files/listing))))))
+    (fn [_] (is (= [] (files/listing (sub/fresh-store)))))))
 
 (deftest listing-skips-directories-that-are-not-dotfiles
   ;; The tests above only ever put a DIRECTORY under a dot-prefixed name
@@ -179,7 +180,7 @@
         (spit (io/file dir "real.csv") "a\n1\n")
         (.mkdirs (io/file dir "subdir"))
         (spit (io/file dir "subdir" "nested.csv") "a\n1\n")
-        (is (= ["real.csv"] (mapv :file (files/listing)))
+        (is (= ["real.csv"] (mapv :file (files/listing (sub/fresh-store))))
             "a subdirectory is not content, dotfile-named or not")))))
 
 (deftest listing-skips-dotfiles-that-are-not-directories
@@ -192,7 +193,7 @@
       (let [dir (doto (files/dir) .mkdirs)]
         (spit (io/file dir "real.csv") "a\n1\n")
         (spit (io/file dir ".DS_Store") "junk")
-        (is (= ["real.csv"] (mapv :file (files/listing)))
+        (is (= ["real.csv"] (mapv :file (files/listing (sub/fresh-store))))
             "a dotfile is not content, directory or not")))))
 
 (deftest listing-reports-the-manifest-name-for-a-file-loci-named
@@ -202,8 +203,67 @@
         (spit (io/file dir "72b441a9c3e05f18.csv") "a\n1\n")
         (spit (io/file dir "hand-placed.csv") "b\n2\n")
         (files/remember! "72b441a9c3e05f18.csv" "sales-2026.csv")
-        (let [by-file (into {} (map (juxt :file identity)) (files/listing))]
+        (let [by-file (into {} (map (juxt :file identity)) (files/listing (sub/fresh-store)))]
           (is (= "sales-2026.csv" (:name (by-file "72b441a9c3e05f18.csv")))
               "the listing reads the real manifest")
           (is (nil? (:name (by-file "hand-placed.csv")))
               "and a file loci never named has no name, rather than borrowing one"))))))
+
+;; ---------------------------------------------------------------------------
+;; `:connectedAs` — which file is already a table, said on the LISTING, which
+;; is what the panel fetches before you pick. On `describe` it would arrive
+;; after the click, and would make `describe` two things.
+;; ---------------------------------------------------------------------------
+
+(deftest connected-as-names-the-table-already-bound-to-a-uri
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (is (nil? (files/connected-as st "loci://files/a.csv"))
+            "nothing connected is nil, not a blank string")
+        ;; `tbl:sales` FIRST and `tbl:again` second, on purpose. `fresh-store`
+        ;; answers `objects` as a small array-map, which iterates in insertion
+        ;; order — measured 2026-08-22 — so committing them the other way round
+        ;; would make the unsorted answer and the sorted answer the same string
+        ;; and the assertion below could not see the `compare` at all. Phase 2
+        ;; hit this on `listing`'s own sort and had to write its fixture in
+        ;; reverse lexical order for the same reason.
+        (sub/commit! st {:op :put :id "tbl:sales"
+                         :value {:id "tbl:sales" :source {:uri "loci://files/a.csv"}}})
+        (sub/commit! st {:op :put :id "tbl:again"
+                         :value {:id "tbl:again" :source {:uri "loci://files/a.csv"}}})
+        (is (= ["tbl:sales" "tbl:again"] (mapv :id (vals (sub/objects st))))
+            "the fixture's premise, asserted rather than assumed: iteration order is
+             NOT sort order here, which is the only thing that makes the next line
+             an assertion about sorting")
+        (is (= "tbl:again" (files/connected-as st "loci://files/a.csv"))
+            "first in sort order — the same answer import-csv! already gives, and one
+             call site changing the meaning is worse than the answer being arbitrary")
+        (is (nil? (files/connected-as st "loci://files/b.csv"))
+            "and a different uri is not connected just because something is")))))
+
+(deftest listing-marks-the-file-that-is-already-a-table
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "a.csv") "x\n1\n")
+        (spit (io/file (files/dir) "b.csv") "y\n2\n")
+        (sub/commit! st {:op :put :id "tbl:sales"
+                         :value {:id "tbl:sales" :source {:uri "loci://files/a.csv"}}})
+        (let [by-file (into {} (map (juxt :file identity)) (files/listing st))]
+          (is (= {:file "a.csv" :uri "loci://files/a.csv" :bytes 4 :connectedAs "tbl:sales"}
+                 (get by-file "a.csv"))
+              "the whole row, so the id is the table's own and not something derived
+               from the file name")
+          ;; The whole map again, and NOT `(nil? (:connectedAs …))`. That form
+          ;; answers the same for a missing key and a present-and-nil one, so a
+          ;; `cond->` that always assoc'd would pass it — the exact defect
+          ;; found in Task 4 of this branch an hour before this was written.
+          (is (= {:file "b.csv" :uri "loci://files/b.csv" :bytes 4}
+                 (get by-file "b.csv"))
+              "absent, not false and not nil — the shell tells a remembered value from
+               a missing one")
+          (is (not (contains? (get by-file "b.csv") :connectedAs))
+              "said directly as well, so the reason this test is written with whole
+               maps does not get lost in a later edit"))))))
