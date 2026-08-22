@@ -910,3 +910,153 @@
              one takes the side a reclaim can never act on. Drop the `:name` test
              from `mine` and this file becomes `:orphaned`, which a reclaim
              deletes")))))
+
+;; ---------------------------------------------------------------------------
+;; `report` and `reclaim!` — the dry run, and the deletion
+;;
+;; `report` is the dry run, which is why `reclaim!` has no dry-run flag — the
+;; shape `loci.lakegc` keeps. Every window below is `nothing-retained`, so an
+;; `:in-window` answer cannot be what saves a file here: the only thing that can
+;; is its CLASS, which is what these fixtures are about.
+;; ---------------------------------------------------------------------------
+
+(deftest report-says-what-a-reclaim-would-free-without-freeing-it
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        ;; TWO files of DIFFERENT sizes, one reclaimable and one not, because
+        ;; the obvious one-file fixture cannot see the mistake it is meant to
+        ;; catch: with a single file in the directory `:total-bytes` and
+        ;; `:reclaimable-bytes` are the same number, and a `report` that summed
+        ;; every row into both passes `(= 10 (:reclaimable-bytes r))` green.
+        (spit (io/file (files/dir) "old.csv") "0123456789")
+        (spit (io/file (files/dir) "keep.csv") "abc")
+        (files/remember! "old.csv" "gone")
+        (files/remember! "keep.csv" "kept")
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (let [r (files/report st nothing-retained)]
+          (is (= ["old.csv"] (map :file (:reclaimable r)))
+              "only the file nothing names any more")
+          (is (= 10 (:reclaimable-bytes r)) "the file's actual length, not a count")
+          (is (= 13 (:total-bytes r))
+              "and the two are different on this fixture, which is the whole reason
+               there is a second file in it")
+          (is (= {"old.csv" :reclaimable "keep.csv" :current}
+                 (into {} (map (juxt :file :class)) (:files r)))
+              "every file gets a row and a class, not only the doomed ones — a
+               storage panel says what the directory COSTS as well as what it frees")
+          (is (= "gone" (:name (first (:reclaimable r))))
+              "and the row carries the manifest name, which is what `reclaim!` hands
+               to `retire!` instead of re-parsing files.edn once per file")
+          (is (.exists (io/file (files/dir) "old.csv"))
+              "report is the dry run — there is no dry-run flag because of it"))))))
+
+(deftest reclaim-deletes-the-file-retires-the-name-and-leaves-the-rest
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "old.csv") "x\n")
+        (spit (io/file (files/dir) "keep.csv") "y\n")
+        (files/remember! "old.csv" "gone")
+        (files/remember! "keep.csv" "kept")
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        (let [r (files/reclaim! st nothing-retained)]
+          (is (= ["old.csv"] (map :file r)))
+          (is (nil? (:error (first r))) "a delete that worked carries no :error")
+          (is (not (.exists (io/file (files/dir) "old.csv"))))
+          (is (.exists (io/file (files/dir) "keep.csv")) "a live table's file is untouched")
+          (is (= #{"old.csv"} (files/retired)))
+          (is (= "gone" (get (files/names) "old.csv"))
+              "the name outlives the bytes — files.edn is primary"))))))
+
+(deftest reclaim-reports-a-file-it-could-not-delete-rather-than-dropping-it
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "old.csv") "x\n")
+        (files/remember! "old.csv" "gone")
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (sub/commit! st {:op :delete :id "tbl:a"})
+        ;; The file must stay a FILE — `listing` filters directories out via
+        ;; `content?`, so a directory named `old.csv` never becomes a candidate
+        ;; and this would pass over an empty result. Deletion on POSIX is a
+        ;; property of the CONTAINING directory, so make that unwritable.
+        (.setWritable (files/dir) false)
+        (try
+          (let [r (files/reclaim! st nothing-retained)]
+            ;; Running as root ignores the permission bit. Say so loudly rather
+            ;; than passing green on a mechanism that never ran — a silent skip
+            ;; here is a test that certifies.
+            (is (= ["old.csv"] (map :file r))
+                "the candidate is still reported, not silently dropped: a `:when`
+                 filter would answer a shorter vector and a caller comparing counts
+                 would read that as success")
+            (if (.exists (io/file (files/dir) "old.csv"))
+              (do (is (re-find #"could not delete" (str (:error (first r))))
+                      "and the row says which file and why")
+                  (is (= #{} (files/retired))
+                      "and the name is NOT retired, because the bytes are still there"))
+              (is false (str "the delete succeeded despite an unwritable directory"
+                             " — running as root? this test proved nothing"))))
+          (finally (.setWritable (files/dir) true)))))))
+
+(deftest reclaim-with-nothing-reclaimable-deletes-nothing
+  (with-dir
+    (fn [_]
+      (let [st (sub/fresh-store)]
+        (.mkdirs (files/dir))
+        (spit (io/file (files/dir) "placed.csv") "x\n")
+        ;; **The positive control, and it is not decoration.** `(= [] …)` is
+        ;; also what a `reclaim!` that threw its candidates away answers, and
+        ;; what one answers over a directory it never managed to read at all.
+        ;; So establish first that there WAS a file here for a class to protect,
+        ;; and that the class is the one doing the protecting.
+        (is (= [{:file "placed.csv" :class :foreign}]
+               (mapv #(select-keys % [:file :class])
+                     (:files (files/report st nothing-retained))))
+            "report saw exactly one file and called it foreign")
+        (is (= [] (files/reclaim! st nothing-retained)))
+        (is (.exists (io/file (files/dir) "placed.csv"))
+            "a hand-placed file survives a reclaim that had no other candidates —
+             the class that protects it is not a special case of having something
+             else to do")))))
+
+(deftest reclaim-reads-the-manifest-once-and-not-once-per-file
+  ;; `retire!`'s ONE-argument arity resolves the name with `(get (names) id)` —
+  ;; a full parse of `files.edn`, per file, which in a loop is quadratic: 27.9 s
+  ;; over 2,000 files against 0.040 s handed the name (measured 2026-08-22 and
+  ;; recorded on `retire!` itself). `report` has already read the manifest and
+  ;; put the name on the row, so `reclaim!` hands it over.
+  ;;
+  ;; **Nothing about the RESULT can see which arity was used.** The two write
+  ;; the same record — `retiring-with-the-name-in-hand-writes-the-same-record`
+  ;; is what pins that — so a fixture reading `names` or `retired` afterwards
+  ;; passes either way, and the only thing that can hold this is the COUNT of
+  ;; reads. One for the whole reclaim, which is `listing`'s, against one more
+  ;; per reclaimed file.
+  (with-dir
+    (fn [_]
+      (let [st    (sub/fresh-store)
+            reads (atom 0)
+            real  files/names]
+        (.mkdirs (files/dir))
+        (doseq [n ["a.csv" "b.csv" "c.csv"]]
+          (spit (io/file (files/dir) n) "x\n")
+          (files/remember! n (str "name of " n))
+          (put-source! st (str "tbl:" n) (files/uri n) :materialise)
+          (sub/commit! st {:op :delete :id (str "tbl:" n)}))
+        (let [r (with-redefs [files/names (fn [] (swap! reads inc) (real))]
+                  (files/reclaim! st nothing-retained))]
+          (is (= ["a.csv" "b.csv" "c.csv"] (map :file r))
+              "the premise: three files really were reclaimed, so a per-file read
+               would have somewhere to happen")
+          (is (= 1 @reads)
+              (str "the manifest is parsed once for the whole reclaim and not once "
+                   "per file — three files read it " @reads " times")))))))

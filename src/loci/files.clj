@@ -325,10 +325,14 @@
    **One pass, because `listing` needs an answer per file.** `connected-as`
    below is the single-uri question and is what `loci.server/import-csv!` asks;
    asking it once per file would make `listing` O(files × objects), and the
-   files GC's `report` walks the listing twice. A directory of 10,000 files
-   against a store of 10,000 objects is a hundred million comparisons for a
-   panel that draws on open. The store is scanned once and the listing does
-   lookups.
+   files GC calls `listing` for a panel that draws on open. A directory of
+   10,000 files against a store of 10,000 objects is a hundred million
+   comparisons. The store is scanned once and the listing does lookups.
+
+   (This paragraph said the GC's `report` \"walks the listing twice\" until
+   2026-08-22, when `report` was written to walk it once and hand the rows to
+   `classify` — see `classify`'s last section. The multiplier was never the
+   point; one pass would be the shape at one walk too.)
 
    The `compare` is `sort`'s own comparator, kept as a running minimum rather
    than sorting each group: same answer, no intermediate seq per uri. An object
@@ -640,101 +644,221 @@
    last-wins over a newest-first walk takes the OLDEST mention of a repeated
    uri, and because two objects on one file — the ordinary state `:connectedAs`
    and `:duplicateOf` exist for — otherwise get whichever one the fold happened
-   to finish on."
-  [st {:keys [versions days] :as _window}]
-  (let [recs   (latest)
-        ;; `mine` is `(keys (names))` minus `retired`, read off the one map
-        ;; rather than from two more parses.
-        ;;
-        ;; **The `:name` test is this function's rule and NOT `names`'.** An
-        ;; earlier comment here claimed it was `names`' own rule kept so the two
-        ;; sets could not drift; that is not what either one does. `names` is
-        ;; *the last record that HAS a name* — `latest`'s docstring is explicit
-        ;; that folding it in would change its answer — while this is *the last
-        ;; record, and does it have a name*. They part on a nameless record
-        ;; following a named one. Measured 2026-08-22 over a hand-written
-        ;; `{:id "a.csv" :name "Alpha"}` followed by `{:id "a.csv" :at 1}`:
-        ;; `names` answers `{"a.csv" "Alpha"}` and this file comes back
-        ;; `:foreign`.
-        ;;
-        ;; That shape is unreachable from `src/` — both `remember!` callers
-        ;; guard with `not-empty` (`server.clj`'s import route and
-        ;; `finish-upload!` below), and `retire!`'s nameless record carries
-        ;; `:retired`, which the clause above drops first. A hand-edited or
-        ;; truncated manifest reaches it, which is why the divergence is written
-        ;; down rather than removed: `:foreign` is the never-reclaimed side, so
-        ;; where the two rules part this one takes the direction a GC over a
-        ;; primary file must take. `a-nameless-record-after-a-named-one-parts-
-        ;; mine-from-names` is the fixture.
-        ;;
-        ;; **`remove :retired` is what makes a retirement mean loci gave the
-        ;; file up.** Re-uploading the same bytes calls `remember!`, which
-        ;; un-retires the id and puts it straight back in `mine`. Bytes that
-        ;; reappear WITHOUT loci — a restore, an rsync, a re-mounted volume —
-        ;; are a file loci did not write, and this is what returns them to
-        ;; `:foreign` so a second reclaim cannot delete them.
-        mine   (into #{} (comp (remove #(:retired (val %)))
-                               (filter #(:name (val %)))
-                               (map key))
-                     recs)
-        ;; **`connections` and not a third spelling of the same store walk.**
-        ;; Measured 2026-08-22, `(set (keys (connections st)))` and the
-        ;; `(keep #(:uri (:source %)) (vals (sub/objects st)))` this replaces are
-        ;; identical by construction — `keep` drops exactly the nils
-        ;; `connections`' `if-let` skips — and this namespace already had that
-        ;; walk written once for `:connectedAs`. Not for speed: a scan is ~6 ms
-        ;; over a 20,000-object store (measured 2026-08-22, half of them
-        ;; connected tables) and `objects` is an atom deref in production. For
-        ;; the reason `connected-as` gives about itself — which uri counts as
-        ;; connected is one rule, and two spellings of it are two things to keep
-        ;; in step.
-        ;;
-        ;; **The keys, not the rows `listing` already carries.** A file's
-        ;; `:connectedAs` is absent when the object holding the uri has no
-        ;; `:id`, and reading liveness off that key would call such a file
-        ;; unreferenced while an object is still reading it. Under-coverage is
-        ;; the unsafe direction for both GCs; the key set has neither hole.
-        live   (set (keys (connections st)))
-        cutoff (- (System/currentTimeMillis) (* days 24 60 60 1000))
-        ;; **Rank among the object's URI-BEARING entries only, and merge per uri
-        ;; toward whichever answer retains more.** Both halves of that sentence
-        ;; are corrections to `lakegc`'s `seen`, which this was copied from and
-        ;; which is right there and wrong here — see the note in the docstring.
-        ;;
-        ;; `filter` before `map-indexed`, so a rank is a position among FILES.
-        ;; `keepier` rather than `into {}`, so a uri named twice does not take
-        ;; whichever mention the fold happened to finish on.
-        seen   (reduce (fn [acc [o hs]]
-                         (reduce (fn [a [i e]]
-                                   (update a (uri-of e) keepier
-                                           {:object o :ts (:ts e) :age-rank i}))
-                                 acc
-                                 (map-indexed vector (filter uri-of hs))))
-                       {}
-                       (tbl/handles-in-history st))]
-    (into {}
-          (for [{:keys [file uri]} (listing st)
-                :let [m (get seen uri)]]
-            [file
-             (cond
-               (not (mine file)) {:class :foreign :object nil :ts nil}
-               (live uri)        (assoc (or m {}) :class :current)
-               (nil? m)          (let [at (:at (get recs file))]
-                                   ;; **A missing `:at` means KEEP.** `(or at 0)`
-                                   ;; would read an unreadable clock as the epoch —
-                                   ;; maximally old — and send the record straight to
-                                   ;; `:orphaned`, the one class a reclaim deletes with
-                                   ;; no object to warn about. `files.edn` is PRIMARY
-                                   ;; and cannot be recomputed, so a GC over it fails
-                                   ;; toward keeping. Measured 2026-08-22: under
-                                   ;; `default-window`, `{:id "x.csv" :name "X"}` came
-                                   ;; back `:orphaned`.
-                                   {:class  (if (or (nil? at) (>= at cutoff))
-                                              :in-window :orphaned)
-                                    :object nil :ts nil :at at})
-               (or (< (:age-rank m) versions)
-                   (>= (or (:ts m) 0) cutoff)) (assoc m :class :in-window)
-               :else             (assoc m :class :reclaimable))]))))
+   to finish on.
+
+   ## The three-argument arity takes a listing you already have
+
+   `report` needs the same rows this does — `:bytes` per file is on them — and
+   calling `listing` at both levels would walk the directory twice for one
+   answer. The walk is the largest single term here. Measured 2026-08-22 over
+   10,000 files with a 10,000-line manifest and an EMPTY store, so that the
+   figures are the directory-and-manifest axis alone and the store walks above
+   sit on top of them unchanged: `listing` is 68 ms of one `classify`'s 104 ms,
+   and a `report` that walks twice costs 174 ms against 109 ms. That establishes
+   the mechanism's shape rather than that anyone's panel is slow — the second
+   walk is a little over a third of a report the storage panel draws on open,
+   whatever the absolute number turns out to be on a real directory.
+
+   Speed is the smaller half of the reason. Two walks are also **two different
+   directories**: a file written between them is reported with no `:class` at
+   all, and one deleted between them is classified and never reported. One walk
+   makes the rows and the classes answers about the same instant by
+   construction."
+  ([st window] (classify st window (listing st)))
+  ([st {:keys [versions days] :as _window} rows]
+   (let [recs   (latest)
+         ;; `mine` is `(keys (names))` minus `retired`, read off the one map
+         ;; rather than from two more parses.
+         ;;
+         ;; **The `:name` test is this function's rule and NOT `names`'.** An
+         ;; earlier comment here claimed it was `names`' own rule kept so the two
+         ;; sets could not drift; that is not what either one does. `names` is
+         ;; *the last record that HAS a name* — `latest`'s docstring is explicit
+         ;; that folding it in would change its answer — while this is *the last
+         ;; record, and does it have a name*. They part on a nameless record
+         ;; following a named one. Measured 2026-08-22 over a hand-written
+         ;; `{:id "a.csv" :name "Alpha"}` followed by `{:id "a.csv" :at 1}`:
+         ;; `names` answers `{"a.csv" "Alpha"}` and this file comes back
+         ;; `:foreign`.
+         ;;
+         ;; That shape is unreachable from `src/` — both `remember!` callers
+         ;; guard with `not-empty` (`server.clj`'s import route and
+         ;; `finish-upload!` below), and `retire!`'s nameless record carries
+         ;; `:retired`, which the clause above drops first. A hand-edited or
+         ;; truncated manifest reaches it, which is why the divergence is written
+         ;; down rather than removed: `:foreign` is the never-reclaimed side, so
+         ;; where the two rules part this one takes the direction a GC over a
+         ;; primary file must take. `a-nameless-record-after-a-named-one-parts-
+         ;; mine-from-names` is the fixture.
+         ;;
+         ;; **`remove :retired` is what makes a retirement mean loci gave the
+         ;; file up.** Re-uploading the same bytes calls `remember!`, which
+         ;; un-retires the id and puts it straight back in `mine`. Bytes that
+         ;; reappear WITHOUT loci — a restore, an rsync, a re-mounted volume —
+         ;; are a file loci did not write, and this is what returns them to
+         ;; `:foreign` so a second reclaim cannot delete them.
+         mine   (into #{} (comp (remove #(:retired (val %)))
+                                (filter #(:name (val %)))
+                                (map key))
+                      recs)
+         ;; **`connections` and not a third spelling of the same store walk.**
+         ;; Measured 2026-08-22, `(set (keys (connections st)))` and the
+         ;; `(keep #(:uri (:source %)) (vals (sub/objects st)))` this replaces are
+         ;; identical by construction — `keep` drops exactly the nils
+         ;; `connections`' `if-let` skips — and this namespace already had that
+         ;; walk written once for `:connectedAs`. Not for speed: a scan is ~6 ms
+         ;; over a 20,000-object store (measured 2026-08-22, half of them
+         ;; connected tables) and `objects` is an atom deref in production. For
+         ;; the reason `connected-as` gives about itself — which uri counts as
+         ;; connected is one rule, and two spellings of it are two things to keep
+         ;; in step.
+         ;;
+         ;; **The keys, not the rows `listing` already carries.** A file's
+         ;; `:connectedAs` is absent when the object holding the uri has no
+         ;; `:id`, and reading liveness off that key would call such a file
+         ;; unreferenced while an object is still reading it. Under-coverage is
+         ;; the unsafe direction for both GCs; the key set has neither hole.
+         live   (set (keys (connections st)))
+         cutoff (- (System/currentTimeMillis) (* days 24 60 60 1000))
+         ;; **Rank among the object's URI-BEARING entries only, and merge per uri
+         ;; toward whichever answer retains more.** Both halves of that sentence
+         ;; are corrections to `lakegc`'s `seen`, which this was copied from and
+         ;; which is right there and wrong here — see the note in the docstring.
+         ;;
+         ;; `filter` before `map-indexed`, so a rank is a position among FILES.
+         ;; `keepier` rather than `into {}`, so a uri named twice does not take
+         ;; whichever mention the fold happened to finish on.
+         seen   (reduce (fn [acc [o hs]]
+                          (reduce (fn [a [i e]]
+                                    (update a (uri-of e) keepier
+                                            {:object o :ts (:ts e) :age-rank i}))
+                                  acc
+                                  (map-indexed vector (filter uri-of hs))))
+                        {}
+                        (tbl/handles-in-history st))]
+     (into {}
+           (for [{:keys [file uri]} rows
+                 :let [m (get seen uri)]]
+             [file
+              (cond
+                (not (mine file)) {:class :foreign :object nil :ts nil}
+                (live uri)        (assoc (or m {}) :class :current)
+                (nil? m)          (let [at (:at (get recs file))]
+                                    ;; **A missing `:at` means KEEP.** `(or at 0)`
+                                    ;; would read an unreadable clock as the epoch —
+                                    ;; maximally old — and send the record straight to
+                                    ;; `:orphaned`, the one class a reclaim deletes with
+                                    ;; no object to warn about. `files.edn` is PRIMARY
+                                    ;; and cannot be recomputed, so a GC over it fails
+                                    ;; toward keeping. Measured 2026-08-22: under
+                                    ;; `default-window`, `{:id "x.csv" :name "X"}` came
+                                    ;; back `:orphaned`.
+                                    {:class  (if (or (nil? at) (>= at cutoff))
+                                               :in-window :orphaned)
+                                     :object nil :ts nil :at at})
+                (or (< (:age-rank m) versions)
+                    (>= (or (:ts m) 0) cutoff)) (assoc m :class :in-window)
+                :else             (assoc m :class :reclaimable))])))))
+
+(defn report
+  "What every file in `dir` costs, and what a reclaim would free. **Deletes
+   nothing.**
+
+   `report` IS the dry run, and that is why `reclaim!` has no dry-run flag — the
+   shape `loci.lakegc` keeps, for the reason its own docstring gives: the report
+   names exactly the files the reclaim will delete and the bytes it will free,
+   so a flag would only add a second way to ask the same question, with the
+   destructive answer as the default one.
+
+   `:files` carries EVERY file and not only the doomed ones. A storage panel has
+   to say what the directory COSTS as well as what it can free, and `lakegc`
+   learned that the hard way — it reports `:catalog` beside `:files` because a
+   reclaim that freed every reclaimable byte in the lake looked, against a
+   catalog that never shrinks, like it had done nothing. Each row is its
+   `listing` row — `:file`, `:uri`, `:bytes`, and `:name`/`:connectedAs` where
+   there are any — with `classify`'s `:class`, `:object` and `:ts` merged onto
+   it. `:name` is on the row for `reclaim!`'s sake; see there.
+
+   **One `listing`, handed to `classify`.** 174 ms → 109 ms over 10,000 files,
+   and rows and classes that describe one instant rather than two; `classify`'s
+   last section has the measurement and the sharper half of the reason.
+
+   No `:window` key, unlike `lakegc/report`. Every caller here passes the window
+   in and holds it; echoing it back would be a second place for it to be wrong."
+  [st window]
+  (let [rows (listing st)
+        cls  (classify st window rows)
+        all  (mapv #(merge % (get cls (:file %))) rows)
+        recl (filterv #(= :reclaimable (:class %)) all)]
+    {:files             all
+     :reclaimable       recl
+     :reclaimable-bytes (reduce + 0 (map :bytes recl))
+     :total-bytes       (reduce + 0 (map :bytes all))}))
+
+(defn reclaim!
+  "Delete every `:reclaimable` file and retire its manifest line. Irreversible.
+
+   The bytes go and the NAME STAYS. `retire!` appends a tombstone rather than
+   rewriting `files.edn`, because that file is PRIMARY and cannot be rebuilt: a
+   reclaim that dropped the line would be the one operation in loci that can
+   lose a name for good, since by then the bytes are gone and the hash never
+   carried it.
+
+   **`retire!` is handed the name off the row, not left to look it up.** The
+   one-argument arity resolves it with `(get (names) id)`, a full parse of the
+   manifest per file, which in a loop is quadratic — measured 2026-08-22,
+   retiring 2,000 files costs 27.9 s that way against 0.040 s with the name in
+   hand. `report` has already read the manifest and put the name on the row.
+
+   **Every candidate gets a row, and a failure carries `:error` rather than
+   vanishing.** The spec asks for it by name — *a reclaim that cannot delete a
+   file reports which and why* — and the alternative is worse than it looks: a
+   `:when` filter answers a SHORTER vector, and a caller comparing its count
+   against `report`'s reads a total failure as a completed sweep. The name is
+   **not** retired on a failed delete, because the bytes are still there and a
+   tombstone would say they were not.
+
+   A file that vanished between `report` and here is not an error; it is the
+   outcome the caller asked for. `.delete` answers false for a file that no
+   longer exists, so the check is `deleted OR already gone`.
+
+   ## The gap between classifying and deleting, written down rather than closed
+
+   Nothing holds a lock across the two, and none is wanted: loci is
+   single-writer for the STORE, but http-kit answers from a worker pool and
+   handlers do interleave — `server.clj:1037` records 48 of 64 tag colours lost
+   to exactly that, which is measurement and not theory. So a
+   `POST /api/source/connect` naming a `:reclaimable` file's uri, landing after
+   `classify` read `connections` and before the `.delete` below, connects a
+   table whose bytes this then removes.
+
+   Reachable, and left open. **Every available check narrows the window without
+   closing it**, and shipping a mechanism that cannot deliver the property it is
+   named for is worse than the gap being written here. Re-reading `connections`
+   immediately before each delete moves the exposure from the report's duration
+   to a few instructions and still loses the same race, at the ~6 ms per call
+   `classify` records over a 20,000-object store — 60 s across 10,000 files,
+   against a `report` that is meant to be cheap enough to draw a panel with.
+   Re-running `classify` per file is the whole classification again, which is
+   the 104 ms measured in its own docstring before a single object is in the
+   store.
+
+   What it costs when it does happen is bounded and already drawn: a passthrough
+   table becomes `:table/unavailable`, the state phase 2 draws and offers a
+   reconnect for, and a materialised table loses nothing it is currently
+   reading — its rows are in the lake — only the ability to `refresh!`. Closing
+   this properly means one writer for the directory as well as the store, which
+   is a decision about the server and not about this function."
+  [st window]
+  (vec (for [{:keys [file bytes] :as row} (:reclaimable (report st window))
+             :let [f    (io/file (dir) file)
+                   gone (or (.delete f) (not (.exists f)))]]
+         (if gone
+           (do (retire! file (:name row))
+               {:file file :bytes bytes})
+           {:file  file :bytes bytes
+            :error (str "loci could not delete " file " — it is still in "
+                        (.getPath (dir)))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; the chunked upload — the `.partial` working file, and the sequence that
