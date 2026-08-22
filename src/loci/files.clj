@@ -656,22 +656,33 @@
    alone: `listing` is 68 ms of one `classify`'s 104 ms, and a `report` that
    walks twice costs 174 ms against 109 ms.
 
-   **Most of that 65 ms is the MANIFEST and not the directory**, and an earlier
-   draft of this paragraph put it all on \"the walk\". `listing` *contains* a
-   `names` parse, priced at 56 ms in the section above, so of its 68 ms only
-   ~12 ms is `readdir` plus 10,000 `.length` stats. If the saving were the
-   reason to do this, hoisting one manifest read would collect most of it and
-   need no second arity at all. It is not the reason — the paragraph below
-   always was — but the number belongs on the term that carries it.
+   **The saving is about half manifest and half directory**, and the two drafts
+   before this one both got the split wrong in the same way: by subtracting one
+   measurement from another taken at a different moment. The first put all of it
+   on \"the walk\"; the second reasoned that `listing` *contains* a `names` parse
+   priced at 56 ms elsewhere, so of its 68 ms only ~12 ms could be `readdir`
+   plus 10,000 `.length` stats.
+
+   Measured directly on one fixture 2026-08-22 — Task 9's, 10,000 files and a
+   10,000-line manifest — the walk is not a rounding error: `.listFiles`,
+   `content?`, the sort and 10,000 `.length` stats cost **36 ms** against the
+   `names` parse's **38 ms**, and `listing` itself is 81 ms. So hoisting one
+   manifest read would collect a little under half the saving, not most of it.
+   The reason to take the rows is still the paragraph below rather than the
+   clock, but the number belongs on the terms that carry it, and a difference of
+   two numbers is not a measurement of either. The spec's Measured section for
+   2026-08-22 has the full table.
 
    **And the fraction is the empty store's, not a panel's.** 65 of 174 is 37%.
    At the scale the section above measures — 20,000 objects, 40,000 events — the
    store walks sit on top of BOTH numbers: `connections` at 6 ms (once inside
    `listing`, once here) and `handles-in-history` at 26 ms make one walk 149 ms
    and two 223 ms, so the saving is 74 of 223, about a third rather than
-   \"a little over\" one. That is arithmetic on the terms recorded above and not
-   a fresh measurement. Every figure here establishes the mechanism's SHAPE;
-   none of them says anyone's panel is slow.
+   \"a little over\" one. That was arithmetic on the terms recorded above rather
+   than a fresh measurement, and Task 9 then took it: over 15,000 objects and
+   30,000 events, one walk is 160 ms and two are 234 ms — **74 of 234**, which is
+   the third the arithmetic predicted. Every figure here establishes the
+   mechanism's SHAPE; none of them says anyone's panel is slow.
 
    Speed is the smaller half of the reason. Two walks are also **two different
    directories**: a file written between them is reported with no `:class` at
