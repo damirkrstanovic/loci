@@ -655,10 +655,23 @@ const API = {
   // shape rather than a missing argument.
   //
   // Answers {reclaimed:[{file,bytes,error?}], freed}. One row per CANDIDATE,
-  // including the ones it could not delete — and `freed` is the server's own sum
-  // over the rows with no `error`, because a failed row carries the same `bytes`
+  // including the ones it could not delete — and `freed` is computed beside the
+  // deletes in `files/reclaim!`, because a failed row carries the same `bytes`
   // as a done one and adding them up here would report files still on disk.
-  reclaimFiles: () => POST('/api/storage/reclaim-files',{}),
+  //
+  // **Its own fetch, because this is the one call where a 500 is not "nothing
+  // happened".** `POST` above is `.then(r=>r.json())` with no status check, and
+  // `handler` has no top-level catch — so a throw partway through a sweep
+  // (a read-only manifest, a full disk) answers a non-JSON 500, `r.json()`
+  // rejects, and the caller's catch says *could not reach the server — nothing
+  // was deleted* over four files that are gone. `reached` is what lets the
+  // caller tell a server that failed from a server that was never there.
+  reclaimFiles: async () => {
+    const r = await fetch('/api/storage/reclaim-files',
+                          {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){ const e=new Error('the server answered '+r.status); e.reached=true; throw e; }
+    return r.json();
+  },
   suggest: space => POST('/api/suggest',{space}),
   suggestRun: (space,items,destination) => POST('/api/suggest-run',{space,items,destination}),
   job: id => fetch('/api/job?id='+encodeURIComponent(id)).then(r=>r.json()),
@@ -1317,10 +1330,18 @@ function dataFileTab(i,sp,host){
       // one loci had rather than the one you just chose. They are the same
       // bytes; that is what a matching hash means.
       if(r&&r.existed) showToast('loci already had these exact bytes — connecting the file it holds');
-      // The same `{file,name,uri,bytes}` shape the listing answers with, handed
-      // to the same preview a picked row gets. An upload is a file ARRIVING in
-      // loci's directory, and there is one describe→preview→connect flow.
-      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size});
+      // The same `{file,name,uri,bytes,connectedAs}` shape the listing answers
+      // with, handed to the same preview a picked row gets. An upload is a file
+      // ARRIVING in loci's directory, and there is one describe→preview→connect
+      // flow.
+      //
+      // `connectedAs` is on it because an upload IS an import: drag in a file
+      // whose bytes are already a table and the hash matches, so nothing is
+      // written and `existed` says so — but without this key the preview drew no
+      // duplicate note and Connect made a second table from the same rows in
+      // silence, which is the one thing the picked-row door has warned about
+      // since phase 2.
+      dataPreview(i,sp,host,{file:r.file,name:f.name,uri:r.uri,bytes:f.size,connectedAs:r.connectedAs});
     });
   };
   API.sourceFiles().then(r=>{
@@ -3233,17 +3254,42 @@ async function openStorage(){
   // length — bytes a reclaim could never free. Left alone rather than engineered
   // around: a hand-placed symlink has no manifest entry, so it is `:foreign` and
   // never reclaimable, and the figure the button acts on is the other one.
+  //
+  // `reclaimable-count`, an integer, and NOT the rows. The rows carry
+  // file/uri/bytes/name/connectedAs/class/object/ts/at each, and `.length` was
+  // the only thing ever read off them — 2 MB of JSON on every panel open to
+  // draw one number, which is the shape the payload's own docstring rejects for
+  // the `:files` key one line above. The count is over BOTH classes a reclaim
+  // deletes, `:reclaimable` and `:orphaned`; `reclaimable-bytes` keeps its name
+  // because it is the right word for the BYTES, over that same widened set.
   const fd=p.files||{}, fCount=+fd.count||0, fTotal=+fd['total-bytes']||0,
-        fRecl=+fd['reclaimable-bytes']||0, fRows=fd.reclaimable||[];
+        fRecl=+fd['reclaimable-bytes']||0, fN=+fd['reclaimable-count']||0,
+        fCls=fd.classes||{};
+  // The zero state names the REASON, from the classifier's own counts. The one
+  // sentence this used to have — "nothing loci wrote is unreferenced" — is
+  // false in the case this whole section exists for: an uploaded file nobody
+  // connected IS loci-written and IS unreferenced, and is held back only by the
+  // window the orphan grace gives it, so the person who just uploaded 200 MiB
+  // was told the opposite of why it cannot go. It was also vacuously true over
+  // a directory of rsync'd files, which loci wrote none of.
+  const fWhy = !fCount ? 'nothing in it yet'
+    : fCls['in-window'] ? 'nothing old enough yet — a file loci wrote is kept while the window still reaches it'
+    : fCls.current      ? 'every file loci wrote is still in use'
+    : 'nothing in here was written by loci';
   h+='<div class="stfiles"><div class="stfh">loci’s files directory</div><div class="strow">'+
     '<div class="stmain"><div class="stmeta">'+fCount+' file'+(fCount===1?'':'s')+' · '+fmtBytes(fTotal)+
       ' — what an upload or a pasted CSV lands in</div>'+
-      (fRecl?'<div class="stmeta">'+fRows.length+' of them, '+fmtBytes(fRecl)+', loci wrote and '+
-             'nothing names any more</div>':'')+
+      (fN?'<div class="stmeta">'+fN+' of them, '+fmtBytes(fRecl)+', loci wrote and '+
+          'nothing names any more</div>':'')+
     '</div>'+
-    (fRecl?'<button type="button" class="st-reclaim" id="stReclaimFiles" data-bytes="'+fRecl+
-           '" data-files="'+fRows.length+'">reclaim '+fRows.length+' file'+(fRows.length===1?'':'s')+'</button>'
-          :'<span class="stnone">'+(fCount?'nothing loci wrote is unreferenced':'nothing in it yet')+'</span>')+
+    // Gated on the COUNT and not on the bytes, as the lake rows above are
+    // (`rv`, a count of versions). Nothing refuses an empty upload, so a
+    // zero-length reclaimable file makes the bytes 0 while there is plainly
+    // something to delete — and the section would say "nothing loci wrote is
+    // unreferenced" over files that are, with no way to remove them.
+    (fN?'<button type="button" class="st-reclaim" id="stReclaimFiles" data-bytes="'+fRecl+
+        '" data-files="'+fN+'">reclaim '+fN+' file'+(fN===1?'':'s')+'</button>'
+       :'<span class="stnone">'+fWhy+'</span>')+
     '</div></div>';
   h+='</div><div class="modal-f"><button class="btn ghost sm" id="closeModal">Close</button>'+
     '<span style="font-size:11.5px;color:var(--muted)">keeps the last '+(win.versions||0)+
@@ -3289,7 +3335,18 @@ async function openStorage(){
     fbtn.disabled=true;                      // one sweep, not a double-click's two
     let res;
     try{ res=await API.reclaimFiles(); }
-    catch(e){ fbtn.disabled=false; showToast('could not reach the server — nothing was deleted'); return; }
+    catch(e){
+      // Two different failures, and only one of them deleted nothing. A request
+      // that never got an answer deleted nothing. A request the SERVER failed
+      // may have deleted every file before the one it threw on — `reclaim!`
+      // deletes in a loop and a manifest write that throws aborts it — so the
+      // panel is redrawn from what is actually on disk rather than told it is
+      // unchanged. Everything else in this control refuses to overstate a
+      // success; this is the path that used to understate a deletion.
+      if(e&&e.reached){ await openStorage(); showToast('the sweep stopped partway — the panel is redrawn from what is actually there'); }
+      else { fbtn.disabled=false; showToast('could not reach the server — nothing was deleted'); }
+      return;
+    }
     const rows=res.reclaimed||[], bad=rows.filter(r=>r.error);
     await openStorage();
     // `res.freed`, NEVER a sum over `rows`. Every candidate gets a row and a

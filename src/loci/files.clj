@@ -646,24 +646,51 @@
    and `:duplicateOf` exist for — otherwise get whichever one the fold happened
    to finish on.
 
-   ## The three-argument arity takes a listing you already have
+   ## The three-argument arity takes a listing you already have, and reads
+   ## `:file` off it
 
    `report` needs the same rows this does — `:bytes` per file is on them — and
    calling `listing` at both levels would walk the directory twice for one
-   answer. The walk is the largest single term here. Measured 2026-08-22 over
-   10,000 files with a 10,000-line manifest and an EMPTY store, so that the
-   figures are the directory-and-manifest axis alone and the store walks above
-   sit on top of them unchanged: `listing` is 68 ms of one `classify`'s 104 ms,
-   and a `report` that walks twice costs 174 ms against 109 ms. That establishes
-   the mechanism's shape rather than that anyone's panel is slow — the second
-   walk is a little over a third of a report the storage panel draws on open,
-   whatever the absolute number turns out to be on a real directory.
+   answer. Measured 2026-08-22 over 10,000 files with a 10,000-line manifest and
+   an EMPTY store, so that the figures are the directory-and-manifest axis
+   alone: `listing` is 68 ms of one `classify`'s 104 ms, and a `report` that
+   walks twice costs 174 ms against 109 ms.
+
+   **Most of that 65 ms is the MANIFEST and not the directory**, and an earlier
+   draft of this paragraph put it all on \"the walk\". `listing` *contains* a
+   `names` parse, priced at 56 ms in the section above, so of its 68 ms only
+   ~12 ms is `readdir` plus 10,000 `.length` stats. If the saving were the
+   reason to do this, hoisting one manifest read would collect most of it and
+   need no second arity at all. It is not the reason — the paragraph below
+   always was — but the number belongs on the term that carries it.
+
+   **And the fraction is the empty store's, not a panel's.** 65 of 174 is 37%.
+   At the scale the section above measures — 20,000 objects, 40,000 events — the
+   store walks sit on top of BOTH numbers: `connections` at 6 ms (once inside
+   `listing`, once here) and `handles-in-history` at 26 ms make one walk 149 ms
+   and two 223 ms, so the saving is 74 of 223, about a third rather than
+   \"a little over\" one. That is arithmetic on the terms recorded above and not
+   a fresh measurement. Every figure here establishes the mechanism's SHAPE;
+   none of them says anyone's panel is slow.
 
    Speed is the smaller half of the reason. Two walks are also **two different
    directories**: a file written between them is reported with no `:class` at
    all, and one deleted between them is classified and never reported. One walk
-   makes the rows and the classes answers about the same instant by
-   construction."
+   makes the rows and the classes answer about the same DIRECTORY by
+   construction — which is all it makes them agree about, and the sentence here
+   used to claim the same instant outright. `report` still reads `connections`
+   twice and the manifest twice, at four moments none of which coincide; the
+   race that matters between them is `reclaim!`'s and is written down there.
+
+   **It takes `:file` and derives the uri itself.** Reading `:uri` off the row
+   made *this must be a `listing` row* an unstated precondition whose wrong
+   direction is a deletion: measured 2026-08-22, the row
+   `{:file \"live.csv\" :uri \"loci://files/dead.csv\"}` came back
+   `{\"live.csv\" :reclaimable}` for a file a live passthrough table was reading,
+   which `reclaim!` would then delete. `report` is the only caller and its rows
+   are consistent, so it was never reachable — and `(uri file)` removes the
+   precondition instead of documenting it, which is the difference between a
+   caller that cannot get it wrong and one that must be told not to."
   ([st window] (classify st window (listing st)))
   ([st {:keys [versions days] :as _window} rows]
    (let [recs   (latest)
@@ -737,12 +764,17 @@
                         {}
                         (tbl/handles-in-history st))]
      (into {}
-           (for [{:keys [file uri]} rows
-                 :let [m (get seen uri)]]
+           ;; `:file` only, and `(uri file)` rather than the row's own `:uri` —
+           ;; see the last section of the docstring. A row whose two keys
+           ;; disagree took the OTHER file's class, and the wrong direction of
+           ;; that is a delete.
+           (for [{:keys [file]} rows
+                 :let [u (uri file)
+                       m (get seen u)]]
              [file
               (cond
                 (not (mine file)) {:class :foreign :object nil :ts nil}
-                (live uri)        (assoc (or m {}) :class :current)
+                (live u)          (assoc (or m {}) :class :current)
                 (nil? m)          (let [at (:at (get recs file))]
                                     ;; **A missing `:at` means KEEP.** `(or at 0)`
                                     ;; would read an unreadable clock as the epoch —
@@ -779,24 +811,93 @@
    there are any — with `classify`'s `:class`, `:object` and `:ts` merged onto
    it. `:name` is on the row for `reclaim!`'s sake; see there.
 
-   **One `listing`, handed to `classify`.** 174 ms → 109 ms over 10,000 files,
-   and rows and classes that describe one instant rather than two; `classify`'s
-   last section has the measurement and the sharper half of the reason.
+   ## `:doomed`, and why it is not called `:reclaimable`
+
+   **The set a reclaim deletes is `:reclaimable` AND `:orphaned`**, which is
+   what `lakegc/reclaim!` has taken since it was written (`lakegc.clj:151`).
+   This key was called `:reclaimable` for one commit, and naming a two-member
+   set after one of its members is exactly how the other got left out: a file
+   loci wrote that nothing ever named — the ordinary state of an upload nobody
+   connected, and of a connect that was undone — contributed 0 to
+   `:reclaimable-bytes` and was never deleted. Measured 2026-08-22: a 200-byte
+   file remembered 40 days ago and never connected classified `:orphaned`, and
+   `reclaim!` answered `[]` with the file still on disk. At the scale the spec
+   states — 200 MiB uploads, ten stale ones is 2 GB — the storage panel would
+   not have offered those bytes at all, and offering them is the complaint the
+   phase opens with.
+
+   **`:reclaimable-bytes` keeps its name over the widened set on purpose.**
+   \"Reclaimable\" is the right word for the BYTES — they are the ones a reclaim
+   frees — and it is the wrong word for the ROWS, because it is also the name of
+   one of the two classes those rows are drawn from. The panel reads the bytes
+   key and would have to be changed for nothing.
+
+   `:doomed` is safe only because of the orphan grace in `classify`: an orphan
+   younger than the cutoff is `:in-window`, so an upload sitting in the panel
+   waiting to be picked is never in this set. The two corrections are
+   load-bearing for each other — widen this without that grace and a reclaim
+   deletes the 200 MiB somebody uploaded a minute ago.
+
+   **One `listing`, handed to `classify`.** 174 ms → 109 ms over 10,000 files
+   against an empty store, and rows and classes that describe one directory
+   rather than two; `classify`'s last section has the measurement, what each of
+   its terms is actually made of, and the sharper half of the reason.
 
    No `:window` key, unlike `lakegc/report`. Every caller here passes the window
    in and holds it; echoing it back would be a second place for it to be wrong."
   [st window]
-  (let [rows (listing st)
-        cls  (classify st window rows)
-        all  (mapv #(merge % (get cls (:file %))) rows)
-        recl (filterv #(= :reclaimable (:class %)) all)]
+  (let [rows   (listing st)
+        cls    (classify st window rows)
+        all    (mapv #(merge % (get cls (:file %))) rows)
+        doomed (filterv #(#{:reclaimable :orphaned} (:class %)) all)]
     {:files             all
-     :reclaimable       recl
-     :reclaimable-bytes (reduce + 0 (map :bytes recl))
+     :doomed            doomed
+     :reclaimable-bytes (reduce + 0 (map :bytes doomed))
      :total-bytes       (reduce + 0 (map :bytes all))}))
 
+(defn- delete-cause
+  "The platform's own reason a delete failed, as a short phrase.
+
+   `Files/delete` throws a `FileSystemException` subclass that NAMES the cause —
+   `AccessDeniedException` for a POSIX permission bit or a `chattr +i`,
+   `ReadOnlyFileSystemException` for a mounted-ro volume,
+   `DirectoryNotEmptyException` for a directory with something in it. The string
+   `reclaim!` used to write instead — *\"it is still in <dir>\"* — restates the
+   failure and invents a why: all three of those causes produced that same
+   sentence, and the spec asks for *which and why*.
+
+   `getMessage` on these is the PATH and not a reason (measured 2026-08-22
+   against an unwritable directory: `\"…/x.csv\"`), so the class name is the
+   answer, plus `getReason` on the occasions the filesystem supplies one."
+  [^java.io.IOException e]
+  (let [reason (when (instance? java.nio.file.FileSystemException e)
+                 (.getReason ^java.nio.file.FileSystemException e))]
+    (str (.getSimpleName (class e))
+         (when (seq reason) (str ": " reason)))))
+
 (defn reclaim!
-  "Delete every `:reclaimable` file and retire its manifest line. Irreversible.
+  "Delete every doomed file — `:reclaimable` AND `:orphaned` — and retire its
+   manifest line. Answers `{:files [row …] :freed bytes}`. Irreversible.
+
+   **Both classes, which is `report`'s `:doomed` and not its
+   `:reclaimable-bytes`.** An orphan is a file loci wrote that nothing in
+   history ever named, and taking `:reclaimable` alone left the ordinary
+   outcome of an upload nobody connected on disk forever — `report`'s own
+   docstring has the measurement. It is safe here only because `classify` gives
+   an orphan the window: one younger than the cutoff is `:in-window`, so a file
+   waiting in the panel to be picked is never in this set. Widen one without the
+   other and this deletes an upload a minute old.
+
+   **`:freed` is computed here so that no caller has to.** Every candidate gets
+   a row and a failed delete is shape-identical to a done one apart from
+   `:error` — `:bytes` is on both, because the row describes the FILE and not
+   the outcome — so the arithmetic that looks obvious at any caller,
+   `(reduce + (map :bytes …))`, reports as freed the bytes of every file still
+   on disk. Against an unwritable directory, which is a real fixture in
+   `loci.files-test`, every delete fails and that sum is the total it hoped for
+   while nothing moved. `lakegc/reclaim!` answers `:freed` from inside for
+   exactly this reason and this now does too; `loci.server/files-reclaim!` used
+   to do the sum itself and delegates here instead.
 
    The bytes go and the NAME STAYS. `retire!` appends a tombstone rather than
    rewriting `files.edn`, because that file is PRIMARY and cannot be rebuilt: a
@@ -819,8 +920,34 @@
    tombstone would say they were not.
 
    A file that vanished between `report` and here is not an error; it is the
-   outcome the caller asked for. `.delete` answers false for a file that no
-   longer exists, so the check is `deleted OR already gone`.
+   outcome the caller asked for. That is `Files/deleteIfExists` on its face, and
+   it is the platform call rather than the hand-rolled
+   `(or (.delete f) (not (.exists f)))` it replaces for two reasons. The
+   hand-rolled pair has a **seam** — the delete fails, something else removes the
+   file, `.exists` answers false, and a failure is reported as a success — where
+   one syscall has none. And `.delete` answers a bare false, which is why the
+   `:error` above had to invent a why; see `delete-cause`.
+
+   ## The deletes are eager, and a throw mid-loop loses the answer
+
+   `reduce` and not a `for`. The `vec` around the `for` this replaces realised
+   it, so it was correct — but an irreversible operation inside a lazy seq's
+   `:let` is one edit away from being performed by whoever consumes it. Drop the
+   `vec`, or wrap the call in a `filter` or a `take`, and files are deleted as a
+   side effect of consumption. `lakegc/reclaim!` uses `run!` for the same
+   reason.
+
+   **`retire!` is not wrapped in the `try`, so a manifest write that throws
+   aborts the whole call and the rows already deleted are lost.** Considered and
+   left, rather than overlooked. It needs `<LOCI_DATA>` unwritable while
+   `<LOCI_DATA>/files/` is writable, which `chmod -w` on the parent alone does
+   produce. What it costs is small and one-sided: the bytes are gone and the
+   name simply stays un-retired, which nothing downstream reads — `classify` is
+   driven by the DIRECTORY, so a remembered id with no file on disk never
+   reaches it. Catching it would buy the caller a row, and cost a third outcome
+   shape: a file that WAS deleted carrying `:error`, which the storage panel
+   renders as *\"could not be deleted\"* — a false sentence in exchange for a
+   true one nobody has asked for.
 
    ## The gap between classifying and deleting, written down rather than closed
 
@@ -834,31 +961,65 @@
 
    Reachable, and left open. **Every available check narrows the window without
    closing it**, and shipping a mechanism that cannot deliver the property it is
-   named for is worse than the gap being written here. Re-reading `connections`
-   immediately before each delete moves the exposure from the report's duration
-   to a few instructions and still loses the same race, at the ~6 ms per call
-   `classify` records over a 20,000-object store — 60 s across 10,000 files,
-   against a `report` that is meant to be cheap enough to draw a panel with.
-   Re-running `classify` per file is the whole classification again, which is
-   the 104 ms measured in its own docstring before a single object is in the
-   store.
+   named for is worse than the gap being written here.
+
+   The two expensive checks are easy to reject and this paragraph used to reject
+   only those, which made the argument against a straw version of the cheap one.
+   Re-reading `connections` *per file* is ~6 ms a call over a 20,000-object
+   store, 60 s across 10,000 files. Re-running `classify` per file is the whole
+   classification again, the 104 ms measured in its own docstring before a
+   single object is in the store. Both are obviously not worth it.
+
+   **One `(connections st)` at the top of this loop is not**, and it is the
+   option worth stating honestly: ~6 ms *in total*, which closes the whole
+   report window — 149 ms at the scale `classify` measures, and growing with the
+   log — and leaves only the few instructions between the check and each
+   `.delete`. It is affordable. It is not in, for two reasons that are about
+   shape rather than cost.
+
+   As `lakegc`'s **refusal**, it is the wrong instrument here. `lakegc/reclaim!`
+   aborts the whole call on any overlap (`lakegc.clj:134-143`) and its docstring
+   says why: there, an overlap means `tbl/event-handles` has a GAP — a classifier
+   bug — and *\"the only useful outcome of the classifier and the live set
+   disagreeing is that someone reads this.\"* Here an overlap means a person
+   connected a file while a sweep was running. That is the ordinary interleave
+   this section is about and evidence of nothing, so aborting a 10,000-file
+   sweep on it turns a benign race into a failed operation that will simply
+   succeed on the retry. (This is the second place a files GC declines a
+   `lakegc` tripwire — `classify`'s `:current`-before-`:orphaned` section is the
+   first — and two divergences want writing down, not discovering.)
+
+   As a **filter** it fits: a doomed file whose uri came back live gets a row
+   with an `:error` saying so, which is what `:error` already means and what the
+   panel already draws. That is the version to take if the window is ever felt.
+   It is not taken now because nobody has hit it, and a cost becomes a
+   constraint when someone feels it rather than when it is noticed — the same
+   rule that keeps every other unrequested mechanism out of this namespace.
 
    What it costs when it does happen is bounded and already drawn: a passthrough
-   table becomes `:table/unavailable`, the state phase 2 draws and offers a
-   reconnect for, and a materialised table loses nothing it is currently
-   reading — its rows are in the lake — only the ability to `refresh!`. Closing
-   this properly means one writer for the directory as well as the store, which
-   is a decision about the server and not about this function."
+   table becomes `:table/unavailable`, which phase 2 draws and offers a
+   reconnect from — though the reconnect needs the original file back, since the
+   bytes are gone and the line is retired, so it is a way through rather than a
+   recovery. A materialised table loses nothing it is currently reading — its
+   rows are in the lake — only the ability to `refresh!`. Closing this properly
+   means one writer for the directory as well as the store, which is a decision
+   about the server and not about this function."
   [st window]
-  (vec (for [{:keys [file bytes] :as row} (:reclaimable (report st window))
-             :let [f    (io/file (dir) file)
-                   gone (or (.delete f) (not (.exists f)))]]
-         (if gone
-           (do (retire! file (:name row))
-               {:file file :bytes bytes})
-           {:file  file :bytes bytes
-            :error (str "loci could not delete " file " — it is still in "
-                        (.getPath (dir)))}))))
+  (reduce (fn [acc {:keys [file bytes] :as row}]
+            (let [f   (io/file (dir) file)
+                  err (try (java.nio.file.Files/deleteIfExists (.toPath f))
+                           nil
+                           (catch java.io.IOException e
+                             (str "loci could not delete " file " from "
+                                  (.getPath (dir)) " — " (delete-cause e))))]
+              (if err
+                (update acc :files conj {:file file :bytes bytes :error err})
+                (do (retire! file (:name row))
+                    (-> acc
+                        (update :files conj {:file file :bytes bytes})
+                        (update :freed + (or bytes 0)))))))
+          {:files [] :freed 0}
+          (:doomed (report st window))))
 
 ;; ---------------------------------------------------------------------------
 ;; the chunked upload — the `.partial` working file, and the sequence that

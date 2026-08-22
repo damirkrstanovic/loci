@@ -2251,7 +2251,21 @@
 (defn source-upload!
   "`POST /api/source/upload` — one chunk of a file being uploaded from the
    browser. Answers `{:id :seq :bytes}` while the file is still arriving, and
-   `{:file :uri :existed}` once `:final` lands it.
+   `{:file :uri :existed :connectedAs}` once `:final` lands it.
+
+   **`:connectedAs` is why this takes a store**, and it is the same key
+   `files/listing` puts on a picked row, from the same `files/connected-as`, so
+   the two doors of the ＋ Data panel answer the duplicate question once. Upload
+   `sales.csv`, connect it, drag the same file in a week later: the bytes match,
+   so `finish-upload!` keeps the file it already has and `:existed` says so —
+   but without this the preview drew no duplicate note and Connect made a second
+   table from the same rows in silence. The picked-row door has warned since
+   phase 2; an upload IS an import, and *warn them that we already have this
+   file before import* is the sentence this phase started from.
+
+   Absent rather than nil when there is none, which is `listing`'s rule for the
+   same key: the shell tests it for truthiness and an explicit null is one more
+   shape to mean nothing.
 
    **It does not connect.** The panel takes the `:uri` and calls the shipped
    `/api/source/describe` and `/api/source/connect` with it, so the preview a
@@ -2270,7 +2284,7 @@
    `loci.files`'s, which owns the directory they are about. Those throw, and
    this is the `try`/`catch` that turns a throw into the `{:error …}` every
    other route in this file answers with."
-  [{:keys [id final] s :seq nm :name} chunk]
+  [st {:keys [id final] s :seq nm :name} chunk]
   (try
     ;; `append-chunk!`'s own answer is passed through rather than rebuilt: its
     ;; `:bytes` is the partial's length on disk, which is the one progress
@@ -2278,7 +2292,10 @@
     ;; landed.
     (let [landed (files/append-chunk! id s chunk)]
       (if final
-        (files/finish-upload! id nm)
+        (let [r (files/finish-upload! id nm)]
+          (cond-> r
+            (files/connected-as st (:uri r))
+            (assoc :connectedAs (files/connected-as st (:uri r)))))
         landed))
     (catch Exception e {:error (.getMessage e)})))
 
@@ -3267,17 +3284,40 @@
    unambiguous would move a key three readers already know. The panel names its
    local after the depth for the same reason.
 
-   The report's `:files` ROWS do not travel. `report` carries one row per file
-   because a caller may want them; a panel needs how many there are and what
-   they cost, and shipping 10,000 rows to draw two figures is the shape
-   `lakegc/report` avoids by reporting `:orphaned` as a count and a total. The
-   `:reclaimable` rows DO travel — they are the files a button is about to
-   delete, and there are as many of them as there is something to say."
+   **No rows travel at all — five integers and a map of counts do.** `report`
+   carries one row per file because a caller may want them, and the paragraph
+   this replaces shipped the doomed ones while rejecting the same shape for
+   `:files` in the same breath: *shipping 10,000 rows to draw two figures is the
+   shape `lakegc/report` avoids*. That was the right rule applied to one key and
+   not the other. Each row carries `:file :uri :bytes :name :connectedAs :class
+   :object :ts :at`, so a mostly-reclaimable directory at the scale these
+   docstrings reason about is ~2 MB of JSON on every panel open — to draw one
+   number, because `.length` is all the shell ever read off them.
+   `lakegc/report` answers `:orphaned` as `{:tables n :bytes b}` for this reason.
+
+   So `:reclaimable-count` is the count of `report`'s `:doomed` rows — the set a
+   reclaim deletes, which is `:reclaimable` AND `:orphaned`; naming that set
+   after one of its two members is how the other got left out of
+   `files/reclaim!`. The bytes figure keeps the name `:reclaimable-bytes` over
+   the same widened set, because that is the right word for the bytes.
+
+   **`:classes` is `frequencies` over the classes, and it is what makes the
+   panel's zero state honest.** With `:count` alone the only sentence available
+   for *nothing can be freed* was \"nothing loci wrote is unreferenced\" — false
+   in exactly the case this phase exists for: an uploaded-and-never-connected
+   file IS loci-written and unreferenced, and is held back only by the orphan
+   grace, so the person who has just uploaded 200 MiB was told the opposite of
+   why it cannot go. Four integers the classifier has already computed let the
+   phrase name the actual reason, which is this codebase's voice everywhere
+   else."
   [st]
   (assoc (gc/report st (force lake/lake) gc/default-window)
          :files (let [r (files/report st files/default-window)]
-                  (assoc (select-keys r [:total-bytes :reclaimable-bytes :reclaimable])
-                         :count (count (:files r))))))
+                  {:count             (count (:files r))
+                   :classes           (frequencies (map :class (:files r)))
+                   :total-bytes       (:total-bytes r)
+                   :reclaimable-bytes (:reclaimable-bytes r)
+                   :reclaimable-count (count (:doomed r))})))
 
 (defn- storage-reclaim!
   "Reclaim one object's out-of-window versions. Irreversible, so it refuses a
@@ -3314,25 +3354,28 @@
   "Reclaim what the window releases from the files directory, and say what
    actually went.
 
-   **`:freed` sums only the rows with no `:error`.** `files/reclaim!` answers one
-   row per CANDIDATE, and a failed delete is shape-identical to a done one apart
-   from that key — `:bytes` is on both, because the row describes the file and
-   not the outcome. So the arithmetic that looks obvious at any caller,
-   `(reduce + (map :bytes rows))`, reports as freed the bytes of every file that
-   is still on disk: against a directory the process cannot write to — which is
-   a real fixture in `loci.files-test` — every delete fails and the answer is
-   the total it hoped for, while nothing moved. `lakegc/reclaim!` computes its
-   own `:freed` inside the function for exactly this reason; `files/reclaim!`
-   does not, so it is computed here, once, rather than in the panel.
+   **`:freed` comes from `files/reclaim!` and is not computed here.** It was,
+   for one commit, and the docstring then said it should move as soon as the
+   function offered one: `files/reclaim!` answers a row per CANDIDATE, and a
+   failed delete is shape-identical to a done one apart from `:error` — `:bytes`
+   is on both, because the row describes the file and not the outcome — so
+   `(reduce + (map :bytes rows))` at any caller reports as freed the bytes of
+   every file still on disk. `lakegc/reclaim!` has always answered its own
+   `:freed` for that reason; `files/reclaim!` now does too, so the sum has one
+   implementation next to the deletes it is about rather than one per caller.
+
+   All that is left here is the envelope's spelling: `:reclaimed` on the wire
+   for `:files` in the answer, because the panel reads `res.reclaimed` and
+   `:files` at this depth would sit beside `storage-payload`'s `:files` meaning
+   the whole directory.
 
    The failures themselves are not summarised: they stay in `:reclaimed` with
    their own sentences, which is what makes *a reclaim that cannot delete a file
    reports which and why* true at the only place a person reads it. A count of
    them is `(filter :error …)` and needs no second key to be wrong in."
   [st]
-  (let [rows (files/reclaim! st files/default-window)]
-    {:reclaimed rows
-     :freed     (reduce + 0 (map :bytes (remove :error rows)))}))
+  (let [{:keys [files freed]} (files/reclaim! st files/default-window)]
+    {:reclaimed files :freed freed}))
 
 ;; ---- routing ----
 (defn handler [{:keys [uri query-string] :as req}]
@@ -3406,7 +3449,7 @@
       ;; forever after. The body streams to disk as bytes and is never a String.
       (= uri "/api/source/upload")
       (json-resp (if-let [m (upload-meta req)]
-                   (source-upload! m (:body req))
+                   (source-upload! st m (:body req))
                    {:error (str "POST /api/source/upload needs an X-Loci-Upload "
                                 "header carrying {id, seq, name, final}")}))
       (= uri "/api/notebook")(if (= :post (:request-method req))

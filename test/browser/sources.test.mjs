@@ -643,6 +643,11 @@ const storedName = buf => createHash('sha256').update(buf).digest('hex').slice(0
 
 const listedFiles = page => page.evaluate(() => API.sourceFiles().then(r => r.files));
 
+// A table id inside a `new RegExp(…)`. `tbl:` ids carry no metacharacter today,
+// so this changes no result — but an unescaped `.` matches any character, and a
+// test that would pass against the wrong id is not the assertion it reads as.
+const rx = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // Open ＋ Data on its file tab and wait for the upload control. Waiting for
 // `.dupfile` and not for `[data-file]` on purpose: the listing and the upload
 // row arrive together, and a first-run loci with an empty directory has to offer
@@ -712,6 +717,27 @@ test('a file uploaded from the file tab previews, connects, and keeps its name',
       'the uploaded table drew no rows');
     assert.match(await page.textContent('.molder-b'), /EMEA/,
       'the table landed with none of the uploaded file’s rows in it');
+
+    // And the same file again. The bytes match, so nothing is written and
+    // `existed` says so — which is precisely the moment a person is about to
+    // make a second table from one file. The picked-row door has warned since
+    // phase 2; this door drew nothing until 2026-08-22, because the upload path
+    // hand-built its preview row from `finish-upload!`'s answer and that answer
+    // carried no `connectedAs`.
+    const bound = (await listedFiles(page)).find(x => x.file === storedName(f.buf));
+    assert.ok(bound && bound.connectedAs,
+      `the uploaded file is connected to nothing, so there is no duplicate to draw: ${JSON.stringify(bound)}`);
+    const j = await openUpload(page);
+    const at2 = `#body${j} `;
+    await page.setInputFiles(`${at2}.dupfile`, f.path);
+    await page.waitForSelector(`${at2}.srcpreview`, { timeout: 20000 });
+    assert.equal(await page.locator(`${at2}.dupe-note`).count(), 1,
+      'a re-uploaded file whose bytes are already a table is previewed with no warning — ' +
+      'Connect would make a second table from the same rows in silence');
+    assert.match(await page.textContent(`${at2}.dupe-note`), new RegExp(rx(bound.connectedAs)),
+      'the warning does not name the table those bytes already are');
+    assert.equal(await page.locator(`${at2}[data-a="connect"]:not([disabled])`).count(), 1,
+      'Connect is disabled on a re-upload — loci warns, it does not refuse');
   });
 });
 
@@ -890,7 +916,7 @@ test('the file tab says a file is already a table, and connects it anyway', asyn
     await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
     assert.equal(await page.locator(`${at}.dupe-note`).count(), 1,
       'the preview of a file that is already a table says nothing about it');
-    assert.match(await page.textContent(`${at}.dupe-note`), new RegExp(taken.connectedAs),
+    assert.match(await page.textContent(`${at}.dupe-note`), new RegExp(rx(taken.connectedAs)),
       'the preview warns about a duplicate without naming which table it duplicates');
     // The rule, made testable. A veto would pass every assertion above.
     assert.equal(await page.locator(`${at}[data-a="connect"]:not([disabled])`).count(), 1,
@@ -920,22 +946,47 @@ test('the storage panel counts loci’s files, and draws a button only when one 
   await withPage(browser, 'sources-storage-files', async (page) => {
     await bootedShell(page, server.url);
 
+    // The in-window state this test's phrase is about, made HERE rather than
+    // inherited from whichever earlier test happened to leave one behind.
+    // Through the route, because this file has to stay unconnected — an upload
+    // is a file arriving and not a second way to connect one, so `remember!`
+    // runs and nothing names it: loci-written, unreferenced, and inside the
+    // window. Measured 2026-08-22 with `--test-name-pattern`, which runs this
+    // test alone: without these four lines the directory is `{foreign: 2}` and
+    // the premise below fails.
+    const stok = 's' + Math.random().toString(36).slice(2, 9);
+    await page.evaluate(async (t) => {
+      await fetch('/api/source/upload', {
+        method: 'POST',
+        headers: { 'X-Loci-Upload': JSON.stringify({ id: 'stor-' + t, seq: 0, name: 'waiting-' + t + '.csv', final: true }) },
+        body: 'region,revenue,token\nEMEA,10,' + t + '\n' });
+    }, stok);
+
     // Asked of the server, so the zero below is a zero it REPORTED rather than
     // one the panel failed to draw.
     const p = await page.evaluate(() => API.storage());
     assert.ok(p.files, `/api/storage carries no files figure at all: ${JSON.stringify(Object.keys(p))}`);
     assert.ok(p.files.count > 0 && p.files['total-bytes'] > 0,
       `this server's files directory is empty, so the section has nothing to say: ${JSON.stringify(p.files)}`);
-    assert.equal(p.files['reclaimable-bytes'], 0,
+    assert.equal(p.files['reclaimable-count'], 0,
       `something here is reclaimable, and the zero state below is not the state under test: ${JSON.stringify(p.files)}`);
+    // The state the phrase has to be true OF. An uploaded-and-never-connected
+    // file is loci-written AND unreferenced — held back only by the orphan
+    // grace — so "nothing loci wrote is unreferenced", which this asserted until
+    // 2026-08-22, is the opposite of why those bytes cannot go.
+    assert.ok(p.files.classes && p.files.classes['in-window'] > 0,
+      `nothing here is in-window, so the sentence under test is not the one that fires: ${JSON.stringify(p.files.classes)}`);
 
     await page.click('#storageBtn');
     await page.waitForSelector('.storage-panel .stfiles', { timeout: 8000 });
     const t = (await page.textContent('.storage-panel .stfiles')).trim();
     assert.match(t, new RegExp(`${p.files.count} files?\\b`),
       `the section does not say how many files the directory holds (${p.files.count}): ${JSON.stringify(t)}`);
-    assert.match(t, /nothing loci wrote is unreferenced/,
+    assert.match(t, /nothing old enough yet/,
       `the zero state does not say WHY there is nothing to reclaim: ${JSON.stringify(t)}`);
+    assert.doesNotMatch(t, /nothing loci wrote is unreferenced/,
+      `the zero state claims nothing loci wrote is unreferenced over ${p.files.classes['in-window']} ` +
+      `file(s) that are exactly that, and are waiting out the window: ${JSON.stringify(t)}`);
     assert.equal(await page.locator('.stfiles #stReclaimFiles').count(), 0,
       'a reclaim button was drawn over a directory with nothing reclaimable in it');
     // A disabled control invites a click that can never work, which is the thing
@@ -945,11 +996,16 @@ test('the storage panel counts loci’s files, and draws a button only when one 
 
     // The other branch. Only `files` is replaced; the lake half of the payload is
     // the server's own, so this is the same panel drawing a different directory.
+    //
+    // `reclaimable-count` and NOT the rows: `.length` was the only thing the
+    // shell ever read off them, and each one carries nine keys. The count is
+    // over both classes a reclaim deletes; `reclaimable-bytes` keeps its name
+    // because it is the right word for the bytes, over that same widened set.
     await page.route('**/api/storage', async route => {
       const j = await (await route.fetch()).json();
       j.files = { count: 9, 'total-bytes': 3000,
-                  'reclaimable-bytes': 2048,
-                  reclaimable: [{ file: 'a.csv', bytes: 1024 }, { file: 'b.csv', bytes: 1024 }] };
+                  'reclaimable-bytes': 2048, 'reclaimable-count': 2,
+                  classes: { foreign: 7, reclaimable: 1, orphaned: 1 } };
       await route.fulfill({ contentType: 'application/json', body: JSON.stringify(j) });
     });
     await page.click('#closeModal');
@@ -960,6 +1016,98 @@ test('the storage panel counts loci’s files, and draws a button only when one 
       `the button does not say how many files it would delete: ${JSON.stringify(btn)}`);
     assert.match((await page.textContent('.storage-panel .stfiles')).trim(), /2\.0 KB/,
       'the section does not say what a reclaim would free');
+    await page.unroute('**/api/storage');
+  });
+});
+
+// Nothing ever clicked this button. Deleting the whole `fbtn.addEventListener`
+// block left both suites green — so the confirm text, which is the last thing
+// between a reader and a permanent deletion, the disable, and the toast that
+// must never sum the rows itself were all unexercised. The lake's equivalent has
+// two dedicated tests for exactly this.
+//
+// The payload is stubbed so the button draws, and the sweep is stubbed so that a
+// refused confirmation cannot be the thing that deletes this server's files —
+// and so that the mixed outcome the toast is really about (one file gone, one
+// carrying `error`) can happen at all, which needs a delete that fails and
+// therefore an unwritable directory.
+test('the files reclaim button asks first, and its toast says what actually went', async () => {
+  await withPage(browser, 'sources-storage-files-reclaim', async (page) => {
+    await bootedShell(page, server.url);
+    await page.route('**/api/storage', async route => {
+      const j = await (await route.fetch()).json();
+      j.files = { count: 9, 'total-bytes': 3000,
+                  'reclaimable-bytes': 2048, 'reclaimable-count': 2,
+                  classes: { foreign: 7, reclaimable: 1, orphaned: 1 } };
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify(j) });
+    });
+    let posts = 0;
+    await page.route('**/api/storage/reclaim-files', route => {
+      posts++;
+      // One done and one that could not be deleted — `freed` is 1024 and the
+      // rows sum to 2048, which is the whole point of the server computing it.
+      route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ freed: 1024, reclaimed: [
+          { file: 'a.csv', bytes: 1024 },
+          { file: 'b.csv', bytes: 1024,
+            error: 'loci could not delete b.csv from /files — AccessDeniedException' }] }) });
+    });
+
+    const dialogs = [];
+    // Dismissed — playwright's default, said out loud because the default is what
+    // makes a MISSING dialog indistinguishable from a refused one.
+    page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
+    await page.click('#storageBtn');
+    await page.waitForSelector('.stfiles #stReclaimFiles', { timeout: 8000 });
+    await page.click('#stReclaimFiles');
+    await page.waitForTimeout(400);
+    assert.equal(dialogs.length, 1,
+      'the files reclaim fired with no confirmation — one click deletes files forever');
+    const said = dialogs[0];
+    assert.match(said, /2 files/, `the confirmation does not say how many files go: ${said}`);
+    assert.match(said, /2\.0 KB/, `the confirmation does not say how many bytes go: ${said}`);
+    assert.match(said, /cannot be undone|permanent/i,
+      `the confirmation does not say the act is irreversible: ${said}`);
+    assert.equal(posts, 0, 'refusing the confirmation posted the sweep anyway');
+
+    // …and accepted.
+    page.removeAllListeners('dialog');
+    page.on('dialog', d => d.accept());
+    await page.click('#stReclaimFiles');
+    await page.waitForFunction(() => document.getElementById('toast').classList.contains('on'),
+      null, { timeout: 8000 });
+    const toast = (await page.textContent('#toast')).trim();
+    assert.equal(posts, 1, 'accepting the confirmation posted nothing');
+    assert.match(toast, /1 of 2 could not be deleted/,
+      `the toast does not say the sweep was partial: ${JSON.stringify(toast)}`);
+    assert.match(toast, /AccessDeniedException/,
+      `the toast does not carry the row's own sentence, which is where *which and why* ` +
+      `is answered: ${JSON.stringify(toast)}`);
+    // `res.freed`, never a sum over the rows: 2048 is what they add up to and
+    // half of that is still on disk.
+    assert.match(toast, /1\.0 KB freed/,
+      `the toast reports bytes that are still on disk as freed: ${JSON.stringify(toast)}`);
+
+    // And a sweep the SERVER failed. `handler` has no top-level catch, so a
+    // throw partway through — `retire!`'s spit against a read-only manifest, a
+    // full disk — answers a non-JSON 500 after N files are already gone. This
+    // control is scrupulous everywhere else about never overstating a success;
+    // saying "nothing was deleted" over four deleted files is the same fault
+    // pointed the other way.
+    await page.unroute('**/api/storage/reclaim-files');
+    await page.route('**/api/storage/reclaim-files', route =>
+      route.fulfill({ status: 500, contentType: 'text/plain', body: 'boom' }));
+    await page.waitForSelector('.stfiles #stReclaimFiles', { timeout: 8000 });
+    await page.click('#stReclaimFiles');
+    await page.waitForFunction(
+      prev => (document.getElementById('toast').textContent || '').trim() !== prev,
+      toast, { timeout: 8000 });
+    const failed = (await page.textContent('#toast')).trim();
+    assert.doesNotMatch(failed, /nothing was deleted/,
+      `a 500 partway through a sweep is reported as nothing having happened: ${JSON.stringify(failed)}`);
+    assert.match(failed, /stopped partway/,
+      `the toast does not say the sweep was interrupted: ${JSON.stringify(failed)}`);
+    await page.unroute('**/api/storage/reclaim-files');
     await page.unroute('**/api/storage');
   });
 });
