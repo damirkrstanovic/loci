@@ -501,11 +501,18 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 
 - [ ] **Step 1: Write the failing test**
 
-```clojure
-(def ^:private day (* 24 60 60 1000))
+**Do not backdate an event to age it out.** `EventStore/commit!` does `(assoc event :ts (System/currentTimeMillis))` (`substrate.clj:133`) — it **overwrites** any `:ts` a caller supplies, silently, so a test that commits with a 90-day-old `:ts` gets one stamped *now* and its window assertion becomes vacuous. `loci.lakegc`'s own tests never backdate; they pass a **shrunken window** instead (`{:versions 3 :days 0}`, `lakegc_test.clj:38`). Do the same.
 
-(defn- put-source! [st id uri mode ts]
-  (sub/commit! st {:op :put :id id :ts ts
+`nothing-retained` below is `{:versions 0 :days -1}`, not `{:versions 0 :days 0}`. With `:days 0` the cutoff is *now*, and an event committed in the same millisecond satisfies `(>= ts cutoff)` and comes back `:in-window` — a rare flake that would look like a real failure. A negative day puts the cutoff in the future, so the age half is off deterministically.
+
+```clojure
+(def ^:private nothing-retained
+  ;; retain nothing: no versions, and a cutoff in the FUTURE so no event can be
+  ;; inside the age half. See the note above on why not `:days 0`.
+  {:versions 0 :days -1})
+
+(defn- put-source! [st id uri mode]
+  (sub/commit! st {:op :put :id id
                    :value {:id id :source {:uri uri :mode mode}
                            :value (if (= mode :passthrough)
                                     {:store :source :uri uri :format :csv}
@@ -518,8 +525,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "a.csv") "x\n")
         (files/remember! "a.csv" "kept")
-        (put-source! st "tbl:a" "loci://files/a.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
-        (is (= :current (:class (get (files/classify st files/default-window) "a.csv")))
+        (put-source! st "tbl:a" "loci://files/a.csv" :materialise)
+        (is (= :current (:class (get (files/classify st nothing-retained) "a.csv")))
             "current beats the window — a live object's file is never reclaimable however old")))))
 
 (deftest classify-reclaims-a-file-loci-wrote-that-nothing-names-any-more
@@ -529,9 +536,9 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "x\n")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (is (= :reclaimable (:class (get (files/classify st files/default-window) "old.csv")))
+        (is (= :reclaimable (:class (get (files/classify st nothing-retained) "old.csv")))
             "no live object names it and its only mention is 90 days old")))))
 
 (deftest classify-never-reclaims-a-file-loci-did-not-write
@@ -540,7 +547,7 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
       (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "placed.csv") "x\n")
-        (is (= :foreign (:class (get (files/classify st files/default-window) "placed.csv")))
+        (is (= :foreign (:class (get (files/classify st nothing-retained) "placed.csv")))
             "no manifest entry means a person put it there — rsync, a mount, a volume —
              and deleting it would destroy data loci never created")))))
 
@@ -551,8 +558,8 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "live.csv") "x\n")
         (files/remember! "live.csv" "live")
-        (put-source! st "tbl:p" "loci://files/live.csv" :passthrough (- (System/currentTimeMillis) (* 90 day)))
-        (is (= :current (:class (get (files/classify st files/default-window) "live.csv")))
+        (put-source! st "tbl:p" "loci://files/live.csv" :passthrough)
+        (is (= :current (:class (get (files/classify st nothing-retained) "live.csv")))
             "it is re-read on every query — reclaiming it turns a working table
              into :table/unavailable, and no window makes that acceptable")))))
 
@@ -563,7 +570,7 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "recent.csv") "x\n")
         (files/remember! "recent.csv" "recent")
-        (put-source! st "tbl:a" "loci://files/recent.csv" :materialise (- (System/currentTimeMillis) day))
+        (put-source! st "tbl:a" "loci://files/recent.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
         (is (= :in-window (:class (get (files/classify st files/default-window) "recent.csv")))
             "deleted yesterday — undo and as-of can still reach it, which is what
@@ -572,17 +579,16 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 (deftest classify-finds-a-file-named-only-inside-a-tx
   (with-dir
     (fn [_]
-      (let [st (sub/fresh-store)
-            ts (- (System/currentTimeMillis) (* 90 day))]
+      (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "txd.csv") "x\n")
         (files/remember! "txd.csv" "in a tx")
-        (sub/commit! st {:op :tx :ts ts
+        (sub/commit! st {:op :tx
                          :events [{:op :put :id "tbl:t"
                                    :value {:id "tbl:t" :source {:uri "loci://files/txd.csv"}
                                            :value {:store :lake :table "t_t" :snapshot 1}}}
                                   {:op :put :id "note:t" :value {:id "note:t" :value "x"}}]})
-        (is (= :current (:class (get (files/classify st files/default-window) "txd.csv")))
+        (is (= :current (:class (get (files/classify st nothing-retained) "txd.csv")))
             "THE test the lifted walk exists for — a top-level-only walk finds no
              handle here, calls the file unreferenced, and reclaims a live table's source")))))
 ```
@@ -678,9 +684,9 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "0123456789")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (let [r (files/report st files/default-window)]
+        (let [r (files/report st nothing-retained)]
           (is (= 10 (:reclaimable-bytes r)) "the file's actual length, not a count")
           (is (= ["old.csv"] (map :file (:reclaimable r))))
           (is (.exists (io/file (files/dir) "old.csv"))
@@ -694,10 +700,10 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (spit (io/file (files/dir) "old.csv") "x\n")
         (spit (io/file (files/dir) "keep.csv") "y\n")
         (files/remember! "old.csv" "gone") (files/remember! "keep.csv" "kept")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
-        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise (System/currentTimeMillis))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
+        (put-source! st "tbl:k" "loci://files/keep.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
-        (let [r (files/reclaim! st files/default-window)]
+        (let [r (files/reclaim! st nothing-retained)]
           (is (= ["old.csv"] (map :file r)))
           (is (not (.exists (io/file (files/dir) "old.csv"))))
           (is (.exists (io/file (files/dir) "keep.csv")) "a live table's file is untouched")
@@ -712,7 +718,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "old.csv") "x\n")
         (files/remember! "old.csv" "gone")
-        (put-source! st "tbl:a" "loci://files/old.csv" :materialise (- (System/currentTimeMillis) (* 90 day)))
+        (put-source! st "tbl:a" "loci://files/old.csv" :materialise)
         (sub/commit! st {:op :delete :id "tbl:a"})
         ;; The file must stay a FILE — `listing` filters directories out via
         ;; `content?`, so a directory named `old.csv` never becomes a candidate
@@ -720,7 +726,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
         ;; property of the containing directory, so make that unwritable.
         (.setWritable (files/dir) false)
         (try
-          (let [r (files/reclaim! st files/default-window)]
+          (let [r (files/reclaim! st nothing-retained)]
             ;; Running as root ignores the permission bit. Say so loudly rather
             ;; than passing green on a mechanism that never ran — a silent skip
             ;; here is a test that certifies.
@@ -738,7 +744,7 @@ The third and sixth rows are the ones most likely to report 0 failures. **If eit
       (let [st (sub/fresh-store)]
         (.mkdirs (files/dir))
         (spit (io/file (files/dir) "placed.csv") "x\n")
-        (is (= [] (files/reclaim! st files/default-window)))
+        (is (= [] (files/reclaim! st nothing-retained)))
         (is (.exists (io/file (files/dir) "placed.csv"))
             "a hand-placed file survives a reclaim that had no other candidates —
              the class that protects it is not a special case of having something else to do")))))
@@ -831,7 +837,7 @@ The `with-redefs [c/store …]` is not optional — `handler` binds `st (store)`
 Add to `storage-payload`, beside the lake numbers:
 
 ```clojure
-   :files (let [r (files/report st files/default-window)]
+   :files (let [r (files/report st nothing-retained)]
             (select-keys r [:total-bytes :reclaimable-bytes :reclaimable]))
 ```
 
@@ -839,7 +845,7 @@ and a route beside `/api/storage/reclaim`:
 
 ```clojure
       (and (= :post (:request-method req)) (= uri "/api/storage/reclaim-files"))
-      (json-resp {:reclaimed (files/reclaim! st files/default-window)})
+      (json-resp {:reclaimed (files/reclaim! st nothing-retained)})
 ```
 
 Method-gated because it deletes, exactly as `/api/storage/reclaim` is and for the same reason its comment gives.
