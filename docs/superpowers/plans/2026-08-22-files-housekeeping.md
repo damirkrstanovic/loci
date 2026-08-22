@@ -630,11 +630,18 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
         live    (set (keep #(:uri (:source %)) (vals (sub/objects st))))
         cutoff  (- (System/currentTimeMillis) (* days 24 60 60 1000))
         by-obj  (tbl/handles-in-history st)
-        seen    (into {} (for [[o hs] by-obj
-                               [i e]  (map-indexed vector hs)
-                               :let [u (or (:uri (:source e)) (:uri (:handle e)))]
-                               :when u]
-                           [u {:object o :ts (:ts e) :age-rank i}]))]
+        ;; Rank among the object's URI-BEARING entries only, and merge per uri
+        ;; toward whichever answer RETAINS more. Both corrections are load-bearing;
+        ;; see the note below on why the lakegc shape is wrong here.
+        seen    (reduce
+                  (fn [acc [o hs]]
+                    (reduce-kv
+                      (fn [a i e]
+                        (let [u (uri-of e)]
+                          (update a u keepier {:object o :ts (:ts e) :age-rank i})))
+                      acc
+                      (vec (filter uri-of hs))))
+                  {} by-obj)]
     (into {}
           (for [{:keys [file uri]} (listing st)
                 :let [m (get seen uri)]]
@@ -649,6 +656,32 @@ Sabotage `connected-as` to compare `(:uri %)` on the object rather than `(:uri (
 ```
 
 Note the `cond` order: **`:foreign` first**, so a hand-placed file can never fall through to any other class, and **`:current` before the window**, mirroring `lakegc` and mirroring `source-block`'s precedence lesson from phase 2.
+
+**Why `seen` is not `lakegc`'s shape.** Corrected 2026-08-22 after two independent reviews measured it deleting live data. `lakegc`'s `seen` is right there and wrong here, because a lake table name is minted fresh per write — every entry is a *distinct* table, so ranking entries ranks versions and no key ever repeats. A **file uri repeats**, and entries that name no uri still exist. Three consequences, all measured against the shipped code:
+
+- **`:versions` counted events, not files.** `map-indexed` spent a rank on every entry and `:when u` dropped the nil-uri ones *afterwards* — and a materialised `refresh!` commits an `:assoc [:value]` carrying `{:store :lake …}`, which names no location. So an object with **one** file, refreshed ten times, came back `:age-rank 10` and `:reclaimable`. Refreshing a table was what aged its own source out. The spec says "the three most recent **files** per object"; filter first, then rank.
+- **`(into {} …)` is last-wins and `handles-in-history` is newest-first, so the *oldest* mention won.** `:ts` reported the original connect, and a passthrough table refreshed yesterday looked thirty days stale.
+- **Two tables on one file were attributed to an arbitrary one.** `group-by`'s map iterates in insertion order below 8 keys and hash order above, so the answer flipped — measured — when an unrelated tenth object entered the store. `:reclaimable` on one run, `:in-window` on the next, same fixture.
+
+`uri-of` is `#(or (:uri (:source %)) (:uri (:handle %)))`. `keepier` merges two answers for one uri toward retention, taking the halves **independently** — `min` of `:age-rank`, `max` of `:ts` — because they are two different reasons to keep a file and neither should be able to veto the other:
+
+```clojure
+(defn- keepier
+  "Of two classifications for one uri, the one that retains more.
+
+   The window's two halves are independent reasons to keep a file, so they
+   merge independently: the lowest rank any object gives it, and the newest
+   moment any object named it. Taking the pair from one entry would let a
+   stale rank cancel a fresh timestamp."
+  [a b]
+  (if (nil? a)
+    b
+    {:object   (if (< (:age-rank b) (:age-rank a)) (:object b) (:object a))
+     :ts       (max (or (:ts a) 0) (or (:ts b) 0))
+     :age-rank (min (:age-rank a) (:age-rank b))}))
+```
+
+**A manifest record with no `:at` must be kept, not reclaimed.** `(or at 0)` reads a missing clock as the epoch — maximally old — which sends a hand-edited or older manifest line straight to `:orphaned`. `(if at (>= at cutoff) true)` costs nothing and makes an unreadable clock mean *keep it*, which is the direction a GC over a primary file must fail in.
 
 **Read the manifest once.** An earlier draft of this `let` called `(retired)` inside a `keep` over `(keys (names))` — one full parse of `files.edn` per manifest entry. Measured 2026-08-22 during Task 4's review: `records` costs ~43 ms over 10,000 lines, so that shape is ~10,000 × 43 ms ≈ **7 minutes for one `classify`** — and `classify` is what `report` calls, which Task 9 asks to be cheap enough to sit in a panel that draws on open. Both `(retired)` and `(names)` are hoisted into the `let` and each reads the file once. If you add another manifest consumer here, hoist it too.
 
