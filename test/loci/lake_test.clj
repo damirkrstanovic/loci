@@ -47,6 +47,22 @@
    file and prove nothing about whether the *data* was found again."
   (mapv (fn [i] {:id i :name (str "n" i)}) (range 100)))
 
+(defn- bare-lake
+  "A `Lake` over a connection that has NOT been through `open-lake!` — no
+   ducklake, no ATTACH, no `USE lake`.
+
+   Wanted by every test whose subject is what `open-lake!` does *before* there
+   is a lake, which an already-open one cannot observe: `ensure-extension!`
+   loading ducklake, `ensure-remote!` loading httpfs, and the pre-fix relative
+   DATA_PATH a moved lake used to be refused for.
+
+   The third field is `ensure-remote!`'s once-per-connection set. It starts
+   empty here for the same reason `open-lake!` gives it an empty one: the guard
+   is a fact about this connection, so a second `Lake` over a second connection
+   must not inherit the first's."
+  [conn dir]
+  (lake/->Lake conn dir (atom #{})))
+
 (defn- tmpdir [tag] (str (System/getProperty "java.io.tmpdir") "/loci-lake-" tag "-" (System/nanoTime)))
 
 (defn- parquets [dir]
@@ -100,7 +116,7 @@
       (.mkdirs (io/file rel))
       ;; create it the pre-fix way: relative DATA_PATH, no override
       (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
-            lk   (lake/->Lake conn rel)]
+            lk   (bare-lake conn rel)]
         (try
           (#'lake/ensure-extension! lk "ducklake")
           (lake/x! lk (str "ATTACH 'ducklake:" rel "/catalog.duckdb' AS lake (DATA_PATH '" rel "/files/')"))
@@ -111,7 +127,7 @@
           "the rows must be in a Parquet file under files/, or the reopen proves nothing")
       (is (= [{:key "data_path" :value (str rel "/files/")}]
              (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
-                   lk   (lake/->Lake conn abs)]
+                   lk   (bare-lake conn abs)]
                (try
                  (lake/x! lk (str "ATTACH '" abs "/catalog.duckdb' AS cat (READ_ONLY)"))
                  (lake/q lk "SELECT key, value FROM cat.main.ducklake_metadata WHERE key = 'data_path'")
@@ -707,7 +723,7 @@
   ;; exposure: `with-lake` reaches `open-lake!` the same way, and every test in
   ;; this namespace uses it.
   (let [conn    (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
-        lk      (lake/->Lake conn (str (System/getProperty "java.io.tmpdir") "/loci-no-lake"))
+        lk      (bare-lake conn (str (System/getProperty "java.io.tmpdir") "/loci-no-lake"))
         loaded? #(:loaded (first (lake/q lk (str "SELECT loaded FROM duckdb_extensions()"
                                                  " WHERE extension_name = 'ducklake'"))))]
     (try
@@ -756,6 +772,206 @@
                     "LOAD only reads."]]
       (is (str/includes? d shared) (str "the ducklake message lost: " shared))
       (is (str/includes? h shared) (str "the httpfs message never got: " shared)))))
+
+;; ---------------------------------------------------------------------------
+;; ensure-remote! — httpfs and the secret, once, lazily
+;; ---------------------------------------------------------------------------
+
+(defn- remote-sql
+  "What `ensure-remote!` issues for each of `uris` in turn against ONE
+   connection, with `x!` captured and nothing executed.
+
+   `fail?` is a predicate on the SQL; a statement it matches throws the way
+   DuckDB's would. **Injected rather than provoked, because provoking either
+   failure is a trip nobody asked for.** A missing extension means an `INSTALL`
+   that downloads — measured 2026-08-23 at 237 ms and an HTTP 404 against
+   extensions.duckdb.org, see `failed-extension` above. A credential chain that
+   finds nothing means a `CREATE SECRET` that walks the AWS SDK for **6.0 s**
+   before refusing, measured the same day. The network is not a test fixture,
+   and neither is the absence of an AWS account.
+
+   Returns the SQL, whatever each call answered or threw, and the guard set —
+   the last because the SQL alone cannot show which failures were remembered."
+  ([uris] (remote-sql uris (constantly false)))
+  ([uris fail?]
+   (let [sql (atom [])
+         ;; nil for the connection: `x!` is the only thing that touches one and
+         ;; it is stubbed, exactly as `failed-extension` above does it.
+         lk  (bare-lake nil "/no-such-lake")
+         out (with-redefs [lake/x! (fn [_ s]
+                                     (swap! sql conj s)
+                                     (if (fail? s)
+                                       (throw (java.sql.SQLException. "injected"))
+                                       :ok))]
+               (mapv (fn [u] (try (lake/ensure-remote! lk u)
+                                  (catch clojure.lang.ExceptionInfo e e)))
+                     uris))]
+     {:sql @sql :out out :ensured @(:ensured lk)})))
+
+(deftest ensure-remote-really-loads-httpfs
+  ;; The one assertion in this section a stub cannot make, and the reason this
+  ;; test exists beside the SQL-counting ones below: those see the statements
+  ;; and never the effect.
+  ;;
+  ;; A BARE connection, because an already-open lake cannot observe it either
+  ;; way. `ensure-extension!`'s docstring records that `ATTACH 'ducklake:…'`
+  ;; loads ducklake by itself; httpfs has the same trap one step further out,
+  ;; since loci sets neither `autoload_known_extensions` nor
+  ;; `autoinstall_known_extensions` and both default true, so a
+  ;; `read_csv('https://…')` would load it with no LOAD from loci at all.
+  ;; Measured 2026-08-23 on DuckDB 1.5.5: `open-lake!` leaves httpfs
+  ;; `loaded false`, and this call flips it to true.
+  ;;
+  ;; A machine that has never installed httpfs INSTALLs here — 313 ms and one
+  ;; request, measured the same day. That is the one outbound request this
+  ;; phase's ground rules allow, and it is the exposure
+  ;; `ensure-extension-really-loads-the-extension-it-was-asked-for` already has
+  ;; for ducklake.
+  (let [conn    (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
+        lk      (bare-lake conn (str (System/getProperty "java.io.tmpdir") "/loci-no-lake"))
+        loaded? #(:loaded (first (lake/q lk (str "SELECT loaded FROM duckdb_extensions()"
+                                                 " WHERE extension_name = 'httpfs'"))))]
+    (try
+      (is (false? (loaded?))
+          "a fresh connection must NOT already carry httpfs, or this observes nothing")
+      (is (= :ok (lake/ensure-remote! lk "https://example.com/x.csv")))
+      (is (true? (loaded?))
+          "and now it does — the one assertion here a no-op cannot pass")
+      (finally (.close conn)))))
+
+(deftest ensure-remote-loads-httpfs-and-issues-the-secret-once
+  (let [{:keys [sql out ensured]} (remote-sql ["s3://bucket/sales.csv"
+                                               "s3://bucket/sales.csv"])]
+    ;; Equality and not two counts, because it also pins the ORDER and the
+    ;; absence of anything else: the whole of what a remote read costs a
+    ;; connection is two statements, and a count of each would stay green if a
+    ;; third appeared beside them.
+    (is (= ["LOAD httpfs" "CREATE SECRET loci_s3 (TYPE s3, PROVIDER credential_chain)"] sql)
+        "twice asked, once done — this runs before every remote read")
+    (is (= [:ok :ok] out))
+    (is (= #{:httpfs :s3} ensured))
+    (is (not (re-find #"(?i)or\s+replace" (str/join "\n" sql)))
+        "no OR REPLACE, so DuckDB refuses a duplicate secret name and the guard is
+         what stops a second remote read on this connection throwing. Counting the
+         statements without this leaves the guard looking like an optimisation")))
+
+(deftest an-http-location-never-runs-the-credential-chain
+  ;; The measurement this branch exists for, and the one correction to the plan
+  ;; that changes behaviour rather than a test. `CREATE SECRET … PROVIDER
+  ;; credential_chain` is validated when it is CREATED: DuckDB's `aws`
+  ;; extension walks the whole chain then and there, and on a machine the chain
+  ;; cannot satisfy it does not hand back an unused secret, it throws.
+  ;;
+  ;; Measured 2026-08-23 on DuckDB 1.5.5 with no AWS credentials present:
+  ;; 10.5 s the first time — the `aws` extension autoinstalls, which is also
+  ;; how we know `httpfs` alone is not enough for it — and 6.0 s every time
+  ;; after, with `Invalid Configuration Error: Secret Validation Failure:
+  ;; during `create``.
+  ;;
+  ;; So a secret issued for every remote scheme would put six seconds and a
+  ;; hard failure in front of every https:// read on every machine without AWS
+  ;; credentials: most laptops, and this suite. Task 6's loopback fetch is the
+  ;; test that would go red; this is the one that says why.
+  (let [{:keys [sql out ensured]} (remote-sql ["https://example.com/a.csv"
+                                               "http://127.0.0.1:9/b.csv"])]
+    (is (= ["LOAD httpfs"] sql)
+        "httpfs once, and NO credential chain — an http(s) location needs none")
+    (is (= [:ok :ok] out))
+    (is (= #{:httpfs} ensured)
+        "and the s3 guard is left unset, so an s3:// source arriving later on this
+         same connection still gets its secret")))
+
+(deftest the-secret-is-issued-when-an-s3-location-finally-arrives
+  (let [{:keys [sql ensured]} (remote-sql ["https://h/a.csv" "s3://b/c.csv" "s3://b/d.csv"])]
+    (is (= ["LOAD httpfs" "CREATE SECRET loci_s3 (TYPE s3, PROVIDER credential_chain)"] sql)
+        "the s3 read did not load httpfs a second time and the one after it did not
+         re-issue the secret — two guards, independent, each firing once")
+    (is (= #{:httpfs :s3} ensured))))
+
+(deftest the-s3-secret-carries-no-credential-material
+  (let [sql    (:sql (remote-sql ["s3://bucket/sales.csv"]))
+        secret (first (filter #(re-find #"(?i)create\s+secret" %) sql))]
+    ;; The assertion that stops the rest being vacuous, and it is not
+    ;; theoretical: a negative match over a string the test itself produced
+    ;; passes just as happily against an empty one, and `(first (filter …))` of
+    ;; nothing is nil. Without this line an `ensure-remote!` that issued no
+    ;; secret at all would read as clean.
+    (is (some? secret) (str "no CREATE SECRET was issued at all: " (pr-str sql)))
+    (is (re-find #"(?i)provider\s+credential_chain" (str secret))
+        "the whole design is that loci hands DuckDB a provider, not a key")
+    (is (not (re-find #"(?i)key_id|secret\s+'|session_token|password"
+                      (str/join "\n" sql)))
+        (str "the SQL names credential material: " (pr-str sql)))
+    (is (not (re-find #"(?i)persistent" (str secret)))
+        "TEMPORARY is DuckDB's default and keeping it is the point: a PERSISTENT
+         secret is written unencrypted under ~/.duckdb, so that one word would move
+         loci from storing no credential to storing one")))
+
+(deftest a-failed-credential-chain-names-what-to-fix-and-is-not-remembered
+  (let [{:keys [sql out ensured]} (remote-sql ["s3://bucket/x.csv" "s3://bucket/x.csv"]
+                                              #(re-find #"(?i)create\s+secret" %))
+        e   (first out)
+        ;; `(some-> ^Throwable e .getMessage)` was the obvious spelling and it
+        ;; is the wrong one: against an `ensure-remote!` that threw nothing,
+        ;; `e` is `:ok`, the hint casts, and the test dies with a
+        ;; ClassCastException BEFORE its first assertion — a failure that
+        ;; reports the sabotage's shape instead of the assertion's meaning.
+        msg (if (instance? Throwable e) (.getMessage ^Throwable e) (pr-str e))]
+    (is (instance? clojure.lang.ExceptionInfo e)
+        "loci's ex-info, not a raw SQLException escaping into connect!")
+    (is (str/includes? msg "s3://bucket/x.csv") "the sentence names the location")
+    (is (str/includes? msg "AWS_ACCESS_KEY_ID")
+        (str "and names what to set. DuckDB's own text does not contain the word "
+             "credentials and names no variable — it is `Secret Validation Failure: "
+             "during `create` … Credential Chain: 'config'`, where 'config' is the "
+             "chain's name and not a file loci wrote: " msg))
+    (is (str/includes? msg "DuckDB said: injected")
+        "with DuckDB's own error kept rather than swallowed")
+    (is (= "injected" (when (instance? Throwable e) (some-> ^Throwable e .getCause .getMessage))))
+    (is (= "s3://bucket/x.csv" (:uri (ex-data e))))
+    (is (= ["LOAD httpfs"
+            "CREATE SECRET loci_s3 (TYPE s3, PROVIDER credential_chain)"
+            "CREATE SECRET loci_s3 (TYPE s3, PROVIDER credential_chain)"]
+           sql)
+        "the failure is not remembered, so the next connect retries the secret — a
+         machine that grows credentials is one reconnect away and not one restart.
+         And httpfs was NOT loaded again, which is what makes the guards separate
+         rather than one flag doing two jobs")
+    (is (= #{:httpfs} ensured))))
+
+(deftest a-missing-httpfs-refuses-one-source-and-says-so
+  ;; `extension-problem` puts its two consequence sentences behind `required?`,
+  ;; because ", so the lake cannot open" is true only for ducklake — where
+  ;; `open-lake!`'s try closes the connection and rethrows. That is right, and
+  ;; it leaves httpfs with a message that names no consequence at all: loci
+  ;; cannot load an extension, and nothing about what that means for the thing
+  ;; the reader was doing. The consequence is the half only this caller knows,
+  ;; and "refuse this source, not the store" is the requirement the whole
+  ;; laziness exists to meet, so it belongs where the user reads it.
+  (let [{:keys [sql out ensured]} (remote-sql ["https://example.com/a.csv"]
+                                              #(str/starts-with? % "LOAD"))
+        e   (first out)
+        ;; See the sibling test above for why this is not `some->`.
+        msg (if (instance? Throwable e) (.getMessage ^Throwable e) (pr-str e))]
+    (is (instance? clojure.lang.ExceptionInfo e))
+    (is (str/includes? msg "https://example.com/a.csv") "which source was refused")
+    (is (str/includes? msg "This source cannot be read; nothing else is affected")
+        (str "the message never says what the failure costs: " msg))
+    (is (not (str/includes? msg "so the lake cannot open"))
+        (str "it claimed the store cannot open, which is ducklake's sentence: " msg))
+    (is (str/includes? msg "Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension.")
+        "and `extension-problem`'s actionable paragraph survives the wrapping. A
+         consequence sentence that REPLACED the directory, the uid and the fix
+         would be a worse message than the one it set out to improve")
+    (is (= "httpfs" (:extension (ex-data e)))
+        "ex-data keeps ensure-extension!'s keys under the wrapper's :uri")
+    (is (= "https://example.com/a.csv" (:uri (ex-data e))))
+    (is (= ["LOAD httpfs" "INSTALL httpfs" "LOAD httpfs"] sql)
+        "the LOAD-then-INSTALL retry ran, so this failed the way a real missing
+         extension fails and not one statement early")
+    (is (empty? ensured)
+        "and nothing was remembered, so a container that gains the extension does
+         not need a restart before a source can use it")))
 
 (deftest unwrap-renders-temporal-types-as-iso-strings
   ;; DuckDB's CSV sniffer gives LocalDate for DATE and java.sql.Timestamp for
