@@ -58,9 +58,69 @@
     (is (thrown? clojure.lang.ExceptionInfo (ssp/locate bad)) (str "must refuse " bad))))
 
 (deftest locate-names-the-phase-when-it-does-not-know-a-scheme
-  (let [e (try (ssp/locate "s3://bucket/x.csv") nil (catch clojure.lang.ExceptionInfo e e))]
+  ;; Was `s3://bucket/x.csv` until phase 3, and it PASSED only while locate
+  ;; threw on s3:// — so its failure is the first evidence the new branch runs.
+  ;; `gs://` is now the nearest scheme loci does not know, and it stays that way
+  ;; on purpose: it rides httpfs and would cost one entry in `remote-schemes`.
+  (let [e (try (ssp/locate "gs://bucket/x.csv") nil (catch clojure.lang.ExceptionInfo e e))]
     (is (some? e))
-    (is (re-find #"loci://" (.getMessage e)) "the error must say what it DOES know")))
+    ;; `str`/`some->` rather than a bare `.getMessage`, for the reason the two
+    ;; tests above already give: when this test fails it is because `e` is nil,
+    ;; and `(.getMessage nil)` turns the second assertion into an NPE stack
+    ;; trace instead of a sentence. Seen doing exactly that on 2026-08-23.
+    (is (re-find #"loci://" (str (some-> e .getMessage)))
+        "the error must say what it DOES know")))
+
+(deftest locate-answers-a-remote-uri-verbatim
+  (is (= "s3://bucket/sales.csv" (ssp/locate "s3://bucket/sales.csv")))
+  (is (= "https://example.com/a/b.csv" (ssp/locate "https://example.com/a/b.csv")))
+  (is (= "http://127.0.0.1:8080/x.csv" (ssp/locate "http://127.0.0.1:8080/x.csv"))
+      "plaintext too — httpfs reads it, and loci does not police the transport of a
+       location a person typed, exactly as file:// is unrestricted by decision")
+  (is (= "s3://bucket/a b.csv" (ssp/locate "s3://bucket/a b.csv"))
+      "verbatim means verbatim: no re-encoding, no URI round trip. DuckDB is handed
+       the string the user gave, quoted by sql-str, and it is DuckDB's job to parse it"))
+
+(deftest locate-still-refuses-a-scheme-it-does-not-know
+  ;; A THROW and not a nil: a locate that fell off the end of the cond and
+  ;; answered nil would satisfy an `(is (nil? …))` assertion while handing every
+  ;; caller a location it never checked. Only refusing distinguishes them.
+  ;;
+  ;; `(is (thrown? …))` says that too, and the plan's sketch used it — but it
+  ;; binds `e` to whatever `do-report` RETURNS when nothing was thrown, which is
+  ;; nil only because clojure.test's default reporter happens to return nil.
+  ;; Measured 2026-08-23 under a reporter that returns its accumulator instead:
+  ;; the next line became `No matching field found: getMessage for class
+  ;; PersistentVector` — a stack trace where a sentence should be. That is the
+  ;; failure `locate-refuses-a-file-uri-whose-first-segment-reads-as-a-host`
+  ;; already has a comment about, so this uses the same try/catch shape as the
+  ;; rest of the file rather than depending on a reporter's return value.
+  ;;
+  ;; `HTTPS://` is in the list because `remote?` is case-sensitive by decision,
+  ;; and this is where locate has to agree with it — a case-insensitive remote?
+  ;; passes this uri through verbatim and this line is what notices.
+  (doseq [u ["gs://bucket/x.csv" "az://c/x.csv" "ftp://h/x.csv" "redis://h/1"
+             "HTTPS://h/x.csv"]]
+    (let [e (try (ssp/locate u) nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str u " must be refused, not resolved"))
+      (is (re-find #"loci does not know this location" (str (some-> e .getMessage)))
+          (str u " must be refused by name")))))
+
+(deftest remote?-is-about-the-scheme-and-nothing-else
+  (is (true?  (ssp/remote? "s3://b/x.csv")))
+  (is (true?  (ssp/remote? "https://h/x.csv")))
+  (is (true?  (ssp/remote? "http://h/x.csv")))
+  (is (false? (ssp/remote? "loci://files/x.csv")))
+  (is (false? (ssp/remote? "file:///data/x.csv")))
+  (is (false? (ssp/remote? "gs://b/x.csv"))
+      "a scheme loci does not know is not remote — it is unknown, and locate says so")
+  ;; `false?` and not `nil?`: the callers branch on this, and a nil that reads as
+  ;; falsey in an `if` is not the same var as one that answers a boolean. This is
+  ;; the assertion that fails if the `boolean` wrapper is dropped.
+  (is (false? (ssp/remote? nil)) "nil is not a location")
+  (is (false? (ssp/remote? "HTTPS://h/x.csv"))
+      "case-sensitive, deliberately: every uri loci mints is lower-case, and a
+       case-insensitive test here would have to be repeated in locate to agree"))
 
 (deftest relation-builds-one-reader-call-per-format
   (is (= "read_csv('/tmp/a.csv')"

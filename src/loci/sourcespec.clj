@@ -29,6 +29,27 @@
 
 (def ^:private loci-prefix "loci://")
 
+(def ^:private remote-schemes
+  "The location schemes DuckDB's httpfs extension reads, and therefore the ones
+   `locate` hands through untouched.
+
+   `gs://` and `az://` are absent deliberately. `gs://` rides httpfs and would
+   cost one entry here; `az://` is a separate extension with its own
+   install-at-build-time problem — the one that cost two commits for ducklake in
+   August 2026. Both arrive the day someone has one, which is the same rule the
+   `readers` map above already applies to Excel."
+  #{"http://" "https://" "s3://"})
+
+(defn remote?
+  "Is `uri` a location DuckDB fetches rather than one loci resolves?
+
+   A scheme test and nothing more — it does not ask whether the object exists,
+   which is the whole point: for a remote location, nothing short of a fetch
+   can answer that, and the callers that use this are choosing a code path
+   rather than reporting a state."
+  [uri]
+  (boolean (some #(str/starts-with? (str uri) %) remote-schemes)))
+
 (defn locate
   "A location URI → a string DuckDB can address.
 
@@ -53,7 +74,13 @@
    someone typed with two slashes instead of three, so naming that as what they
    meant is never a guess. Refusing localhost too would be one clause shorter
    and would have to tell the one caller who spelled it correctly to use
-   `file:///localhost/x`, which is a different file."
+   `file:///localhost/x`, which is a different file.
+
+   **A `remote?` scheme is answered VERBATIM**, and that identity is the whole
+   of phase 3: `relation` already emits `read_csv('<location>')` from whatever
+   this returns, so a location DuckDB can fetch needs no reader, no handle
+   shape and no route of its own. Nothing is parsed on the way through — see
+   the branch."
   [uri]
   (let [uri (str uri)]
     (cond
@@ -95,6 +122,15 @@
         (when (str/blank? p)
           (throw (ex-info (str "file:// location has no path: " uri) {:uri uri})))
         p)
+
+      (remote? uri)
+      ;; Verbatim. `relation` wraps this in `sql-str` and DuckDB parses it —
+      ;; loci re-encoding it here could only make it wrong, and a `java.net.URI`
+      ;; round trip is exactly what mangled `file://data/x.csv` into `/x.csv`
+      ;; before `606505c` refused it. Measured 2026-08-23: that round trip does
+      ;; not even survive `s3://bucket/a b.csv`, which throws "Illegal character
+      ;; in path at index 13" rather than answering anything.
+      uri
 
       :else
       (throw (ex-info (str "loci does not know this location: " uri
