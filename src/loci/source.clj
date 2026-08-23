@@ -92,6 +92,53 @@
                       {:mode (:mode src) :known modes})))
     m'))
 
+(defn- refuse-remote-passthrough!
+  "Refuse `:mode :passthrough` when the location is one DuckDB fetches.
+
+   **A guard, not a validation, and the distinction is the reason it is here
+   rather than on the handle.** It refuses new CONNECTS; it does not refuse
+   existing objects. `refresh!` reads `:mode` back off the object `connect!`
+   already committed and never comes through this function, so an object that
+   was committed as a remote passthrough before this landed keeps that state for
+   as long as it exists — the mode is on the log, and the log is append-only.
+   That is the whole argument for refusing here, in front of the first read,
+   rather than reporting the problem at render time: there is no later moment at
+   which loci can take it back.
+
+   **And it was reachable, not hypothetical.** DuckDB sets neither
+   `autoload_known_extensions` nor `autoinstall_known_extensions`, so both
+   default true and it installs and loads `httpfs` on its own. Measured
+   2026-08-23 with the guard removed: `connect!` over `s3://bucket/x.csv`
+   reached `bucket.s3.amazonaws.com` for real and came back with an HTTP 403 —
+   which is to say the read happened. Against a bucket the credential chain CAN
+   reach it would have described, landed, and committed
+   `{:store :source :uri \"s3://…\"}` with no complaint from anywhere.
+
+   The cost is measured rather than disliked. Phase 1 measured a passthrough
+   connect at 10M rows as 294 ms, of which 244 ms is one `count(*)` — a full
+   pass over the location. A `:store :source` handle repeats that pass on every
+   query, and `hydrate` adds a liveness check on every render. Locally those are
+   disk reads. Remotely each one is a fetch of the whole object across the
+   network, and loci has no query timeout to stop it, so a single mis-chosen
+   mode makes a notebook slow in a way nothing local can with the cause
+   invisible. `:materialise` plus `refresh!` — phase 2 already built the button
+   — is the same source at a cost the reader chose.
+
+   `modes` one docstring above is the precedent for both the shape and the
+   reasoning: it exists because `:mode \"passthrough\"` silently created a real
+   table while every report said passthrough, so the lie survived into the log
+   and every later `refresh!` repeated it. This is the same class one axis over
+   — a passthrough that must not quietly become an unbounded fetch — and the
+   answer is the same, a refusal before anything is committed."
+  [src]
+  (when (and (= :passthrough (:mode src)) (ssp/remote? (:uri src)))
+    (throw (ex-info (str "loci does not connect a remote location as passthrough: " (:uri src)
+                         " — a passthrough source is re-read on every query and checked"
+                         " on every render, which over the network is a fetch of the whole"
+                         " object each time and nothing in loci times it out."
+                         " Connect it with :mode :materialise, and refresh it when it changes.")
+                    {:uri (:uri src) :mode (:mode src)}))))
+
 (def ^:private slug-max
   "How long the readable half of a minted id may be.
 
@@ -251,11 +298,18 @@
    Returns `{:id … :cols … :rows … :mode …}`, whose `:mode` is read off the
    handle that was built rather than echoed from `src`. Throws whatever
    `describe` throws: a bad location, an unknown format, or two headers that
-   would become one column all fail here, before anything is committed."
+   would become one column all fail here, before anything is committed — and
+   before any of those, `refuse-remote-passthrough!` refuses a remote location
+   asked for as passthrough, which is the one refusal that happens without
+   reading the source at all."
   ([st src] (connect! st src nil))
   ([st src space]
    (let [lk    @lake/lake
          src   (assoc src :mode (mode-of src))
+         ;; Between the mode being decided and the source being read, which is
+         ;; the only window there is: `describe` below is the first fetch, and
+         ;; for a remote location that fetch is the cost this refuses.
+         _     (refuse-remote-passthrough! src)
          title (or (not-empty (:title src)) "Table")
          d     (describe lk src)
          at    (now-iso)

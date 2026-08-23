@@ -546,6 +546,83 @@
       (is (re-find #"unknown source mode" (str (.getMessage ^Exception e)))
           (str "…and say so, for mode " (pr-str bad))))))
 
+(deftest connect-refuses-passthrough-for-a-remote-location
+  ;; Not a pre-emptive refusal. DuckDB sets neither `autoload_known_extensions`
+  ;; nor `autoinstall_known_extensions`, so both default true and it installs
+  ;; and loads `httpfs` by itself — measured 2026-08-23 against this suite's own
+  ;; lake. Without the guard `describe` therefore SUCCEEDS over `s3://` and
+  ;; `land!` commits `{:store :source :uri "s3://…"}`, which is the shape the
+  ;; spec's measurement says must not exist.
+  (let [st (sub/fresh-store)
+        e  (is (thrown? clojure.lang.ExceptionInfo
+                        (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                          :mode :passthrough :title "S3"})))
+        m  (str (some-> e .getMessage))]
+    (is (re-find #"passthrough" m) "the sentence names the mode that was refused")
+    (is (re-find #"s3://bucket/x\.csv" m) "and the location it was refused for")
+    (is (empty? (sub/objects st))
+        "and nothing was committed — a refusal that leaves an object behind is
+         worse than no refusal, because the shell then draws a broken table, and
+         the guard is on connect! rather than on the handle, so an object that
+         got past it keeps its degraded state forever")
+    ;; The CONTROL for the assertion above, not a second test of `connect!`.
+    ;; `(empty? (sub/objects st))` over a fresh store is a negative: it passes
+    ;; unchanged if `connect!` threw before doing anything at all — a typo in
+    ;; this map, a `mode-of` refusal, an ExceptionInfo from somewhere else — and
+    ;; then proves nothing about where the guard sits. So the SAME store takes
+    ;; the SAME call one scheme apart, down to the title, and only because that
+    ;; one lands an object does the emptiness above mean the refusal kept one
+    ;; out rather than that nothing was ever going to arrive.
+    (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                      :mode :passthrough :title "S3"})
+    (is (= 1 (count (sub/objects st)))
+        "this store does record a passthrough connect")))
+
+(deftest the-remote-passthrough-refusal-happens-before-the-first-read
+  ;; The assertion that pins WHERE the guard sits, because `(empty? …)` above
+  ;; cannot. Measured 2026-08-23, with the guard moved to after the commit:
+  ;; the s3:// case in the test above still passes every assertion it has,
+  ;; because `describe` reaches `bucket.s3.amazonaws.com`, gets an HTTP 403 and
+  ;; throws before anything is committed — so a LATE guard and a MISSING guard
+  ;; are indistinguishable there. Over a loopback server, where the read
+  ;; succeeds, the same late guard threw the right sentence and left
+  ;; `{:store :source :uri "http://…"}` in the store: one object, the exact
+  ;; state the sentence above calls worse than no refusal.
+  ;;
+  ;; Stubbing the read is the direct way to say it, and it needs no server and
+  ;; no network in ANY state — a guard that is removed or merely late reaches
+  ;; `describe` and comes back carrying the marker instead of the refusal.
+  (with-redefs [src/describe (fn [& _] (throw (ex-info "describe ran" {::read true})))]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode :passthrough :title "S3"})))]
+      (is (not (::read (ex-data e)))
+          "connect! read the source before refusing it — the fetch this refusal
+           exists to prevent is the one it just made")
+      (is (re-find #"passthrough" (str (some-> e .getMessage)))
+          "and the refusal is the reason it stopped"))))
+
+(deftest connect-still-allows-passthrough-for-a-local-file
+  ;; The guard must be about the SCHEME and not about `connect!` having grown a
+  ;; new failure path — phase 1's whole passthrough story is local. Written
+  ;; against `(remote? uri)` this passes; written against `:mode` it fails here,
+  ;; and `connect-passthrough-stores-the-recipe-and-creates-no-table` above
+  ;; fails in the same run.
+  (let [st (sub/fresh-store)
+        r  (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                             :mode :passthrough :title "Live"})
+        h  (:value (sub/object st (:id r)))]
+    ;; DEVIATION from the plan's draft, which asserted `(is (nil? (:error r)))`.
+    ;; `connect!` returns `{:id :cols :rows :mode}` and throws rather than
+    ;; carrying an `:error` — so that assertion reads `(nil? nil)` on a map with
+    ;; no such key and cannot fail, on this branch or any other. `:mode` is read
+    ;; off the handle `land!` actually built, so it is the one key that a guard
+    ;; written too wide could move.
+    (is (= :passthrough (:mode r)) "the mode connect! reports comes off the handle it built")
+    (is (= :source (:store h))
+        "a local passthrough still stores the recipe, not a lake table")))
+
 (deftest concurrent-connects-do-not-mint-one-id-twice
   ;; `mint-id` reads the objects and `connect!` commits under what it read, so
   ;; two connects that both read before either commits both mint `tbl:race` —
