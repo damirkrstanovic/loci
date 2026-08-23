@@ -28,9 +28,37 @@
    3. **The schema a preview shows**, before anything is committed.
 
    Throws with `check-names!`'s ex-data when two headers would become one
-   column — the same refusal `normalize-rows` makes for rows."
+   column — the same refusal `normalize-rows` makes for rows.
+
+   **This is also where a remote connection is prepared, and it is the one
+   place that is true for every read loci makes.** `connect!`, `refresh!` and
+   the ＋ Data panel's own preview all arrive here and nowhere else, so
+   `lake/ensure-remote!` is called once, here, rather than at each of the three
+   — and `land!`'s CREATE runs on the same connection immediately after, so the
+   materialise is covered by the preparation the description already did."
   [lk src]
   (let [rel  (ssp/relation src (ssp/locate (:uri src)))
+        ;; **Guarded on the scheme, and the guard is not a tidiness.**
+        ;; `ensure-remote!` LOADs httpfs for whatever uri it is handed, and this
+        ;; function sees every uri there is. Called unguarded, an ordinary
+        ;; `loci://` CSV would issue `LOAD httpfs`; on a machine without the
+        ;; extension that falls through to `INSTALL`, which is the one statement
+        ;; in `ensure-extension!` that reaches the network — and under
+        ;; `--network none`, the container this phase targets, it dies. The
+        ;; person is then refused a file on local disk with a sentence about
+        ;; httpfs. `ensure-extension!`'s own paragraph records that an httpfs
+        ;; LOAD in a container still falls through, so that is reachable rather
+        ;; than theoretical, and `a-local-connect-asks-for-no-httpfs` is the
+        ;; assertion.
+        ;;
+        ;; Here rather than inside `ensure-remote!` for two reasons. `describe`
+        ;; is the only caller, and the scheme is the reason the call exists at
+        ;; all — a reader of this function should not have to open `lake.clj` to
+        ;; learn that a local connect touches no extension. And `lake.clj` was
+        ;; under review as this landed, so a behavioural change there would have
+        ;; raced it. `ensure-remote!`'s docstring carries the precondition, so a
+        ;; second caller is told rather than left to find out.
+        _    (when (ssp/remote? (:uri src)) (lake/ensure-remote! lk (:uri src)))
         rows (try (lake/q lk (str "DESCRIBE SELECT * FROM " rel))
                   (catch java.sql.SQLException e
                     (throw (ex-info (str "loci cannot read " (:uri src) " — " (ssp/duckdb-said e))

@@ -1,6 +1,7 @@
 (ns loci.source-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is use-fixtures]]
+            [loci.files :as files]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.server :as server]
@@ -8,7 +9,8 @@
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
-            [loci.tools :as tools]))
+            [loci.tools :as tools]
+            [org.httpkit.server :as httpd]))
 
 ;; `with-temp-lake` rather than `with-lake`, from the first test: it REBINDS
 ;; `lake/lake`, and a later task's `source/connect!` reads that var. A local
@@ -622,6 +624,167 @@
     (is (= :passthrough (:mode r)) "the mode connect! reports comes off the handle it built")
     (is (= :source (:store h))
         "a local passthrough still stores the recipe, not a lake table")))
+
+
+;; ---------------------------------------------------------------------------
+;; a remote location, over a loopback server — and what went over the wire
+;; ---------------------------------------------------------------------------
+
+;; Copied from `loci.chunks-test`, where the same shape stubs the embedder. It
+;; is private there, and a test namespace reaching across for another's helper
+;; couples two suites through a var neither owns — so this is a copy on purpose
+;; and not a missed extraction. The `seen` atom is what makes the copy worth
+;; having: a remote read is only provable from the wire, and a row count alone
+;; cannot tell a fetch from a re-read of the table the last fetch created.
+;;
+;; The body slurp `chunks-test` does is dropped: httpfs sends none, and slurping
+;; a nil body records nothing.
+(defn- with-stub
+  "Start `handler` on an ephemeral loopback port, call `(f port seen)`, stop the
+   server. `seen` holds every request received."
+  [handler f]
+  (let [seen (atom [])
+        srv  (httpd/run-server
+              (fn [req]
+                (swap! seen conj (select-keys req [:uri :request-method]))
+                (handler req))
+              {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
+    (try (f (httpd/server-port srv) seen)
+         (finally (httpd/server-stop! srv {:timeout 100})))))
+
+(defn- with-data-dir
+  "Run `(f root)` with `<LOCI_DATA>` at a fresh directory holding an empty
+   `files/`, always removed.
+
+   `files/listing` reads `(io/file (sub/data-dir) \"files\")`, and nothing in
+   the test alias moves `data-dir` — so without this the assertion below that
+   nothing landed in `<LOCI_DATA>/files/` would be over the repository's own
+   `data/files/`, and would start failing the day a person connects a file
+   through the running app. It also removes the other way that assertion could
+   pass for nothing: `File.listFiles` on a directory that does not exist answers
+   nil, and `listing` renders that as `[]`."
+  [f]
+  (let [root (str (System/getProperty "java.io.tmpdir") "/loci-src-data-" (System/nanoTime))]
+    (.mkdirs (io/file root "files"))
+    (try (with-redefs [sub/data-dir (constantly root)] (f root))
+         (finally (lf/rm-rf root)))))
+
+(deftest a-remote-csv-materialises-into-the-lake
+  (with-stub (fn [_] {:status 200 :headers {"content-type" "text/csv"}
+                      :body "region,revenue\nEMEA,10\nAPAC,20\n"})
+    (fn [port seen]
+      (with-data-dir
+        (fn [root]
+          ;; The fixture's lake is `:once` for this whole namespace and
+          ;; `ensure-remote!` remembers `:httpfs` on it, while `deftest` order is
+          ;; `ns-interns` order and therefore unspecified. Without this reset the
+          ;; LOAD assertion below would pass or fail on which remote test ran
+          ;; first, which is the worst kind of green.
+          (reset! (:ensured @lake/lake) #{})
+          (let [sql  (atom [])
+                real lake/x!
+                st   (sub/fresh-store)
+                r    (with-redefs [lake/x! (fn [l s] (swap! sql conj s) (real l s))]
+                       (src/connect! st {:uri (str "http://127.0.0.1:" port "/sales.csv")
+                                         :format :csv :mode :materialise :title "Remote"}))
+                h    (:value (sub/object st (:id r)))]
+            ;; No `(is (nil? (:error r)))` — `connect!` returns `{:id :cols :rows
+            ;; :mode}` and throws rather than carrying an `:error`, so that
+            ;; assertion cannot fail on any branch. It reached this plan's
+            ;; sketch twice; `connect-still-allows-passthrough-for-a-local-file`
+            ;; records the same deviation.
+            (is (= 2 (:rows r)) "the rows came from the stub and nowhere else")
+            (is (= [:region :revenue] (:cols r)))
+            (is (= :lake (:store h))
+                "materialised, so the handle names a lake table and not the uri")
+            (is (= #{"/sales.csv"} (set (map :uri @seen)))
+                (str "DuckDB asked this server for something other than the path loci
+                      was given — `locate` is verbatim precisely so a uri is not
+                      re-encoded on the way through, and this is where that shows: "
+                     (pr-str @seen)))
+            ;; **The assertion that survives autoload**, and the reason it is
+            ;; here rather than only `(seq @seen)`. httpfs is a known extension
+            ;; and loci sets neither `autoload_known_extensions` nor
+            ;; `autoinstall_known_extensions`, so DuckDB loads it by itself and
+            ;; every assertion above passes with `ensure-remote!` deleted —
+            ;; measured 2026-08-23 on this machine, where httpfs is installed but
+            ;; reports `loaded false` on a fresh connection. What autoload cannot
+            ;; do is the two things `ensure-remote!`'s docstring names: issue the
+            ;; s3 secret, and put the failure at connect with the paragraph that
+            ;; names the extension directory and the uid instead of inside a read
+            ;; with DuckDB's own message. So this asserts that loci issues the
+            ;; LOAD, which is the decision, rather than that the read worked,
+            ;; which this machine would grant either way.
+            (is (some #(re-find #"(?i)load\s+httpfs" %) @sql)
+                (str "loci left the httpfs load to DuckDB's autoload, which is not
+                      available in the offline image this phase targets: " (pr-str @sql)))
+            (is (empty? (files/listing st))
+                "and NOTHING landed in <LOCI_DATA>/files/ — the spec's claim that the
+                 files GC never sees a remote source, asserted rather than assumed")
+            ;; The control for the line above, which is otherwise a negative over
+            ;; a directory this test made empty two lines ago. `files/listing` is
+            ;; only evidence that no fetch was cached there if it can see a file
+            ;; that is.
+            (spit (io/file root "files" "cafebabe.csv") "a\n1\n")
+            (is (= 1 (count (files/listing st)))
+                "the listing does observe this directory, so the emptiness above is
+                 about the remote connect and not about where it was looking")))))))
+
+(deftest refresh-of-a-remote-source-re-fetches-the-object
+  ;; A remote source is materialise-only, so `refresh!` is the only way its
+  ;; bytes ever change — and `(> (count @seen) n1)` is the load-bearing half.
+  ;; Ask what the row count alone would report if `refresh!` re-read the LAKE
+  ;; TABLE rather than the source: with the body changed it answers 1 and fails,
+  ;; but with the body unchanged it answers correctly for the wrong reason, and
+  ;; a later reader trusts it. The wire count is what only a re-fetch produces.
+  (let [body (atom "region,revenue\nEMEA,10\n")]
+    (with-stub (fn [_] {:status 200 :headers {"content-type" "text/csv"} :body @body})
+      (fn [port seen]
+        (let [st (sub/fresh-store)
+              r  (src/connect! st {:uri (str "http://127.0.0.1:" port "/s.csv")
+                                   :format :csv :mode :materialise :title "R"})
+              n1 (count @seen)]
+          (is (= 1 (:rows r)))
+          (is (pos? n1) "the connect fetched, so the comparison below has a floor")
+          (reset! body "region,revenue\nEMEA,10\nAPAC,20\nLATAM,30\n")
+          (let [r2 (src/refresh! st (:id r))]
+            (is (= 3 (:rows r2)) "the new object was read, not the old handle re-reported")
+            (is (> (count @seen) n1)
+                "and it went over the wire again — a refresh that answered from the
+                 lake would give the same row count as a re-fetch of unchanged bytes,
+                 so the request count is the only thing that separates them")))))))
+
+(deftest a-local-connect-asks-for-no-httpfs
+  ;; `ensure-remote!` LOADs httpfs for whatever uri it is handed, and `describe`
+  ;; — the one place that serves `connect!`, `refresh!` and the panel's own
+  ;; preview — sees EVERY uri there is. So the call is guarded on the scheme,
+  ;; and this is the assertion that says so.
+  ;;
+  ;; Unguarded it is not a wasted statement, it is a broken local connect: LOAD
+  ;; fails on a machine without the extension, falls through to INSTALL, and
+  ;; INSTALL is the one line here that reaches the network — which under
+  ;; `--network none`, the container this whole phase targets, dies. The person
+  ;; is then refused a CSV on local disk with a sentence about httpfs.
+  ;; `ensure-extension!`'s own paragraph records that an httpfs LOAD in a
+  ;; container still falls through, so this is reachable rather than theoretical.
+  ;; **The reset is what makes this bite**, and without it the test is a false
+  ;; green. `ensure-remote!` remembers `:httpfs` on the lake, the fixture's lake
+  ;; is `:once` for the namespace, and `a-remote-csv-materialises-into-the-lake`
+  ;; leaves it set — so with the guard removed the call here would return early,
+  ;; issue no LOAD, and this test would pass. Measured 2026-08-23: with the reset
+  ;; the same sabotage fails, without it it does not.
+  (reset! (:ensured @lake/lake) #{})
+  (let [sql  (atom [])
+        real lake/x!
+        st   (sub/fresh-store)]
+    (with-redefs [lake/x! (fn [l s] (swap! sql conj s) (real l s))]
+      (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                        :mode :materialise :title "Local"}))
+    (is (some #(re-find #"(?i)create table" %) @sql)
+        (str "the spy saw no CREATE TABLE, so it saw nothing and the assertion below
+              would hold over an empty list: " (pr-str @sql)))
+    (is (empty? (filter #(re-find #"(?i)load\s+httpfs" %) @sql))
+        (str "a local connect asked DuckDB to load httpfs: " (pr-str @sql)))))
 
 (deftest concurrent-connects-do-not-mint-one-id-twice
   ;; `mint-id` reads the objects and `connect!` commits under what it read, so

@@ -465,6 +465,16 @@
   "Make this connection able to read `uri`, once per connection: load `httpfs`,
    and for an `s3://` location issue the credential secret. Returns :ok.
 
+   **Precondition: `uri` is one `ssp/remote?` answers true to.** The LOAD below
+   is unconditional, so calling this for a `loci://` or `file://` location
+   issues `LOAD httpfs` for a file on local disk — and on a machine without the
+   extension that falls through to `ensure-extension!`'s `INSTALL`, the one
+   statement here that reaches the network, which under `--network none` dies
+   and refuses a local CSV with a sentence about httpfs. The only caller,
+   `loci.source/describe`, holds the guard and says why; a second caller must
+   too. It is not asserted here because `describe` is where the scheme is
+   already known and where a reader of the call needs to see it.
+
    **Called on the first remote read, not from `open-lake!`.** `open-lake!`
    calls `ensure-extension!` inside a `try` that closes the connection and
    rethrows, which is right for `ducklake` — no extension, no lake, and loci
