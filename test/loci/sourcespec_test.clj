@@ -85,7 +85,11 @@
           ;; that on 2026-08-23.
           msg (str (some-> e .getMessage))]
       (is (some? e) (str u " must be refused"))
-      (doseq [known ["loci://" "file://" "http://" "https://" "s3://"]]
+      ;; Derived, not written out: with the five spelled as literals here this
+      ;; test scores the same 21/21 against a message that spells them as
+      ;; literals too, so reverting the composition is a silent no-op. It is
+      ;; `remote-schemes` that must be named, whatever is in it.
+      (doseq [known (concat ["loci://" "file://"] @#'ssp/remote-schemes)]
         (is (str/includes? msg known)
             (str "the message must name every scheme locate accepts, and "
                  known " is missing from: " msg)))
@@ -96,6 +100,89 @@
                  msg)))
       (is (not (re-find #"arrive with httpfs" msg))
           (str "and it must not promise a future that has already shipped: " msg)))))
+
+(deftest locate-composes-both-halves-of-its-scheme-list-from-one-set
+  ;; The test above cannot see the drift it guards against, because both halves
+  ;; of the sentence are right while `remote-schemes` is what it is today. This
+  ;; is the day it changes, which is the day the deferred half was wrong:
+  ;; measured 2026-08-23 with the deferred pair written as a literal —
+  ;;
+  ;;   … it knows loci://, file://, gs://, http://, https://, s3://.
+  ;;     gs:// and az:// are not among them yet.
+  ;;
+  ;; — naming `gs://` twice, once as known and once as deferred, at the one
+  ;; reader who typed it. `remote-schemes` is `def`'d, so `with-redefs` reaches
+  ;; it and `locate` derefs it per call; the probe stays `ftp://` so that every
+  ;; `gs://` in the message came from the sentence and not from the echoed uri.
+  (with-redefs [ssp/remote-schemes (conj @#'ssp/remote-schemes "gs://")]
+    (let [e   (try (ssp/locate "ftp://h/x.csv") nil (catch clojure.lang.ExceptionInfo e e))
+          msg (str (some-> e .getMessage))]
+      (is (some? e))
+      ;; The known half, as one substring: `(includes? msg "gs://")` alone is
+      ;; satisfied by the deferred clause of a fully hardcoded message, which is
+      ;; the sabotage this has to fail against.
+      (is (str/includes? msg (str/join ", " (concat ["loci://" "file://"]
+                                                    (sort @#'ssp/remote-schemes))))
+          (str "the schemes it knows are the set it reads, in order: " msg))
+      (is (= 1 (count (re-seq #"gs://" msg)))
+          (str "and a scheme is named ONCE — a literal deferred half says gs://"
+               " twice the day it arrives: " msg))
+      (is (str/includes? msg "az:// is not among them yet")
+          (str "the half still deferred is what is left after subtraction,"
+               " and it reads as one scheme rather than two: " msg)))))
+
+(deftest locate-refuses-a-scheme-whose-case-is-wrong-by-naming-the-spelling
+  ;; `remote?` is case-sensitive by decision, so this is where a person who
+  ;; typed `S3://` arrives. The old message recited five schemes at them — with
+  ;; `s3://` among the ones it says loci knows, one clause after "loci does not
+  ;; know this location: S3://bucket/x.csv". The reader's eye finds `s3://` in
+  ;; the list and concludes loci is broken; nothing in the sentence says
+  ;; SCHEMES ARE CASE-SENSITIVE, which is the one fact that resolves it.
+  ;;
+  ;; The assertion that bites is the SPELLING, not the word "case": the old
+  ;; message contains `s3://` too, and only a message that echoes the whole
+  ;; corrected location contains `s3://bucket/Q3-Sales.csv`.
+  (doseq [[typed spelled] {"S3://bucket/Q3-Sales.csv" "s3://bucket/Q3-Sales.csv"
+                           "HTTPS://h/x.csv"          "https://h/x.csv"
+                           "FILE:///data/x.csv"       "file:///data/x.csv"
+                           "LOCI://files/x.csv"       "loci://files/x.csv"}]
+    (let [e   (try (ssp/locate typed) nil (catch clojure.lang.ExceptionInfo e e))
+          msg (str (some-> e .getMessage))]
+      (is (some? e) (str typed " is still refused — the rule has not changed"))
+      (is (str/includes? msg "case-sensitive")
+          (str "and says WHY, which is the fact the reader is missing: " msg))
+      (is (str/includes? msg spelled)
+          (str "and names the location as loci reads it, with the path's own case
+                intact — an S3 key is case-sensitive, so a lower-cased
+                Q3-Sales.csv is a different object. Got: " msg))
+      (is (not (str/includes? msg "not among them yet"))
+          (str "and does not recite the deferred pair at someone whose scheme
+                loci already reads: " msg)))))
+
+(deftest locate-tells-a-path-from-a-location
+  ;; A bare filename is the other accident loci can see, and the answer is the
+  ;; two schemes that name a path — not the three that fetch one, and not
+  ;; `gs://`/`az://`, which someone who forgot the scheme is not shopping for.
+  ;; The `loci://` branch already knows how to say this facing the other way:
+  ;; "Use file:// for a path outside it."
+  (let [e   (try (ssp/locate "sales.csv") nil (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (some? e))
+    (is (str/includes? msg "loci://sales.csv")
+        (str "an uploaded file is the common case, and loci:// is where it lives: " msg))
+    (is (str/includes? msg "file://") (str "with the other spelling named too: " msg))
+    (is (not (str/includes? msg "s3://"))
+        (str "and no scheme list — they forgot the scheme, they are not choosing one: " msg)))
+  ;; An absolute path can be spelled `file://` + itself, and CANNOT be spelled
+  ;; `loci://` + itself: `loci:///data/x.csv` is refused two branches up for the
+  ;; leading slash. So the repair offered is the one that works.
+  (let [e   (try (ssp/locate "/data/x.csv") nil (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (some? e))
+    (is (str/includes? msg "file:///data/x.csv")
+        (str "the three-slash form, built from the path they typed: " msg))
+    (is (= "/data/x.csv" (ssp/locate (str "file://" "/data/x.csv")))
+        "and it is a location locate then accepts — the repair must actually work")))
 
 (deftest locate-answers-a-remote-uri-verbatim
   (is (= "s3://bucket/sales.csv" (ssp/locate "s3://bucket/sales.csv")))
@@ -194,8 +281,16 @@
                 s3:// to s3:/, which is exactly how the old sentence went wrong. Got: "
                (pr-str msg)))
       (is (re-find #"remote" (str msg))
-          (str "and it says WHY loci cannot answer, rather than borrowing the sentence
-                of a branch that did look at something. Got: " (pr-str msg)))
+          (str "and it says WHY loci has nothing of its own to add, rather than
+                borrowing the sentence of a branch that did look at something.
+                Got: " (pr-str msg)))
+      (is (re-find #"could not read" (str msg))
+          (str "and it STATES THE FAILURE. `tbl/unusable` composes this under
+                \"its source is unreachable — \", and the first phrasing —
+                \"loci cannot tell whether it can be read without fetching it\" —
+                retracted that heading at the one instant loci had fetched it and
+                knew: this function is reached from hydrate's catch, after a read
+                that already failed. Got: " (pr-str msg)))
       (is (not (re-find #"there is no file at" (str msg)))
           (str "it claimed a missing local file for " u ": " (pr-str msg))))))
 
@@ -215,7 +310,20 @@
       (is (re-find #"there is no file at"
                    (str (ssp/unreadable-because (str "file://" (.getAbsolutePath f)))))
           "and a missing one still says so — the local branches are untouched")
-      (finally (.delete f)))))
+      (finally (.delete f))))
+  ;; `loci://` and not only `file://`, because it is the scheme most sources
+  ;; actually have — `index.html` strips `loci://files/` for display precisely
+  ;; because that is the common shape — and because every other assertion here
+  ;; and in the test above is written over `file://`. A remote branch spelled
+  ;; `(not (str/starts-with? uri "file://"))` is a plausible inversion and it
+  ;; passes all eighteen of them, while reporting a missing uploaded file as a
+  ;; remote location. Measured 2026-08-23. This is the assertion that fails.
+  (let [msg (str (ssp/unreadable-because (str "loci://files/ubc-" (System/nanoTime) ".csv")))]
+    (is (re-find #"there is no file at" msg)
+        (str "a loci:// upload that is not there is a MISSING FILE, and loci
+              resolved it under the data directory to find that out: " msg))
+    (is (not (re-find #"remote" msg))
+        (str "and it is not remote — nothing fetches it: " msg))))
 
 (deftest relation-builds-one-reader-call-per-format
   (is (= "read_csv('/tmp/a.csv')"

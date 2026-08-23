@@ -7,10 +7,12 @@
    testable with `=`, and the connector-specific part of the framework is the
    part you can be sure of without a fixture.
 
-   **`unreadable-because` is the exception, and deliberately so**: it asks the
-   filesystem, because telling a missing source from a changed one is a question
-   only the filesystem can answer, and answering it by matching on DuckDB's
-   error text would be the fragile alternative. Its tests use temp files.
+   **`unreadable-because` is the exception, and deliberately so**: for a local
+   location it asks the filesystem, because telling a missing source from a
+   changed one is a question only the filesystem can answer, and answering it by
+   matching on DuckDB's error text would be the fragile alternative. Its tests
+   use temp files. A remote location has no filesystem to ask, so there it
+   names the failure and leaves the diagnosis to its caller — see its docstring.
 
    It is also what breaks the cycle. `loci.lake` needs `relation` to read a
    `:source` handle; `loci.source` needs `loci.lake` to run anything. Both
@@ -50,6 +52,21 @@
    would leave this phase with no test that does not reach the network."
   #{"http://" "https://" "s3://"})
 
+(def ^:private deferred-schemes
+  "The schemes someone is likeliest to type that loci does not read, named by
+   `locate`'s refusal because the reader who sees that sentence is, more often
+   than not, the one who just typed one of them.
+
+   **Subtracted from, never quoted.** `remote-schemes` above says both of these
+   arrive the day someone has one, and this is a literal set — so a message that
+   printed it verbatim would name `gs://` TWICE the day it arrives, once among
+   the schemes loci knows and once among the ones it defers. Measured
+   2026-08-23, with `gs://` added to `remote-schemes`: \"it knows loci://,
+   file://, gs://, http://, https://, s3://. gs:// and az:// are not among them
+   yet.\" `locate` removes what it knows before printing, and drops the sentence
+   entirely when nothing is left."
+  #{"gs://" "az://"})
+
 (defn remote?
   "Is `uri` a location DuckDB fetches?
 
@@ -65,15 +82,25 @@
 
    **Case-sensitive, so `HTTPS://h/x` is not remote** and `locate` refuses it by
    name. The reason is consistency and nothing else: `loci://` and `file://` are
-   matched with `str/starts-with?` in the two branches below, so a
-   case-insensitive test here would make one scheme of five behave differently
-   from the other four and `locate` would have to repeat the rule to agree with
-   it. RFC 3986 does define a scheme as case-insensitive, so this is loci being
-   stricter than the spec — deliberately, and in one place. The day someone
-   types `S3://`, the repair is to lower-case the scheme for all five in
-   `locate`, not to loosen this predicate alone. (The reason a first draft gave
-   — \"every uri loci mints is lower-case\" — is not the reason: a remote uri
-   is typed or pasted by a person, and loci mints none of them.)"
+   matched with `str/starts-with?` in the two branches below, so loosening this
+   predicate alone would make the THREE schemes it holds behave differently from
+   the other two, and `locate` would have to repeat the rule to agree with it.
+   RFC 3986 §3.1 does define a scheme as case-insensitive, so this is loci being
+   stricter than the spec — deliberately, and in one place.
+
+   **The repair loci ships is the refusal, and it names the spelling.** The day
+   someone types `S3://bucket/Q3-Sales.csv`, `locate` answers \"schemes are
+   case-sensitive here. Spell it s3://bucket/Q3-Sales.csv\" — the same location,
+   one edit away, with the path's own case untouched. Lower-casing it for them
+   is NOT the repair, and an earlier draft of this docstring prescribing it
+   contradicted `locate` one docstring below in the same commit: a remote uri is
+   \"answered VERBATIM … Nothing is parsed on the way through\", and a
+   normalising `locate` hands its caller a string nobody typed. If it is ever
+   done anyway it can only touch the scheme — `s3://bucket/Q3-Sales.csv` and
+   `s3://bucket/q3-sales.csv` are different objects, which is what
+   `locate-answers-a-remote-uri-verbatim` exists to pin. (The reason a first
+   draft gave — \"every uri loci mints is lower-case\" — is not the reason: a
+   remote uri is typed or pasted by a person, and loci mints none of them.)"
   [uri]
   (boolean (some #(str/starts-with? (str uri) %) remote-schemes)))
 
@@ -160,22 +187,58 @@
       uri
 
       :else
-      ;; The known half is composed from `remote-schemes`, so the sentence
-      ;; cannot fall behind the set. Phase 1 wrote this line as a promise —
+      ;; BOTH halves of the list are composed from `remote-schemes`, so neither
+      ;; can fall behind the set. Phase 1 wrote this line as a promise —
       ;; "Remote schemes (s3://, https://) arrive with httpfs" — and phase 3
       ;; kept it while making it come true, which left a message in the future
       ;; tense about schemes that had already arrived, naming two of the five
-      ;; `locate` accepts and omitting `http://` altogether.
+      ;; `locate` accepts and omitting `http://` altogether. Task 2 then fixed
+      ;; the known half and left the deferred half a literal, which is the same
+      ;; defect one clause along: with `gs://` in the set the sentence named it
+      ;; twice, as known and as deferred. `deferred-schemes` minus what loci
+      ;; knows cannot do that.
       ;;
-      ;; The deferred pair is named because the reader who sees this sentence
-      ;; is, more often than not, the one who typed `gs://`. Being told which
-      ;; schemes are deferred answers that; being told remote support is coming
-      ;; when it has already shipped does not.
-      (throw (ex-info (str "loci does not know this location: " uri
-                           " — it knows loci://, file://, "
-                           (str/join ", " (sort remote-schemes)) "."
-                           " gs:// and az:// are not among them yet.")
-                      {:uri uri})))))
+      ;; Three refusals, not one, because "loci does not know this" is the
+      ;; least useful thing to say to the two people who reach here by an
+      ;; accident loci can see. Reciting five schemes at someone who typed
+      ;; `S3://` is worse than useless: they find `s3://` in the list and
+      ;; conclude loci is broken.
+      (let [known    (concat [loci-prefix "file://"] (sort remote-schemes))
+            lower    (str/lower-case uri)
+            ;; The scheme LOWER-CASED matches, the remainder does not move: an
+            ;; S3 key is case-sensitive, so `S3://bucket/Q3-Sales.csv` must be
+            ;; spelled back as `s3://bucket/Q3-Sales.csv` and never as
+            ;; `s3://bucket/q3-sales.csv`, which is a different object.
+            mis-case (some #(when (str/starts-with? lower %) %) known)
+            deferred (sort (remove (set known) deferred-schemes))]
+        (throw (ex-info
+                (str "loci does not know this location: " uri
+                     (cond
+                       mis-case
+                       (str " — schemes are case-sensitive here. Spell it "
+                            mis-case (subs uri (count mis-case)) ".")
+
+                       ;; No scheme at all. `loci://` and `file://` are the two
+                       ;; that name a path, and they are the whole answer — the
+                       ;; remote ones are noise to someone who typed a filename.
+                       ;; This is the sentence the `loci://` branch above
+                       ;; already knows how to say, facing the other way.
+                       (not (re-find #"^[A-Za-z][A-Za-z0-9+.-]*://" uri))
+                       (if (str/starts-with? uri "/")
+                         (str " — that is a path, not a location. Use file://" uri
+                              " for a path on this machine, or loci:// for one under"
+                              " the data directory.")
+                         (str " — that is a path, not a location. Use loci://" uri
+                              " for a path under the data directory, or file:// and an"
+                              " absolute path for one outside it."))
+
+                       :else
+                       (str " — it knows " (str/join ", " known) "."
+                            (when (seq deferred)
+                              (str " " (str/join " and " deferred)
+                                   (if (next deferred) " are" " is")
+                                   " not among them yet.")))))
+                {:uri uri}))))))
 
 (defn- sql-str
   "A value as a single-quoted SQL string literal."
@@ -278,8 +341,15 @@
         (str e))))
 
 (defn unreadable-because
-  "Why `uri` cannot be read as a file right now, as a phrase — or nil when it
-   can.
+  "Why `uri` cannot be read right now, as a phrase — or nil, which only a local
+   file that is there and readable ever earns.
+
+   Two kinds of phrase come out of here, and a caller that needs to tell them
+   apart asks `remote?` — public, free, and never a match on this text. For a
+   local uri the phrase is the whole answer, because loci looked at the
+   filesystem and knows it. For a remote one it names the location and stops;
+   the reason is in the exception the caller is already handling, and
+   `tablestore/hydrate` appends `duckdb-said` to this line.
 
    This is what tells `:table/unavailable` from `:table/source-drift`: a
    passthrough read can fail because the bytes are not there, or because they
@@ -326,21 +396,41 @@
    fetch loci did not ask the user for. Unavailable is the state that puts that
    behind a `Try again` button instead.
 
-   What the phrase costs is `duckdb-said`: the drift marker carries DuckDB's
-   own text and this one does not. That loss is bounded, because only a
-   `:store :source` handle reaches this function at all and `connect!` refuses
-   `:mode :passthrough` over a remote location — so the shape that would pay it
-   is one the sanctioned path cannot build."
+   **What the phrase must NOT do is claim to know why.** The first draft of it
+   said the location \"is a remote location — loci cannot tell whether it can be
+   read without fetching it\", which is false at the instant a person reads it:
+   this function is reached from `hydrate`'s `catch`, after a read that went to
+   DuckDB and failed, and the block it lands in is headed \"source unreachable\".
+   The sentence retracted its own heading, and every neighbouring branch —
+   \"there is no file at /d/x.csv\", \"/d/revdir is a directory, not a file\" —
+   states a fact about the source instead. A 403, an expired credential, a
+   bucket in the wrong region and a key that was never there are indeed
+   indistinguishable FROM THE URI; they were not indistinguishable to the
+   caller, which was holding the exception that named one of them.
+
+   So this says the read failed and where, and the reason arrives from
+   `hydrate` — the same `duckdb-said` its drift marker carries, for the same
+   reason: on this branch loci looked at nothing, so DuckDB's account is the
+   only account there is. A caller with no exception in hand gets the phrase
+   without it.
+
+   **This shape is reachable today, which is why it had to be worth reading.**
+   An earlier draft called the loss bounded because \"`connect!` refuses
+   `:mode :passthrough` over a remote location\" — it does not: that refusal is
+   Task 5 and is not written yet, and DuckDB autoloads httpfs on its own
+   (`autoinstall_known_extensions` and `autoload_known_extensions` both default
+   to true and loci sets neither), so a passthrough connect over `https://…`
+   describes and lands right now. Task 5 will refuse NEW connects; it cannot
+   refuse a handle already committed, which would carry this sentence for as
+   long as it exists."
   [uri]
   (try
     (if (remote? uri)
       ;; The uri VERBATIM, and no `File` — see the docstring for why this is a
-      ;; phrase and not nil. A 404, a 403, an expired credential and a bucket
-      ;; in the wrong region are all one round trip away and none of them is
-      ;; knowable from the uri, so this says only the thing the scheme already
-      ;; told it.
-      (str uri " is a remote location — loci cannot tell whether it can be read"
-           " without fetching it")
+      ;; phrase and not nil, and why it states the failure rather than loci's
+      ;; own ignorance of its cause. It ends where loci's knowledge ends:
+      ;; `hydrate` continues the sentence with what DuckDB said.
+      (str "loci could not read the remote location " uri)
       (let [f (java.io.File. ^String (locate uri))]
         (cond
           (not (.exists f))  (str "there is no file at " (.getPath f))

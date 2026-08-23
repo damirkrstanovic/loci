@@ -1,5 +1,6 @@
 (ns loci.tablestore-test
   (:require [clojure.edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
@@ -221,6 +222,65 @@
     (is (thrown-with-msg? Exception #"disk on fire"
           (tbl/hydrate boom {:kind :table :value h}))
         "the original read error survives, not the one from asking about it")))
+
+;; A DuckDB httpfs failure in the driver's own shape: a preamble about the
+;; driver's state, the `Error:` paragraph that is the only line about what the
+;; caller did, then a dump of SQL loci generated. `duckdb-said` keeps the middle
+;; one, and "(HTTP 403)" appears in NO phrase loci writes — which is what makes
+;; matching on it an actual test of whether the message was carried.
+(def ^:private duckdb-403
+  (str "Invalid Input Error: Attempting to execute an unsuccessful or closed pending query result\n"
+       "Error: HTTP Error: HTTP GET error on 'https://acme-reports.s3.amazonaws.com/q3.csv' (HTTP 403)\n"
+       "\n"
+       "LINE 1: DESCRIBE SELECT * FROM read_csv('s3://acme-reports/q3.csv')\n"
+       "                               ^"))
+
+(defn- forbidden
+  "A store whose every read fails the way an expired credential does."
+  []
+  (reify tbl/TableStore
+    (put-rows! [_ _ _] nil)
+    (rows [_ _ _] (throw (java.sql.SQLException. duckdb-403)))
+    (row-count [_ h] (:rows h))
+    (reclaimed-at [_ _] nil)
+    (column-samples [_ _ _ _] nil)))
+
+(defn- src-hydrate [uri]
+  (tbl/hydrate (forbidden)
+               {:id "tbl:q3" :kind :table :title "Q3"
+                :value {:store :source :uri uri :format :csv :cols [:a]
+                        :rows 1 :at "2026-08-23T10:00:00Z"}}))
+
+(deftest a-remote-source-that-will-not-read-says-what-duckdb-said
+  ;; `unreadable-because` takes a uri and nothing else, so over a remote one it
+  ;; can name the location and no more — there is no filesystem it could have
+  ;; consulted. The reason was in the exception this branch is already holding,
+  ;; and dropping it drew a block headed "source unreachable" that could not say
+  ;; whether the credentials had expired or the key was never written.
+  (let [why (:table/unavailable (src-hydrate "s3://acme-reports/q3.csv"))]
+    (is (string? why))
+    (is (str/includes? why "s3://acme-reports/q3.csv")
+        (str "the location, verbatim: " why))
+    (is (str/includes? why "(HTTP 403)")
+        (str "and DuckDB's own account, which is the only account of WHY that
+              exists on this branch: " why))
+    (is (not (str/includes? why "pending query result"))
+        (str "through duckdb-said, so not the driver's state: " why))
+    (is (not (str/includes? why "LINE 1"))
+        (str "and not a dump of SQL the caller never wrote: " why))))
+
+(deftest a-local-unavailable-source-stays-in-locis-own-words
+  ;; The control, and what fails if the append above is written unconditionally.
+  ;; loci looked at the filesystem to choose this branch and knows the real
+  ;; answer, so DuckDB's line is the same fact in a worse voice — the rule this
+  ;; file's docstring states, and the one the remote branch is an exception to
+  ;; because there loci looked at nothing.
+  (let [why (:table/unavailable (src-hydrate (str "file:///no/such/dir-" (System/nanoTime)
+                                                  "/q3.csv")))]
+    (is (str/includes? why "there is no file at")
+        (str "loci's own phrase, from the filesystem it asked: " why))
+    (is (not (str/includes? why "HTTP 403"))
+        (str "and nothing appended over it — a local phrase is the whole message: " why))))
 
 (deftest check-names-refuses-two-names-that-become-one-column
   (is (nil? (tbl/check-names! ["Total Revenue ($)" "Region"]))
