@@ -35,7 +35,34 @@ mode; DuckDB is the connector framework"*, finally being paid out.
 ## Credentials: loci stores none
 
 **`CREATE SECRET (TYPE s3, PROVIDER credential_chain)`**, issued once against the lake's connection,
-**on first remote use rather than at lake open**. The AWS SDK chain finds environment variables,
+**on first `s3://` use rather than at lake open**.
+
+**On first `s3://` use, not first remote use — corrected 2026-08-23 after measuring.** An earlier
+draft said "first remote use", and that would have been a real defect. `CREATE SECRET … PROVIDER
+credential_chain` is **validated at CREATE time**: the `aws` extension walks the entire chain right
+there and throws if it finds nothing. Measured on a machine with no AWS credentials, twice on two
+fresh connections: **6,069 ms and 6,053 ms**, ending in
+
+```
+Invalid Configuration Error: Secret Validation Failure: during `create` using the following:
+Credential Chain: 'config'
+```
+
+and **10.5 s on a first call**, because `aws` autoinstalls over the network before it can refuse.
+
+So issuing the secret on first *remote* use would have put six seconds and a hard failure in front of
+every `https://` read on every machine without AWS credentials — most laptops, and this project's own
+test suite. The secret is therefore conditional on the `s3://` scheme, and an `https://` read issues
+none.
+
+**A failed attempt is deliberately not remembered**, so a user who fixes their credentials and
+retries succeeds without restarting loci — at the cost of paying the ~6 s again on each attempt that
+still has none.
+
+**`aws` is a second extension, and the image needs it.** `httpfs` alone reads `https://` and fails
+`s3://` with `Extension Autoloading Error: … the required extension 'aws'`. Verified against an
+extension directory holding only `httpfs` with autoinstall off — which is exactly the offline image
+this spec targets. The AWS SDK chain finds environment variables,
 `~/.aws/credentials`, an EC2 instance profile, or IRSA in Kubernetes — the same way every other tool
 in that container already does.
 
