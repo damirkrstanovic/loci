@@ -533,11 +533,18 @@
      an instance profile and IRSA — every one of them an input to the chain,
      and not one of them the thing that was already set up.
 
-   **Cheap enough that it is not a trade.** 12.7 ms against the 6,000 ms
+   **Cheap enough that it is not a trade.** ~2 ms against the 6,000 ms
    `CREATE SECRET` it can skip, and it needs neither `httpfs` nor `aws`:
    measured on a bare connection with httpfs `loaded false`, `which_secret`
    answered. So it also removes the six seconds on a machine that has a secret,
    which is the deployment where a lake gets connected most often.
+
+   **12.7 ms was the number here until 2026-08-23 and it was a first call.**
+   Re-measured in a cold JVM: 5.8 and 5.3 ms for the first `which_secret` of a
+   process, 2.1 and 1.9 ms after; warm, five calls gave 2.3 / 7.4 / 2.1 / 2.4 /
+   2.6 ms. Corrected rather than left, because a reader deciding whether to add
+   a cache in front of this should see the real figure — there is nothing here
+   to cache.
 
    `which_secret` and not `duckdb_secrets()` because the question is about THIS
    uri, not about the secret table: it takes the path and the type and returns
@@ -595,12 +602,23 @@
    *created*: DuckDB's `aws` extension walks the whole chain then and there,
    and on a machine the chain cannot satisfy it does not hand back an unused
    secret, it throws. Measured 2026-08-23 on DuckDB 1.5.5 with no AWS
-   credentials present: **10.5 s** the first time, of which the autoinstall of
-   the `aws` extension is part, and **6.0 s** every time after. Issuing it for
+   credentials present: **10.5 s** the first time and **6.0 s** every time
+   after. Issuing it for
    every remote scheme would therefore put six seconds and a hard failure in
    front of every `https://` read on every machine without AWS credentials —
    most laptops, and the whole test suite — to obtain a credential that scheme
    never uses. See `s3-prefix`.
+
+   **The first time is not the autoinstall, corrected 2026-08-23 after
+   re-measuring.** The sentence here used to say the extra four seconds were
+   `aws` arriving over the network. They are not: with `aws` already installed
+   AND explicitly `LOAD`ed first, a cold JVM still paid 10,022 ms on its first
+   CREATE and 6,018 ms on its second, twice, while the `LOAD` itself cost
+   46 ms. It is a once-per-process cost inside the chain's first walk — a warm
+   process that had already paid it opened a brand-new lake connection and got
+   6,028 ms on that connection's first CREATE. So an **offline image pays the
+   four seconds too**, which is the opposite of what the autoinstall story
+   predicts, and the reason to correct it rather than round it away.
 
    That measurement also said what the `aws` extension costs, which is a fact
    about the image rather than about this function: `credential_chain` needs
