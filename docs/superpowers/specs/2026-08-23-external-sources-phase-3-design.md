@@ -158,7 +158,16 @@ way every other DuckDB failure already is.
 
 ## What does not change
 
-- **The `＋ Data` panel.** Its file tab already accepts a typed URI; a remote one is a URI.
+- ~~**The `＋ Data` panel.** Its file tab already accepts a typed URI; a remote one is a URI.~~
+  **False, corrected 2026-08-23.** It does not. `dataFileTab` renders exactly two controls — an
+  `<input type="file">` and a list of `.filerow` buttons built from `GET /api/source/files` — and
+  both `dataPreview` call sites take their uri from the upload reply or that listing, so every uri
+  the panel can produce is `loci://files/<hash>`. There is no text input in it at all.
+
+  I asserted this without checking and it propagated into `describe`'s docstring. Left struck rather
+  than deleted, because the phase was planned on it: **as built, phase 3 is reachable only by `curl`
+  or a REPL** — which is the state phase 2 opened by naming as unfinished. **The door is a task of
+  its own**, added to the plan on 2026-08-23.
 - **The `:source` block, the live badge, drift, unavailable, `refresh!`, `:connectedAs`.** A remote
   materialised table is an ordinary materialised table.
 - **`sourcespec/relation`, the `readers` map, the handle shapes.** Untouched.
@@ -193,8 +202,13 @@ way every other DuckDB failure already is.
 
 ## What connecting a remote source exposes, decided 2026-08-23
 
-**Connecting a source is a server-side fetch of a caller-supplied URL.** After this phase, a
-`POST /api/source/connect` makes loci issue an outbound request from its own network position — and
+**Connecting a source is a server-side fetch of a caller-supplied URL — and so is previewing one.**
+After this phase, a `POST /api/source/connect` **or `POST /api/source/describe`** makes loci issue an
+outbound request from its own network position. `describe` matters more than it looks: it is the
+cheap-by-construction route, it commits nothing, and `server.clj`'s own routing comment argues the
+source routes sit on the safe side of the line partly for that reason. For `s3://` it is now also the
+route that issues the credential secret, so an unauthenticated preview signs its requests with the
+host's IAM identity — and
 `server.clj`'s `(http/run-server #'handler {:port port})` passes no `:ip`, so http-kit binds
 `0.0.0.0`, and the handler has no authentication.
 
