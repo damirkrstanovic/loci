@@ -790,23 +790,37 @@
    before refusing, measured the same day. The network is not a test fixture,
    and neither is the absence of an AWS account.
 
-   Returns the SQL, whatever each call answered or threw, and the guard set —
-   the last because the SQL alone cannot show which failures were remembered."
-  ([uris] (remote-sql uris (constantly false)))
-  ([uris fail?]
-   (let [sql (atom [])
-         ;; nil for the connection: `x!` is the only thing that touches one and
-         ;; it is stubbed, exactly as `failed-extension` above does it.
-         lk  (bare-lake nil "/no-such-lake")
+   `covered?` is a predicate on the QUERY text, and says whether DuckDB already
+   holds a secret for the location `secret-covers?` is asking about. Stubbed
+   rather than set up for real because a real one is a `CREATE PERSISTENT
+   SECRET`, which writes a file into the developer's own `~/.duckdb` and
+   outlives the test run. `which_secret`'s real answers are zero rows and one
+   `{:name …}` row, measured 2026-08-23 on DuckDB 1.5.5, and that is what this
+   returns.
+
+   Returns the statements, the queries, whatever each call answered or threw,
+   and the guard set — the last because the SQL alone cannot show which
+   failures were remembered."
+  ([uris] (remote-sql uris (constantly false) (constantly false)))
+  ([uris fail?] (remote-sql uris fail? (constantly false)))
+  ([uris fail? covered?]
+   (let [sql     (atom [])
+         queries (atom [])
+         ;; nil for the connection: `x!` and `q` are the only things that touch
+         ;; one and both are stubbed, as `failed-extension` above does it.
+         lk      (bare-lake nil "/no-such-lake")
          out (with-redefs [lake/x! (fn [_ s]
                                      (swap! sql conj s)
                                      (if (fail? s)
                                        (throw (java.sql.SQLException. "injected"))
-                                       :ok))]
+                                       :ok))
+                           lake/q  (fn [_ s]
+                                     (swap! queries conj s)
+                                     (if (covered? s) [{:name "opsecret"}] []))]
                (mapv (fn [u] (try (lake/ensure-remote! lk u)
                                   (catch clojure.lang.ExceptionInfo e e)))
                      uris))]
-     {:sql @sql :out out :ensured @(:ensured lk)})))
+     {:sql @sql :queries @queries :out out :ensured @(:ensured lk)})))
 
 (deftest ensure-remote-really-loads-httpfs
   ;; The one assertion in this section a stub cannot make, and the reason this
@@ -840,8 +854,12 @@
       (finally (.close conn)))))
 
 (deftest ensure-remote-loads-httpfs-and-issues-the-secret-once
-  (let [{:keys [sql out ensured]} (remote-sql ["s3://bucket/sales.csv"
-                                               "s3://bucket/sales.csv"])]
+  (let [{:keys [sql queries out ensured]} (remote-sql ["s3://bucket/sales.csv"
+                                                       "s3://bucket/sales.csv"])]
+    (is (= ["SELECT name FROM which_secret('s3://bucket/sales.csv', 's3')"] queries)
+        "the check for an existing secret runs BEFORE the six-second CREATE, and
+         it is inside the same guard — asked once for the connection, not once
+         per read, so it cannot become a per-read query nobody counted")
     ;; Equality and not two counts, because it also pins the ORDER and the
     ;; absence of anything else: the whole of what a remote read costs a
     ;; connection is two statements, and a count of each would stay green if a
@@ -906,6 +924,145 @@
         "TEMPORARY is DuckDB's default and keeping it is the point: a PERSISTENT
          secret is written unencrypted under ~/.duckdb, so that one word would move
          loci from storing no credential to storing one")))
+
+(deftest a-secret-duckdb-already-holds-is-not-overridden
+  ;; The escape hatch the spec promises — "a bucket the chain cannot reach fails
+  ;; with an auth error, and the user fixes it outside loci" — and DuckDB's
+  ;; documented way to do that is `CREATE PERSISTENT SECRET`. Without this
+  ;; check it did not work, measured 2026-08-23 on DuckDB 1.5.5: a persistent
+  ;; `loci_s3` and a temporary one COEXIST with no error, and at equal scope the
+  ;; temporary wins — `which_secret('s3://bucket/x.csv','s3')` named the
+  ;; operator's secret, then named loci's the moment it existed. On the machine
+  ;; that actually needs the hatch it is worse: the chain has nothing, so the
+  ;; CREATE throws first and the source is refused before any read, with working
+  ;; keys sitting unused in ~/.duckdb/stored_secrets.
+  (let [{:keys [sql queries out ensured]}
+        (remote-sql ["s3://bucket/sales.csv"] (constantly false) (constantly true))]
+    (is (= ["LOAD httpfs"] sql)
+        "httpfs still, because the read needs it — but NO CREATE SECRET, so the
+         operator's own secret is the one DuckDB consults")
+    (is (= ["SELECT name FROM which_secret('s3://bucket/sales.csv', 's3')"] queries)
+        "asked about THIS location and not about the secret table, so a secret
+         scoped to some other bucket does not count as covering this one")
+    (is (= [:ok] out))
+    (is (= #{:httpfs :s3} ensured)
+        "and the connection is still marked prepared — a covered location is
+         prepared, so the query is not repeated on every later remote read")))
+
+(deftest a-quote-in-the-location-cannot-break-out-of-the-secret-check
+  ;; Unlike `ensure-extension!`'s `ext`, whose docstring argues at length that a
+  ;; closed caller set is the only thing closing its injection seam, this
+  ;; argument is a location a person typed into the ＋ Data panel — and `x!`'s
+  ;; `.execute` runs `;`-separated statements, measured in that same docstring.
+  (let [{:keys [queries]} (remote-sql ["s3://b/x'); CREATE TABLE pwned(i INT); --"])]
+    (is (= ["SELECT name FROM which_secret('s3://b/x''); CREATE TABLE pwned(i INT); --', 's3')"]
+           queries)
+        "the quote is doubled, so the payload stays inside the string literal")))
+
+(deftest the-refusal-names-the-extension-its-cause-carries
+  ;; `ensure-extension!` already puts the name it was asked for into ex-data, so
+  ;; writing "httpfs" here as well was a second copy of the same fact. One
+  ;; caller makes the two agree by luck; a second one loading `aws` — which
+  ;; `ensure-remote!`'s docstring says an offline image will need — would make
+  ;; this message name the wrong extension, in a sentence whose whole job is to
+  ;; say which one.
+  (let [aws (#'lake/remote-extension-problem
+             "s3://b/x.csv" (ex-info "boom" {:extension "aws" :dir "/x"}))
+        raw (#'lake/remote-extension-problem
+             "s3://b/x.csv" (java.sql.SQLException. "boom"))]
+    (is (str/includes? aws "DuckDB's aws extension is not available") aws)
+    (is (not (str/includes? aws "httpfs"))
+        (str "it named the extension the caller happens to use today: " aws))
+    (is (str/includes? raw "DuckDB's httpfs extension is not available")
+        (str "a cause carrying no ex-data must still say something true — httpfs "
+             "is the only way to reach here: " raw))))
+
+(deftest two-threads-arriving-together-issue-one-secret
+  ;; The guard and the statement it guards were separated by a SIX SECOND
+  ;; `CREATE SECRET`, so two threads in that window both found `:s3` absent and
+  ;; both issued it. The loser gets `Invalid Input Error: Temporary secret with
+  ;; name 'loci_s3' already exists!` — measured 2026-08-23 on DuckDB 1.5.5 by
+  ;; issuing the statement twice on one connection — which the `catch` turns
+  ;; into `credential-problem`, telling a machine whose credentials are FINE to
+  ;; go and set AWS_ACCESS_KEY_ID.
+  ;;
+  ;; Not an invented concurrency requirement: `loci.source/describe` is
+  ;; deliberately OUTSIDE `connect-lock` and `refresh!` takes no lock at all,
+  ;; both on http-kit worker threads, so two tabs connecting s3:// sources is
+  ;; the whole of what it takes. `source.clj` records a measured 8-thread race
+  ;; on `mint-id` that lost seven objects, which is why `connect-lock` exists;
+  ;; this is the same shape.
+  ;;
+  ;; **Deterministic, and not a load test.** The interleave is forced rather
+  ;; than hoped for: the stub holds thread A inside the CREATE on a latch, so A
+  ;; provably has not reached `(swap! ensured conj :s3)` when B starts, and B is
+  ;; released to run with the guard in exactly the state that makes the race
+  ;; real. Nothing here measures how often anything goes wrong — the two
+  ;; outcomes are distinguished by which of them happened at all.
+  (let [uri      "s3://bucket/sales.csv"
+        sql      (atom [])
+        seen     (atom 0)
+        at-chain (java.util.concurrent.CountDownLatch. 1)
+        release  (java.util.concurrent.CountDownLatch. 1)
+        create?  #(str/includes? % "CREATE SECRET")
+        ;; off for the warm-up below, or the warm-up is the thread that parks on
+        ;; the latch and the suite never returns
+        armed    (atom false)
+        stub     (fn [_ s]
+                   (swap! sql conj s)
+                   (when (and @armed (create? s))
+                     (if (= 1 (swap! seen inc))
+                       ;; the first one in stands where the six seconds are.
+                       ;; Bounded, so a mistake in the driver below fails the
+                       ;; test instead of hanging the suite — which it did once.
+                       (do (.countDown at-chain)
+                           (.await release 30 java.util.concurrent.TimeUnit/SECONDS))
+                       (throw (java.sql.SQLException.
+                               (str "Invalid Input Error: Temporary secret with"
+                                    " name 'loci_s3' already exists!")))))
+                   :ok)]
+    (with-redefs [lake/x! stub
+                  lake/q  (fn [_ _] [])]
+      ;; Warm every class this path touches before the race, so a
+      ;; class-initialization monitor cannot be mistaken for ours below.
+      (lake/ensure-remote! (bare-lake nil "/no-such-lake") uri)
+      (reset! sql []) (reset! seen 0) (reset! armed true)
+      (let [lk (bare-lake nil "/no-such-lake")
+            a  (future (try (lake/ensure-remote! lk uri) (catch Throwable t t)))
+            ;; A is provably inside the CREATE and provably has NOT yet set the
+            ;; guard, which is the whole of what makes the interleave forced
+            in? (.await at-chain 30 java.util.concurrent.TimeUnit/SECONDS)
+            bx (atom nil)
+            tb (doto (Thread. ^Runnable #(reset! bx (try (lake/ensure-remote! lk uri)
+                                                         (catch Throwable t t))))
+                 (.start))
+            ;; B is now heading for one of two terminal states: parked on the
+            ;; monitor, or through the guard and into the stub. Poll for
+            ;; whichever arrives instead of sleeping a guessed interval — the
+            ;; bound exists so a third possibility fails the test rather than
+            ;; hanging the suite.
+            outcome (loop [n 0]
+                      (cond
+                        (> @seen 1)                             :second-create-issued
+                        (= Thread$State/BLOCKED (.getState tb)) :parked-on-the-monitor
+                        (> n 20000)                             :neither
+                        :else (do (Thread/sleep 1) (recur (inc n)))))]
+        (.countDown release)
+        (.join tb 30000)
+        (let [ax @a]
+          (is (true? in?) "A never reached the CREATE, so nothing below is testing a race")
+          (is (= :parked-on-the-monitor outcome)
+              (str "B got past a guard A had not yet set — the read-then-write is "
+                   "not serialised: " outcome))
+          (is (= 1 (count (filter create? @sql)))
+              (str "the six-second statement was issued twice: " (pr-str @sql)))
+          (is (= :ok ax) (str "the winner: " (pr-str ax)))
+          (is (= :ok @bx)
+              (str "the loser must WAIT and then find the work done, not be told "
+                   "its credentials are broken: "
+                   (if (instance? Throwable @bx) (.getMessage ^Throwable @bx)
+                       (pr-str @bx))))
+          (is (= #{:httpfs :s3} @(:ensured lk))))))))
 
 (deftest a-failed-credential-chain-names-what-to-fix-and-is-not-remembered
   (let [{:keys [sql out ensured]} (remote-sql ["s3://bucket/x.csv" "s3://bucket/x.csv"]
