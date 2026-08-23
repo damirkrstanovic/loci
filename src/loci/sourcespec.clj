@@ -218,19 +218,42 @@
                        (str " — schemes are case-sensitive here. Spell it "
                             mis-case (subs uri (count mis-case)) ".")
 
-                       ;; No scheme at all. `loci://` and `file://` are the two
-                       ;; that name a path, and they are the whole answer — the
-                       ;; remote ones are noise to someone who typed a filename.
-                       ;; This is the sentence the `loci://` branch above
-                       ;; already knows how to say, facing the other way.
+                       ;; No scheme at all — and this sentence has TWO audiences
+                       ;; now, which is what phase 3 changed about it. It was
+                       ;; written for someone who typed a filename, and for that
+                       ;; reader `loci://` and `file://` really are the whole
+                       ;; answer. But the ＋ Data panel now puts it under a field
+                       ;; whose placeholder reads *…or a URL loci fetches*, so
+                       ;; `example.com/sales.csv` lands here too, and so does the
+                       ;; `s3:/bucket/x.csv` one-slash typo — and telling either
+                       ;; of them to write `loci://example.com/sales.csv` is
+                       ;; telling them to make it worse. `https://` is the one
+                       ;; edit that fixes the first and `s3://` the second, and
+                       ;; neither was named.
+                       ;;
+                       ;; **Named, not composed onto what was typed.** Prefixing
+                       ;; `https://` is the right repair for a host and nonsense
+                       ;; for a filename, and nothing in the string separates
+                       ;; `example.com/x.csv` from `sales.csv` without a guess.
+                       ;; So the two that CAN be composed are, and the remote set
+                       ;; is listed — from `remote-schemes` and never as a
+                       ;; literal, for the reason the `:else` clause below gives:
+                       ;; a literal here is a second place to fall behind the set.
+                       ;;
+                       ;; A leading slash is not ambiguous and keeps the sentence
+                       ;; it had: `/data/x.csv` is a path on this machine, and
+                       ;; `https:///data/x.csv` is not a repair for anything.
                        (not (re-find #"^[A-Za-z][A-Za-z0-9+.-]*://" uri))
                        (if (str/starts-with? uri "/")
                          (str " — that is a path, not a location. Use file://" uri
                               " for a path on this machine, or loci:// for one under"
                               " the data directory.")
-                         (str " — that is a path, not a location. Use loci://" uri
-                              " for a path under the data directory, or file:// and an"
-                              " absolute path for one outside it."))
+                         (str " — there is no scheme on the front of it, so loci"
+                              " cannot tell where it is. Use loci://" uri
+                              " for a path under the data directory, file:// and an"
+                              " absolute path for one outside it, or "
+                              (str/join ", " (sort remote-schemes))
+                              " for a location loci fetches."))
 
                        :else
                        (str " — it knows " (str/join ", " known) "."

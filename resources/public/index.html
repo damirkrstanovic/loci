@@ -264,7 +264,16 @@
      DuckDB's own text and an indented fix, over eight lines. `esc()` keeps those
      newlines and a `<p>` collapses every one of them, so without this the whole
      of it is drawn as a single run-on line. `pre-wrap` and not `pre-line`: the
-     two-space indents are the author's, and pre-line eats them. */
+     two-space indents are the author's, and pre-line eats them.
+
+     `overflow-wrap` is the other half of the same paragraph, and it is the
+     declaration that decides how a long URL breaks. Every one of these messages
+     names the location it failed on, and a presigned s3 URL is 500-odd
+     characters with no space anywhere in it; `pre-wrap` breaks at soft wrap
+     opportunities only, so without this that one word sets the width of the
+     column and the message runs off the side of the panel. `anywhere` and not
+     `break-word` because only `anywhere` is counted when the min-content width
+     is computed, which is the width this box is actually laid out against. */
   .reclaimed p.srcerr{white-space:pre-wrap;overflow-wrap:anywhere}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
@@ -1333,11 +1342,26 @@ async function uploadChunks(f,onProgress){
 // and the moment ‹ another file exists during a fetch the late answer can land
 // on a host somebody else has already repainted.
 //
-// `host.isConnected` cannot see that. It is the SAME element both times — the
-// panel's `.dbody` — so the guard 12af324 added one level up is true for a stale
-// describe and the preview paints straight over the listing. So: one token per
-// render, bumped by whoever paints, and every async paint checks that it is
-// still the last one to have bumped it.
+// `host.isConnected` cannot see that. It is the SAME element every time — the
+// panel's `.dbody` — so it is true for a stale describe and the preview paints
+// straight over the listing. Element identity is the TECHNIQUE 12af324 used one
+// level up, and it is the technique that cannot discriminate here, not that
+// guard: 12af324's is about a notebook render landing on a body somebody opened
+// a form in, and it is not on this path at all. What carries over from it is its
+// rule — losing what someone typed is worse than showing slightly old cells.
+//
+// So: one token per render, bumped by whoever paints, and every async paint
+// checks that it is still the last one to have bumped it. THREE painters bump
+// it — `dataFileTab`, `dataPreview` and `dataPasteTab` — because the tab buttons
+// sit outside `.dbody` and stay clickable while a describe is in flight.
+//
+// **Not an `AbortController`, and the reason is not that it would be awkward.**
+// It would cancel the browser's half of one fetch and nothing else: `describe`
+// IS the remote read, it runs in the JVM, and loci has no cancel for it — so the
+// six seconds are spent either way and only the PAINT was ever in question. The
+// token also covers what a signal would not reach without being threaded there:
+// the upload, which is one request per chunk, and a paint that was never a fetch
+// at all (Paste). One rule for every async paint in this panel, and no second.
 const dgen   = host => (host.__dgen=(host.__dgen||0)+1);
 const dstale = (host,gen) => !host.isConnected || host.__dgen!==gen;
 function dataFileTab(i,sp,host){
@@ -1366,11 +1390,23 @@ function dataFileTab(i,sp,host){
     '<button type="button" class="btn ghost sm" data-a="durlgo">Preview</button></div>';
   const wireUrl=()=>{
     const inp=host.querySelector('.durlin'); if(!inp) return;
+    // **The URL survives ‹ back**, and this line is the whole of the mechanism.
+    // A remote preview that failed has just cost six seconds, and ‹ redraws this
+    // tab from scratch — so without it the way out of a failure is to paste a
+    // 500-character presigned URL again, from a clipboard that may not still
+    // hold it. There is no "try again" on the error state and none is wanted:
+    // ‹ IS the retry once the field it goes back to is not empty.
+    //
+    // Kept on the host and not in a closure, because `dataFileTab` runs again
+    // from nothing each time and the host is the one thing that does not. It
+    // dies with the panel: `startData` builds a fresh `.dbody` every open.
+    inp.value=host.__durl||'';
     // Straight into `dataPreview`, which is the picker's own path — describe,
     // columns, mode, Connect. A typed URL is a location arriving, not a second
     // way to connect one, exactly as an upload is not.
     const go=()=>{
       const u=inp.value.trim(); if(!u) return;
+      host.__durl=u;
       dataPreview(i,sp,host,{uri:u,name:uriTail(u)});
     };
     host.querySelectorAll('[data-a="durlgo"]').forEach(el=>el.addEventListener('click',go));
@@ -1537,12 +1573,19 @@ function dataPreview(i,sp,host,f){
     // rather than a decision that it does not matter. `files/connected-as` can
     // answer for ANY uri, but the two places that fill this key —
     // `/api/source/files` and the upload reply — are both about loci's own
-    // directory, and no directory listing will ever contain a bucket. Asking for
-    // one uri needs a route that does not exist, and inventing one is a route, a
-    // contract and a test in a phase that is about locations. So: not now, and
-    // the cost is that connecting the same URL twice makes two tables in silence
-    // — which `undo!` reverses, and which the picked-row door has warned about
-    // since phase 2.
+    // directory, and no directory listing will ever contain a bucket.
+    //
+    // What it does NOT need is a route that does not exist, and an earlier draft
+    // of this comment said it did. `source-describe` already takes the store and
+    // already ignores it — *"Takes `st` and ignores it, so the three routes read
+    // alike and a later preview that wants the store does not change the route"*
+    // is its own docstring, written in anticipation of exactly this — so the
+    // answer is one more key on a reply the panel already waits for. It is
+    // deferred because it is still a server change with its own contract and its
+    // own test, in a phase that is about locations; not because there is nowhere
+    // to put it. The cost is unchanged: connecting the same URL twice makes two
+    // tables in silence — which `undo!` reverses, and which the picked-row door
+    // has warned about since phase 2.
     const dupe=f.connectedAs
       ? '<div class="dupe-note">loci already has this file as <b>'+esc(f.connectedAs)+
         '</b>. Connecting again makes a second table from the same rows.</div>'
@@ -1615,7 +1658,18 @@ function dataPreview(i,sp,host,f){
 // The paste tab — `startImport`'s body, moved and not rewritten, ids included.
 // A CSV you can paste is one somebody already has in a clipboard, which makes
 // this the narrowest of the doors and no longer the only one.
+//
+// **It bumps the token too, and that is not bookkeeping.** The `.dtabs` buttons
+// live OUTSIDE `.dbody` and stay clickable through the whole of a six-second
+// remote describe, so Paste is the THIRD painter of this host — and the only one
+// whose paint is a form somebody types into. Without the bump a describe that
+// lands afterwards is stale by no test the other two apply: `.dbody` is still
+// connected, and `__dgen` still holds the number the preview set. It then paints
+// its columns over the textarea and everything typed into it, under a Paste tab
+// still highlighted as the active one. 12af324's rule is the one being kept —
+// losing what someone typed is worse than showing slightly old cells.
 function dataPasteTab(i,sp,host){
+  dgen(host);
   host.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
     'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
     '<button class="btn sm" id="goImp">Import</button><button class="btn ghost sm" id="cancelImp">Cancel</button></div>'+
@@ -2012,7 +2066,20 @@ const srcFile = uri => String(uri||'').replace(/^loci:\/\/files\//,'');
 // the server reads map one-to-one onto extensions, so a second place to say it
 // would be a second place to be wrong. Unknown extensions ask as CSV, which is
 // what `read_csv`'s sniffer is for.
-const srcFormat = uri => (String(uri||'').toLowerCase().match(/\.(csv|parquet|json)$/)||[,'csv'])[1];
+//
+// **The query string comes off first**, for the same reason `uriTail` strips it
+// a few lines down. A presigned URL is the ordinary way an S3 object is handed
+// over https — it is the escape hatch loci's own credential message points at —
+// and it carries its signature after a `?`. Matched with `$` against the whole
+// string, `sales.parquet?X-Amz-Signature=…` ends in neither `.parquet` nor
+// `.csv`, falls through to the default, and loci reads a parquet file with
+// `read_csv`: a DuckDB parse error attributed to the URL, or, for `.json?token=`,
+// one VARCHAR column of raw JSON text that Connect will happily materialise.
+// The heading says `sales.parquet · csv` while it happens — the panel disagreeing
+// with itself on screen. A `?` cannot occur in a `loci://files/<hash>` uri, so no
+// caller that existed before the URL field changes.
+const srcFormat = uri => (String(uri||'').toLowerCase().split(/[?#]/)[0]
+  .match(/\.(csv|parquet|json)$/)||[,'csv'])[1];
 // Is this a location DuckDB FETCHES rather than one loci resolves? The same
 // question `sourcespec/remote?` answers, and yes, that is two places.
 //
@@ -2030,7 +2097,19 @@ const isRemote = uri => /^(https?|s3):\/\//.test(String(uri||''));
 // behind it to take a name from: `https://h/a/sales.csv?t=1` → `sales.csv`.
 // Falls back to the whole uri rather than to '' — an empty heading and a blank
 // proposed title are worse than a long one.
-const uriTail = uri => String(uri||'').split(/[?#]/)[0].split('/').filter(Boolean).pop() || String(uri||'');
+//
+// Decoded, because what this answers is a HEADING and a proposed table title —
+// not a location. `sales%20q3.csv` is what the URL has to say; `sales q3.csv` is
+// what the file is called, and it is the name that goes in the title field. In a
+// try/catch and not bare: a lone `%` is a legal character in a path DuckDB will
+// fetch, `decodeURIComponent` throws `URIError` on it, and that would take the
+// whole preview out over a heading. The uri itself is never touched — `locate`
+// answers a remote location verbatim, and `f.uri` is the only string that
+// reaches DuckDB.
+const uriTail = uri => {
+  const t = String(uri||'').split(/[?#]/)[0].split('/').filter(Boolean).pop() || String(uri||'');
+  try{ return decodeURIComponent(t); }catch(e){ return t; }
+};
 
 // A drifted source's columns AS THEY ARE NOW, by object id — the actionable
 // half, and the half the recorded handle cannot know.

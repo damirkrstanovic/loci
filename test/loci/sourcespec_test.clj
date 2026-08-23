@@ -160,19 +160,56 @@
                 loci already reads: " msg)))))
 
 (deftest locate-tells-a-path-from-a-location
-  ;; A bare filename is the other accident loci can see, and the answer is the
-  ;; two schemes that name a path — not the three that fetch one, and not
-  ;; `gs://`/`az://`, which someone who forgot the scheme is not shopping for.
-  ;; The `loci://` branch already knows how to say this facing the other way:
-  ;; "Use file:// for a path outside it."
+  ;; A bare filename is the other accident loci can see, and `loci://` is the
+  ;; repair for it: an uploaded file is the common case and that is where it
+  ;; lives. The `loci://` branch already knows how to say this facing the other
+  ;; way — "Use file:// for a path outside it."
+  ;;
+  ;; **This assertion used to end at `file://`, and required the message NOT to
+  ;; name a remote scheme** — "they forgot the scheme, they are not choosing
+  ;; one." That was right while the only way to reach `locate` was a REPL or an
+  ;; upload. Phase 3 put the sentence under a ＋ Data field whose placeholder
+  ;; reads *…or a URL loci fetches*, and the reader who types
+  ;; `example.com/sales.csv` or `s3:/bucket/x.csv` into it lands in exactly this
+  ;; branch — with `https://` and `s3://` being the single edit each of them
+  ;; needs, and neither named. So the branch has two audiences and answers both,
+  ;; and this test now pins that rather than the older half of it.
   (let [e   (try (ssp/locate "sales.csv") nil (catch clojure.lang.ExceptionInfo e e))
         msg (str (some-> e .getMessage))]
     (is (some? e))
     (is (str/includes? msg "loci://sales.csv")
         (str "an uploaded file is the common case, and loci:// is where it lives: " msg))
     (is (str/includes? msg "file://") (str "with the other spelling named too: " msg))
-    (is (not (str/includes? msg "s3://"))
-        (str "and no scheme list — they forgot the scheme, they are not choosing one: " msg)))
+    (is (str/includes? msg "https://")
+        (str "and the scheme a URL needs, which is the one edit the ＋ Data field's own
+              reader is missing: " msg))
+    (is (not (str/includes? msg "gs://"))
+        (str "but not the deferred pair — someone who forgot a scheme is not shopping
+              for one loci cannot read: " msg)))
+  ;; The same sentence, reached the way the panel reaches it. `example.com/x.csv`
+  ;; is a host and a path with the scheme left off, not a filename, and every
+  ;; repair the older message composed for it — `loci://example.com/x.csv` — made
+  ;; it worse. The scheme it needs is named; it is not glued onto what was typed,
+  ;; because `https://sales.csv` would be the same mistake facing the other way.
+  (let [e   (try (ssp/locate "example.com/sales.csv") nil
+                 (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (some? e))
+    (is (str/includes? msg "https://")
+        (str "a URL with the scheme left off is told nothing about the scheme: " msg))
+    (is (not (str/includes? msg "https://example.com/sales.csv"))
+        (str "the repair is composed onto a string loci cannot tell a host from a
+              filename in — `https://sales.csv` is the same edit for the other
+              audience of this sentence: " msg)))
+  ;; And the one-slash typo, which has no `://` in it and so lands here too.
+  ;; Nothing composes a repair for it — `loci://s3:/bucket/x.csv` is nonsense —
+  ;; so what has to be true is that the scheme it meant is on screen.
+  (let [e   (try (ssp/locate "s3:/bucket/x.csv") nil
+                 (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (some? e))
+    (is (str/includes? msg "s3://")
+        (str "one slash short of a location loci reads, and s3:// is not named: " msg)))
   ;; An absolute path can be spelled `file://` + itself, and CANNOT be spelled
   ;; `loci://` + itself: `loci:///data/x.csv` is refused two branches up for the
   ;; leading slash. So the repair offered is the one that works.
