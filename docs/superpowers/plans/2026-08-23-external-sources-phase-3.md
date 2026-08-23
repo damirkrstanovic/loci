@@ -438,6 +438,44 @@ The `(> (count @seen) n1)` assertion is the load-bearing one. Ask what the row-c
 
 ---
 
+### Task 9: the ＋ Data panel gets a door for a remote location
+
+**Files:**
+- Modify: `resources/public/index.html`
+- Test: `test/browser/sources.test.mjs`
+
+**Why this exists.** The spec asserted the panel *"already accepts a typed URI"*. It does not — `dataFileTab` renders an `<input type="file">` and a list of `.filerow` buttons from `GET /api/source/files`, and every uri it can produce is `loci://files/<hash>`. There is no text input in it. **So without this task phase 3 is reachable only by `curl` or a REPL**, which is the state phase 2 opened by naming as unfinished.
+
+- [ ] **Step 1: Write the failing test**
+
+Against the loopback server the browser harness can already serve, not the internet. `sources.test.mjs` boots a real loci; add a small static route or reuse the fixture directory over `http://127.0.0.1:<port>/…` so the URL is genuinely remote to DuckDB while never leaving the machine.
+
+```javascript
+test('a remote URL typed into the ＋ Data panel becomes a table', async () => {
+  // type the loopback CSV's URL, preview it, connect it, assert the table is
+  // materialised — a remote source has no other mode.
+});
+```
+
+Write the body against the file's own helpers (`withPage(browser, name, fn)`, `enterCosmos`, the `SOURCES_FIXTURE` server) — the sketch above is the shape, not the code. Assert on **scoped elements you created**, never a substring of the page: phase 2's `/takings/` check passed against a block that fetched nothing because DuckDB's error already contained the string.
+
+- [ ] **Step 2: Run, confirm FAIL** — there is no input to type into.
+
+- [ ] **Step 3: Implement.** A URL field in the file tab, feeding the **existing** `dataPreview` → Connect flow. `dataPreview` takes `{file, name, uri, bytes, connectedAs}`; a typed URL has no `bytes` and no `connectedAs`, so decide what it shows for those and say why. Do not write a second preview or a second connect — `srcFormat(uri)` already derives the format from the extension, and the mode control already exists.
+
+- [ ] **Step 4: Run, confirm PASS.**
+
+- [ ] **Step 5: Two things a remote preview does that a local one does not.** Both are measured, and a thin door is worst exactly here:
+
+  - **An `s3://` describe costs ~6 s on a machine without credentials** (measured 6,069 ms; 62 ms in a container with no route out, because the chain gives up rather than timing out on IMDS). There is no timeout and no cancel anywhere in loci. A field that looks idle for six seconds reads as broken.
+  - **The failure is an eight-line paragraph.** `credential-problem` and `extension-problem` both compose multi-line prose with an indented fix; `esc()` leaves the newlines and `<p>` collapses them into one run-on line. This task is what first routes a multi-line paragraph onto the preview path. Check how it actually renders before deciding whether it needs `white-space: pre-line`.
+
+- [ ] **Step 6: Prove it bites**, then read the printed output. Ask what each assertion reports when the mechanism is absent — the plan's sketches were wrong on six tasks of this phase, including an assertion that failed against working code.
+
+- [ ] **Step 7:** both suites, commit.
+
+---
+
 ### Task 8: the measurement, and both suites
 
 - [ ] **Step 1:** Measure a real remote read **once**, against a loopback server, at the design's stated scale — a 200 MiB CSV over HTTP. Report wall clock and peak heap for `connect!` with `:mode :materialise`, beside phase 1's local numbers (10M rows / 398 MiB materialises in **893 ms at 57 MB peak heap**). The question is whether a remote fetch changes the heap story or only the wall clock; loopback removes the network variable deliberately, so **say that this establishes the mechanism and the local-side cost, and not what a real S3 fetch costs.**
@@ -452,6 +490,7 @@ The `(> (count @seen) n1)` assertion is the load-bearing one. Ask what the row-c
 
 ## Definition of done
 
+- [ ] A remote URL can be typed into the ＋ Data panel, previewed and connected — the feature is reachable without `curl`
 - [ ] `http://`, `https://` and `s3://` locations resolve verbatim; `gs://`, `az://` and unknown schemes are refused by name
 - [ ] `unreadable-because` never claims a local file for a remote uri
 - [ ] A remote CSV materialises into the lake and the rows are right, and nothing lands in `<LOCI_DATA>/files/`
