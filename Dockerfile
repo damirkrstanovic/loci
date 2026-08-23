@@ -130,7 +130,8 @@ COPY resources ./resources
 # baked in. With it, both steps read and write one store.
 RUN --mount=type=cache,target=/root/.m2,sharing=locked \
     clojure -T:build uber :slim true
-# DuckDB's ducklake extension, fetched HERE rather than on the user's first boot.
+# DuckDB's ducklake, httpfs and aws extensions, fetched HERE rather than on the
+# user's first boot.
 #
 # `loci.lake/ensure-extension!` installs it when LOAD fails, and INSTALL is the
 # one line in loci that reaches the network at runtime. Leaving it there meant a
@@ -145,12 +146,37 @@ RUN --mount=type=cache,target=/root/.m2,sharing=locked \
 # through `loci.lake` instead would load Datalevin and all of src/ for one
 # statement, and would create a lake directory it does not need.
 #
-# The `test -f` is not ceremony. A silently empty /duckdb-ext produces an image
-# that builds green and fails at first boot — which is exactly where the failure
-# is today.
+# Three extensions since 2026-08-23, and `aws` is not optional. `httpfs` is what
+# reads http://, https:// and s3://. `aws` is what validates `CREATE SECRET (TYPE
+# s3, PROVIDER credential_chain)` — DuckDB walks the whole chain at CREATE time,
+# not at first read, so `aws` is needed by the statement `loci.lake/ensure-remote!`
+# issues before any byte moves. Measured 2026-08-23 against an extension directory
+# holding only httpfs, autoinstall off: `read_csv('https://…')` reached the fetch
+# and failed on the connection, while `CREATE SECRET … PROVIDER credential_chain`
+# died with `Extension "…/aws.duckdb_extension" not found. Install it first using
+# "INSTALL aws"`. An image shipping only httpfs therefore reads https:// and fails
+# s3:// on a MISSING EXTENSION rather than on credentials — which is a first boot
+# reaching the network, the one thing this line exists to prevent.
+#
+# The `test -f` is not ceremony, and there is now one per extension. A silently
+# empty /duckdb-ext produces an image that builds green and fails at first boot —
+# which is exactly where the failure is today. Three guards rather than one
+# because a PARTIAL install is likelier than an empty directory: `INSTALL
+# ducklake` succeeding and `INSTALL aws` failing would ship an image that opens a
+# lake, reads https://, and dies on the first s3:// — the same silent failure one
+# layer in. Verified 2026-08-23 by installing only ducklake behind the three-way
+# guard: the build fails at this line rather than producing that image.
+#
+# `ls -l` beside the `du -sh` because the total stopped being the interesting
+# number when the second extension arrived: it is the per-extension bytes that
+# say whether a new one is worth its place, and the comment on the runtime COPY
+# below quotes them.
 RUN --mount=type=cache,target=/root/.m2,sharing=locked \
-    clojure -M -e '(let [p (java.util.Properties.)] (.setProperty p "extension_directory" "/duckdb-ext") (with-open [c (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" p) s (.createStatement c)] (.execute s "INSTALL ducklake")))' \
+    clojure -M -e '(let [p (java.util.Properties.)] (.setProperty p "extension_directory" "/duckdb-ext") (with-open [c (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" p) s (.createStatement c)] (doseq [e ["ducklake" "httpfs" "aws"]] (.execute s (str "INSTALL " e)))))' \
  && test -f /duckdb-ext/v*/linux_amd64/ducklake.duckdb_extension \
+ && test -f /duckdb-ext/v*/linux_amd64/httpfs.duckdb_extension \
+ && test -f /duckdb-ext/v*/linux_amd64/aws.duckdb_extension \
+ && ls -l /duckdb-ext/v*/linux_amd64/ \
  && du -sh /duckdb-ext
 
 # …and run it on that runtime, on the same distribution the runtime was linked on.
@@ -172,8 +198,8 @@ ENV PATH="/opt/java/bin:${PATH}"
 # the seed again. Mount a named volume to outlive the container.
 ENV LOCI_DATA=/data
 ENV PORT=7777
-# The ducklake extension, and the one thing that has to be said out loud about
-# where it lives. DuckDB composes its extension directory from $HOME, and this
+# The extensions, and the one thing that has to be said out loud about
+# where they live. DuckDB composes its extension directory from $HOME, and this
 # image sets no HOME — `USER` below does not set one and debian:bookworm-slim
 # does not either — so getenv("HOME") was null, the path became "/.duckdb", and
 # the container died with EACCES before the listener:
@@ -188,13 +214,27 @@ ENV PORT=7777
 #
 # Root-owned and NOT chowned to loci, deliberately: LOAD only reads, and a
 # writable extension directory would let a version mismatch quietly re-download
-# 36 MB at boot instead of failing where someone would notice.
+# 86 MB at boot instead of failing where someone would notice.
 #
-# Cost, measured 2026-08-18 with `docker images`: 213 MB → 249 MB. All of it is
-# the extension itself — 36,436,086 bytes of ducklake.duckdb_extension — which is
-# the price of a first boot that needs no network. It is the largest single item
-# this image spends after the JDK runtime and the jar, so: if it ever needs to
-# come back out, the alternative is a writable extension directory under /data
+# Cost, measured with `docker inspect --format {{.Size}}`:
+#
+#   2026-08-18  ducklake                213 MB → 249 MB
+#   2026-08-23  + httpfs + aws          249,391,443 → 299,418,382 bytes
+#                                       (+50,026,939, +20.1%)
+#
+# The 2026-08-23 delta is the extensions and NOTHING else, to the byte:
+# httpfs 21,570,542 + aws 28,456,078 = 50,026,620, plus 319 bytes of the two
+# `.info` files DuckDB writes beside them. Both images were built from the same
+# source tree so the jar is not in the number. With ducklake's 36,436,086 that
+# is 86.5 MB of extension in a 299 MB image — comfortably the largest thing this
+# image spends after the JDK runtime and the jar, and the price of a first boot
+# that needs no network.
+#
+# So if it ever needs to come back out, it comes out in pieces and not all at
+# once: `aws` is dead weight for anyone who never types an `s3://` location, and
+# `httpfs` is dead weight for anyone who never types a remote one at all —
+# `loci.lake/ensure-remote!` loads neither until a remote source is connected.
+# The alternative in every case is a writable extension directory under /data
 # and a first boot that downloads.
 COPY --from=build /duckdb-ext /opt/duckdb-extensions
 ENV LOCI_DUCKDB_EXTENSIONS=/opt/duckdb-extensions
