@@ -159,8 +159,8 @@
   (config/env "LOCI_DUCKDB_EXTENSIONS"))
 
 (defn- extension-problem
-  "One paragraph naming the directory, the uid and the fix — `data-dir-problem`'s
-   job, for the other directory loci needs.
+  "One paragraph naming the extension, the directory, the uid and the fix —
+   `data-dir-problem`'s job, for the other directory loci needs.
 
    Without it the reader gets DuckDB's own error, which names neither loci nor
    anything actionable:
@@ -170,11 +170,30 @@
    That is the failure this whole mechanism exists for, and it killed the
    container before the listener. `/.duckdb` is the filesystem root because
    DuckDB composes its extension directory from $HOME and the runtime image sets
-   none — see `open-lake!`."
-  [^Throwable cause]
-  (let [dir  (extension-dir)
-        home (System/getenv "HOME")]
-    (str "loci cannot load DuckDB's ducklake extension, so the lake cannot open.\n"
+   none — see `open-lake!`.
+
+   **One function and not two, because only the CONSEQUENCE is per-extension.**
+   Everything between the first line and the last — the directory, the uid,
+   DuckDB's own message, and the paragraph about installing at build time — is
+   about the extension *mechanism*, and is exactly as true for any other
+   extension as it is for `ducklake`. A second function would be a second copy
+   of measured prose to keep in agreement, and the half that would drift is the
+   actionable half.
+
+   What is not shared is the two sentences saying what the failure COSTS.
+   `ducklake` is required — no extension, no lake — so its message says the lake
+   cannot open, and says loci is failing at boot rather than at the first table
+   read, which `open-lake!`'s `try` is what makes true. Nothing else here is
+   required, so for any other extension this says only what it knows and leaves
+   the consequence to the caller that has one. Both ducklake sentences are
+   therefore behind `required?` rather than deleted, and the ducklake message is
+   byte-identical to the one measured before this argument existed."
+  [ext ^Throwable cause]
+  (let [dir       (extension-dir)
+        home      (System/getenv "HOME")
+        required? (= "ducklake" ext)]
+    (str "loci cannot load DuckDB's " ext " extension"
+         (when required? ", so the lake cannot open") ".\n"
          "  looking in " (cond dir  (str dir " (LOCI_DUCKDB_EXTENSIONS)")
                                home (str home "/.duckdb — DuckDB's default, from HOME")
                                :else "/.duckdb — DuckDB's default, and HOME is unset")
@@ -187,12 +206,12 @@
          "  into the image then: INSTALL is the one step here that reaches the\n"
          "  network, and the directory it writes need never be writable again —\n"
          "  LOAD only reads.\n"
-         "\nFailing here rather than at the first table read.")))
+         (when required? "\nFailing here rather than at the first table read."))))
 
 (defn- ensure-extension!
-  "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
-   on any machine that has already run loci, and it is the only reason a machine
-   that has not can open a lake at all.
+  "LOAD `ext` first, INSTALL only if that fails. **Do not delete this.** It
+   looks dead on any machine that has already run loci, and it is the only
+   reason a machine that has not can open a lake at all.
 
    Measured twice on DuckDB 1.5.5 (2026-08-16), because the first measurement
    supported the opposite conclusion and was incomplete.
@@ -221,14 +240,26 @@
    this fallback never fires. Verified with `docker run --network none`. It stays
    for the machine that is not a container: a `clojure -M:serve` on a laptop that
    has never opened a lake still needs it, and there this branch is the whole
-   reason that works."
-  [lk]
-  (try (x! lk "LOAD ducklake")
+   reason that works.
+
+   **`ext` is loci's own literal and never anything a person typed**, which is
+   what makes interpolating it bare into the SQL right: `LOAD` and `INSTALL`
+   take a bare extension name, not a string, so there is nothing to quote — and
+   nothing arrives here that would need quoting.
+
+   It is also what the message names, which is the point of the argument rather
+   than a side effect of it. Everything measured above is about `ducklake`,
+   whose failure means the store cannot open; a caller whose failure means
+   something narrower gets a sentence about the extension IT asked for, and
+   `extension-problem` composes only the consequence it can justify."
+  [lk ext]
+  (try (x! lk (str "LOAD " ext))
        (catch Exception _
-         (try (x! lk "INSTALL ducklake")
-              (x! lk "LOAD ducklake")
+         (try (x! lk (str "INSTALL " ext))
+              (x! lk (str "LOAD " ext))
               (catch Exception e
-                (throw (ex-info (extension-problem e) {:dir (extension-dir)} e)))))))
+                (throw (ex-info (extension-problem ext e)
+                                {:dir (extension-dir) :extension ext} e)))))))
 
 (defrecord Lake [conn dir])
 
@@ -309,7 +340,7 @@
          conn  (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" props)
          lk    (->Lake conn dir)]
      (try
-       (ensure-extension! lk)
+       (ensure-extension! lk "ducklake")
        (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"
                    " (DATA_PATH '" dir "/files/', OVERRIDE_DATA_PATH true)"))
        (x! lk "USE lake")

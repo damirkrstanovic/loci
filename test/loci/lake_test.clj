@@ -102,7 +102,7 @@
       (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
             lk   (lake/->Lake conn rel)]
         (try
-          (#'lake/ensure-extension! lk)
+          (#'lake/ensure-extension! lk "ducklake")
           (lake/x! lk (str "ATTACH 'ducklake:" rel "/catalog.duckdb' AS lake (DATA_PATH '" rel "/files/')"))
           (lake/x! lk "USE lake")
           (lake/x! lk "CREATE TABLE t_rel AS SELECT * FROM range(100) t(id)")
@@ -650,6 +650,112 @@
               (is (str/includes? (or (some-> ^Throwable t .getCause .getMessage) "") "Permission denied")
                   "and DuckDB's own error survives as the cause")))
           (finally (.setWritable f true) (rm-rf ext) (rm-rf dir)))))))
+
+;; ---------------------------------------------------------------------------
+;; ensure-extension! takes the extension's name
+;; ---------------------------------------------------------------------------
+
+(defn- failed-extension
+  "`ensure-extension!` for `ext` with the SQL captured and every LOAD forced to
+   fail — what it issued, and what it threw.
+
+   **The failure is injected rather than provoked, because provoking it goes to
+   the network.** The obvious way to make this function fail is to ask for an
+   extension that does not exist. Measured 2026-08-23 on DuckDB 1.5.5, that is
+   not a local refusal: LOAD fails locally in 9 ms, but the INSTALL behind it is
+   a download, and it took 237 ms to come back with
+
+     HTTP Error: Failed to download extension \"not_a_real_extension_xyz\" at URL
+     \"http://extensions.duckdb.org/v1.5.5/linux_amd64/not_a_real_extension_xyz.duckdb_extension.gz\"
+     (HTTP 404)
+
+   That is an outbound request on every run of this suite, for a refusal that is
+   DuckDB's rather than loci's, and one that answers differently on a machine
+   with no route out. The network is not a test fixture — the same rule
+   `seed-extension-dir!` above exists for.
+
+   INSTALL is allowed to SUCCEED here, so the retry's second LOAD is reached and
+   the sequence below is all three statements rather than the two an INSTALL
+   failure would stop at."
+  [ext]
+  (let [sql (atom [])
+        e   (with-redefs [lake/x! (fn [_ s]
+                                    (swap! sql conj s)
+                                    (if (str/starts-with? s "LOAD")
+                                      (throw (java.sql.SQLException. "injected"))
+                                      :ok))]
+              ;; nil for the lake: `x!` is the only thing here that touches a
+              ;; connection, and it is stubbed.
+              (try (#'lake/ensure-extension! nil ext) nil
+                   (catch clojure.lang.ExceptionInfo e e)))]
+    {:sql @sql :e e :msg (str (some-> ^Throwable e .getMessage))}))
+
+(deftest ensure-extension-really-loads-the-extension-it-was-asked-for
+  ;; A BARE connection, not `with-lake`, and that IS the test. `ATTACH
+  ;; 'ducklake:…'` loads the extension by itself — `ensure-extension!`'s own
+  ;; docstring records that measurement, and it is why an assertion taken over
+  ;; an already-open lake cannot tell this function from a no-op.
+  ;;
+  ;; The plan sketched `(is (nil? (ensure-extension! lk \"ducklake\")))` here.
+  ;; Measured 2026-08-23: the function returns `:ok`, because that is what `x!`
+  ;; returns — so that assertion is not merely vacuous, it is inverted. It fails
+  ;; against the working function and passes against every implementation that
+  ;; does nothing at all.
+  ;;
+  ;; No `extension_directory` is set, so this is DuckDB's default and a machine
+  ;; that has never installed ducklake would INSTALL here. That is not new
+  ;; exposure: `with-lake` reaches `open-lake!` the same way, and every test in
+  ;; this namespace uses it.
+  (let [conn    (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
+        lk      (lake/->Lake conn (str (System/getProperty "java.io.tmpdir") "/loci-no-lake"))
+        loaded? #(:loaded (first (lake/q lk (str "SELECT loaded FROM duckdb_extensions()"
+                                                 " WHERE extension_name = 'ducklake'"))))]
+    (try
+      (is (false? (loaded?))
+          "a fresh connection must NOT already carry it, or this observes nothing")
+      (is (= :ok (#'lake/ensure-extension! lk "ducklake")))
+      (is (true? (loaded?))
+          "and now it does — the one assertion here that a no-op cannot pass")
+      (finally (.close conn)))))
+
+(deftest ensure-extension-names-the-extension-it-was-asked-for
+  (let [{:keys [sql e msg]} (failed-extension "httpfs")]
+    (is (= ["LOAD httpfs" "INSTALL httpfs" "LOAD httpfs"] sql)
+        "LOAD first, INSTALL only if that fails, then LOAD again — and all three
+         name the extension they were asked for rather than a hard-coded one")
+    (is (instance? clojure.lang.ExceptionInfo e)
+        "and the failure is loci's ex-info, not a raw JDBC exception escaping")
+    (is (str/includes? msg "httpfs") "the message names it too")
+    (is (not (str/includes? msg "ducklake"))
+        (str "the message named the other extension: " msg))
+    (is (= "httpfs" (:extension (ex-data e))))
+    (is (= "injected" (some-> ^Throwable e .getCause .getMessage))
+        "with DuckDB's own error kept as the cause, the way the ducklake path keeps it")))
+
+(deftest only-ducklake-claims-the-lake-cannot-open
+  ;; The two sentences that are about the CONSEQUENCE rather than the mechanism.
+  ;; `open-lake!` closes the connection and rethrows, so for ducklake they are
+  ;; true; for an extension loaded lazily on the path that needs it they would be
+  ;; a false claim about the whole store.
+  ;;
+  ;; The shared half is asserted for BOTH, deliberately. A split that gave the
+  ;; new caller a short sentence and dropped the directory, the uid and the fix
+  ;; would pass any assertion that only read the first line — and it is the
+  ;; actionable half that would have gone.
+  (let [d (:msg (failed-extension "ducklake"))
+        h (:msg (failed-extension "httpfs"))]
+    (is (str/includes? d "so the lake cannot open"))
+    (is (str/includes? d "Failing here rather than at the first table read"))
+    (is (not (str/includes? h "so the lake cannot open"))
+        (str "httpfs claimed the store cannot open: " h))
+    (is (not (str/includes? h "Failing here rather than at the first table read"))
+        (str "httpfs claimed loci is failing at boot: " h))
+    (doseq [shared ["Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension."
+                    "running as "
+                    "DuckDB said: injected"
+                    "LOAD only reads."]]
+      (is (str/includes? d shared) (str "the ducklake message lost: " shared))
+      (is (str/includes? h shared) (str "the httpfs message never got: " shared)))))
 
 (deftest unwrap-renders-temporal-types-as-iso-strings
   ;; DuckDB's CSV sniffer gives LocalDate for DATE and java.sql.Timestamp for
