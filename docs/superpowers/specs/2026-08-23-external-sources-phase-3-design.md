@@ -4,8 +4,8 @@ Date: 2026-08-23
 Status: **design settled, nothing built.** Everything below is design except where it says measured.
 
 Phase 1 shipped the framework and the file connector; phase 2 gave the shell a way in; the
-housekeeping branch merged at `98c3757` cleaned up after both. This phase adds `https://` and `s3://`
-to the set of locations a source can have.
+housekeeping branch merged at `98c3757` cleaned up after both. This phase adds `http://`, `https://`
+and `s3://` to the set of locations a source can have.
 
 It is the smaller half of what phase 1 deferred. The other half — SQL databases — is the next spec,
 and phase 1 predicted the coupling correctly: *"which is also the spec that unblocks SQL databases,
@@ -107,8 +107,8 @@ sentence, or the retry logic is lifted and both callers wrap it. Whichever, **th
 must not change**: it is measured prose about a real deployment failure, and it earns its length.
 
 `INSTALL` is also what makes the two suites' offline promise conditional: a machine that has never
-seen `httpfs` will reach the network on the first remote test. The tests below avoid that by serving
-`https://` from localhost, but the extension itself still has to arrive once.
+seen `httpfs` will reach the network on the first remote test. The tests below avoid the *reads* going
+out by serving loopback plaintext, but the extension itself still has to arrive once.
 
 ## Errors
 
