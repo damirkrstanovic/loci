@@ -131,7 +131,19 @@
    as long as it exists — the mode is on the log, and the log is append-only.
    That is the whole argument for refusing here, in front of the first read,
    rather than reporting the problem at render time: there is no later moment at
-   which loci can take it back.
+   which loci can take it back. **No such object exists outside this branch** —
+   `master`'s `locate` refuses `s3://` outright, so a remote scheme only became
+   connectable four commits ago in `e1a5083` — so the point is structural and
+   there is no migration to go looking for.
+
+   The check is on `(:mode src)` as a KEYWORD, which is right only because
+   `connect!` calls this on `(assoc src :mode (mode-of src))`. Its own traffic
+   is HTTP and REPL callers — the shell has no remote-uri door — and
+   `server/source-connect!` does not coerce `:mode` while `body-json`
+   keywordises keys and not values, so every HTTP caller sends the STRING
+   `\"passthrough\"`. Running this before `mode-of` would let all of them
+   through. `connect-refuses-a-remote-passthrough-spelled-as-a-string` is the
+   assertion, and it is the `modes` defect below one function along.
 
    **And it was reachable, not hypothetical.** DuckDB sets neither
    `autoload_known_extensions` nor `autoinstall_known_extensions`, so both

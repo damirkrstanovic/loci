@@ -414,15 +414,25 @@
    only account there is. A caller with no exception in hand gets the phrase
    without it.
 
-   **This shape is reachable today, which is why it had to be worth reading.**
+   **This shape is still reachable, which is why it had to be worth reading.**
    An earlier draft called the loss bounded because \"`connect!` refuses
-   `:mode :passthrough` over a remote location\" — it does not: that refusal is
-   Task 5 and is not written yet, and DuckDB autoloads httpfs on its own
-   (`autoinstall_known_extensions` and `autoload_known_extensions` both default
-   to true and loci sets neither), so a passthrough connect over `https://…`
-   describes and lands right now. Task 5 will refuse NEW connects; it cannot
-   refuse a handle already committed, which would carry this sentence for as
-   long as it exists."
+   `:mode :passthrough` over a remote location\". As of `2b5402a` it does —
+   `loci.source/refuse-remote-passthrough!` — and this paragraph was rewritten
+   when it landed, because the version before it said the refusal *was not
+   written yet* and no diff would have shown that going stale.
+
+   The refusal does not close this. It is a guard on new CONNECTS and not a
+   property of the handle, so a `{:store :source :uri \"https://…\"}` still
+   arrives through `POST /api/edit`, which writes a caller-supplied `:value`
+   onto an object with no shape check; through a REPL caller, who commits what
+   they like; and from any object committed before the guard existed, which
+   carries this sentence for as long as it exists.
+
+   The draft's reasoning was also wrong for a reason that outlives the guard:
+   DuckDB autoloads httpfs on its own — `autoload_known_extensions` and
+   `autoinstall_known_extensions` both default to true and loci sets neither —
+   so nothing about whether a remote read HAPPENS was ever gated on loci
+   deciding to allow it."
   [uri]
   (try
     (if (remote? uri)

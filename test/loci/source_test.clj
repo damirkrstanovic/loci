@@ -548,37 +548,99 @@
       (is (re-find #"unknown source mode" (str (.getMessage ^Exception e)))
           (str "…and say so, for mode " (pr-str bad))))))
 
+(defn- no-remote-reads
+  "`describe`, real for a local uri and throwing for a remote one.
+
+   **A test that reaches the network when it regresses is a test that reaches
+   the network.** The refusals below never read today — that is what they
+   assert — but without this the day the guard breaks is the day
+   `clojure -M:test` calls `bucket.s3.amazonaws.com`, with no timeout anywhere
+   in loci, in a suite the spec says stays offline. It delegates for `file://`
+   so the local control in each test is still a real connect, and the `::read`
+   marker is what a broken guard trips instead of a socket."
+  []
+  (let [real src/describe]
+    (fn [lk s]
+      (if (ssp/remote? (:uri s))
+        (throw (ex-info "the suite does not reach the network" {::read true}))
+        (real lk s)))))
+
 (deftest connect-refuses-passthrough-for-a-remote-location
   ;; Not a pre-emptive refusal. DuckDB sets neither `autoload_known_extensions`
   ;; nor `autoinstall_known_extensions`, so both default true and it installs
   ;; and loads `httpfs` by itself — measured 2026-08-23 against this suite's own
-  ;; lake. Without the guard `describe` therefore SUCCEEDS over `s3://` and
-  ;; `land!` commits `{:store :source :uri "s3://…"}`, which is the shape the
-  ;; spec's measurement says must not exist.
-  (let [st (sub/fresh-store)
-        e  (is (thrown? clojure.lang.ExceptionInfo
-                        (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
-                                          :mode :passthrough :title "S3"})))
-        m  (str (some-> e .getMessage))]
-    (is (re-find #"passthrough" m) "the sentence names the mode that was refused")
-    (is (re-find #"s3://bucket/x\.csv" m) "and the location it was refused for")
-    (is (empty? (sub/objects st))
-        "and nothing was committed — a refusal that leaves an object behind is
-         worse than no refusal, because the shell then draws a broken table, and
-         the guard is on connect! rather than on the handle, so an object that
-         got past it keeps its degraded state forever")
-    ;; The CONTROL for the assertion above, not a second test of `connect!`.
-    ;; `(empty? (sub/objects st))` over a fresh store is a negative: it passes
-    ;; unchanged if `connect!` threw before doing anything at all — a typo in
-    ;; this map, a `mode-of` refusal, an ExceptionInfo from somewhere else — and
-    ;; then proves nothing about where the guard sits. So the SAME store takes
-    ;; the SAME call one scheme apart, down to the title, and only because that
-    ;; one lands an object does the emptiness above mean the refusal kept one
-    ;; out rather than that nothing was ever going to arrive.
-    (src/connect! st {:uri (csv! "a\n1\n") :format :csv
-                      :mode :passthrough :title "S3"})
-    (is (= 1 (count (sub/objects st)))
-        "this store does record a passthrough connect")))
+  ;; lake. Without the guard `describe` therefore READS over `s3://`. Against
+  ;; THIS fixture that read then 403s rather than succeeding, which is why the
+  ;; emptiness assertion below needs its control and why the next test exists at
+  ;; all; against a bucket the credential chain can reach it would have
+  ;; described, landed and committed `{:store :source :uri "s3://…"}`, the shape
+  ;; the spec's measurement says must not exist.
+  (with-redefs [src/describe (no-remote-reads)]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode :passthrough :title "S3"})))
+          m  (str (some-> e .getMessage))]
+      ;; The ex-data, and it is the only assertion here that DISCRIMINATES.
+      ;; `re-find #"passthrough"` matches `mode-of`'s refusal too — measured, its
+      ;; message ends "loci knows :materialise and :passthrough" — and
+      ;; `#"s3://bucket/x.csv"` matches `describe`'s own failure, which names the
+      ;; uri as well. Only `:uri` on the ex-data belongs to this guard alone.
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e))))
+      (is (= :passthrough (:mode (ex-data e))))
+      (is (not (::read (ex-data e))) "and it refused before the read")
+      ;; The two below are about the SENTENCE a person is shown, which is a
+      ;; separate thing from which branch threw. Kept for that, not for
+      ;; discrimination — see above.
+      (is (re-find #"passthrough" m) "the sentence names the mode that was refused")
+      (is (re-find #"s3://bucket/x\.csv" m) "and the location it was refused for")
+      (is (empty? (sub/objects st))
+          "and nothing was committed — a refusal that leaves an object behind is
+           worse than no refusal, because the shell then draws a broken table, and
+           the guard is on connect! rather than on the handle, so an object that
+           got past it keeps its degraded state forever")
+      ;; The CONTROL for the assertion above, not a second test of `connect!`.
+      ;; `(empty? (sub/objects st))` over a fresh store is a negative: it passes
+      ;; unchanged if `connect!` threw before doing anything at all — a typo in
+      ;; this map, a `mode-of` refusal, an ExceptionInfo from somewhere else — and
+      ;; then proves nothing about where the guard sits. So the SAME store takes
+      ;; the SAME call one scheme apart, down to the title, and only because that
+      ;; one lands an object does the emptiness above mean the refusal kept one
+      ;; out rather than that nothing was ever going to arrive.
+      (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                        :mode :passthrough :title "S3"})
+      (is (= 1 (count (sub/objects st)))
+          "this store does record a passthrough connect"))))
+
+(deftest connect-refuses-a-remote-passthrough-spelled-as-a-string
+  ;; **The guard compares a KEYWORD, and is only right because `connect!` hands
+  ;; it `(assoc src :mode (mode-of src))`.** Every other test of it passes
+  ;; `:passthrough`; every HTTP caller passes `"passthrough"`.
+  ;; `server/source-connect!` deliberately does not coerce `:mode`, and
+  ;; `body-json` keywordises KEYS and not values — and the shell has no
+  ;; remote-uri door at all, reaching `sourceConnect` from the file listing and
+  ;; the paste box only, so an HTTP client or a REPL caller is this guard's
+  ;; entire traffic.
+  ;;
+  ;; What it closes: hoisting `(refuse-remote-passthrough! src)` above the
+  ;; `(assoc src :mode (mode-of src))` line — a plausible "guard first" edit, and
+  ;; the comment there says "between the mode being decided and the source being
+  ;; read" without saying which decision is load-bearing. Every other test still
+  ;; passes and the JSON path lands `{:store :source :uri "s3://…"}` again. That
+  ;; is the `modes` defect verbatim one function along, and `modes`' own
+  ;; docstring records what it cost on 2026-08-19.
+  (with-redefs [src/describe (no-remote-reads)]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode "passthrough" :title "S3"})))]
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e)))
+          "the string reached the guard as a mode, not as an unknown one")
+      (is (= :passthrough (:mode (ex-data e)))
+          "and it is the NORMALIZED mode on the ex-data, which is the whole
+           reason the guard runs after mode-of rather than before it")
+      (is (not (::read (ex-data e))) "and nothing was read")
+      (is (empty? (sub/objects st)) "and nothing was committed"))))
 
 (deftest the-remote-passthrough-refusal-happens-before-the-first-read
   ;; The assertion that pins WHERE the guard sits, because `(empty? …)` above
@@ -602,8 +664,12 @@
       (is (not (::read (ex-data e)))
           "connect! read the source before refusing it — the fetch this refusal
            exists to prevent is the one it just made")
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e)))
+          "and the refusal is THIS guard's. `re-find #\"passthrough\"` cannot say
+           that: mode-of's message lists both modes by name and matches it too,
+           so it would keep a partial fix invisible")
       (is (re-find #"passthrough" (str (some-> e .getMessage)))
-          "and the refusal is the reason it stopped"))))
+          "and the sentence a person sees names the mode"))))
 
 (deftest connect-still-allows-passthrough-for-a-local-file
   ;; The guard must be about the SCHEME and not about `connect!` having grown a
