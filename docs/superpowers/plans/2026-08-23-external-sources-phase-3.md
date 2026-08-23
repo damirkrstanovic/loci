@@ -424,11 +424,15 @@ The `(> (count @seen) n1)` assertion is the load-bearing one. Ask what the row-c
 **Files:**
 - Modify: `Dockerfile`
 
-- [ ] **Step 1:** Add `INSTALL httpfs` beside `INSTALL ducklake` in the build-stage `RUN` at `Dockerfile:152`, and extend the `test -f` guard to cover it. Read the surrounding comment block first — it explains why the line is raw JDBC with no alias (so the extension version matches the driver that will load it) and why the guard exists (*"a silently empty /duckdb-ext produces an image"*).
+**`INSTALL aws` as well as `INSTALL httpfs`** — measured 2026-08-23 during Task 4, and the plan did not know it. `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` is validated at CREATE time by the **`aws`** extension, which walks the whole chain there and then. httpfs alone is not enough: on a first call `aws` autoinstalls over the network (10.5 s), which is exactly what an offline image cannot do. An image shipping only httpfs reads `https://` and fails on `s3://`.
+
+- [ ] **Step 1:** Add `INSTALL httpfs` and `INSTALL aws` beside `INSTALL ducklake` in the build-stage `RUN` at `Dockerfile:152`, and extend the `test -f` guard to cover both. Read the surrounding comment block first — it explains why the line is raw JDBC with no alias (so the extension version matches the driver that will load it) and why the guard exists (*"a silently empty /duckdb-ext produces an image"*).
 
 - [ ] **Step 2:** Build the image. Report the size delta against the previous image — httpfs is not free and the number belongs in the commit message.
 
 - [ ] **Step 3:** `docker run --network none` and connect a `file://` source, to prove the image still opens a lake offline. This is the check that caught the ducklake packaging problem twice.
+
+- [ ] **Step 3b:** Still offline, connect an `s3://` source and confirm it fails on **credentials** rather than on a missing extension. That is the assertion that separates "the image carries aws" from "the image reaches the network to get it" — and it is the only way to see the Task 4 measurement from outside.
 
 - [ ] **Step 4:** Commit with the size delta.
 
