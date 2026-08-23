@@ -79,7 +79,27 @@ an extension it does not need is missing. So loading `httpfs` and issuing the se
 first remote read, and their failure is a **connect-time** error against one source, not a boot-time
 error against everything.
 
-loci never sees a key, never writes one, and never has to rotate, back up or redact one. The storage
+**But a URL can itself be a credential, and that one loci does commit.** Corrected 2026-08-23 after
+Task 9 added the door. Two ordinary URLs carry secrets:
+
+- a **presigned S3 URL**, carrying `X-Amz-Signature` — which is precisely the escape hatch this
+  section points at for a bucket the chain cannot reach;
+- `https://user:pass@host/data.csv`, which is a password in a URL.
+
+Both are typed by a person into the ＋ Data panel, committed **verbatim** into the append-only log,
+and drawn in the table's source badge. So the sentence below is true of the credentials loci
+*manages* and false of the ones a user hands it by another name.
+
+**Recorded, nothing built — decided 2026-08-23.** Stripping userinfo or the query from what is stored
+would mean the stored uri is not the uri that works, and `refresh!` would break for exactly the
+presigned case that most needs it: worse than the disease. Refusing userinfo touches the smaller half
+and dresses it as a solution. A warning in the panel only reaches the user who reads it.
+
+The mitigation that actually holds is the one presigning already provides: **a presigned URL
+expires.** A password in a URL does not, and someone who types one has put it somewhere `undo!`
+does not remove. That is the honest boundary, and it is the same one `file://` already draws.
+
+loci never sees a key it manages, never writes one, and never has to rotate, back up or redact one. The storage
 panel gains nothing to account for. `undo!` and `as-of` cannot resurrect a credential, because none
 was ever committed — which matters more here than anywhere else in loci: **the substrate is an
 append-only log, so a secret written into it is recoverable forever by design.** That is the log's
