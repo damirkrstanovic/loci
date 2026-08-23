@@ -18,8 +18,15 @@ does not have to.
 
 Phase 1 built `sourcespec/relation` to emit `read_csv('<location>')` from whatever `locate` returns.
 For `loci://` that answer is a resolution under `<LOCI_DATA>`; for `file://` it is a host path;
-**for `https://` and `s3://` it is the URI itself.** `locate` becomes identity for remote schemes and
-DuckDB does the reading.
+**for `http://`, `https://` and `s3://` it is the URI itself.** `locate` becomes identity for remote
+schemes and DuckDB does the reading.
+
+**`http://` is in the set, corrected 2026-08-23 while planning.** An earlier draft listed only
+`https://`, and its own testing section then asked for a local HTTPS server — which the harness
+cannot provide, since `test/loci/chunks_test.clj`'s `with-stub` pattern runs http-kit on a loopback
+port in plaintext. `httpfs` reads both schemes, and refusing plaintext while accepting TLS would be
+loci policing the transport of a location a person typed, which is the opposite of the decision
+`file://` already records: *"a host path is spelled `file://`, which is unrestricted by decision."*
 
 So this phase adds no reader, no handle shape, no failure marker and no route. That is not a
 coincidence — it is the design phase 1 chose, stated as *"a source is a location, a format and a
@@ -135,8 +142,9 @@ way every other DuckDB failure already is.
 - `locate` answers a remote uri verbatim, and still refuses a scheme it does not know.
 - `unreadable-because` on a remote uri says something true and does not invent a file path.
 - `connect!` refuses `:mode :passthrough` for a remote scheme, and the sentence names the mode.
-- `connect!` with `:mode :materialise` over `https://` lands rows — against a local HTTP server, not
-  the internet, so the suite stays offline and deterministic.
+- `connect!` with `:mode :materialise` over `http://` lands rows — against a loopback server built
+  the way `chunks_test/with-stub` already builds one, so the suite stays offline and deterministic
+  and can assert on what actually went over the wire, including that nothing did.
 - `refresh!` re-fetches a changed remote object.
 - The secret is issued once per connection and its SQL contains **no** credential material — the
   assertion is on the `PROVIDER credential_chain` form, since there is nothing else to assert.
