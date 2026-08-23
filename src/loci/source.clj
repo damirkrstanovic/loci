@@ -30,12 +30,28 @@
    Throws with `check-names!`'s ex-data when two headers would become one
    column — the same refusal `normalize-rows` makes for rows.
 
-   **This is also where a remote connection is prepared, and it is the one
-   place that is true for every read loci makes.** `connect!`, `refresh!` and
-   the ＋ Data panel's own preview all arrive here and nowhere else, so
+   **This is also where a remote connection is prepared — for every read
+   `connect!` and `refresh!` make, which is narrower than every read loci
+   makes.** Those two and the ＋ Data panel's own preview all arrive here, so
    `lake/ensure-remote!` is called once, here, rather than at each of the three
    — and `land!`'s CREATE runs on the same connection immediately after, so the
-   materialise is covered by the preparation the description already did."
+   materialise is covered by the preparation the description already did.
+
+   **`lake/from-of` is the exception, and naming it is the point.** It builds
+   `read_csv('<location>')` straight from a `{:store :source}` handle without
+   coming through here, and `tbl/hydrate` reaches it on every render while
+   `server/recompute` reaches it per query — so a REMOTE `:store :source`
+   handle would read with no `LOAD httpfs` and no secret behind it. Nothing
+   mints one: `refuse-remote-passthrough!` stops `connect!` before the mode is
+   committed, and the doors that stay open are the three
+   `ssp/unreadable-because` enumerates — `/api/edit`, a REPL caller, an object
+   committed before the guard existed — of which none exist. Written down
+   rather than left implicit because the two docstrings would otherwise
+   disagree, and because if one of those handles is ever reached the
+   degradation is exactly the one `ensure-remote!` exists to prevent: `s3://`
+   goes out anonymous, and the failure lands inside a read with DuckDB's own
+   message instead of at connect with the paragraph naming the extension
+   directory and the uid."
   [lk src]
   (let [rel  (ssp/relation src (ssp/locate (:uri src)))
         ;; **Guarded on the scheme, and the guard is not a tidiness.**
@@ -132,9 +148,13 @@
    That is the whole argument for refusing here, in front of the first read,
    rather than reporting the problem at render time: there is no later moment at
    which loci can take it back. **No such object exists outside this branch** —
-   `master`'s `locate` refuses `s3://` outright, so a remote scheme only became
-   connectable four commits ago in `e1a5083` — so the point is structural and
-   there is no migration to go looking for.
+   `master`'s `sourcespec` has no `remote?` at all and its `locate` refuses
+   `s3://` outright, so a remote scheme only became connectable in `e1a5083`,
+   on this branch — so the point is structural and there is no migration to go
+   looking for. The commit is named and the DISTANCE to it is not: an earlier
+   draft of this sentence said \"four commits ago\", which was already ten by
+   the time anyone read it and is a number no edit to this function can keep
+   true.
 
    The check is on `(:mode src)` as a KEYWORD, which is right only because
    `connect!` calls this on `(assoc src :mode (mode-of src))`. Its own traffic

@@ -696,18 +696,48 @@
 ;; a remote location, over a loopback server — and what went over the wire
 ;; ---------------------------------------------------------------------------
 
-;; Copied from `loci.chunks-test`, where the same shape stubs the embedder. It
-;; is private there, and a test namespace reaching across for another's helper
-;; couples two suites through a var neither owns — so this is a copy on purpose
-;; and not a missed extraction. The `seen` atom is what makes the copy worth
-;; having: a remote read is only provable from the wire, and a row count alone
-;; cannot tell a fetch from a re-read of the table the last fetch created.
+;; **What leaves this machine, stated once for the whole section.** Every
+;; request these tests make goes to a loopback stub on 127.0.0.1, and none of
+;; them fetches an external URL. That is not the same as "the suite makes zero
+;; requests off 127.0.0.1", which an earlier commit message claimed flatly and
+;; which is only true on a machine that already has the DuckDB extensions:
+;; `LOAD ducklake` in this namespace's `:once` fixture, and `LOAD httpfs` under
+;; `a-remote-csv-materialises-into-the-lake` and
+;; `refresh-of-a-remote-source-re-fetches-the-object`, both fall through to
+;; `ensure-extension!`'s `INSTALL` when the extension directory does not hold
+;; them — which reaches the DuckDB extension repository, once, and then never
+;; again on that machine. The plan's ground rules allow that one install; the
+;; sibling assertions in `loci.lake-test` (`ensure-remote-really-loads-httpfs`,
+;; `ensure-extension-really-loads-the-extension-it-was-asked-for`) sit under
+;; the same allowance. Nothing here reaches a data source off this host in any
+;; state, which is the property the spec actually wants.
+
+;; Copied from `loci.chunks-test`, where the same shape stubs the embedder.
 ;;
-;; The body slurp `chunks-test` does is dropped: httpfs sends none, and slurping
-;; a nil body records nothing.
+;; **Not because reaching across would couple two suites.** That reason was
+;; written here first and a file already in the tree contradicts it:
+;; `loci.lake-fixture` exists precisely so `loci.server-test` and
+;; `loci.tools-test` can share one helper, and its docstring says so. The real
+;; reason is that the two copies have already diverged and the divergence is
+;; the point of each — `chunks-test` slurps the request body, because an
+;; embedder POSTs one and its assertions read it; this drops the slurp, because
+;; httpfs sends none and slurping a nil body records nothing. **A third caller
+;; is what should trigger the move**, into `loci.lake-fixture` or a sibling,
+;; not a second.
+;;
+;; One further divergence, inert but not silent: `chunks-test` hands its
+;; handler the DERIVED map it recorded, this one hands it the raw Ring request.
+;; Neither handler looks at its argument, so nothing turns on it today; the raw
+;; request is the more honest thing to pass to a handler and is why it was not
+;; changed to match.
+;;
+;; The `seen` atom is what makes the copy worth having: a remote read is only
+;; provable from the wire, and a row count alone cannot tell a fetch from a
+;; re-read of the table the last fetch created.
 (defn- with-stub
   "Start `handler` on an ephemeral loopback port, call `(f port seen)`, stop the
-   server. `seen` holds every request received."
+   server. `seen` holds every request received, so a test can assert on what
+   actually went over the wire — including that nothing did."
   [handler f]
   (let [seen (atom [])
         srv  (httpd/run-server
@@ -743,15 +773,46 @@
         (fn [root]
           ;; The fixture's lake is `:once` for this whole namespace and
           ;; `ensure-remote!` remembers `:httpfs` on it, while `deftest` order is
-          ;; `ns-interns` order and therefore unspecified. Without this reset the
-          ;; LOAD assertion below would pass or fail on which remote test ran
-          ;; first, which is the worst kind of green.
+          ;; `ns-interns` order — hash order over the var names, stable for a
+          ;; given set of them and re-shuffled by the next one added. Without
+          ;; this reset the LOAD assertion below would pass or fail on which
+          ;; remote test ran first.
+          ;;
+          ;; **A review argued this reset is inert today and the measurement
+          ;; says otherwise, so the argument is written down with it.** The
+          ;; claim was that `a-local-connect-asks-for-no-httpfs` sorts ahead of
+          ;; both remote tests in the current order — it does, index 13 against
+          ;; 19 and 35 — and that the guard sabotage therefore bites with the
+          ;; resets deleted. It does not, because being ahead of the two REMOTE
+          ;; tests is not the property that matters. With the guard removed,
+          ;; `ensure-remote!` is reached by every uri `describe` sees, and FIVE
+          ;; tests that reach `describe` sort ahead of index 13 — the first,
+          ;; `a-very-long-title-still-connects`, at index 1. Measured 2026-08-23,
+          ;; guard removed and both resets deleted: `a-local-connect-asks-for-
+          ;; no-httpfs` PASSED, and the one failure in the run was this test's
+          ;; own LOAD assertion, firing because the flag was already set for an
+          ;; unrelated reason. With both resets restored and the same sabotage:
+          ;; the local test fails, on `["LOAD httpfs" …]`, which is the sentence
+          ;; it exists for.
+          ;;
+          ;; And what the reset does NOT do: it clears loci's MEMORY of what it ensured
+          ;; without undoing the connection's STATE. For `:httpfs` that is
+          ;; benign because `LOAD` is idempotent. The statement `:s3` guards is
+          ;; not — `CREATE SECRET loci_s3` carries no `OR REPLACE` and a second
+          ;; one throws `Invalid Input Error: Temporary secret with name
+          ;; 'loci_s3' already exists!`, measured 2026-08-23 on DuckDB 1.5.5.
+          ;; It stays unreachable through `ensure-remote!` because `88e6d87` put
+          ;; `secret-covers?` in front of the CREATE, and `which_secret` returns
+          ;; loci's OWN temporary secret — also measured today, so the second
+          ;; issue is skipped rather than repeated. That is the load-bearing
+          ;; half: a reset here is safe on both flags because of a check added
+          ;; for another reason entirely, and it was not safe before it.
           (reset! (:ensured @lake/lake) #{})
           (let [sql  (atom [])
                 real lake/x!
                 st   (sub/fresh-store)
                 r    (with-redefs [lake/x! (fn [l s] (swap! sql conj s) (real l s))]
-                       (src/connect! st {:uri (str "http://127.0.0.1:" port "/sales.csv")
+                       (src/connect! st {:uri (str "http://127.0.0.1:" port "/Sales+Q3%20final.csv")
                                          :format :csv :mode :materialise :title "Remote"}))
                 h    (:value (sub/object st (:id r)))]
             ;; No `(is (nil? (:error r)))` — `connect!` returns `{:id :cols :rows
@@ -763,7 +824,52 @@
             (is (= [:region :revenue] (:cols r)))
             (is (= :lake (:store h))
                 "materialised, so the handle names a lake table and not the uri")
-            (is (= #{"/sales.csv"} (set (map :uri @seen)))
+            ;; **The path is `Sales+Q3%20final.csv` so that this assertion can
+            ;; fail.** It replaced `(seq @seen)`, which the row count above
+            ;; already implied — the stub is the only source of those rows — and
+            ;; over the old `/sales.csv` it inherited that property exactly:
+            ;; `/sales.csv` is a fixed point of every re-encoder there is, so
+            ;; nothing plausible moved it and the comment claimed a coverage the
+            ;; fixture did not supply.
+            ;;
+            ;; **The obvious fix is the wrong one, and that is why the path
+            ;; looks like this.** `loci.sourcespec-test`'s
+            ;; `locate-answers-a-remote-uri-verbatim` covers the same property
+            ;; with `s3://bucket/a b.csv`, so a bare space is the natural thing
+            ;; to reach for — but that test is pure and reads `locate`'s return
+            ;; value, while this one reads the WIRE, and the wire has already
+            ;; been normalised once. Measured 2026-08-23 against this stub:
+            ;; `read_csv('http://…/sales q3.csv')` and
+            ;; `read_csv('http://…/sales%20q3.csv')` produce the byte-identical
+            ;; request line `/sales%20q3.csv`, because httpfs percent-encodes the
+            ;; space itself. Over the wire a space proves nothing about loci.
+            ;;
+            ;; So the fixture carries only what DuckDB leaves ALONE — measured
+            ;; verbatim on the request line: mixed case, a literal `+`, and a
+            ;; literal `%20` that is passed through rather than re-encoded — and
+            ;; every plausible re-encoder moves at least one of the three:
+            ;;
+            ;;   (URLDecoder/decode u)      → /Sales Q3 final.csv   caught by +
+            ;;   (.getPath (URI. u))        → /Sales+Q3 final.csv   caught by %20
+            ;;   (str/lower-case u)         → /sales+q3%20final.csv caught by case
+            ;;   (URI. "http" … path … )    → /Sales+Q3%2520final.csv  caught by %20
+            ;;
+            ;; Each of the three earns its place, and the `+` earns it hardest:
+            ;; a DECODER is invisible to `%20` alone, since httpfs re-encodes the
+            ;; space it produced and the request line comes out unchanged. It is
+            ;; the `+` becoming `%20` that shows. Conversely an ENCODER is
+            ;; invisible to the `+` and shows on the `%20` doubling. The two that
+            ;; are genuine no-ops — `(str (URI. u))` and `.normalize` — leave the
+            ;; whole thing alone, which is correct: they are not defects.
+            ;;
+            ;; Sabotaged 2026-08-23 to prove it bites: `locate`'s remote branch
+            ;; returning `(URLDecoder/decode uri "UTF-8")` instead of `uri` fails
+            ;; THIS assertion and only this one — the row count, the columns,
+            ;; `:store :lake` and the LOAD assertion all still pass. Re-run with
+            ;; the fixture path put back to `/sales.csv` and the same sabotage in
+            ;; place: zero failures. That is the finding the assertion was
+            ;; rewritten for.
+            (is (= #{"/Sales+Q3%20final.csv"} (set (map :uri @seen)))
                 (str "DuckDB asked this server for something other than the path loci
                       was given — `locate` is verbatim precisely so a uri is not
                       re-encoded on the way through, and this is where that shows: "
@@ -833,12 +939,30 @@
   ;; is then refused a CSV on local disk with a sentence about httpfs.
   ;; `ensure-extension!`'s own paragraph records that an httpfs LOAD in a
   ;; container still falls through, so this is reachable rather than theoretical.
-  ;; **The reset is what makes this bite**, and without it the test is a false
-  ;; green. `ensure-remote!` remembers `:httpfs` on the lake, the fixture's lake
-  ;; is `:once` for the namespace, and `a-remote-csv-materialises-into-the-lake`
-  ;; leaves it set — so with the guard removed the call here would return early,
-  ;; issue no LOAD, and this test would pass. Measured 2026-08-23: with the reset
-  ;; the same sabotage fails, without it it does not.
+  ;; **The reset is what makes this bite, and it is load-bearing right now** —
+  ;; not a hazard held in reserve against a future reordering. `ensure-remote!`
+  ;; remembers `:httpfs` on the lake and the fixture's lake is `:once` for the
+  ;; namespace, so a run that reached it before this test leaves the flag set,
+  ;; and with the guard removed the call here returns early, issues no LOAD, and
+  ;; this test passes.
+  ;;
+  ;; The trap is that it is not the two REMOTE tests that set it. Remove the
+  ;; guard and `ensure-remote!` is reached by every uri `describe` sees, and
+  ;; `deftest` order is `ns-interns` order — hash order over the var names —
+  ;; which puts this var at index 13 with FIVE tests that reach `describe`
+  ;; ahead of it, the first being `a-very-long-title-still-connects` at index 1.
+  ;; So the flag is set a dozen tests before any remote uri exists. Measured
+  ;; 2026-08-23, guard removed: with the resets deleted this test PASSED and the
+  ;; run's only failure was the remote test's own LOAD assertion; with them
+  ;; restored this test fails on `["LOAD httpfs" …]`. A review reached the
+  ;; opposite conclusion from the index alone — see the longer note in
+  ;; `a-remote-csv-materialises-into-the-lake`, which is where the measurement
+  ;; is recorded.
+  ;;
+  ;; That note also carries the other half: a reset clears loci's memory of what
+  ;; it ensured without undoing the connection's state, which is free for
+  ;; `:httpfs` because `LOAD` is idempotent and is not free for the
+  ;; `CREATE SECRET` behind `:s3`.
   (reset! (:ensured @lake/lake) #{})
   (let [sql  (atom [])
         real lake/x!
