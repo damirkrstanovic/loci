@@ -163,3 +163,36 @@ way every other DuckDB failure already is.
 - **Passthrough over a remote location.** Refused, with the measured reason above. Revisit it with a
   measurement of a real remote read, not with reasoning.
 - **Storing credentials in any form.** Not a deferral — a decision.
+
+## What connecting a remote source exposes, decided 2026-08-23
+
+**Connecting a source is a server-side fetch of a caller-supplied URL.** After this phase, a
+`POST /api/source/connect` makes loci issue an outbound request from its own network position — and
+`server.clj`'s `(http/run-server #'handler {:port port})` passes no `:ip`, so http-kit binds
+`0.0.0.0`, and the handler has no authentication.
+
+Put beside this spec's own credential decision — the process holds ambient cloud credentials **by
+design**, because `PROVIDER credential_chain` is the whole point —
+`http://169.254.169.254/latest/meta-data/iam/security-credentials/` becomes a loci table on EC2, and
+the same for the ECS and EKS metadata endpoints.
+
+**No guard is built, and that is a decision rather than an oversight.** Reaching the port is already
+total compromise: every fact in the substrate is readable, `file://` is unrestricted by decision so
+any file the process can read is readable, and everything is deletable. An attacker who can POST to
+`/api/source/connect` does not need the metadata endpoint to own the data. What this phase adds is
+**reach** — the server's network position, including link-local addresses only it can see — and on a
+cloud instance that widens the blast radius from loci's own data to the instance's role.
+
+The alternatives were considered and rejected for stated reasons:
+
+- **Blocking link-local ranges** is a partial guard that DNS rebinding, an HTTP redirect to the
+  metadata IP, and IPv6 spellings all route around. Shipping protection that cannot deliver what its
+  name promises is the failure mode `reclaim!`'s interleave note already argues against.
+- **Binding to loopback by default** addresses the cause rather than a symptom and helps every route,
+  not this one — but it changes how loci is reached and belongs to a deployment decision, not to a
+  source-connector phase.
+- **Designing authentication first** is the honest long answer and is out of scope here.
+
+**The deployment answer is not to expose the port.** That was already true; this phase is the point at
+which it stops being only about confidentiality of the substrate and starts being about the
+credentials of the host.
