@@ -660,7 +660,7 @@
    shadowed by a temporary one — which is what happened before, measured, and
    which broke the escape hatch the spec promises for a bucket the chain cannot
    reach. See `secret-covers?` for the three measurements and for why the check
-   costs 12.7 ms rather than a trade.
+   is not a trade — it costs about 2 ms against the 6,000 ms it can skip.
 
    **A failure is not remembered.** The flag moves only after the statement
    returns, so a machine that grows credentials, or an extension directory that

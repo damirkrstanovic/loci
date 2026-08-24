@@ -361,7 +361,8 @@ Nothing the design rests on moves. The 6.0 s steady-state figure is unchanged, a
 reason the secret is conditional on `s3://`. What changes is what an operator should expect: **an
 offline image pays the four seconds too**, because it was never the network.
 
-**(b) `secret-covers?` costs about 2 ms, not 12.7 ms.** Its docstring says 12.7 ms. Measured cold,
+**(b) `secret-covers?` costs about 2 ms, not 12.7 ms.** Its docstring said 12.7 ms; corrected there
+on the day, and in `ensure-remote!` on 2026-08-24. Measured cold,
 the first `which_secret` of a process is 5.8 / 5.3 ms and every one after is 2.1 / 1.9 ms; warm,
 five calls gave 2.3 / 7.4 / 2.1 / 2.4 / 2.6 ms. The 12.7 ms was a first call in a busier process and
 it was never wrong about the decision — the check is three orders of magnitude below the 6,000 ms

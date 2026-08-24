@@ -881,10 +881,15 @@
   ;; cannot satisfy it does not hand back an unused secret, it throws.
   ;;
   ;; Measured 2026-08-23 on DuckDB 1.5.5 with no AWS credentials present:
-  ;; 10.5 s the first time — the `aws` extension autoinstalls, which is also
-  ;; how we know `httpfs` alone is not enough for it — and 6.0 s every time
-  ;; after, with `Invalid Configuration Error: Secret Validation Failure:
-  ;; during `create``.
+  ;; 10.5 s the first time and 6.0 s every time after, with `Invalid
+  ;; Configuration Error: Secret Validation Failure: during `create``.
+  ;;
+  ;; The extra four seconds are NOT the `aws` extension autoinstalling — an
+  ;; earlier version of this comment said they were. With `aws` already
+  ;; installed and explicitly LOADed first (46 ms), a cold JVM still paid
+  ;; 10,022 ms on its first CREATE and 6,018 ms on its second, twice. It is a
+  ;; once-per-process cost inside the chain's first walk, so an offline image
+  ;; pays it too. See `ensure-remote!`'s docstring.
   ;;
   ;; So a secret issued for every remote scheme would put six seconds and a
   ;; hard failure in front of every https:// read on every machine without AWS
