@@ -253,11 +253,12 @@
   .dmode-fixed{display:inline-flex;align-items:center;font-family:var(--mono);font-size:10.5px;
                letter-spacing:.06em;text-transform:uppercase;color:var(--muted);
                border:1px solid var(--line);border-radius:7px;padding:5px 8px}
-  /* the sentence under `reading its columns…`, which for a URL is not a
-     figure of speech: the fetch happens HERE, at preview, and an s3:// location
-     whose credentials have to be walked and refused takes ~6 s (measured 6,069 ms
-     2026-08-23). loci has no timeout and no cancel, so the panel's only honest
-     move is to say what the wait is and keep the way out drawn. */
+  /* `reading its columns…`, which for a URL is not a figure of speech: the
+     fetch happens HERE, at preview, and an s3:// location whose credentials
+     have to be walked and refused takes ~6 s — see `dataPreview`'s comment for
+     the measurement and for why a container with no route out is fast instead.
+     loci has no timeout and no cancel, so the panel's only honest move is to
+     say what the wait is and keep the way out drawn. */
   .dwait{color:var(--muted);font-size:13px;line-height:1.55;padding:6px 0}
   /* loci's remote failures are PARAGRAPHS — `credential-problem` and
      `remote-extension-problem` compose a sentence, an indented context block,

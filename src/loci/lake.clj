@@ -244,12 +244,12 @@
    the day `ensure-remote!` landed, because until then an `httpfs` LOAD in a
    container fell through to INSTALL and died under `--network none`, refusing
    a remote source with a download error. Whoever adds a line to that `RUN`
-   should still add its name here. What the three cost, measured on the actual
-   build: ducklake 36,436,086 bytes, aws 28,456,078, httpfs 21,570,542, and the
-   image went 249,391,443 → 299,418,382, a delta of +50,026,939 (+20.1%) that
-   the two new extensions account for to within 319 bytes — the two `.info`
-   files. Written down rather than argued from: nobody has complained about the
-   size of this image.
+   should still add its name here. The three cost about 86 MB of a 299 MB image
+   between them, which is the largest thing it spends after the JDK runtime and
+   the jar. The per-extension bytes and the build-to-build delta are in the
+   Dockerfile beside the `COPY` that ships them, because that is where the
+   decision to pay it is made, and in the spec's Measured section. Written down
+   rather than argued from: nobody has complained about the size of this image.
 
    It stays for the machine that is not a container: a `clojure -M:serve` on a
    laptop that has never opened a lake still needs it, and there this branch is
