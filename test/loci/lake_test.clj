@@ -118,7 +118,10 @@
       (let [conn (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" (java.util.Properties.))
             lk   (bare-lake conn rel)]
         (try
-          (#'lake/ensure-extension! lk "ducklake")
+          (#'lake/ensure-extension!
+           lk "ducklake"
+           "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+           "\nFailing here rather than at the first table read.")
           (lake/x! lk (str "ATTACH 'ducklake:" rel "/catalog.duckdb' AS lake (DATA_PATH '" rel "/files/')"))
           (lake/x! lk "USE lake")
           (lake/x! lk "CREATE TABLE t_rel AS SELECT * FROM range(100) t(id)")
@@ -692,19 +695,26 @@
 
    INSTALL is allowed to SUCCEED here, so the retry's second LOAD is reached and
    the sequence below is all three statements rather than the two an INSTALL
-   failure would stop at."
-  [ext]
-  (let [sql (atom [])
-        e   (with-redefs [lake/x! (fn [_ s]
-                                    (swap! sql conj s)
-                                    (if (str/starts-with? s "LOAD")
-                                      (throw (java.sql.SQLException. "injected"))
-                                      :ok))]
-              ;; nil for the lake: `x!` is the only thing here that touches a
-              ;; connection, and it is stubbed.
-              (try (#'lake/ensure-extension! nil ext) nil
-                   (catch clojure.lang.ExceptionInfo e e)))]
-    {:sql @sql :e e :msg (str (some-> ^Throwable e .getMessage))}))
+   failure would stop at.
+
+   The one-argument arity is for the tests that are about the SQL and the
+   ex-data rather than the prose — its head and tail are a caller's to compose
+   since 2026-08-24, so a default stands in. The three-argument arity is what
+   `only-the-lake-claims-the-lake-cannot-open` uses, to put the two real call
+   sites' own strings through this function."
+  ([ext] (failed-extension ext (str "loci cannot load DuckDB's " ext " extension.") ""))
+  ([ext head tail]
+   (let [sql (atom [])
+         e   (with-redefs [lake/x! (fn [_ s]
+                                     (swap! sql conj s)
+                                     (if (str/starts-with? s "LOAD")
+                                       (throw (java.sql.SQLException. "injected"))
+                                       :ok))]
+               ;; nil for the lake: `x!` is the only thing here that touches a
+               ;; connection, and it is stubbed.
+               (try (#'lake/ensure-extension! nil ext head tail) nil
+                    (catch clojure.lang.ExceptionInfo e e)))]
+     {:sql @sql :e e :msg (str (some-> ^Throwable e .getMessage))})))
 
 (deftest ensure-extension-really-loads-the-extension-it-was-asked-for
   ;; A BARE connection, not `with-lake`, and that IS the test. `ATTACH
@@ -729,7 +739,10 @@
     (try
       (is (false? (loaded?))
           "a fresh connection must NOT already carry it, or this observes nothing")
-      (is (= :ok (#'lake/ensure-extension! lk "ducklake")))
+      (is (= :ok (#'lake/ensure-extension!
+                  lk "ducklake"
+                  "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+                  "\nFailing here rather than at the first table read.")))
       (is (true? (loaded?))
           "and now it does — the one assertion here that a no-op cannot pass")
       (finally (.close conn)))))
@@ -748,18 +761,19 @@
     (is (= "injected" (some-> ^Throwable e .getCause .getMessage))
         "with DuckDB's own error kept as the cause, the way the ducklake path keeps it")))
 
-(deftest only-ducklake-claims-the-lake-cannot-open
-  ;; The two sentences that are about the CONSEQUENCE rather than the mechanism.
-  ;; `open-lake!` closes the connection and rethrows, so for ducklake they are
-  ;; true; for an extension loaded lazily on the path that needs it they would be
-  ;; a false claim about the whole store.
-  ;;
-  ;; The shared half is asserted for BOTH, deliberately. A split that gave the
-  ;; new caller a short sentence and dropped the directory, the uid and the fix
-  ;; would pass any assertion that only read the first line — and it is the
-  ;; actionable half that would have gone.
-  (let [d (:msg (failed-extension "ducklake"))
-        h (:msg (failed-extension "httpfs"))]
+(deftest only-the-lake-claims-the-lake-cannot-open
+  ;; Was `only-ducklake-claims-the-lake-cannot-open`, over an internal
+  ;; `(= "ducklake" ext)` flag inside `extension-problem`. The consequence is
+  ;; the CALLER's now, so this asserts the two messages that actually reach a
+  ;; reader rather than the flag that used to pick between them — and the
+  ;; shared paragraph is checked in both, which is what stops a caller
+  ;; composing a consequence that replaces the directory, the uid and the fix.
+  (let [d (:msg (failed-extension "ducklake"
+                                  "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+                                  "\nFailing here rather than at the first table read."))
+        h (:msg (failed-extension "httpfs"
+                                  "loci cannot read https://h/x.csv — DuckDB's httpfs extension is not available."
+                                  "\n  This source cannot be read; nothing else is affected."))]
     (is (str/includes? d "so the lake cannot open"))
     (is (str/includes? d "Failing here rather than at the first table read"))
     (is (not (str/includes? h "so the lake cannot open"))
@@ -772,6 +786,36 @@
                     "LOAD only reads."]]
       (is (str/includes? d shared) (str "the ducklake message lost: " shared))
       (is (str/includes? h shared) (str "the httpfs message never got: " shared)))))
+
+(deftest the-ducklake-paragraph-did-not-move
+  ;; The signature change of 2026-08-24 is a refactor of who composes the
+  ;; consequence, and a refactor that alters the message a container operator
+  ;; reads at boot is not one.
+  ;;
+  ;; The expected string was captured from the OLD `extension-problem` — the one
+  ;; with the `required?` flag — before that function was touched. The two
+  ;; machine-dependent lines are stubbed rather than left real, or the assertion
+  ;; would pin this developer's HOME and uid and fail on every other machine;
+  ;; both branches of the `cond` they feed are still exercised, since the
+  ;; LOCI_DUCKDB_EXTENSIONS one is what a container takes.
+  (is (= (str "loci cannot load DuckDB's ducklake extension, so the lake cannot open.\n"
+              "  looking in /opt/duckdb-extensions (LOCI_DUCKDB_EXTENSIONS)\n"
+              "  running as uid 0 (root)\n"
+              "  DuckDB said: DuckDB's own text\n"
+              "\n"
+              "  Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension.\n"
+              "  A container should set it at build time and install the extension\n"
+              "  into the image then: INSTALL is the one step here that reaches the\n"
+              "  network, and the directory it writes need never be writable again —\n"
+              "  LOAD only reads.\n"
+              "\n"
+              "Failing here rather than at the first table read.")
+         (with-redefs [lake/extension-dir (constantly "/opt/duckdb-extensions")
+                       sub/running-as     (constantly "uid 0 (root)")]
+           ((deref #'lake/extension-problem)
+            "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+            (Exception. "DuckDB's own text")
+            "\nFailing here rather than at the first table read.")))))
 
 ;; ---------------------------------------------------------------------------
 ;; ensure-remote! — httpfs and the secret, once, lazily
@@ -964,23 +1008,13 @@
            queries)
         "the quote is doubled, so the payload stays inside the string literal")))
 
-(deftest the-refusal-names-the-extension-its-cause-carries
-  ;; `ensure-extension!` already puts the name it was asked for into ex-data, so
-  ;; writing "httpfs" here as well was a second copy of the same fact. One
-  ;; caller makes the two agree by luck; a second one loading `aws` — which
-  ;; `ensure-remote!`'s docstring says an offline image will need — would make
-  ;; this message name the wrong extension, in a sentence whose whole job is to
-  ;; say which one.
-  (let [aws (#'lake/remote-extension-problem
-             "s3://b/x.csv" (ex-info "boom" {:extension "aws" :dir "/x"}))
-        raw (#'lake/remote-extension-problem
-             "s3://b/x.csv" (java.sql.SQLException. "boom"))]
-    (is (str/includes? aws "DuckDB's aws extension is not available") aws)
-    (is (not (str/includes? aws "httpfs"))
-        (str "it named the extension the caller happens to use today: " aws))
-    (is (str/includes? raw "DuckDB's httpfs extension is not available")
-        (str "a cause carrying no ex-data must still say something true — httpfs "
-             "is the only way to reach here: " raw))))
+;; `the-refusal-names-the-extension-its-cause-carries` was here. It pinned that
+;; `remote-extension-problem` read the extension name off its cause's ex-data
+;; instead of hardcoding "httpfs", so that a second caller loading `aws` would
+;; not be told the wrong one. That function is gone (2026-08-24): the head is
+;; composed at the call site from the `ext` being loaded, so there is no second
+;; copy of the name to fall behind. Deleted rather than adapted, because what it
+;; guarded no longer exists.
 
 (deftest two-threads-arriving-together-issue-one-secret
   ;; The guard and the statement it guards were separated by a SIX SECOND
@@ -1102,14 +1136,13 @@
     (is (= #{:httpfs} ensured))))
 
 (deftest a-missing-httpfs-refuses-one-source-and-says-so
-  ;; `extension-problem` puts its two consequence sentences behind `required?`,
-  ;; because ", so the lake cannot open" is true only for ducklake — where
-  ;; `open-lake!`'s try closes the connection and rethrows. That is right, and
-  ;; it leaves httpfs with a message that names no consequence at all: loci
-  ;; cannot load an extension, and nothing about what that means for the thing
-  ;; the reader was doing. The consequence is the half only this caller knows,
-  ;; and "refuse this source, not the store" is the requirement the whole
-  ;; laziness exists to meet, so it belongs where the user reads it.
+  ;; `extension-problem` composes the directory, the uid and the fix and cannot
+  ;; know what the failure costs — ", so the lake cannot open" is true only for
+  ;; ducklake, where `open-lake!`'s try closes the connection and rethrows. The
+  ;; consequence is the half only this caller knows, and "refuse this source,
+  ;; not the store" is the requirement the whole laziness exists to meet, so it
+  ;; belongs where the user reads it: this caller hands it in as the head and
+  ;; tail around that paragraph.
   (let [{:keys [sql out ensured]} (remote-sql ["https://example.com/a.csv"]
                                               #(str/starts-with? % "LOAD"))
         e   (first out)
@@ -1122,11 +1155,12 @@
     (is (not (str/includes? msg "so the lake cannot open"))
         (str "it claimed the store cannot open, which is ducklake's sentence: " msg))
     (is (str/includes? msg "Set LOCI_DUCKDB_EXTENSIONS to a directory holding the extension.")
-        "and `extension-problem`'s actionable paragraph survives the wrapping. A
-         consequence sentence that REPLACED the directory, the uid and the fix
-         would be a worse message than the one it set out to improve")
+        "and `extension-problem`'s actionable paragraph is still between the head
+         and the tail. A consequence sentence that REPLACED the directory, the
+         uid and the fix would be a worse message than the one it set out to
+         improve")
     (is (= "httpfs" (:extension (ex-data e)))
-        "ex-data keeps ensure-extension!'s keys under the wrapper's :uri")
+        "ex-data keeps ensure-extension!'s keys beside this caller's :uri")
     (is (= "https://example.com/a.csv" (:uri (ex-data e))))
     (is (= ["LOAD httpfs" "INSTALL httpfs" "LOAD httpfs"] sql)
         "the LOAD-then-INSTALL retry ran, so this failed the way a real missing
@@ -1134,6 +1168,26 @@
     (is (empty? ensured)
         "and nothing was remembered, so a container that gains the extension does
          not need a restart before a source can use it")))
+
+(deftest the-remote-refusal-does-not-say-it-twice
+  ;; Two message composers, one nested inside the other, drew two headlines for
+  ;; one failure — measured 2026-08-24, and drawn in the ＋ Data panel under
+  ;; `.srcerr` exactly as composed:
+  ;;
+  ;;   loci cannot read s3://… — DuckDB's httpfs extension is not available.
+  ;;
+  ;;   loci cannot load DuckDB's httpfs extension.
+  ;;
+  ;; The count is on "extension is not available"/"cannot load", not on the word
+  ;; httpfs: httpfs legitimately appears in the LOAD/INSTALL advice below, so
+  ;; counting the extension name would fail against a correct message.
+  (let [{:keys [out]} (remote-sql ["https://example.com/a.csv"]
+                                  #(str/starts-with? % "LOAD"))
+        msg (.getMessage ^Throwable (first out))]
+    (is (= 1 (count (re-seq #"(?i)cannot load DuckDB's|extension is not available" msg)))
+        (str "one failure, drawn with two headlines: " msg))
+    (is (str/includes? msg "https://example.com/a.csv")
+        (str "and the surviving headline is the one naming the source: " msg))))
 
 (deftest unwrap-renders-temporal-types-as-iso-strings
   ;; DuckDB's CSV sniffer gives LocalDate for DATE and java.sql.Timestamp for

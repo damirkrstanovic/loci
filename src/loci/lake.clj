@@ -159,8 +159,8 @@
   (config/env "LOCI_DUCKDB_EXTENSIONS"))
 
 (defn- extension-problem
-  "One paragraph naming the extension, the directory, the uid and the fix —
-   `data-dir-problem`'s job, for the other directory loci needs.
+  "The mechanism paragraph — the directory, the uid, DuckDB's own message and
+   the fix — between a `head` and a `tail` the CALLER composes.
 
    Without it the reader gets DuckDB's own error, which names neither loci nor
    anything actionable:
@@ -172,28 +172,29 @@
    DuckDB composes its extension directory from $HOME and the runtime image sets
    none — see `open-lake!`.
 
-   **One function and not two, because only the CONSEQUENCE is per-extension.**
-   Everything between the first line and the last — the directory, the uid,
-   DuckDB's own message, and the paragraph about installing at build time — is
-   about the extension *mechanism*, and is exactly as true for any other
-   extension as it is for `ducklake`. A second function would be a second copy
-   of measured prose to keep in agreement, and the half that would drift is the
-   actionable half.
+   **Everything between `head` and `tail` is about the extension MECHANISM**,
+   and is exactly as true for any extension as it is for `ducklake`. What is not
+   shared is what the failure COSTS, which only the caller knows: `open-lake!`
+   is failing at boot with no lake, and `ensure-remote!` is refusing one source
+   while the store stays open. Both are sentences about a consequence, and a
+   consequence is not derivable from an extension name.
 
-   What is not shared is the two sentences saying what the failure COSTS.
-   `ducklake` is required — no extension, no lake — so its message says the lake
-   cannot open, and says loci is failing at boot rather than at the first table
-   read, which `open-lake!`'s `try` is what makes true. Nothing else here is
-   required, so for any other extension this says only what it knows and leaves
-   the consequence to the caller that has one. Both ducklake sentences are
-   therefore behind `required?` rather than deleted, and the ducklake message is
-   byte-identical to the one measured before this argument existed."
-  [ext ^Throwable cause]
-  (let [dir       (extension-dir)
-        home      (System/getenv "HOME")
-        required? (= "ducklake" ext)]
-    (str "loci cannot load DuckDB's " ext " extension"
-         (when required? ", so the lake cannot open") ".\n"
+   **It used to be derived from one anyway, and that is why this signature
+   changed.** `required? (= \"ducklake\" ext)` gated ducklake's two sentences,
+   and the other caller then wrapped this whole message in a SECOND composer to
+   add its own — which rendered two headlines for one failure, `\"loci cannot
+   read <uri> — DuckDB's httpfs extension is not available.\"` immediately
+   above `\"loci cannot load DuckDB's httpfs extension.\"`, measured
+   2026-08-24. That wrapper also had to `str/trimr` a newline the flag left
+   behind and read the extension name back off the cause's `ex-data`. All of it
+   was one concern implemented twice.
+
+   The ducklake message is byte-identical to the one measured before this
+   argument existed; `the-ducklake-paragraph-did-not-move` pins it."
+  [head ^Throwable cause tail]
+  (let [dir  (extension-dir)
+        home (System/getenv "HOME")]
+    (str head "\n"
          "  looking in " (cond dir  (str dir " (LOCI_DUCKDB_EXTENSIONS)")
                                home (str home "/.duckdb — DuckDB's default, from HOME")
                                :else "/.duckdb — DuckDB's default, and HOME is unset")
@@ -206,7 +207,7 @@
          "  into the image then: INSTALL is the one step here that reaches the\n"
          "  network, and the directory it writes need never be writable again —\n"
          "  LOAD only reads.\n"
-         (when required? "\nFailing here rather than at the first table read."))))
+         tail)))
 
 (defn- ensure-extension!
   "LOAD `ext` first, INSTALL only if that fails. **Do not delete this.** It
@@ -275,14 +276,22 @@
    than a side effect of it. Everything measured above is about `ducklake`,
    whose failure means the store cannot open; a caller whose failure means
    something narrower gets a sentence about the extension IT asked for, and
-   `extension-problem` composes only the consequence it can justify."
-  [lk ext]
+   `extension-problem` composes only the consequence it can justify.
+
+   **`head` and `tail` are the caller's, not this function's.** What a missing
+   extension costs is not derivable from its name — `open-lake!` has no lake and
+   is failing at boot, `ensure-remote!` is refusing one source while everything
+   else keeps working — so each caller composes the sentences it can justify and
+   this composes the paragraph they share. `ext` is still interpolated into both
+   heads at the call site, so neither can name an extension other than the one
+   that failed."
+  [lk ext head tail]
   (try (x! lk (str "LOAD " ext))
        (catch Exception _
          (try (x! lk (str "INSTALL " ext))
               (x! lk (str "LOAD " ext))
               (catch Exception e
-                (throw (ex-info (extension-problem ext e)
+                (throw (ex-info (extension-problem head e tail)
                                 {:dir (extension-dir) :extension ext} e)))))))
 
 ;; `ensured` holds the set of one-per-connection preparations already done —
@@ -374,7 +383,9 @@
          conn  (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" props)
          lk    (->Lake conn dir (atom #{}))]
      (try
-       (ensure-extension! lk "ducklake")
+       (ensure-extension! lk "ducklake"
+                          "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+                          "\nFailing here rather than at the first table read.")
        (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"
                    " (DATA_PATH '" dir "/files/', OVERRIDE_DATA_PATH true)"))
        (x! lk "USE lake")
@@ -413,50 +424,6 @@
    are not here for the same reason they are not in `remote-schemes`: they
    arrive the day someone has one, and each brings its own secret type."
   "s3://")
-
-(defn- remote-extension-problem
-  "`extension-problem`'s paragraph with the CONSEQUENCE this caller knows and it
-   does not: which source cannot be read, and that nothing else is affected.
-
-   That gap is real and is why this exists. `extension-problem` puts its two
-   consequence sentences — `\", so the lake cannot open\"` and `\"Failing here
-   rather than at the first table read.\"` — behind a `required?` flag, because
-   they are true only for `ducklake`, where `open-lake!`'s `try` closes the
-   connection and rethrows. For `httpfs` they would be a lie. But dropping them
-   leaves a message that says loci cannot load an extension and never says what
-   that means for the thing the reader was trying to do, and \"refuse this
-   source, not the store\" is the requirement the whole laziness exists to
-   meet. It is worth stating where the user reads it and not only in a
-   docstring.
-
-   A wrapper here rather than a third branch in `extension-problem`, because
-   the missing half is the **uri**, which that function has no way to know and
-   would have to grow an argument for that only one of its two callers could
-   fill. The cause is kept whole — loci's own ex-info, DuckDB's underneath it —
-   so `ex-data`'s `:extension` and `:dir` survive for anything reading them.
-
-   **The extension is READ off that `ex-data` rather than written out here.**
-   It was the literal `\"httpfs\"`, which was correct and was a second copy of
-   a fact the cause was already carrying: `ensure-extension!` puts the name it
-   was asked for into `{:dir … :extension ext}`. One caller today makes the two
-   agree by luck, and the day a second one loads `aws` explicitly — which
-   `ensure-remote!`'s own docstring says an offline image will need — the
-   literal starts naming the wrong extension in a message whose whole job is to
-   say which one. `\"httpfs\"` stays as the fallback for a cause that is not
-   `ensure-extension!`'s ex-info, since that is the only way to reach here."
-  [uri ^Throwable cause]
-  (str "loci cannot read " uri " — DuckDB's "
-       (or (:extension (ex-data cause)) "httpfs") " extension is not available.\n"
-       "\n"
-       ;; trimmed: `extension-problem`'s ducklake half ends the string with a
-       ;; newline whether or not it fired, so this would otherwise be two blank
-       ;; lines for httpfs and one for ducklake.
-       (str/trimr (.getMessage cause)) "\n"
-       "\n"
-       "  This source cannot be read; nothing else is affected. The extension is\n"
-       "  loaded only for a remote location, so loci is running, the store is open,\n"
-       "  every loci:// and file:// source still reads, and every table already in\n"
-       "  the lake is unchanged. Connect this one again once the extension is there."))
 
 (defn- credential-problem
   "One paragraph naming the location, DuckDB's own error and the fix —
@@ -583,8 +550,8 @@
    remote source must not fail to start because an extension it does not need
    is missing. So this fails one source at connect time, not the store at boot
    — and says so: `extension-problem` composes the directory, the uid and the
-   fix but cannot know the consequence, so `remote-extension-problem` wraps it
-   with the half only this caller has, which source cannot be read and that
+   fix but cannot know the consequence, so this caller hands `ensure-extension!`
+   the head and tail only it can compose: which source cannot be read, and that
    nothing else is affected.
 
    **The secret is `PROVIDER credential_chain`, so loci hands DuckDB a provider
@@ -711,10 +678,16 @@
   (let [ensured (:ensured lk)]
     (locking ensured
       (when-not (contains? @ensured :httpfs)
-        (try (ensure-extension! lk "httpfs")
-             (catch Exception e
-               (throw (ex-info (remote-extension-problem uri e)
-                               (assoc (ex-data e) :uri uri) e))))
+        (try (ensure-extension!
+              lk "httpfs"
+              (str "loci cannot read " uri " — DuckDB's httpfs extension is not available.")
+              (str "\n"
+                   "  This source cannot be read; nothing else is affected. The extension is\n"
+                   "  loaded only for a remote location, so loci is running, the store is open,\n"
+                   "  every loci:// and file:// source still reads, and every table already in\n"
+                   "  the lake is unchanged. Connect this one again once the extension is there."))
+             (catch clojure.lang.ExceptionInfo e
+               (throw (ex-info (.getMessage e) (assoc (ex-data e) :uri uri) e))))
         (swap! ensured conj :httpfs))
       (when (and (str/starts-with? (str uri) s3-prefix)
                  (not (contains? @ensured :s3)))
