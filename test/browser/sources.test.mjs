@@ -1179,10 +1179,10 @@ test('the files reclaim button asks first, and its toast says what actually went
 //     measured 2026-08-23; 62 ms with no route out, because the chain gives up
 //     rather than timing out on IMDS). loci has no timeout and no cancel, so the
 //     panel has to say what the wait is and let you leave it.
-//   - the failure is an eight-line paragraph. `credential-problem` and
-//     `remote-extension-problem` compose prose with an indented fix, `esc()`
-//     keeps the newlines and a `<p>` collapses them. This door is what first
-//     routes a multi-line paragraph onto the preview path.
+//   - the failure is an eight-line paragraph. `credential-problem`, and the head
+//     and tail `ensure-remote!` hands `extension-problem`, compose prose with an
+//     indented fix, `esc()` keeps the newlines and a `<p>` collapses them. This
+//     door is what first routes a multi-line paragraph onto the preview path.
 
 // A CSV at a URL, on this machine and nowhere else.
 //
