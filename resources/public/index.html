@@ -260,11 +260,11 @@
      loci has no timeout and no cancel, so the panel's only honest move is to
      say what the wait is and keep the way out drawn. */
   .dwait{color:var(--muted);font-size:13px;line-height:1.55;padding:6px 0}
-  /* loci's remote failures are PARAGRAPHS — `credential-problem` and
-     `remote-extension-problem` compose a sentence, an indented context block,
-     DuckDB's own text and an indented fix, over eight lines. `esc()` keeps those
-     newlines and a `<p>` collapses every one of them, so without this the whole
-     of it is drawn as a single run-on line. `pre-wrap` and not `pre-line`: the
+  /* loci's remote failures are PARAGRAPHS — `credential-problem`, and the head
+     and tail `ensure-remote!` hands `extension-problem`, compose a sentence, an
+     indented context block, DuckDB's own text and an indented fix, over eight
+     lines. `esc()` keeps those newlines and a `<p>` collapses every one of them,
+     so without this the whole of it is drawn as a single run-on line. `pre-wrap` and not `pre-line`: the
      two-space indents are the author's, and pre-line eats them.
 
      `overflow-wrap` is the other half of the same paragraph, and it is the
