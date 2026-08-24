@@ -28,9 +28,53 @@
    3. **The schema a preview shows**, before anything is committed.
 
    Throws with `check-names!`'s ex-data when two headers would become one
-   column — the same refusal `normalize-rows` makes for rows."
+   column — the same refusal `normalize-rows` makes for rows.
+
+   **This is also where a remote connection is prepared — for every read
+   `connect!` and `refresh!` make, which is narrower than every read loci
+   makes.** Those two and the ＋ Data panel's own preview all arrive here, so
+   `lake/ensure-remote!` is called once, here, rather than at each of the three
+   — and `land!`'s CREATE runs on the same connection immediately after, so the
+   materialise is covered by the preparation the description already did.
+
+   **`lake/from-of` is the exception, and naming it is the point.** It builds
+   `read_csv('<location>')` straight from a `{:store :source}` handle without
+   coming through here, and `tbl/hydrate` reaches it on every render while
+   `server/recompute` reaches it per query — so a REMOTE `:store :source`
+   handle would read with no `LOAD httpfs` and no secret behind it. Nothing
+   mints one: `refuse-remote-passthrough!` stops `connect!` before the mode is
+   committed, and the doors that stay open are the three
+   `ssp/unreadable-because` enumerates — `/api/edit`, a REPL caller, an object
+   committed before the guard existed — of which none exist. Written down
+   rather than left implicit because the two docstrings would otherwise
+   disagree, and because if one of those handles is ever reached the
+   degradation is exactly the one `ensure-remote!` exists to prevent: `s3://`
+   goes out anonymous, and the failure lands inside a read with DuckDB's own
+   message instead of at connect with the paragraph naming the extension
+   directory and the uid."
   [lk src]
   (let [rel  (ssp/relation src (ssp/locate (:uri src)))
+        ;; **Guarded on the scheme, and the guard is not a tidiness.**
+        ;; `ensure-remote!` LOADs httpfs for whatever uri it is handed, and this
+        ;; function sees every uri there is. Called unguarded, an ordinary
+        ;; `loci://` CSV would issue `LOAD httpfs`; on a machine without the
+        ;; extension that falls through to `INSTALL`, which is the one statement
+        ;; in `ensure-extension!` that reaches the network — and under
+        ;; `--network none`, the container this phase targets, it dies. The
+        ;; person is then refused a file on local disk with a sentence about
+        ;; httpfs. `ensure-extension!`'s own paragraph records that an httpfs
+        ;; LOAD in a container still falls through, so that is reachable rather
+        ;; than theoretical, and `a-local-connect-asks-for-no-httpfs` is the
+        ;; assertion.
+        ;;
+        ;; Here rather than inside `ensure-remote!` for two reasons. `describe`
+        ;; is the only caller, and the scheme is the reason the call exists at
+        ;; all — a reader of this function should not have to open `lake.clj` to
+        ;; learn that a local connect touches no extension. And `lake.clj` was
+        ;; under review as this landed, so a behavioural change there would have
+        ;; raced it. `ensure-remote!`'s docstring carries the precondition, so a
+        ;; second caller is told rather than left to find out.
+        _    (when (ssp/remote? (:uri src)) (lake/ensure-remote! lk (:uri src)))
         rows (try (lake/q lk (str "DESCRIBE SELECT * FROM " rel))
                   (catch java.sql.SQLException e
                     (throw (ex-info (str "loci cannot read " (:uri src) " — " (ssp/duckdb-said e))
@@ -91,6 +135,69 @@
                            (str/join " and " (sort (map str modes))))
                       {:mode (:mode src) :known modes})))
     m'))
+
+(defn- refuse-remote-passthrough!
+  "Refuse `:mode :passthrough` when the location is one DuckDB fetches.
+
+   **A guard, not a validation, and the distinction is the reason it is here
+   rather than on the handle.** It refuses new CONNECTS; it does not refuse
+   existing objects. `refresh!` reads `:mode` back off the object `connect!`
+   already committed and never comes through this function, so an object that
+   was committed as a remote passthrough before this landed keeps that state for
+   as long as it exists — the mode is on the log, and the log is append-only.
+   That is the whole argument for refusing here, in front of the first read,
+   rather than reporting the problem at render time: there is no later moment at
+   which loci can take it back. **No such object exists outside this branch** —
+   `master`'s `sourcespec` has no `remote?` at all and its `locate` refuses
+   `s3://` outright, so a remote scheme only became connectable in `e1a5083`,
+   on this branch — so the point is structural and there is no migration to go
+   looking for. The commit is named and the DISTANCE to it is not: an earlier
+   draft of this sentence said \"four commits ago\", which was already ten by
+   the time anyone read it and is a number no edit to this function can keep
+   true.
+
+   The check is on `(:mode src)` as a KEYWORD, which is right only because
+   `connect!` calls this on `(assoc src :mode (mode-of src))`. Its own traffic
+   is HTTP and REPL callers — the shell has no remote-uri door — and
+   `server/source-connect!` does not coerce `:mode` while `body-json`
+   keywordises keys and not values, so every HTTP caller sends the STRING
+   `\"passthrough\"`. Running this before `mode-of` would let all of them
+   through. `connect-refuses-a-remote-passthrough-spelled-as-a-string` is the
+   assertion, and it is the `modes` defect below one function along.
+
+   **And it was reachable, not hypothetical.** DuckDB sets neither
+   `autoload_known_extensions` nor `autoinstall_known_extensions`, so both
+   default true and it installs and loads `httpfs` on its own. Measured
+   2026-08-23 with the guard removed: `connect!` over `s3://bucket/x.csv`
+   reached `bucket.s3.amazonaws.com` for real and came back with an HTTP 403 —
+   which is to say the read happened. Against a bucket the credential chain CAN
+   reach it would have described, landed, and committed
+   `{:store :source :uri \"s3://…\"}` with no complaint from anywhere.
+
+   The cost is measured rather than disliked. Phase 1 measured a passthrough
+   connect at 10M rows as 294 ms, of which 244 ms is one `count(*)` — a full
+   pass over the location. A `:store :source` handle repeats that pass on every
+   query, and `hydrate` adds a liveness check on every render. Locally those are
+   disk reads. Remotely each one is a fetch of the whole object across the
+   network, and loci has no query timeout to stop it, so a single mis-chosen
+   mode makes a notebook slow in a way nothing local can with the cause
+   invisible. `:materialise` plus `refresh!` — phase 2 already built the button
+   — is the same source at a cost the reader chose.
+
+   `modes` one docstring above is the precedent for both the shape and the
+   reasoning: it exists because `:mode \"passthrough\"` silently created a real
+   table while every report said passthrough, so the lie survived into the log
+   and every later `refresh!` repeated it. This is the same class one axis over
+   — a passthrough that must not quietly become an unbounded fetch — and the
+   answer is the same, a refusal before anything is committed."
+  [src]
+  (when (and (= :passthrough (:mode src)) (ssp/remote? (:uri src)))
+    (throw (ex-info (str "loci does not connect a remote location as passthrough: " (:uri src)
+                         " — a passthrough source is re-read on every query and checked"
+                         " on every render, which over the network is a fetch of the whole"
+                         " object each time and nothing in loci times it out."
+                         " Connect it with :mode :materialise, and refresh it when it changes.")
+                    {:uri (:uri src) :mode (:mode src)}))))
 
 (def ^:private slug-max
   "How long the readable half of a minted id may be.
@@ -251,11 +358,18 @@
    Returns `{:id … :cols … :rows … :mode …}`, whose `:mode` is read off the
    handle that was built rather than echoed from `src`. Throws whatever
    `describe` throws: a bad location, an unknown format, or two headers that
-   would become one column all fail here, before anything is committed."
+   would become one column all fail here, before anything is committed — and
+   before any of those, `refuse-remote-passthrough!` refuses a remote location
+   asked for as passthrough, which is the one refusal that happens without
+   reading the source at all."
   ([st src] (connect! st src nil))
   ([st src space]
    (let [lk    @lake/lake
          src   (assoc src :mode (mode-of src))
+         ;; Between the mode being decided and the source being read, which is
+         ;; the only window there is: `describe` below is the first fetch, and
+         ;; for a remote location that fetch is the cost this refuses.
+         _     (refuse-remote-passthrough! src)
          title (or (not-empty (:title src)) "Table")
          d     (describe lk src)
          at    (now-iso)

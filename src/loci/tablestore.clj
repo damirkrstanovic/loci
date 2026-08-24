@@ -538,7 +538,14 @@
    filesystem to choose this branch and knows the real answer — where DuckDB's
    driver, for an unreadable file, reports either a four-line dump or a bare
    `NullPointerException`. `:table/source-drift` carries DuckDB's, because there
-   the message is the actionable part: it names the columns the file has now."
+   the message is the actionable part: it names the columns the file has now.
+
+   **A REMOTE unavailable carries both**, because the sentence above stops being
+   true: there is no filesystem for loci to have looked at, so its phrase names
+   the location and nothing else, and DuckDB's is the only account of what went
+   wrong that exists. Suppressing it there would mean drawing a block headed
+   \"source unreachable\" that cannot say whether the credentials expired or the
+   key was never written."
   [ts o]
   (if (and o (handle? (:value o)))
     (let [ts (force ts)
@@ -557,7 +564,25 @@
           (let [gone (assoc o :value [] :table/total (:rows h) :table/cols (:cols h))]
             (if pt
               (if-let [why (ssp/unreadable-because (:uri h))]
-                (assoc gone :table/passthrough true :table/unavailable why)
+                (assoc gone :table/passthrough true
+                            :table/unavailable
+                            ;; loci's own phrase is the WHOLE message for a
+                            ;; local uri — it looked at the filesystem and knows
+                            ;; the answer, so DuckDB's line would only repeat it
+                            ;; in a worse voice. That argument does not carry to
+                            ;; a remote one, where loci looked at nothing: its
+                            ;; phrase can name the location and no more, and the
+                            ;; 403, the expired credential or the key that was
+                            ;; never there is in `e` and nowhere else. Suppress
+                            ;; it there and the reader is told a source is
+                            ;; unreachable with no way to learn why.
+                            ;;
+                            ;; `remote?` and not a match on the phrase's
+                            ;; English: reading a state back out of prose is
+                            ;; what this file refuses to do everywhere else, and
+                            ;; index.html's own comment forbids it in the shell.
+                            (cond-> why
+                              (ssp/remote? (:uri h)) (str " — " (ssp/duckdb-said e))))
                 (assoc gone :table/passthrough true
                             :table/source-drift
                             ;; The columns it was connected as come first,

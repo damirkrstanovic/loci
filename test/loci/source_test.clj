@@ -1,6 +1,7 @@
 (ns loci.source-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is use-fixtures]]
+            [loci.files :as files]
             [loci.lake :as lake]
             [loci.lake-fixture :as lf]
             [loci.server :as server]
@@ -8,7 +9,8 @@
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
-            [loci.tools :as tools]))
+            [loci.tools :as tools]
+            [org.httpkit.server :as httpd]))
 
 ;; `with-temp-lake` rather than `with-lake`, from the first test: it REBINDS
 ;; `lake/lake`, and a later task's `source/connect!` reads that var. A local
@@ -545,6 +547,674 @@
       (is (some? e) (str "must refuse mode " (pr-str bad)))
       (is (re-find #"unknown source mode" (str (.getMessage ^Exception e)))
           (str "…and say so, for mode " (pr-str bad))))))
+
+(defn- no-remote-reads
+  "`describe`, real for a local uri and throwing for a remote one.
+
+   **A test that reaches the network when it regresses is a test that reaches
+   the network.** The refusals below never read today — that is what they
+   assert — but without this the day the guard breaks is the day
+   `clojure -M:test` calls `bucket.s3.amazonaws.com`, with no timeout anywhere
+   in loci, in a suite the spec says stays offline. It delegates for `file://`
+   so the local control in each test is still a real connect, and the `::read`
+   marker is what a broken guard trips instead of a socket."
+  []
+  (let [real src/describe]
+    (fn [lk s]
+      (if (ssp/remote? (:uri s))
+        (throw (ex-info "the suite does not reach the network" {::read true}))
+        (real lk s)))))
+
+(deftest connect-refuses-passthrough-for-a-remote-location
+  ;; Not a pre-emptive refusal. DuckDB sets neither `autoload_known_extensions`
+  ;; nor `autoinstall_known_extensions`, so both default true and it installs
+  ;; and loads `httpfs` by itself — measured 2026-08-23 against this suite's own
+  ;; lake. Without the guard `describe` therefore READS over `s3://`. Against
+  ;; THIS fixture that read then 403s rather than succeeding, which is why the
+  ;; emptiness assertion below needs its control and why the next test exists at
+  ;; all; against a bucket the credential chain can reach it would have
+  ;; described, landed and committed `{:store :source :uri "s3://…"}`, the shape
+  ;; the spec's measurement says must not exist.
+  (with-redefs [src/describe (no-remote-reads)]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode :passthrough :title "S3"})))
+          m  (str (some-> e .getMessage))]
+      ;; The ex-data, and it is the only assertion here that DISCRIMINATES.
+      ;; `re-find #"passthrough"` matches `mode-of`'s refusal too — measured, its
+      ;; message ends "loci knows :materialise and :passthrough" — and
+      ;; `#"s3://bucket/x.csv"` matches `describe`'s own failure, which names the
+      ;; uri as well. Only `:uri` on the ex-data belongs to this guard alone.
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e))))
+      (is (= :passthrough (:mode (ex-data e))))
+      (is (not (::read (ex-data e))) "and it refused before the read")
+      ;; The two below are about the SENTENCE a person is shown, which is a
+      ;; separate thing from which branch threw. Kept for that, not for
+      ;; discrimination — see above.
+      (is (re-find #"passthrough" m) "the sentence names the mode that was refused")
+      (is (re-find #"s3://bucket/x\.csv" m) "and the location it was refused for")
+      (is (empty? (sub/objects st))
+          "and nothing was committed — a refusal that leaves an object behind is
+           worse than no refusal, because the shell then draws a broken table, and
+           the guard is on connect! rather than on the handle, so an object that
+           got past it keeps its degraded state forever")
+      ;; The CONTROL for the assertion above, not a second test of `connect!`.
+      ;; `(empty? (sub/objects st))` over a fresh store is a negative: it passes
+      ;; unchanged if `connect!` threw before doing anything at all — a typo in
+      ;; this map, a `mode-of` refusal, an ExceptionInfo from somewhere else — and
+      ;; then proves nothing about where the guard sits. So the SAME store takes
+      ;; the SAME call one scheme apart, down to the title, and only because that
+      ;; one lands an object does the emptiness above mean the refusal kept one
+      ;; out rather than that nothing was ever going to arrive.
+      (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                        :mode :passthrough :title "S3"})
+      (is (= 1 (count (sub/objects st)))
+          "this store does record a passthrough connect"))))
+
+(deftest connect-refuses-a-remote-passthrough-spelled-as-a-string
+  ;; **The guard compares a KEYWORD, and is only right because `connect!` hands
+  ;; it `(assoc src :mode (mode-of src))`.** Every other test of it passes
+  ;; `:passthrough`; every HTTP caller passes `"passthrough"`.
+  ;; `server/source-connect!` deliberately does not coerce `:mode`, and
+  ;; `body-json` keywordises KEYS and not values — and the shell has no
+  ;; remote-uri door at all, reaching `sourceConnect` from the file listing and
+  ;; the paste box only, so an HTTP client or a REPL caller is this guard's
+  ;; entire traffic.
+  ;;
+  ;; What it closes: hoisting `(refuse-remote-passthrough! src)` above the
+  ;; `(assoc src :mode (mode-of src))` line — a plausible "guard first" edit, and
+  ;; the comment there says "between the mode being decided and the source being
+  ;; read" without saying which decision is load-bearing. Every other test still
+  ;; passes and the JSON path lands `{:store :source :uri "s3://…"}` again. That
+  ;; is the `modes` defect verbatim one function along, and `modes`' own
+  ;; docstring records what it cost on 2026-08-19.
+  (with-redefs [src/describe (no-remote-reads)]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode "passthrough" :title "S3"})))]
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e)))
+          "the string reached the guard as a mode, not as an unknown one")
+      (is (= :passthrough (:mode (ex-data e)))
+          "and it is the NORMALIZED mode on the ex-data, which is the whole
+           reason the guard runs after mode-of rather than before it")
+      (is (not (::read (ex-data e))) "and nothing was read")
+      (is (empty? (sub/objects st)) "and nothing was committed"))))
+
+(deftest the-remote-passthrough-refusal-happens-before-the-first-read
+  ;; The assertion that pins WHERE the guard sits, because `(empty? …)` above
+  ;; cannot. Measured 2026-08-23, with the guard moved to after the commit:
+  ;; the s3:// case in the test above still passes every assertion it has,
+  ;; because `describe` reaches `bucket.s3.amazonaws.com`, gets an HTTP 403 and
+  ;; throws before anything is committed — so a LATE guard and a MISSING guard
+  ;; are indistinguishable there. Over a loopback server, where the read
+  ;; succeeds, the same late guard threw the right sentence and left
+  ;; `{:store :source :uri "http://…"}` in the store: one object, the exact
+  ;; state the sentence above calls worse than no refusal.
+  ;;
+  ;; Stubbing the read is the direct way to say it, and it needs no server and
+  ;; no network in ANY state — a guard that is removed or merely late reaches
+  ;; `describe` and comes back carrying the marker instead of the refusal.
+  (with-redefs [src/describe (fn [& _] (throw (ex-info "describe ran" {::read true})))]
+    (let [st (sub/fresh-store)
+          e  (is (thrown? clojure.lang.ExceptionInfo
+                          (src/connect! st {:uri "s3://bucket/x.csv" :format :csv
+                                            :mode :passthrough :title "S3"})))]
+      (is (not (::read (ex-data e)))
+          "connect! read the source before refusing it — the fetch this refusal
+           exists to prevent is the one it just made")
+      (is (= "s3://bucket/x.csv" (:uri (ex-data e)))
+          "and the refusal is THIS guard's. `re-find #\"passthrough\"` cannot say
+           that: mode-of's message lists both modes by name and matches it too,
+           so it would keep a partial fix invisible")
+      (is (re-find #"passthrough" (str (some-> e .getMessage)))
+          "and the sentence a person sees names the mode"))))
+
+(deftest connect-still-allows-passthrough-for-a-local-file
+  ;; The guard must be about the SCHEME and not about `connect!` having grown a
+  ;; new failure path — phase 1's whole passthrough story is local. Written
+  ;; against `(remote? uri)` this passes; written against `:mode` it fails here,
+  ;; and `connect-passthrough-stores-the-recipe-and-creates-no-table` above
+  ;; fails in the same run.
+  (let [st (sub/fresh-store)
+        r  (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                             :mode :passthrough :title "Live"})
+        h  (:value (sub/object st (:id r)))]
+    ;; DEVIATION from the plan's draft, which asserted `(is (nil? (:error r)))`.
+    ;; `connect!` returns `{:id :cols :rows :mode}` and throws rather than
+    ;; carrying an `:error` — so that assertion reads `(nil? nil)` on a map with
+    ;; no such key and cannot fail, on this branch or any other. `:mode` is read
+    ;; off the handle `land!` actually built, so it is the one key that a guard
+    ;; written too wide could move.
+    (is (= :passthrough (:mode r)) "the mode connect! reports comes off the handle it built")
+    (is (= :source (:store h))
+        "a local passthrough still stores the recipe, not a lake table")))
+
+
+;; ---------------------------------------------------------------------------
+;; a remote location, over a loopback server — and what went over the wire
+;; ---------------------------------------------------------------------------
+
+;; **What leaves this machine, stated once for the whole section.** Every
+;; request these tests make goes to a loopback stub on 127.0.0.1, and none of
+;; them fetches an external URL. That is not the same as "the suite makes zero
+;; requests off 127.0.0.1", which an earlier commit message claimed flatly and
+;; which is only true on a machine that already has the DuckDB extensions:
+;; `LOAD ducklake` in this namespace's `:once` fixture, and `LOAD httpfs` under
+;; `a-remote-csv-materialises-into-the-lake`,
+;; `refresh-of-a-remote-source-re-fetches-the-object`,
+;; `a-remote-preview-fetches-a-fixed-prefix-and-not-the-object` and
+;; `a-second-preview-pays-the-prefix-again`, all fall through to
+;; `ensure-extension!`'s `INSTALL` when the extension directory does not hold
+;; them — which reaches the DuckDB extension repository, once, and then never
+;; again on that machine. The plan's ground rules allow that one install; the
+;; sibling assertions in `loci.lake-test` (`ensure-remote-really-loads-httpfs`,
+;; `ensure-extension-really-loads-the-extension-it-was-asked-for`) sit under
+;; the same allowance. Nothing here reaches a data source off this host in any
+;; state, which is the property the spec actually wants.
+
+;; Copied from `loci.chunks-test`, where the same shape stubs the embedder.
+;;
+;; **Not because reaching across would couple two suites.** That reason was
+;; written here first and a file already in the tree contradicts it:
+;; `loci.lake-fixture` exists precisely so `loci.server-test` and
+;; `loci.tools-test` can share one helper, and its docstring says so. The real
+;; reason is that the two copies have already diverged and the divergence is
+;; the point of each — `chunks-test` slurps the request body, because an
+;; embedder POSTs one and its assertions read it; this drops the slurp, because
+;; httpfs sends none and slurping a nil body records nothing. **A third caller
+;; is what should trigger the move**, into `loci.lake-fixture` or a sibling,
+;; not a second.
+;;
+;; One further divergence, inert but not silent: `chunks-test` hands its
+;; handler the DERIVED map it recorded, this one hands it the raw Ring request.
+;; Neither handler looks at its argument, so nothing turns on it today; the raw
+;; request is the more honest thing to pass to a handler and is why it was not
+;; changed to match.
+;;
+;; The `seen` atom is what makes the copy worth having: a remote read is only
+;; provable from the wire, and a row count alone cannot tell a fetch from a
+;; re-read of the table the last fetch created.
+(defn- with-stub
+  "Start `handler` on an ephemeral loopback port, call `(f port seen)`, stop the
+   server. `seen` holds every request received, so a test can assert on what
+   actually went over the wire — including that nothing did, and including the
+   `range` header, which is the only instrument that can tell a prefix fetch
+   from a whole-object one."
+  [handler f]
+  (let [seen (atom [])
+        srv  (httpd/run-server
+              (fn [req]
+                (swap! seen conj (select-keys req [:uri :request-method :headers]))
+                (handler req))
+              {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
+    (try (f (httpd/server-port srv) seen)
+         (finally (httpd/server-stop! srv {:timeout 100})))))
+
+(defn- with-data-dir
+  "Run `(f root)` with `<LOCI_DATA>` at a fresh directory holding an empty
+   `files/`, always removed.
+
+   `files/listing` reads `(io/file (sub/data-dir) \"files\")`, and nothing in
+   the test alias moves `data-dir` — so without this the assertion below that
+   nothing landed in `<LOCI_DATA>/files/` would be over the repository's own
+   `data/files/`, and would start failing the day a person connects a file
+   through the running app. It also removes the other way that assertion could
+   pass for nothing: `File.listFiles` on a directory that does not exist answers
+   nil, and `listing` renders that as `[]`."
+  [f]
+  (let [root (str (System/getProperty "java.io.tmpdir") "/loci-src-data-" (System/nanoTime))]
+    (.mkdirs (io/file root "files"))
+    (try (with-redefs [sub/data-dir (constantly root)] (f root))
+         (finally (lf/rm-rf root)))))
+
+(deftest a-remote-csv-materialises-into-the-lake
+  (with-stub (fn [_] {:status 200 :headers {"content-type" "text/csv"}
+                      :body "region,revenue\nEMEA,10\nAPAC,20\n"})
+    (fn [port seen]
+      (with-data-dir
+        (fn [root]
+          ;; The fixture's lake is `:once` for this whole namespace and
+          ;; `ensure-remote!` remembers `:httpfs` on it, while `deftest` order is
+          ;; `ns-interns` order — hash order over the var names, stable for a
+          ;; given set of them and re-shuffled by the next one added. Without
+          ;; this reset the LOAD assertion below would pass or fail on which
+          ;; remote test ran first.
+          ;;
+          ;; **A review argued this reset is inert today and the measurement
+          ;; says otherwise, so the argument is written down with it.** The
+          ;; claim was that `a-local-connect-asks-for-no-httpfs` sorts ahead of
+          ;; both remote tests in the current order — it does, index 13 against
+          ;; 19 and 35 — and that the guard sabotage therefore bites with the
+          ;; resets deleted. It does not, because being ahead of the two REMOTE
+          ;; tests is not the property that matters. With the guard removed,
+          ;; `ensure-remote!` is reached by every uri `describe` sees, and FIVE
+          ;; tests that reach `describe` sort ahead of index 13 — the first,
+          ;; `a-very-long-title-still-connects`, at index 1. Measured 2026-08-23,
+          ;; guard removed and both resets deleted: `a-local-connect-asks-for-
+          ;; no-httpfs` PASSED, and the one failure in the run was this test's
+          ;; own LOAD assertion, firing because the flag was already set for an
+          ;; unrelated reason. With both resets restored and the same sabotage:
+          ;; the local test fails, on `["LOAD httpfs" …]`, which is the sentence
+          ;; it exists for.
+          ;;
+          ;; And what the reset does NOT do: it clears loci's MEMORY of what it ensured
+          ;; without undoing the connection's STATE. For `:httpfs` that is
+          ;; benign because `LOAD` is idempotent. The statement `:s3` guards is
+          ;; not — `CREATE SECRET loci_s3` carries no `OR REPLACE` and a second
+          ;; one throws `Invalid Input Error: Temporary secret with name
+          ;; 'loci_s3' already exists!`, measured 2026-08-23 on DuckDB 1.5.5.
+          ;; It stays unreachable through `ensure-remote!` because `88e6d87` put
+          ;; `secret-covers?` in front of the CREATE, and `which_secret` returns
+          ;; loci's OWN temporary secret — also measured today, so the second
+          ;; issue is skipped rather than repeated. That is the load-bearing
+          ;; half: a reset here is safe on both flags because of a check added
+          ;; for another reason entirely, and it was not safe before it.
+          (reset! (:ensured @lake/lake) #{})
+          (let [sql  (atom [])
+                real lake/x!
+                st   (sub/fresh-store)
+                r    (with-redefs [lake/x! (fn [l s] (swap! sql conj s) (real l s))]
+                       (src/connect! st {:uri (str "http://127.0.0.1:" port "/Sales+Q3%20final.csv")
+                                         :format :csv :mode :materialise :title "Remote"}))
+                h    (:value (sub/object st (:id r)))]
+            ;; No `(is (nil? (:error r)))` — `connect!` returns `{:id :cols :rows
+            ;; :mode}` and throws rather than carrying an `:error`, so that
+            ;; assertion cannot fail on any branch. It reached this plan's
+            ;; sketch twice; `connect-still-allows-passthrough-for-a-local-file`
+            ;; records the same deviation.
+            (is (= 2 (:rows r)) "the rows came from the stub and nowhere else")
+            (is (= [:region :revenue] (:cols r)))
+            (is (= :lake (:store h))
+                "materialised, so the handle names a lake table and not the uri")
+            ;; **The path is `Sales+Q3%20final.csv` so that this assertion can
+            ;; fail.** It replaced `(seq @seen)`, which the row count above
+            ;; already implied — the stub is the only source of those rows — and
+            ;; over the old `/sales.csv` it inherited that property exactly:
+            ;; `/sales.csv` is a fixed point of every re-encoder there is, so
+            ;; nothing plausible moved it and the comment claimed a coverage the
+            ;; fixture did not supply.
+            ;;
+            ;; **The obvious fix is the wrong one, and that is why the path
+            ;; looks like this.** `loci.sourcespec-test`'s
+            ;; `locate-answers-a-remote-uri-verbatim` covers the same property
+            ;; with `s3://bucket/a b.csv`, so a bare space is the natural thing
+            ;; to reach for — but that test is pure and reads `locate`'s return
+            ;; value, while this one reads the WIRE, and the wire has already
+            ;; been normalised once. Measured 2026-08-23 against this stub:
+            ;; `read_csv('http://…/sales q3.csv')` and
+            ;; `read_csv('http://…/sales%20q3.csv')` produce the byte-identical
+            ;; request line `/sales%20q3.csv`, because httpfs percent-encodes the
+            ;; space itself. Over the wire a space proves nothing about loci.
+            ;;
+            ;; So the fixture carries only what DuckDB leaves ALONE — measured
+            ;; verbatim on the request line: mixed case, a literal `+`, and a
+            ;; literal `%20` that is passed through rather than re-encoded — and
+            ;; every plausible re-encoder moves at least one of the three:
+            ;;
+            ;;   (URLDecoder/decode u)      → /Sales Q3 final.csv   caught by +
+            ;;   (.getPath (URI. u))        → /Sales+Q3 final.csv   caught by %20
+            ;;   (str/lower-case u)         → /sales+q3%20final.csv caught by case
+            ;;   (URI. "http" … path … )    → /Sales+Q3%2520final.csv  caught by %20
+            ;;
+            ;; Each of the three earns its place, and the `+` earns it hardest:
+            ;; a DECODER is invisible to `%20` alone, since httpfs re-encodes the
+            ;; space it produced and the request line comes out unchanged. It is
+            ;; the `+` becoming `%20` that shows. Conversely an ENCODER is
+            ;; invisible to the `+` and shows on the `%20` doubling. The two that
+            ;; are genuine no-ops — `(str (URI. u))` and `.normalize` — leave the
+            ;; whole thing alone, which is correct: they are not defects.
+            ;;
+            ;; Sabotaged 2026-08-23 to prove it bites: `locate`'s remote branch
+            ;; returning `(URLDecoder/decode uri "UTF-8")` instead of `uri` fails
+            ;; THIS assertion and only this one — the row count, the columns,
+            ;; `:store :lake` and the LOAD assertion all still pass. Re-run with
+            ;; the fixture path put back to `/sales.csv` and the same sabotage in
+            ;; place: zero failures. That is the finding the assertion was
+            ;; rewritten for.
+            (is (= #{"/Sales+Q3%20final.csv"} (set (map :uri @seen)))
+                (str "DuckDB asked this server for something other than the path loci
+                      was given — `locate` is verbatim precisely so a uri is not
+                      re-encoded on the way through, and this is where that shows: "
+                     (pr-str @seen)))
+            ;; **The assertion that survives autoload**, and the reason it is
+            ;; here rather than only `(seq @seen)`. httpfs is a known extension
+            ;; and loci sets neither `autoload_known_extensions` nor
+            ;; `autoinstall_known_extensions`, so DuckDB loads it by itself and
+            ;; every assertion above passes with `ensure-remote!` deleted —
+            ;; measured 2026-08-23 on this machine, where httpfs is installed but
+            ;; reports `loaded false` on a fresh connection. What autoload cannot
+            ;; do is the two things `ensure-remote!`'s docstring names: issue the
+            ;; s3 secret, and put the failure at connect with the paragraph that
+            ;; names the extension directory and the uid instead of inside a read
+            ;; with DuckDB's own message. So this asserts that loci issues the
+            ;; LOAD, which is the decision, rather than that the read worked,
+            ;; which this machine would grant either way.
+            (is (some #(re-find #"(?i)load\s+httpfs" %) @sql)
+                (str "loci left the httpfs load to DuckDB's autoload, which is not
+                      available in the offline image this phase targets: " (pr-str @sql)))
+            (is (empty? (files/listing st))
+                "and NOTHING landed in <LOCI_DATA>/files/ — the spec's claim that the
+                 files GC never sees a remote source, asserted rather than assumed")
+            ;; The control for the line above, which is otherwise a negative over
+            ;; a directory this test made empty two lines ago. `files/listing` is
+            ;; only evidence that no fetch was cached there if it can see a file
+            ;; that is.
+            (spit (io/file root "files" "cafebabe.csv") "a\n1\n")
+            (is (= 1 (count (files/listing st)))
+                "the listing does observe this directory, so the emptiness above is
+                 about the remote connect and not about where it was looking")))))))
+
+(deftest refresh-of-a-remote-source-re-fetches-the-object
+  ;; A remote source is materialise-only, so `refresh!` is the only way its
+  ;; bytes ever change — and `(> (count @seen) n1)` is the load-bearing half.
+  ;; Ask what the row count alone would report if `refresh!` re-read the LAKE
+  ;; TABLE rather than the source: with the body changed it answers 1 and fails,
+  ;; but with the body unchanged it answers correctly for the wrong reason, and
+  ;; a later reader trusts it. The wire count is what only a re-fetch produces.
+  (let [body (atom "region,revenue\nEMEA,10\n")]
+    (with-stub (fn [_] {:status 200 :headers {"content-type" "text/csv"} :body @body})
+      (fn [port seen]
+        (let [st (sub/fresh-store)
+              r  (src/connect! st {:uri (str "http://127.0.0.1:" port "/s.csv")
+                                   :format :csv :mode :materialise :title "R"})
+              n1 (count @seen)]
+          (is (= 1 (:rows r)))
+          (is (pos? n1) "the connect fetched, so the comparison below has a floor")
+          (reset! body "region,revenue\nEMEA,10\nAPAC,20\nLATAM,30\n")
+          (let [r2 (src/refresh! st (:id r))]
+            (is (= 3 (:rows r2)) "the new object was read, not the old handle re-reported")
+            (is (> (count @seen) n1)
+                "and it went over the wire again — a refresh that answered from the
+                 lake would give the same row count as a re-fetch of unchanged bytes,
+                 so the request count is the only thing that separates them")))))))
+
+;; ---------------------------------------------------------------------------
+;; what a preview COSTS — the phase's most surprising number, in bytes
+;; ---------------------------------------------------------------------------
+
+(defn- csv-of-at-least
+  "A CSV of at least `want` bytes, as a byte array. Two columns and a counter, so
+   DuckDB has a real schema to describe rather than one fabricated column.
+
+   A `ByteArrayOutputStream` and not the `StringBuilder` this was first drafted
+   as: 40 MiB of `StringBuilder` is an 80 MiB `char[]`, and `.toString` then
+   `.getBytes` copy it twice more — ~200 MiB transient against the ~120 MiB
+   here, in a JVM whose test alias sets no `-Xmx`. Measured 2026-08-24: 0.77 s
+   for 40 MiB."
+  ^bytes [want]
+  (let [out (java.io.ByteArrayOutputStream. (+ ^long want 64))
+        put (fn [^String s] (let [b (.getBytes s "UTF-8")] (.write out b 0 (alength b))))]
+    (put "region,revenue\n")
+    (loop [i 0]
+      (when (< (.size out) ^long want)
+        (put (str "EMEA-" i "," i "\n"))
+        (recur (inc i))))
+    (.toByteArray out)))
+
+(def ^:private big-csv
+  "The 40 MiB fixture both tests below read, built once.
+
+   In a delay rather than at load time so a run that reaches neither test never
+   pays for it, and shared rather than per-test because it is read-only and the
+   second 0.77 s buys nothing. 40 MiB retained for the rest of a suite run is
+   noise against the ~4 GB default heap on this machine."
+  (delay (csv-of-at-least (* 40 1024 1024))))
+
+(defn- range-bytes
+  "How many bytes a `Range` header asked for, over an object of `n` bytes.
+   An open-ended `bytes=<a>-` means everything from `a` to the end."
+  [^String r ^long n]
+  (let [[_ a b] (re-matches #"bytes=(\d+)-(\d*)" r)]
+    (inc (- (if (seq b) (Long/parseLong b) (dec n)) (Long/parseLong a)))))
+
+(defn- ranges-of
+  "Every `Range` a `with-stub` `seen` atom recorded, in order."
+  [seen]
+  (vec (keep #(get-in % [:headers "range"]) @seen)))
+
+(defn- ranged-stub
+  "Serve `body` with the Range support httpfs needs, reporting the object's size
+   as `claim` bytes: `206` with a truthful `Content-Range` for a `Range` GET,
+   and — the part that had to be measured — **405 to a HEAD**.
+
+   `claim` is what the stub SAYS the object weighs. Pass `(alength body)` for an
+   honest object; pass more to present the same bytes as a bigger one, which is
+   how the fixed half of the claim below is tested without generating 2 GB. The
+   lie only runs one way and it is the safe way: httpfs never asks past the
+   prefix today, and a regression that made it ask for MORE would be served
+   fewer bytes than the `Content-Range` promised and go red, not green. Not an
+   argument — measured 2026-08-24 by shrinking the fixture below the prefix,
+   which is the same thing from the other side, and DuckDB says so itself:
+
+     HTTP Error: The size reported by HEAD for '…/two-gigabytes.csv' was
+     2147483648 bytes, but the full GET downloaded 20971539 bytes.
+
+   So the stub cannot serve a claim it does not hold, and this test cannot pass
+   by being lied to on the reader's behalf.
+
+   **Without the 405 this test is vacuous rather than red**, which is the trap
+   the plan warned about and which turned out to be live. http-kit's
+   `HttpUtils.HttpEncode` does `headers.putOrReplace(\"content-length\", \"0\")`
+   for any response whose body is nil, and there is no HEAD special case
+   anywhere in it — so a stub answering HEAD with `{:status 200 :headers
+   {\"content-length\" \"41943042\" \"accept-ranges\" \"bytes\"}}` puts
+   `Content-Length: 0` on the wire. Measured with curl 2026-08-24, verbatim:
+
+     HTTP/1.1 200 OK
+     Content-Type: text/csv
+     Content-Length: 0
+     Accept-Ranges: bytes
+
+   httpfs reads that as an object it cannot seek in and falls back to one plain
+   GET with no `Range` at all — `[[:head nil] [:get nil]]`, measured — i.e. a
+   whole-object download, from which this test would have concluded that loci
+   does not range-read, the exact opposite of what the spec recorded. There is
+   no way to hand http-kit a `Content-Length` it did not compute, so the way out
+   is to refuse the method, which is what httpfs's own fallback exists for.
+   Measured 2026-08-24: HEAD 405 makes httpfs learn the size from a two-byte
+   `bytes=0-1` GET and then fetch the same `bytes=0-31999999` a HEAD-answering
+   server gets — the two-byte probe is the only difference, and it is why the
+   totals below read 32,000,002 rather than the spec's 32,000,000.
+
+   405 and not 404: a 404 HEAD is not a fallback, it is a failure. Measured the
+   same day, `describe` threw `HTTP GET error … (HTTP 404 Not Found)` after a
+   single HEAD and never issued a GET."
+  [^bytes body ^long claim]
+  (fn [req]
+    (if (= :head (:request-method req))
+      {:status 405 :headers {"content-type" "text/plain"} :body "this stub does not do HEAD"}
+      (if-let [r (get-in req [:headers "range"])]
+        (let [[_ a b] (re-matches #"bytes=(\d+)-(\d*)" r)
+              from    (Long/parseLong a)
+              to      (min (dec claim) (if (seq b) (Long/parseLong b) (dec claim)))
+              ;; `have` is what the stub actually HOLDS for that range, which is
+              ;; the whole range whenever `claim` is honest. When it is not, a
+              ;; short read is precisely the red this stub wants to be able to
+              ;; produce — see the docstring.
+              have    (min (inc (- to from)) (- (alength body) from))]
+          {:status  206
+           :headers {"content-type"  "text/csv"
+                     "content-range" (str "bytes " from "-" to "/" claim)
+                     "accept-ranges" "bytes"}
+           ;; A `ByteBuffer` and not the sketch's `ByteArrayInputStream`:
+           ;; http-kit's `bodyBuffer` reads an InputStream into a fresh
+           ;; `DynamicBytes`, so 32 MB would be copied on every request, while a
+           ;; ByteBuffer is passed to the socket with no copy at all — its own
+           ;; comment says "makes ultimate optimization possible: no copy".
+           :body    (java.nio.ByteBuffer/wrap body from have)})
+        {:status  200
+         :headers {"content-type"   "text/csv"
+                   "accept-ranges"  "bytes"}
+         :body    (java.nio.ByteBuffer/wrap body)}))))
+
+(deftest a-remote-preview-fetches-a-fixed-prefix-and-not-the-object
+  ;; The phase's most surprising measurement, and until now prose only: a
+  ;; DESCRIBE of a remote CSV downloads a FIXED 32,000,000-byte prefix whatever
+  ;; the object weighs — so a preview of a 2 GB table costs the same 32 MB as a
+  ;; preview of a 40 MB one, and the ＋ Data panel's default path pays it before
+  ;; anyone presses Connect.
+  ;;
+  ;; **The fixture has to exceed the prefix or the test is vacuous**, which is
+  ;; what every other remote test in this file cannot do at three rows: over a
+  ;; 3 KB object "the prefix" and "the whole object" are the same bytes, and no
+  ;; assertion can separate them. Measured 2026-08-24, and this is the shape of
+  ;; the vacuity rather than an argument for it — one describe, three objects:
+  ;;
+  ;;   20 MiB (20,971,539 B)  →  bytes=0-1, bytes=0-20971538   the whole thing
+  ;;   40 MiB (41,943,042 B)  →  bytes=0-1, bytes=0-31999999
+  ;;   60 MiB (62,914,566 B)  →  bytes=0-1, bytes=0-31999999
+  ;;  100 MiB (104,857,614 B) →  bytes=0-1, bytes=0-31999999
+  ;;
+  ;; 40 MiB is generated here rather than committed.
+  ;;
+  ;; **One size cannot show that a prefix is FIXED**, only that it is capped, so
+  ;; the second half serves the same 40 MiB of bytes while reporting the object
+  ;; as 2 GiB. That is the sentence the spec actually makes — a 2 GB table costs
+  ;; what a 40 MB one costs — and it is measurable for the price of the 40 MiB
+  ;; already in hand.
+  ;;
+  ;; Asserted on the RANGE HEADERS and not on wall clock: the number this pins
+  ;; is bytes over the wire, and a loopback server measures no network anyway.
+  (let [body @big-csv
+        n    (alength ^bytes body)]
+    (is (> n 32000000)
+        (str "the fixture is " n " bytes, which is not larger than the prefix — "
+             "every assertion below would then be true of a whole-object fetch too"))
+    ;; Half one: an honest 40 MiB object. The prefix is smaller than it.
+    (with-stub (ranged-stub body n)
+      (fn [port seen]
+        (reset! (:ensured @lake/lake) #{})
+        (src/describe @lake/lake {:uri (str "http://127.0.0.1:" port "/big.csv") :format :csv})
+        (let [ranges (ranges-of seen)
+              asked  (reduce + 0 (map #(range-bytes % n) ranges))]
+          (is (seq ranges)
+              (str "no Range was sent at all, so httpfs downloaded the whole object — "
+                   "either the stub stopped advertising ranges or the reader changed: "
+                   (pr-str @seen)))
+          (is (< asked n)
+              (str "a preview pulled " asked " of " n " bytes, which is the whole object: "
+                   (pr-str ranges)))
+          (is (= ["bytes=0-1" "bytes=0-31999999"] ranges)
+              (str "the prefix is no longer 32,000,000 bytes. That is not a test failure "
+                   "so much as a cost changing under the ＋ Data panel — update the spec's "
+                   "Measured section and this test together, with the date. "
+                   "(`bytes=0-1` is httpfs asking how big the object is, because this stub "
+                   "refuses HEAD; a HEAD-answering server is asked once and the prefix GET "
+                   "is the same.) " (pr-str ranges)))
+          ;; The same fact as the line above, in the unit the cost is felt in,
+          ;; and it CANNOT fail on its own — over this fixture those two ranges
+          ;; are 32,000,002 bytes and nothing else. Kept anyway, and the reason
+          ;; is written down rather than left for a reader to wonder at: the
+          ;; deliverable of this test is a number of bytes, and a number nobody
+          ;; states is a number nobody can grep for when the spec is next
+          ;; rewritten. It is a restatement, not a second measurement.
+          (is (= 32000002 asked)
+              (str "a preview pulled " asked " bytes, not 32,000,002 — 32,000,000 of prefix "
+                   "and 2 of length probe: " (pr-str ranges))))))
+    ;; Half two: the SAME bytes, reported as a 2 GiB object. If the prefix
+    ;; tracked the object at all, this fetch would be larger than the one above,
+    ;; and the stub would run out of bytes to serve rather than agreeing.
+    (with-stub (ranged-stub body (* 2 1024 1024 1024))
+      (fn [port seen]
+        (src/describe @lake/lake {:uri (str "http://127.0.0.1:" port "/two-gigabytes.csv")
+                                  :format :csv})
+        (is (= ["bytes=0-1" "bytes=0-31999999"] (ranges-of seen))
+            (str "a 2 GiB object was previewed for something other than the 32,000,000 bytes "
+                 "a 40 MiB one costs, so the prefix is not fixed after all and the spec's "
+                 "claim that previewing a 2 GB table is free of its size needs rewriting: "
+                 (pr-str (ranges-of seen))))))))
+
+(deftest a-second-preview-pays-the-prefix-again
+  ;; The other half of the same measurement, and the one a reader would guess
+  ;; wrong: DuckDB's external file cache does NOT save the second describe. Two
+  ;; consecutive DESCRIBEs each issued HEAD + GET bytes=0-31999999, 71.4 and
+  ;; 68.3 ms — so a person who previews, presses ‹ back, and previews again has
+  ;; downloaded 64 MB.
+  ;;
+  ;; It is not that the cache is off. `enable_external_file_cache` is `true` on
+  ;; this lake's connection — measured 2026-08-24 out of `duckdb_settings()` —
+  ;; and both describes below run on that one connection, against one URL. It
+  ;; re-fetches anyway.
+  ;;
+  ;; The COUNT of prefix fetches is the load-bearing assertion, not the count of
+  ;; requests: a second describe that re-probed the length and then answered
+  ;; from cache would still push `(count ranges)` up while costing nothing, and
+  ;; the thing being pinned is the 32 MB.
+  (let [body @big-csv]
+    (with-stub (ranged-stub body (alength ^bytes body))
+      (fn [port seen]
+        (reset! (:ensured @lake/lake) #{})
+        (let [uri (str "http://127.0.0.1:" port "/big.csv")]
+          (src/describe @lake/lake {:uri uri :format :csv})
+          (let [after-one (ranges-of seen)]
+            (is (pos? (count after-one)) "the first describe ranged, so the comparison has a floor")
+            (is (= 1 (count (filter #{"bytes=0-31999999"} after-one)))
+                (str "the first describe did not fetch the prefix, so the count below "
+                     "cannot mean what it says: " (pr-str after-one)))
+            (src/describe @lake/lake {:uri uri :format :csv})
+            (let [after-two (ranges-of seen)]
+              (is (> (count after-two) (count after-one))
+                  (str "the second describe was served from a cache, which would be good news
+                        and would mean the panel's second preview is free — check
+                        duckdb_settings() for enable_external_file_cache and update the spec
+                        before believing it: " (pr-str after-two)))
+              (is (= 2 (count (filter #{"bytes=0-31999999"} after-two)))
+                  (str "the second preview did not pay the 32,000,000 bytes again. If that is
+                        real it is the panel getting cheaper, not this test getting wrong —
+                        measure it and rewrite the spec's Measured section: "
+                       (pr-str after-two))))))))))
+
+(deftest a-local-connect-asks-for-no-httpfs
+  ;; `ensure-remote!` LOADs httpfs for whatever uri it is handed, and `describe`
+  ;; — the one place that serves `connect!`, `refresh!` and the panel's own
+  ;; preview — sees EVERY uri there is. So the call is guarded on the scheme,
+  ;; and this is the assertion that says so.
+  ;;
+  ;; Unguarded it is not a wasted statement, it is a broken local connect: LOAD
+  ;; fails on a machine without the extension, falls through to INSTALL, and
+  ;; INSTALL is the one line here that reaches the network — which under
+  ;; `--network none`, the container this whole phase targets, dies. The person
+  ;; is then refused a CSV on local disk with a sentence about httpfs.
+  ;; `ensure-extension!`'s own paragraph records that an httpfs LOAD in a
+  ;; container still falls through, so this is reachable rather than theoretical.
+  ;; **The reset is what makes this bite, and it is load-bearing right now** —
+  ;; not a hazard held in reserve against a future reordering. `ensure-remote!`
+  ;; remembers `:httpfs` on the lake and the fixture's lake is `:once` for the
+  ;; namespace, so a run that reached it before this test leaves the flag set,
+  ;; and with the guard removed the call here returns early, issues no LOAD, and
+  ;; this test passes.
+  ;;
+  ;; The trap is that it is not the two REMOTE tests that set it. Remove the
+  ;; guard and `ensure-remote!` is reached by every uri `describe` sees, and
+  ;; `deftest` order is `ns-interns` order — hash order over the var names —
+  ;; which puts this var at index 13 with FIVE tests that reach `describe`
+  ;; ahead of it, the first being `a-very-long-title-still-connects` at index 1.
+  ;; So the flag is set a dozen tests before any remote uri exists. Measured
+  ;; 2026-08-23, guard removed: with the resets deleted this test PASSED and the
+  ;; run's only failure was the remote test's own LOAD assertion; with them
+  ;; restored this test fails on `["LOAD httpfs" …]`. A review reached the
+  ;; opposite conclusion from the index alone — see the longer note in
+  ;; `a-remote-csv-materialises-into-the-lake`, which is where the measurement
+  ;; is recorded.
+  ;;
+  ;; That note also carries the other half: a reset clears loci's memory of what
+  ;; it ensured without undoing the connection's state, which is free for
+  ;; `:httpfs` because `LOAD` is idempotent and is not free for the
+  ;; `CREATE SECRET` behind `:s3`.
+  (reset! (:ensured @lake/lake) #{})
+  (let [sql  (atom [])
+        real lake/x!
+        st   (sub/fresh-store)]
+    (with-redefs [lake/x! (fn [l s] (swap! sql conj s) (real l s))]
+      (src/connect! st {:uri (csv! "a\n1\n") :format :csv
+                        :mode :materialise :title "Local"}))
+    (is (some #(re-find #"(?i)create table" %) @sql)
+        (str "the spy saw no CREATE TABLE, so it saw nothing and the assertion below
+              would hold over an empty list: " (pr-str @sql)))
+    (is (empty? (filter #(re-find #"(?i)load\s+httpfs" %) @sql))
+        (str "a local connect asked DuckDB to load httpfs: " (pr-str @sql)))))
 
 (deftest concurrent-connects-do-not-mint-one-id-twice
   ;; `mint-id` reads the objects and `connect!` commits under what it read, so

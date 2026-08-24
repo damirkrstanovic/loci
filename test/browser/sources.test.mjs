@@ -14,6 +14,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startServer, launchBrowser, withPage, bootedShell, SOURCES_FIXTURE } from './harness.mjs';
@@ -616,6 +617,55 @@ test('an empty files directory says so, and still offers the way out', async () 
     // an empty panel with no way out is a trap, not an answer
     assert.equal(await page.locator(`#body${i} .dbody [data-a="dcancel"]`).count(), 1,
       'the empty listing offers no Cancel');
+    // ...and the door that does not depend on the directory at all. An empty
+    // `<LOCI_DATA>/files/` is exactly the state where a URL is the only thing
+    // there is to type, and the sentence above still points at Paste.
+    assert.equal(await page.locator(`#body${i} .durlin`).count(), 1,
+      'an empty directory drops the URL field — the one door whose answer has nothing to do with what the directory holds');
+  });
+});
+
+// The other two states of the same tab. Both report a failed listing, and both
+// draw the URL field for the reason the commit that added it gives: whatever
+// went wrong reading loci's OWN directory has nothing to say about a location
+// loci does not hold, and a tab whose only control is Cancel is a dead end
+// beside a working door.
+//
+// These are the branches a later reader would break, and they are the pair that
+// has no upload row standing beside the field to remind them it is there —
+// `.durlin` was asserted in exactly one of the four states the commit claims to
+// draw it in, which is the state that is hardest to delete by accident.
+//
+// `{error}` is the server saying it read the directory and could not; `abort` is
+// the request never arriving, which is the `.catch`. Two different lines of the
+// shell, and stubbing is the only way to reach either.
+test('a listing that failed still offers the URL field, in both ways it can fail', async () => {
+  await withPage(browser, 'sources-data-listing-failed', async (page) => {
+    const i = await enterCosmos(page);
+    const at = `#body${i} `;
+    const failed = async (why) => {
+      await page.click(`${at}#dataBtn`);
+      await page.waitForSelector(`${at}.dbody .reclaimed`, { timeout: 8000 });
+      const said = (await page.textContent(`${at}.dbody .reclaimed`)).trim();
+      assert.ok(said.length > 0, `${why}: the failed listing says nothing at all`);
+      assert.equal(await page.locator(`${at}.durlin`).count(), 1,
+        `${why}: the URL field is gone, so a failure to read loci's own directory took the ` +
+        `one door with it that never looks in that directory — it said: ${JSON.stringify(said)}`);
+      assert.equal(await page.locator(`${at}[data-a="durlgo"]`).count(), 1,
+        `${why}: the field is drawn with no way to submit it`);
+      await page.click(`${at}.dbody [data-a="dcancel"]`);
+      await page.waitForSelector(`${at}#dataBtn`, { timeout: 8000 });
+    };
+
+    await page.route('**/api/source/files', route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ error: 'loci cannot read its files directory.' }) }));
+    await failed('the server refused the listing');
+    await page.unroute('**/api/source/files');
+
+    await page.route('**/api/source/files', route => route.abort());
+    await failed('the listing request never arrived');
+    await page.unroute('**/api/source/files');
   });
 });
 
@@ -1109,5 +1159,441 @@ test('the files reclaim button asks first, and its toast says what actually went
       `the toast does not say the sweep was interrupted: ${JSON.stringify(failed)}`);
     await page.unroute('**/api/storage/reclaim-files');
     await page.unroute('**/api/storage');
+  });
+});
+
+// ---------------- a location loci fetches -----------------------------------
+//
+// Phase 3 made `http://`, `https://` and `s3://` locations that `connect!`
+// accepts, and the ＋ Data panel could produce none of them. `dataFileTab` drew
+// an `<input type="file">` and a list of rows from `GET /api/source/files`, so
+// every uri the panel could hand to `dataPreview` was `loci://files/<hash>` —
+// the phase was reachable only by `curl` or a REPL, which is the state phase 2
+// opened by naming as unfinished.
+//
+// These three pin the door. The first is the feature; the other two are the two
+// things a remote preview does that a local one does not, both measured, and
+// both invisible until a URL can be typed:
+//
+//   - an `s3://` describe costs ~6 s on a machine with no credentials (6,069 ms
+//     measured 2026-08-23; 62 ms with no route out, because the chain gives up
+//     rather than timing out on IMDS). loci has no timeout and no cancel, so the
+//     panel has to say what the wait is and let you leave it.
+//   - the failure is an eight-line paragraph. `credential-problem`, and the head
+//     and tail `ensure-remote!` hands `extension-problem`, compose prose with an
+//     indented fix, `esc()` keeps the newlines and a `<p>` collapses them. This
+//     door is what first routes a multi-line paragraph onto the preview path.
+
+// A CSV at a URL, on this machine and nowhere else.
+//
+// DuckDB's httpfs is what fetches it, so the location has to be genuinely remote
+// TO DUCKDB while the BYTES never leave loopback — the same trick
+// `source_test.clj`'s `with-stub` plays with http-kit, one process further out.
+// A second loci server would serve nothing DuckDB can read, and a static route
+// inside loci would make this fixture part of the product; node's own http
+// server is neither. `hits` is `with-stub`'s `seen`: without it "the preview
+// showed columns" is satisfied by a cached answer, a guess from the file name,
+// or a describe that never left the JVM.
+//
+// The bytes are the only half this controls — see `httpfsInstalled` below for
+// the half it does not.
+const csvServer = async (body, path = '/sales.csv') => {
+  const hits = [], buf = Buffer.from(body, 'utf8');
+  const srv = createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url });
+    if (req.url.split('?')[0] !== path) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'text/csv', 'content-length': buf.length });
+    res.end(req.method === 'HEAD' ? undefined : buf);
+  });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  // `closeAllConnections` before `close`, because `close` only STOPS accepting:
+  // it then waits for every open socket, and DuckDB's http client keeps one
+  // alive after the fetch. Node's own keep-alive timeout is 5 s, so without this
+  // the teardown of this fixture is up to five seconds of nothing, decided by a
+  // timer in the JVM rather than by the test.
+  return { url: `http://127.0.0.1:${srv.address().port}${path}`, hits,
+           stop: () => { srv.closeAllConnections(); return new Promise(r => srv.close(r)); } };
+};
+
+// Whether a `describe` of an `http://` location can happen without a download.
+//
+// The CSV above is loopback; `httpfs` is not. `source/describe` calls
+// `lake/ensure-remote!` → `ensure-extension! "httpfs"`, whose fallback when LOAD
+// fails is `INSTALL httpfs` — 21,570,542 bytes from DuckDB's extension
+// repository. The harness passes `{...process.env, LOCI_DATA: dir}`, so DuckDB
+// looks in `LOCI_DUCKDB_EXTENSIONS` when the environment carries one and in
+// `$HOME/.duckdb` when it does not; the Docker image sets the former at build
+// time and a developer machine that has opened one remote source has the latter.
+// A fresh machine, or a `--network none` CI box, has neither — and there this
+// test would download or fail on a precondition it never stated.
+//
+// So it is stated. A skip and not a silent pass: the reason names the variable
+// to set, because installing the extension once is the whole of the fix.
+const httpfsInstalled = async () => {
+  const dir = process.env.LOCI_DUCKDB_EXTENSIONS || join(process.env.HOME || '', '.duckdb');
+  try { return (await readdir(dir, { recursive: true }))
+          .some(n => /httpfs\.duckdb_extension$/.test(n)); }
+  catch { return false; }
+};
+
+// Open ＋ Data on its file tab and wait for the URL field. `.durlin` and not
+// `[data-file]`: the field is drawn beside the listing and beside the sentence
+// that stands in for one when the directory is empty, and a test that waited for
+// a row would be waiting for the wrong door.
+const openUrlField = async (page) => {
+  const i = await enterCosmos(page);
+  await page.click(`#body${i} #dataBtn`);
+  await page.waitForSelector(`#body${i} .durlin`, { timeout: 8000 });
+  return i;
+};
+
+test('a URL typed into the ＋ Data panel becomes a table, and can only be copied in', async (t) => {
+  if (!await httpfsInstalled()) {
+    t.skip('DuckDB has no httpfs extension where it looks for one, and describe would ' +
+           'INSTALL it — 21.5 MB over the network. Set LOCI_DUCKDB_EXTENSIONS to a ' +
+           'directory holding it, or run loci once against a remote source with a network.');
+    return;
+  }
+  const remote = await csvServer('region,revenue\nEMEA,10\nAPAC,20\n');
+  try {
+    await withPage(browser, 'sources-data-url', async (page) => {
+      const i = await openUrlField(page);
+      const at = `#body${i} `;
+
+      // The contrast first, and it is load-bearing. Every assertion below about
+      // the URL preview NOT offering `read live` is an absence, and an absence
+      // over a control that was deleted for everybody would pass just as well.
+      // So: a local file, through the same preview, still gets both radios.
+      await page.click(`${at}[data-file="live.csv"]`);
+      await page.waitForSelector(`${at}.srcpreview`, { timeout: 8000 });
+      assert.equal(await page.locator(`${at}input[name^="dmode"]`).count(), 2,
+        'a local file no longer offers both modes — the absence asserted for a URL below is about the radios, not the scheme');
+      assert.equal(await page.locator(`${at}.dmode-fixed`).count(), 0,
+        'a local file is told its mode is fixed, so saying it for a URL says nothing');
+      await page.click(`${at}[data-a="dback"]`);
+      await page.waitForSelector(`${at}.durlin`, { timeout: 8000 });
+
+      // Asked of the SERVER, not read off STATE: a preview that committed would
+      // leave STATE.events untouched and this would certify rather than test.
+      const events = () => page.evaluate(() => API.state().then(s => s.events));
+      const before = await events();
+
+      await page.fill(`${at}.durlin`, remote.url);
+      await page.click(`${at}[data-a="durlgo"]`);
+      await page.waitForSelector(`${at}.srcpreview`, { timeout: 20000 });
+
+      // Scoped to `.srcpreview`, and asserting a TYPE — `VARCHAR` and `BIGINT`
+      // are things only /api/source/describe can say, and the URL's own text
+      // contains the word `revenue` nowhere.
+      const prev = (await page.textContent(`${at}.srcpreview`)).trim();
+      assert.match(prev, /region/, `the preview does not name the URL's columns: ${JSON.stringify(prev)}`);
+      assert.match(prev, /revenue/, `the preview does not name the URL's columns: ${JSON.stringify(prev)}`);
+      assert.match(prev, /VARCHAR/, `no DuckDB type for the text column: ${JSON.stringify(prev)}`);
+      assert.match(prev, /BIGINT/, `no DuckDB type for the numeric column: ${JSON.stringify(prev)}`);
+
+      // and the bytes really came off the wire, from the path loci was given —
+      // `locate` is verbatim precisely so a typed uri is not re-encoded
+      assert.ok(remote.hits.length > 0,
+        'the preview drew columns that no request produced — nothing was ever fetched');
+      assert.deepEqual([...new Set(remote.hits.map(h => h.url))], ['/sales.csv'],
+        `DuckDB asked for something other than the path that was typed: ${JSON.stringify(remote.hits)}`);
+
+      assert.equal(await events(), before,
+        'previewing a URL committed an event — describe is supposed to commit nothing');
+
+      // Materialise-only, and no dead control saying so. `connect!` refuses
+      // passthrough for a remote location with a sentence, and a radio that can
+      // only produce that sentence is a control whose click can never work.
+      assert.equal(await page.locator(`${at}input[name^="dmode"]`).count(), 0,
+        'the panel offers read live for a URL, which connect! refuses — a click that can never work');
+      assert.equal(await page.locator(`${at}.dmode-fixed`).count(), 1,
+        'the panel dropped the radios and says nothing in their place — the reader is not told the mode was chosen for them');
+      assert.match((await page.textContent(`${at}.dmode-fixed`)).trim(), /cop/i,
+        'the fixed-mode note does not say the rows are copied in');
+
+      await page.fill(`${at}#dtitle`, 'From a URL');
+      const toast = { text: '' };
+      await page.click(`${at}[data-a="connect"]`);
+      await until(async () => {
+        await catchToast(page, toast);
+        return (await page.locator('.molder-h .t').count()) > 0;
+      }, () => `the table from the URL never opened. the page said: ${JSON.stringify(toast.text)}`, 30000);
+
+      assert.match((await page.textContent('.molder-h .t')).trim(), /From a URL/,
+        'something opened, but not the table the URL just made');
+      assert.equal(await page.locator('.molder-b table.mold').count(), 1, 'the table drew no rows');
+      assert.match(await page.textContent('.molder-b'), /EMEA/,
+        'the table landed with none of the URL’s rows in it');
+
+      // The payload, because the shell can draw rows either way and only the
+      // server knows what was recorded.
+      const id = await page.evaluate(() => openId);
+      assert.ok(id, 'the panel opened a table it cannot name, and every check below would be about nothing');
+      const p = await page.evaluate(x => API.object(x), id);
+      assert.equal(p.source && p.source.uri, remote.url,
+        `the handle does not record the URL that was typed: ${JSON.stringify(p.source)}`);
+      assert.equal(p.source.mode, 'materialise',
+        `the panel sent something other than materialise for a remote location: ${JSON.stringify(p.source)}`);
+      assert.equal(p.source.state, 'stored',
+        `a remote source was recorded as ${p.source.state} — materialise builds a stored handle`);
+
+      // In the lake, and NOT in loci's files directory: the spec's claim that
+      // the files GC never sees a remote source, asserted rather than assumed.
+      const inLake = await page.evaluate(() => API.storage().then(r => r.tables.map(t => t.id)));
+      assert.ok(inLake.includes(id),
+        `the URL's rows went nowhere — the lake holds ${JSON.stringify(inLake)}`);
+      const files = await page.evaluate(() => API.sourceFiles().then(r => r.files.map(f => f.file)));
+      assert.ok(!files.some(f => /sales/.test(f)),
+        `fetching the URL wrote a file into <LOCI_DATA>/files/: ${JSON.stringify(files)}`);
+      // the control for that absence — the listing does observe this directory
+      assert.ok(files.includes('live.csv'),
+        `the file listing sees nothing at all, so the absence above is about where it looked: ${JSON.stringify(files)}`);
+    });
+  } finally { await remote.stop(); }
+});
+
+test('a URL preview that takes its time can be left, and its answer does not paint over what replaced it', async () => {
+  await withPage(browser, 'sources-data-url-slow', async (page) => {
+    const i = await openUrlField(page);
+    const at = `#body${i} `;
+
+    // Routed AFTER the panel is open, so the only describe it holds is the one
+    // this test starts — `askSourceNow` fires one per drifted source when the
+    // notebook renders, and holding those would hang enterCosmos instead.
+    let release;
+    const held = new Promise(r => { release = r; });
+    await page.route('**/api/source/describe', async route => {
+      await held;
+      await route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ cols: [{ raw: 'region', col: 'region', type: 'VARCHAR' }],
+                               relation: "read_csv('…')" }) });
+    });
+
+    // `.invalid` is reserved by RFC 2606 and this describe is intercepted in the
+    // browser, so nothing leaves the machine on any path.
+    await page.fill(`${at}.durlin`, 'https://example.invalid/never.csv');
+    await page.click(`${at}[data-a="durlgo"]`);
+
+    await page.waitForSelector(`${at}.dwait`, { timeout: 8000 });
+    const wait = (await page.textContent(`${at}.dwait`)).trim();
+    assert.match(wait, /second/i,
+      `the wait says nothing about how long a URL can take — six idle seconds read as broken: ${JSON.stringify(wait)}`);
+    assert.equal(await page.locator(`${at}[data-a="dback"]`).count(), 1,
+      'the panel is frozen while a URL is fetched — there is no cancel anywhere in loci, so leaving is the only way out and it was not drawn');
+
+    await page.click(`${at}[data-a="dback"]`);
+    await page.waitForSelector(`${at}.durlin`, { timeout: 8000 });
+
+    // Now let the describe land, against a host that has been repainted since.
+    // `host.isConnected` cannot see this: ‹ another file redraws the SAME
+    // element, so the guard 12af324 added one level up passes here and the
+    // preview paints over the listing you went back to.
+    const answered = page.waitForResponse(r => r.url().includes('/api/source/describe'));
+    release();
+    await answered;
+    await page.waitForTimeout(400);
+    assert.equal(await page.locator(`${at}.srcpreview`).count(), 0,
+      'the late describe painted its preview over the file tab that replaced it');
+    assert.equal(await page.locator(`${at}.durlin`).count(), 1,
+      'the file tab is gone — something repainted the panel out from under it');
+
+    await page.unroute('**/api/source/describe');
+  });
+});
+
+// The same late describe, landing on the OTHER tab — and this is the half the
+// token did not cover when it was written. `dataFileTab` and `dataPreview` both
+// bump it; `dataPasteTab` did not, and the `.dtabs` buttons live outside
+// `.dbody` and stay clickable for the whole of a six-second remote wait. So:
+//
+//   type an s3:// URL → Preview → click Paste → start typing a CSV
+//     → the describe lands, is stale by nobody's test, and paints the preview
+//       over the textarea and everything in it
+//
+// What this asserts is the TEXT, not the presence of a `dgen` call: the rule
+// 12af324 wrote down is "losing what someone typed is worse than showing
+// slightly old cells", so what has to survive is what someone typed.
+test('a describe that lands after the tab changed does not eat what was typed into it', async () => {
+  await withPage(browser, 'sources-data-tab-race', async (page) => {
+    const i = await openUrlField(page);
+    const at = `#body${i} `;
+    const typed = 'region,revenue\nEMEA,10\n';
+
+    // Held, so the window is the test's rather than the network's — the same
+    // shape as the test above, and routed after the panel is open for the same
+    // reason: `askSourceNow` fires one describe per drifted source on render.
+    let release;
+    const held = new Promise(r => { release = r; });
+    await page.route('**/api/source/describe', async route => {
+      await held;
+      await route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ cols: [{ raw: 'region', col: 'region', type: 'VARCHAR' }],
+                               relation: "read_csv('…')" }) });
+    });
+
+    await page.fill(`${at}.durlin`, 'https://example.invalid/never.csv');
+    await page.click(`${at}[data-a="durlgo"]`);
+    await page.waitForSelector(`${at}.dwait`, { timeout: 8000 });
+
+    // The tabs are OUTSIDE `.dbody`, which is why they are still clickable here
+    // and why this is reachable at all.
+    await page.click(`${at}[data-tab="paste"]`);
+    await page.waitForSelector(`${at}#csv`, { timeout: 8000 });
+    await page.fill(`${at}#ctitle`, 'Pasted while it fetched');
+    await page.fill(`${at}#csv`, typed);
+
+    const answered = page.waitForResponse(r => r.url().includes('/api/source/describe'));
+    release();
+    await answered;
+    await page.waitForTimeout(400);
+
+    assert.equal(await page.locator(`${at}#csv`).count(), 1,
+      'the late describe replaced the paste box that was opened while it was in flight');
+    assert.equal(await page.inputValue(`${at}#csv`), typed,
+      'the paste box survived but not the CSV in it');
+    assert.equal(await page.inputValue(`${at}#ctitle`), 'Pasted while it fetched',
+      'the table name typed beside the CSV was lost');
+    assert.equal(await page.locator(`${at}.srcpreview`).count(), 0,
+      'the preview painted its columns over the paste tab');
+    // and the panel is not lying about which tab it is on
+    assert.equal(await page.locator(`${at}[data-tab="paste"].ghost`).count(), 0,
+      'Paste is drawn as the inactive tab while its own body is on screen');
+
+    await page.unroute('**/api/source/describe');
+  });
+});
+
+// The format is read off the extension, and a presigned URL puts a query string
+// after it. This is the ordinary way an S3 object is handed over https — it is
+// the escape hatch loci's own credential message points at — so `.parquet?X-Amz-…`
+// is not an edge case, and `read_csv` over a parquet object is a DuckDB parse
+// error attributed to the user's URL. For `.json?token=` it is worse and silent:
+// one VARCHAR column of raw JSON text, which Connect will happily materialise.
+//
+// Asserted on the REQUEST, because that is where the damage is done. The heading
+// is checked too — it is drawn from the same function, so a panel that got this
+// wrong would say `sales.parquet · csv` and disagree with itself on screen.
+test('a URL with a query string is read as the format its path names', async () => {
+  await withPage(browser, 'sources-data-url-query', async (page) => {
+    const i = await openUrlField(page);
+    const at = `#body${i} `;
+    const asked = [];
+    await page.route('**/api/source/describe', async route => {
+      asked.push(JSON.parse(route.request().postData() || '{}'));
+      // Refused, so nothing is fetched and nothing lands: the request IS the
+      // assertion, and the error state is where the heading stays on screen.
+      await route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ error: 'stopped here — this test is about the request' }) });
+    });
+
+    for (const [uri, format] of [
+      ['https://bucket.s3.amazonaws.com/exports/sales.parquet?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef', 'parquet'],
+      ['https://api.example.com/exports/data.json?token=t', 'json']]) {
+      // By INDEX and not by `.pop()`: `askSourceNow` fires a describe per
+      // drifted source when the notebook renders, so "the last one seen" is not
+      // necessarily this panel's, and a count that grew by two would be a second
+      // describe nobody asked for going unnoticed.
+      const n = asked.length;
+      await page.fill(`${at}.durlin`, uri);
+      await page.click(`${at}[data-a="durlgo"]`);
+      await page.waitForSelector(`${at}.srcerr`, { timeout: 8000 });
+
+      assert.equal(asked.length, n + 1,
+        `Preview sent ${asked.length - n} describes, not 1: ${JSON.stringify(asked.slice(n))}`);
+      const sent = asked[n];
+      assert.equal(sent.uri, uri,
+        `the uri did not reach describe verbatim: ${JSON.stringify(sent)}`);
+      assert.equal(sent.format, format,
+        `loci was asked to read ${uri.split('?')[0].split('/').pop()} as ${JSON.stringify(sent.format)} — ` +
+        `the format is matched against the whole uri, so the signature after the ? is part of ` +
+        `what has to end in an extension and nothing does`);
+      const head = (await page.textContent(`${at}.sec-h`)).trim();
+      assert.match(head, new RegExp(`· ${format}$`),
+        `the heading disagrees with what was sent: ${JSON.stringify(head)}`);
+
+      await page.click(`${at}[data-a="dback"]`);
+      await page.waitForSelector(`${at}.durlin`, { timeout: 8000 });
+      // ‹ back from a FAILED preview, which is the one place this matters: the
+      // fetch that just failed cost up to six seconds, there is no "try again"
+      // on the error state, and a presigned URL is 500-odd characters nobody
+      // retypes. ‹ is the retry, and it only is one if the field still holds it.
+      assert.equal(await page.inputValue(`${at}.durlin`), uri,
+        '‹ back from a failed remote preview redrew an empty URL field — the URL that just cost a fetch has to be pasted again');
+    }
+
+    await page.unroute('**/api/source/describe');
+  });
+});
+
+test('a preview failure keeps the shape of the paragraph loci wrote', async () => {
+  await withPage(browser, 'sources-data-url-error', async (page) => {
+    const i = await openUrlField(page);
+    const at = `#body${i} `;
+
+    // `credential-problem`'s own shape — a sentence, an indented line naming
+    // what loci runs as, DuckDB's own text, a blank line, an indented fix — with
+    // the lines kept SHORT on purpose: collapsed onto one run the whole message
+    // is ~100 characters, so it cannot reach four line boxes by wrapping and the
+    // count below can only be about the newlines.
+    //
+    // Stubbed rather than provoked. The real one costs ~6 s walking the AWS
+    // credential chain, and on a machine that HAS credentials an `s3://`
+    // describe leaves the building — which no test here may do.
+    const msg = 'loci cannot get AWS credentials.\n' +
+                '  running as loci\n' +
+                '  DuckDB said: no.\n' +
+                '\n' +
+                '  Give it one and connect again.';
+    await page.route('**/api/source/describe', route => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ error: msg }) }));
+
+    await page.fill(`${at}.durlin`, 's3://bucket/sales.csv');
+    await page.click(`${at}[data-a="durlgo"]`);
+    await page.waitForSelector(`${at}.srcerr`, { timeout: 8000 });
+
+    const shown = await page.textContent(`${at}.srcerr`);
+    assert.match(shown, /running as loci/,
+      `the panel dropped loci's own paragraph and showed something else: ${JSON.stringify(shown)}`);
+    assert.match(shown, /Give it one/,
+      `the fix at the end of the paragraph did not survive: ${JSON.stringify(shown)}`);
+
+    // ...and on as many lines as it was written on, still carrying the indents
+    // it was written with. A Range over the paragraph's CONTENTS answers one
+    // rect per line box — `getClientRects` on the block itself would answer 1
+    // however it were drawn — so the count is the rendering and not the CSS
+    // declaration.
+    //
+    // **The count alone does not finish the job, and the rule's own comment is
+    // what it fails to certify.** That comment says `pre-wrap` and not
+    // `pre-line`, "because the two-space indents are the author's" — and
+    // pre-line keeps every newline, so it draws these same five line boxes and
+    // passes a count. `page.textContent` cannot separate them either: it returns
+    // DOM text, which holds the spaces under both. What separates them is where
+    // the indented line STARTS, and it has to be measured at the first glyph
+    // rather than off the line box — under pre-wrap the two spaces belong to the
+    // line, so the box itself begins at the content edge either way.
+    const drawn = await page.evaluate(sel => {
+      const el = document.querySelector(sel), node = el.firstChild;
+      const all = document.createRange(); all.selectNodeContents(el);
+      const glyph = text => {
+        const k = node.data.indexOf(text), g = document.createRange();
+        g.setStart(node, k); g.setEnd(node, k + 1);
+        return Math.round(g.getBoundingClientRect().left * 100) / 100;
+      };
+      return { lines: all.getClientRects().length, ws: getComputedStyle(el).whiteSpace,
+               width: el.clientWidth,
+               flush: glyph('loci cannot'), indented: glyph('running as') };
+    }, `${at}.srcerr`);
+    assert.ok(drawn.lines >= 4,
+      `loci's five-line paragraph was drawn on ${drawn.lines} line box(es) — white-space is ` +
+      `${drawn.ws} in a ${drawn.width}px box, so the newlines it was written with were collapsed ` +
+      `into one run-on line, which is what every remote failure looks like`);
+    assert.ok(drawn.indented > drawn.flush,
+      `the indented line starts at x=${drawn.indented} and the unindented one at ` +
+      `x=${drawn.flush} — white-space is ${drawn.ws}, which keeps the newlines and eats the ` +
+      `two-space indents loci composed the fix with, so the paragraph is drawn on the right ` +
+      `number of lines and in the wrong shape`);
+
+    await page.unroute('**/api/source/describe');
   });
 });

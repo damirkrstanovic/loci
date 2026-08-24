@@ -231,11 +231,51 @@
      line, because they are the same question: where did the file get to? */
   .dprog{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
   .dprog.bad{color:var(--attn)}
+  /* the third door, and the only one for a location loci does not hold: a URL is
+     typed, not picked, because `/api/source/files` lists a DIRECTORY and no
+     directory will ever contain an s3:// bucket. Beside the upload row rather
+     than behind a tab of its own — both rows answer "the file is not in the list
+     below", and splitting them would make a reader choose between them before
+     knowing the difference, which is the argument that collapsed ＋ Import CSV
+     into ＋ Data in the first place. */
+  .durl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 13px}
+  .durl input{flex:1;min-width:220px;border:1px solid var(--line);border-radius:8px;
+              padding:8px 10px;font:inherit;font-size:12.5px}
   /* what `describe` answered, boxed so it reads as the FILE's shape and not as
      the table's — there is no table yet, and that is the whole point of it */
   .srcpreview{border:1px solid var(--line);border-radius:9px;padding:3px 11px 5px;background:var(--white);
               max-height:280px;overflow:auto}
   .dmode{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--ink-2)}
+  /* where the two radios stand for a local file, and there is nothing to choose:
+     `connect!` refuses passthrough for a remote location, so a radio for it could
+     only ever produce that refusal. A statement, not a disabled control — a
+     disabled control invites a click that can never work. */
+  .dmode-fixed{display:inline-flex;align-items:center;font-family:var(--mono);font-size:10.5px;
+               letter-spacing:.06em;text-transform:uppercase;color:var(--muted);
+               border:1px solid var(--line);border-radius:7px;padding:5px 8px}
+  /* `reading its columns…`, which for a URL is not a figure of speech: the
+     fetch happens HERE, at preview, and an s3:// location whose credentials
+     have to be walked and refused takes ~6 s — see `dataPreview`'s comment for
+     the measurement and for why a container with no route out is fast instead.
+     loci has no timeout and no cancel, so the panel's only honest move is to
+     say what the wait is and keep the way out drawn. */
+  .dwait{color:var(--muted);font-size:13px;line-height:1.55;padding:6px 0}
+  /* loci's remote failures are PARAGRAPHS — `credential-problem`, and the head
+     and tail `ensure-remote!` hands `extension-problem`, compose a sentence, an
+     indented context block, DuckDB's own text and an indented fix, over eight
+     lines. `esc()` keeps those newlines and a `<p>` collapses every one of them,
+     so without this the whole of it is drawn as a single run-on line. `pre-wrap` and not `pre-line`: the
+     two-space indents are the author's, and pre-line eats them.
+
+     `overflow-wrap` is the other half of the same paragraph, and it is the
+     declaration that decides how a long URL breaks. Every one of these messages
+     names the location it failed on, and a presigned s3 URL is 500-odd
+     characters with no space anywhere in it; `pre-wrap` breaks at soft wrap
+     opportunities only, so without this that one word sets the width of the
+     column and the message runs off the side of the panel. `anywhere` and not
+     `break-word` because only `anywhere` is counted when the min-content width
+     is computed, which is the width this box is actually laid out against. */
+  .reclaimed p.srcerr{white-space:pre-wrap;overflow-wrap:anywhere}
   .md{white-space:normal;font-size:13.5px;line-height:1.65;color:var(--ink-2)}
   .md p{margin:0 0 9px} .md p:last-child{margin-bottom:0}
   .md h3{font-family:'IBM Plex Serif',serif;font-weight:600;font-size:16px;margin:14px 0 6px;color:var(--ink)}
@@ -1295,7 +1335,38 @@ async function uploadChunks(f,onProgress){
 // `/api/source/files` lists the DIRECTORY rather than anything loci recorded, so
 // a file dropped in by hand is offered and a file whose table exists but whose
 // bytes are gone is not.
+//
+// Both of them paint from a promise, and both are now reachable while the other
+// one's promise is still in flight — which is new, and is the URL field's doing.
+// A local describe is milliseconds, so until this phase the waiting state needed
+// no way out and had none; a remote one is up to six seconds, so it grew one,
+// and the moment ‹ another file exists during a fetch the late answer can land
+// on a host somebody else has already repainted.
+//
+// `host.isConnected` cannot see that. It is the SAME element every time — the
+// panel's `.dbody` — so it is true for a stale describe and the preview paints
+// straight over the listing. Element identity is the TECHNIQUE 12af324 used one
+// level up, and it is the technique that cannot discriminate here, not that
+// guard: 12af324's is about a notebook render landing on a body somebody opened
+// a form in, and it is not on this path at all. What carries over from it is its
+// rule — losing what someone typed is worse than showing slightly old cells.
+//
+// So: one token per render, bumped by whoever paints, and every async paint
+// checks that it is still the last one to have bumped it. THREE painters bump
+// it — `dataFileTab`, `dataPreview` and `dataPasteTab` — because the tab buttons
+// sit outside `.dbody` and stay clickable while a describe is in flight.
+//
+// **Not an `AbortController`, and the reason is not that it would be awkward.**
+// It would cancel the browser's half of one fetch and nothing else: `describe`
+// IS the remote read, it runs in the JVM, and loci has no cancel for it — so the
+// six seconds are spent either way and only the PAINT was ever in question. The
+// token also covers what a signal would not reach without being threaded there:
+// the upload, which is one request per chunk, and a paint that was never a fetch
+// at all (Paste). One rule for every async paint in this panel, and no second.
+const dgen   = host => (host.__dgen=(host.__dgen||0)+1);
+const dstale = (host,gen) => !host.isConnected || host.__dgen!==gen;
 function dataFileTab(i,sp,host){
+  const gen=dgen(host);
   host.innerHTML='<div style="color:var(--muted);font-size:13px;padding:6px 0">reading the file list…</div>';
   const back='<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
   const wireCancel=()=>host.querySelectorAll('[data-a="dcancel"]')
@@ -1305,6 +1376,43 @@ function dataFileTab(i,sp,host){
   // where uploading is the only thing there is to do.
   const up='<div class="dupload"><input type="file" class="dupfile" accept=".csv,.parquet,.json">'+
     '<span class="dprog"></span></div>';
+  // The third door: a location loci does not hold and never will. `/api/source/files`
+  // lists a directory, so no listing can ever offer an `s3://` bucket or a URL on
+  // somebody's web server — the only way one reaches `describe` is typed.
+  //
+  // Nothing here validates the scheme. `sourcespec/locate` refuses one it does not
+  // know BY NAME — *loci does not know this location: gs://… Remote schemes
+  // (s3://, https://) arrive with httpfs* — and `describe` carries that back as
+  // `{error}`, which the preview already draws. A copy of the scheme set here
+  // would be a second place to be wrong about which schemes loci reads, and its
+  // sentence would be worse than the one that already exists.
+  const url='<div class="durl"><input class="durlin" type="url" spellcheck="false" autocapitalize="off" '+
+    'placeholder="…or a URL loci fetches: https://host/sales.csv, s3://bucket/sales.csv">'+
+    '<button type="button" class="btn ghost sm" data-a="durlgo">Preview</button></div>';
+  const wireUrl=()=>{
+    const inp=host.querySelector('.durlin'); if(!inp) return;
+    // **The URL survives ‹ back**, and this line is the whole of the mechanism.
+    // A remote preview that failed has just cost six seconds, and ‹ redraws this
+    // tab from scratch — so without it the way out of a failure is to paste a
+    // 500-character presigned URL again, from a clipboard that may not still
+    // hold it. There is no "try again" on the error state and none is wanted:
+    // ‹ IS the retry once the field it goes back to is not empty.
+    //
+    // Kept on the host and not in a closure, because `dataFileTab` runs again
+    // from nothing each time and the host is the one thing that does not. It
+    // dies with the panel: `startData` builds a fresh `.dbody` every open.
+    inp.value=host.__durl||'';
+    // Straight into `dataPreview`, which is the picker's own path — describe,
+    // columns, mode, Connect. A typed URL is a location arriving, not a second
+    // way to connect one, exactly as an upload is not.
+    const go=()=>{
+      const u=inp.value.trim(); if(!u) return;
+      host.__durl=u;
+      dataPreview(i,sp,host,{uri:u,name:uriTail(u)});
+    };
+    host.querySelectorAll('[data-a="durlgo"]').forEach(el=>el.addEventListener('click',go));
+    inp.addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
+  };
   const wireUpload=()=>{
     const inp=host.querySelector('.dupfile'), prog=host.querySelector('.dprog');
     if(!inp) return;
@@ -1314,7 +1422,7 @@ function dataFileTab(i,sp,host){
       let r;
       try{ r=await uploadChunks(f,(n,t)=>{ prog.textContent=f.name+' — '+n+'/'+t; }); }
       catch(e){
-        if(!host.isConnected) return;
+        if(dstale(host,gen)) return;
         // The panel keeps its listing and says what the server said. Every
         // refusal this route can answer already has a sentence from phase 1;
         // the one new one is a chunk out of sequence, and it names itself.
@@ -1323,7 +1431,7 @@ function dataFileTab(i,sp,host){
         prog.textContent='upload: '+((e&&e.message)||'network error');
         return;
       }
-      if(!host.isConnected) return;
+      if(dstale(host,gen)) return;
       inp.disabled=false; prog.textContent='';
       // `:existed` means the hash was already in the directory, so nothing was
       // written — worth saying, because the file about to be previewed is the
@@ -1345,23 +1453,27 @@ function dataFileTab(i,sp,host){
     });
   };
   API.sourceFiles().then(r=>{
-    if(!host.isConnected) return;    // the panel was closed while we asked
+    if(dstale(host,gen)) return;     // the panel was closed, or repainted, while we asked
     const files=(r&&r.files)||[];
     if(r&&r.error){
-      host.innerHTML='<div class="reclaimed"><p>'+esc(r.error)+'</p></div>'+
+      // The URL row survives a failed listing, and that is the point of drawing
+      // it in this branch: whatever went wrong reading loci's own directory has
+      // nothing to say about a location loci does not hold, and a tab whose only
+      // control is Cancel is a dead end where a working door exists.
+      host.innerHTML=url+'<div class="reclaimed"><p>'+esc(r.error)+'</p></div>'+
         '<div class="actions" style="margin-top:10px">'+back+'</div>';
-      wireCancel(); return;
+      wireCancel(); wireUrl(); return;
     }
     if(!files.length){
-      host.innerHTML=up+'<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
-        'Nothing in loci’s files directory yet — upload one above, or paste is the other tab.</div>'+
+      host.innerHTML=up+url+'<div style="color:var(--muted);font-size:13px;padding:2px 0 10px">'+
+        'Nothing in loci’s files directory yet — upload one above, give it a URL, or paste is the other tab.</div>'+
         '<div class="actions">'+back+'</div>';
-      wireCancel(); wireUpload(); return;
+      wireCancel(); wireUpload(); wireUrl(); return;
     }
     // The name the manifest remembers, or the file itself when it remembers
     // none — a hand-placed file is listed under what it is called on disk,
     // permanently, and that is not a degraded case.
-    host.innerHTML=up+'<div class="sec-h">or pick a file loci already has</div><div class="filelist">'+
+    host.innerHTML=up+url+'<div class="sec-h">or pick a file loci already has</div><div class="filelist">'+
       files.map(f=>'<button type="button" class="filerow" data-file="'+esc(f.file)+'">'+
         '<span class="fn">'+esc(f.name||f.file)+'</span>'+
         // Beside the name and not after the size, because it is part of what
@@ -1371,14 +1483,14 @@ function dataFileTab(i,sp,host){
         (f.connectedAs?'<span class="dupe">already '+esc(f.connectedAs)+'</span>':'')+
         '<span class="fmeta">'+esc(srcFormat(f.uri))+' · '+fmtBytes(f.bytes)+'</span></button>').join('')+
       '</div><div class="actions" style="margin-top:11px">'+back+'</div>';
-    wireCancel(); wireUpload();
+    wireCancel(); wireUpload(); wireUrl();
     host.querySelectorAll('[data-file]').forEach(el=>el.addEventListener('click',()=>
       dataPreview(i,sp,host,files.find(f=>f.file===el.dataset.file))));
   }).catch(()=>{
-    if(!host.isConnected) return;
-    host.innerHTML='<div class="reclaimed"><p>loci could not read the file list.</p></div>'+
+    if(dstale(host,gen)) return;
+    host.innerHTML=url+'<div class="reclaimed"><p>loci could not read the file list.</p></div>'+
       '<div class="actions" style="margin-top:10px">'+back+'</div>';
-    wireCancel();
+    wireCancel(); wireUrl();
   });
 }
 // One file, described and not connected. `describe` IS the dry run — it reads
@@ -1392,24 +1504,57 @@ function dataFileTab(i,sp,host){
 // number is the thing worth seeing BEFORE the table exists.
 function dataPreview(i,sp,host,f){
   if(!f) return dataFileTab(i,sp,host);
-  const uri=f.uri, label=f.name||f.file,
+  const gen=dgen(host);
+  const uri=f.uri,
+        // `uriTail` is the typed-URL case: a picked row and an upload both carry
+        // a name, a URL carries only itself, and an empty heading over a blank
+        // proposed title is the worst of the three.
+        label=f.name||f.file||uriTail(uri),
         // From the extension and never from a control: `srcFormat`'s own comment
         // says why — a dropdown would be a second place to say it and so a
         // second place to be wrong.
         format=srcFormat(uri),
+        // A location DuckDB fetches rather than one loci resolves. It changes
+        // three things below and nothing else: what the wait says, what the mode
+        // control is, and what the footnote under it explains.
+        remote=isRemote(uri),
         base=label.replace(/\.[a-z0-9]+$/i,'');
   const head=n=>'<div class="sec-h">'+esc(label)+' · '+esc(format)+(n?' · '+n+' column'+(n===1?'':'s'):'')+'</div>';
-  const nav='<button class="btn ghost sm" data-a="dback">‹ another file</button>'+
+  // `‹ back` for a URL: the destination is the same tab either way, but nothing
+  // about a typed location was ever "another file", and the wait sentence points
+  // at this button by name.
+  const nav='<button class="btn ghost sm" data-a="dback">'+(remote?'‹ back':'‹ another file')+'</button>'+
             '<button class="btn ghost sm" data-a="dcancel">Cancel</button>';
   const wireNav=()=>{
     host.querySelectorAll('[data-a="dback"]').forEach(el=>el.addEventListener('click',()=>dataFileTab(i,sp,host)));
     host.querySelectorAll('[data-a="dcancel"]').forEach(el=>el.addEventListener('click',()=>renderBody(i)));
   };
-  host.innerHTML=head()+'<div style="color:var(--muted);font-size:13px;padding:6px 0">reading its columns…</div>';
+  // The waiting state, which for a URL is not a formality. `describe` IS the
+  // fetch — the object is read here, before Connect — and an `s3://` location
+  // whose credentials have to be found and refused costs ~6 s (measured 6,069 ms
+  // on a machine with none; 62 ms with no route out at all, because the chain
+  // gives up rather than timing out on IMDS). There is no timeout and no cancel
+  // anywhere in loci, so six idle seconds is what a reader gets, and a panel
+  // showing three muted words for six seconds reads as broken.
+  //
+  // Two answers, both of them honest about what loci cannot do. Say how long it
+  // may take and why, and draw the way OUT — which is not a cancel and does not
+  // pretend to be: the fetch runs to completion, and leaving is leaving.
+  host.innerHTML=head()+'<div class="dwait">'+(remote
+      ? 'fetching '+esc(label)+' — a URL is read now, not when you press Connect. '+
+        'Several seconds is normal, and an s3:// location with no credentials takes '+
+        'about six of them before it can say so. Nothing has been committed; ‹ leaves.'
+      : 'reading its columns…')+'</div>'+
+    '<div class="actions" style="margin-top:10px">'+nav+'</div>';
+  wireNav();
   API.sourceDescribe({uri,format}).then(d=>{
-    if(!host.isConnected) return;
+    if(dstale(host,gen)) return;
     if(!d||d.error||!d.cols||!d.cols.length){
-      host.innerHTML=head()+'<div class="reclaimed"><p>'+esc((d&&d.error)||('loci cannot read '+label))+'</p></div>'+
+      // `srcerr`, because THIS is where loci's paragraphs land. Every remote
+      // failure — a missing httpfs, a credential chain with nothing in it — is
+      // multi-line prose with an indented fix, and a `<p>` collapses newlines.
+      host.innerHTML=head()+'<div class="reclaimed"><p class="srcerr">'+
+        esc((d&&d.error)||('loci cannot read '+label))+'</p></div>'+
         '<div class="actions" style="margin-top:10px">'+nav+'</div>';
       wireNav(); return;
     }
@@ -1424,10 +1569,48 @@ function dataPreview(i,sp,host,f){
     // connecting again WOULD do rather than asking you not to — `import-csv!`
     // settled that for the paste box and this is the same rule at the other
     // door. Connect below is untouched.
+    //
+    // A typed URL carries no `connectedAs` and draws no note, and that is a gap
+    // rather than a decision that it does not matter. `files/connected-as` can
+    // answer for ANY uri, but the two places that fill this key —
+    // `/api/source/files` and the upload reply — are both about loci's own
+    // directory, and no directory listing will ever contain a bucket.
+    //
+    // What it does NOT need is a route that does not exist, and an earlier draft
+    // of this comment said it did. `source-describe` already takes the store and
+    // already ignores it — *"Takes `st` and ignores it, so the three routes read
+    // alike and a later preview that wants the store does not change the route"*
+    // is its own docstring, written in anticipation of exactly this — so the
+    // answer is one more key on a reply the panel already waits for. It is
+    // deferred because it is still a server change with its own contract and its
+    // own test, in a phase that is about locations; not because there is nowhere
+    // to put it. The cost is unchanged: connecting the same URL twice makes two
+    // tables in silence — which `undo!` reverses, and which the picked-row door
+    // has warned about since phase 2.
     const dupe=f.connectedAs
       ? '<div class="dupe-note">loci already has this file as <b>'+esc(f.connectedAs)+
         '</b>. Connecting again makes a second table from the same rows.</div>'
       : '';
+    // Where the two radios go for a local file. `connect!` refuses passthrough
+    // for a remote location with a sentence naming the mode and the uri, so a
+    // radio for it is a control whose click can only ever produce an error —
+    // and a disabled one is the same invitation with the click removed. A
+    // statement instead, in the place the choice would have been, so the reader
+    // sees that a mode WAS settled rather than that the panel forgot to offer
+    // one. The measured reason is in the footnote below, not hidden here.
+    const modes=remote
+      ? '<span class="dmode-fixed">copied in</span>'
+      : '<label class="dmode"><input type="radio" name="'+rn+'" value="materialise" checked> copy in</label>'+
+        '<label class="dmode"><input type="radio" name="'+rn+'" value="passthrough"> read live</label>';
+    const modeNote=remote
+      ? '<b>A URL is copied in</b>, and there is no other mode for one. loci fetches the rows '+
+        'now and keeps them; <b>Refresh</b> on the table fetches them again. Reading live would '+
+        'mean a full fetch of the object for every query and another for every render — '+
+        'measured locally at 244 ms of a 294 ms connect just to count the rows, which over a '+
+        'network is a notebook that is slow for a reason nothing on screen can show you.'
+      : '<b>copy in</b> stores the rows in loci, so they stay as they are now. <b>read live</b> '+
+        'keeps the file as the truth and re-reads it every time — nothing is copied, and the '+
+        'rows change when the file does.';
     host.innerHTML=head(d.cols.length)+dupe+
       '<div class="srcpreview"><table class="mold"><thead><tr>'+
         '<th class="txt">header</th><th class="txt">column</th><th class="txt">type</th></tr></thead><tbody>'+
@@ -1437,18 +1620,19 @@ function dataPreview(i,sp,host,f){
       '<div class="actions" style="margin-top:11px">'+
         '<input id="dtitle" placeholder="'+esc(base)+'" '+
         'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
-        '<label class="dmode"><input type="radio" name="'+rn+'" value="materialise" checked> copy in</label>'+
-        '<label class="dmode"><input type="radio" name="'+rn+'" value="passthrough"> read live</label>'+
+        modes+
         '<button class="btn sm" data-a="connect">Connect</button>'+nav+'</div>'+
-      '<div style="font-size:12px;color:var(--muted);margin-top:8px"><b>copy in</b> stores the rows in loci, '+
-      'so they stay as they are now. <b>read live</b> keeps the file as the truth and re-reads it every '+
-      'time — nothing is copied, and the rows change when the file does.</div>';
+      '<div style="font-size:12px;color:var(--muted);margin-top:8px">'+modeNote+'</div>';
     wireNav();
     const btn=host.querySelector('[data-a="connect"]');
     const go=async()=>{
       if(TIME){ showToast('time mode — ↩ now to connect'); return; }
       const title=host.querySelector('#dtitle').value.trim()||base;
-      const mode=host.querySelector('input[name="'+rn+'"]:checked').value;
+      // The same `remote` that decided not to draw the radios, so there is one
+      // condition and not a fallback: a LOCAL preview with no checked radio
+      // still throws here, which is what a silent default to materialise would
+      // hide.
+      const mode=remote?'materialise':host.querySelector('input[name="'+rn+'"]:checked').value;
       const restore=()=>{ btn.disabled=false; btn.textContent='Connect'; };
       btn.disabled=true; btn.textContent='connecting…';
       let res; try{ res=await API.sourceConnect({uri,format,mode,title}, sp.id); }
@@ -1466,8 +1650,8 @@ function dataPreview(i,sp,host,f){
     host.querySelector('#dtitle').addEventListener('keydown',e=>{ if(e.key==='Enter') go(); });
     host.querySelector('#dtitle').focus();
   }).catch(()=>{
-    if(!host.isConnected) return;
-    host.innerHTML=head()+'<div class="reclaimed"><p>loci could not read '+esc(label)+'.</p></div>'+
+    if(dstale(host,gen)) return;
+    host.innerHTML=head()+'<div class="reclaimed"><p class="srcerr">loci could not read '+esc(label)+'.</p></div>'+
       '<div class="actions" style="margin-top:10px">'+nav+'</div>';
     wireNav();
   });
@@ -1475,7 +1659,18 @@ function dataPreview(i,sp,host,f){
 // The paste tab — `startImport`'s body, moved and not rewritten, ids included.
 // A CSV you can paste is one somebody already has in a clipboard, which makes
 // this the narrowest of the doors and no longer the only one.
+//
+// **It bumps the token too, and that is not bookkeeping.** The `.dtabs` buttons
+// live OUTSIDE `.dbody` and stay clickable through the whole of a six-second
+// remote describe, so Paste is the THIRD painter of this host — and the only one
+// whose paint is a form somebody types into. Without the bump a describe that
+// lands afterwards is stale by no test the other two apply: `.dbody` is still
+// connected, and `__dgen` still holds the number the preview set. It then paints
+// its columns over the textarea and everything typed into it, under a Paste tab
+// still highlighted as the active one. 12af324's rule is the one being kept —
+// losing what someone typed is worse than showing slightly old cells.
 function dataPasteTab(i,sp,host){
+  dgen(host);
   host.innerHTML='<div class="actions"><input id="ctitle" placeholder="table name…" '+
     'style="border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px">'+
     '<button class="btn sm" id="goImp">Import</button><button class="btn ghost sm" id="cancelImp">Cancel</button></div>'+
@@ -1872,7 +2067,50 @@ const srcFile = uri => String(uri||'').replace(/^loci:\/\/files\//,'');
 // the server reads map one-to-one onto extensions, so a second place to say it
 // would be a second place to be wrong. Unknown extensions ask as CSV, which is
 // what `read_csv`'s sniffer is for.
-const srcFormat = uri => (String(uri||'').toLowerCase().match(/\.(csv|parquet|json)$/)||[,'csv'])[1];
+//
+// **The query string comes off first**, for the same reason `uriTail` strips it
+// a few lines down. A presigned URL is the ordinary way an S3 object is handed
+// over https — it is the escape hatch loci's own credential message points at —
+// and it carries its signature after a `?`. Matched with `$` against the whole
+// string, `sales.parquet?X-Amz-Signature=…` ends in neither `.parquet` nor
+// `.csv`, falls through to the default, and loci reads a parquet file with
+// `read_csv`: a DuckDB parse error attributed to the URL, or, for `.json?token=`,
+// one VARCHAR column of raw JSON text that Connect will happily materialise.
+// The heading says `sales.parquet · csv` while it happens — the panel disagreeing
+// with itself on screen. A `?` cannot occur in a `loci://files/<hash>` uri, so no
+// caller that existed before the URL field changes.
+const srcFormat = uri => (String(uri||'').toLowerCase().split(/[?#]/)[0]
+  .match(/\.(csv|parquet|json)$/)||[,'csv'])[1];
+// Is this a location DuckDB FETCHES rather than one loci resolves? The same
+// question `sourcespec/remote?` answers, and yes, that is two places.
+//
+// It is two places because the shell has to decide what to DRAW before it has
+// asked anything, and there is no route that answers "is this remote". What
+// makes the duplication safe is what each copy decides: this one picks controls,
+// `sourcespec/remote?` picks a code path, and the server stays the authority on
+// both. Disagree in either direction and the cost is a message, never a wrong
+// table — call a local file remote and the panel offers only copy-in, which is
+// what a local file does anyway; call a remote one local and the panel offers
+// read live, which `connect!` refuses BY NAME with a sentence naming the mode
+// and the uri. Neither is silent, and neither writes anything.
+const isRemote = uri => /^(https?|s3):\/\//.test(String(uri||''));
+// The last path segment of a location, for a preview that has no file row
+// behind it to take a name from: `https://h/a/sales.csv?t=1` → `sales.csv`.
+// Falls back to the whole uri rather than to '' — an empty heading and a blank
+// proposed title are worse than a long one.
+//
+// Decoded, because what this answers is a HEADING and a proposed table title —
+// not a location. `sales%20q3.csv` is what the URL has to say; `sales q3.csv` is
+// what the file is called, and it is the name that goes in the title field. In a
+// try/catch and not bare: a lone `%` is a legal character in a path DuckDB will
+// fetch, `decodeURIComponent` throws `URIError` on it, and that would take the
+// whole preview out over a heading. The uri itself is never touched — `locate`
+// answers a remote location verbatim, and `f.uri` is the only string that
+// reaches DuckDB.
+const uriTail = uri => {
+  const t = String(uri||'').split(/[?#]/)[0].split('/').filter(Boolean).pop() || String(uri||'');
+  try{ return decodeURIComponent(t); }catch(e){ return t; }
+};
 
 // A drifted source's columns AS THEY ARE NOW, by object id — the actionable
 // half, and the half the recorded handle cannot know.

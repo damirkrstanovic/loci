@@ -159,8 +159,8 @@
   (config/env "LOCI_DUCKDB_EXTENSIONS"))
 
 (defn- extension-problem
-  "One paragraph naming the directory, the uid and the fix — `data-dir-problem`'s
-   job, for the other directory loci needs.
+  "The mechanism paragraph — the directory, the uid, DuckDB's own message and
+   the fix — between a `head` and a `tail` the CALLER composes.
 
    Without it the reader gets DuckDB's own error, which names neither loci nor
    anything actionable:
@@ -170,11 +170,31 @@
    That is the failure this whole mechanism exists for, and it killed the
    container before the listener. `/.duckdb` is the filesystem root because
    DuckDB composes its extension directory from $HOME and the runtime image sets
-   none — see `open-lake!`."
-  [^Throwable cause]
+   none — see `open-lake!`.
+
+   **Everything between `head` and `tail` is about the extension MECHANISM**,
+   and is exactly as true for any extension as it is for `ducklake`. What is not
+   shared is what the failure COSTS, which only the caller knows: `open-lake!`
+   is failing at boot with no lake, and `ensure-remote!` is refusing one source
+   while the store stays open. Both are sentences about a consequence, and a
+   consequence is not derivable from an extension name.
+
+   **It used to be derived from one anyway, and that is why this signature
+   changed.** `required? (= \"ducklake\" ext)` gated ducklake's two sentences,
+   and the other caller then wrapped this whole message in a SECOND composer to
+   add its own — which rendered two headlines for one failure, `\"loci cannot
+   read <uri> — DuckDB's httpfs extension is not available.\"` immediately
+   above `\"loci cannot load DuckDB's httpfs extension.\"`, measured
+   2026-08-24. That wrapper also had to `str/trimr` a newline the flag left
+   behind and read the extension name back off the cause's `ex-data`. All of it
+   was one concern implemented twice.
+
+   The ducklake message is byte-identical to the one measured before this
+   argument existed; `the-ducklake-paragraph-did-not-move` pins it."
+  [head ^Throwable cause tail]
   (let [dir  (extension-dir)
         home (System/getenv "HOME")]
-    (str "loci cannot load DuckDB's ducklake extension, so the lake cannot open.\n"
+    (str head "\n"
          "  looking in " (cond dir  (str dir " (LOCI_DUCKDB_EXTENSIONS)")
                                home (str home "/.duckdb — DuckDB's default, from HOME")
                                :else "/.duckdb — DuckDB's default, and HOME is unset")
@@ -187,12 +207,12 @@
          "  into the image then: INSTALL is the one step here that reaches the\n"
          "  network, and the directory it writes need never be writable again —\n"
          "  LOAD only reads.\n"
-         "\nFailing here rather than at the first table read.")))
+         tail)))
 
 (defn- ensure-extension!
-  "LOAD first, INSTALL only if that fails. **Do not delete this.** It looks dead
-   on any machine that has already run loci, and it is the only reason a machine
-   that has not can open a lake at all.
+  "LOAD `ext` first, INSTALL only if that fails. **Do not delete this.** It
+   looks dead on any machine that has already run loci, and it is the only
+   reason a machine that has not can open a lake at all.
 
    Measured twice on DuckDB 1.5.5 (2026-08-16), because the first measurement
    supported the opposite conclusion and was incomplete.
@@ -215,22 +235,76 @@
 
    So this is a guard after all, and the thing it guards is first run. The
    INSTALL is the one line here that can reach the network — and **the image no
-   longer reaches it**: since 2026-08-18 the Dockerfile installs the extension in
-   the build stage into `/opt/duckdb-extensions` and sets
-   `LOCI_DUCKDB_EXTENSIONS`, so in a container LOAD succeeds on the first try and
-   this fallback never fires. Verified with `docker run --network none`. It stays
-   for the machine that is not a container: a `clojure -M:serve` on a laptop that
-   has never opened a lake still needs it, and there this branch is the whole
-   reason that works."
-  [lk]
-  (try (x! lk "LOAD ducklake")
-       (catch Exception _
-         (try (x! lk "INSTALL ducklake")
-              (x! lk "LOAD ducklake")
-              (catch Exception e
-                (throw (ex-info (extension-problem e) {:dir (extension-dir)} e)))))))
+   longer reaches it at all**: since 2026-08-18 the Dockerfile installs into
+   `/opt/duckdb-extensions` in the build stage and sets
+   `LOCI_DUCKDB_EXTENSIONS`, so in a container LOAD succeeds on the first try
+   and this fallback never fires. Verified with `docker run --network none`.
 
-(defrecord Lake [conn dir])
+   **`ducklake`, `httpfs` and `aws`**, as of 2026-08-23 — the last two added
+   the day `ensure-remote!` landed, because until then an `httpfs` LOAD in a
+   container fell through to INSTALL and died under `--network none`, refusing
+   a remote source with a download error. Whoever adds a line to that `RUN`
+   should still add its name here. The three cost about 86 MB of a 299 MB image
+   between them, which is the largest thing it spends after the JDK runtime and
+   the jar. The per-extension bytes and the build-to-build delta are in the
+   Dockerfile beside the `COPY` that ships them, because that is where the
+   decision to pay it is made, and in the spec's Measured section. Written down
+   rather than argued from: nobody has complained about the size of this image.
+
+   It stays for the machine that is not a container: a `clojure -M:serve` on a
+   laptop that has never opened a lake still needs it, and there this branch is
+   the whole reason that works.
+
+   **`ext` is loci's own literal and never anything a person typed**, and that
+   is the whole of what makes interpolating it bare into the SQL right. There
+   is a closed set of callers — `open-lake!` and `ensure-remote!`, both passing
+   a hard-coded string — and nothing derives this argument from anything.
+
+   An earlier draft gave a second reason and it was **false**, so it is written
+   down here rather than deleted: *\"LOAD and INSTALL take a bare extension
+   name, not a string, so there is nothing to quote\"*. Measured 2026-08-23 on
+   DuckDB 1.5.5 — `LOAD 'ducklake'` is accepted and indistinguishable from
+   `LOAD ducklake`, so quoting is available; and `.execute` runs `;`-separated
+   statements, so `LOAD ducklake; CREATE TABLE pwned(i INT); INSERT INTO pwned
+   VALUES (42)` ran all three and the table held 42. This is a textbook
+   injection seam and the caller set is the only thing closing it. Do **not**
+   add validation or quoting for a case nobody has — but if you ever compute
+   `ext` from a scheme→extension map keyed on a uri someone typed, this
+   paragraph is the one that should stop you.
+
+   It is also what the message names, which is the point of the argument rather
+   than a side effect of it. Everything measured above is about `ducklake`,
+   whose failure means the store cannot open; a caller whose failure means
+   something narrower gets a sentence about the extension IT asked for, and
+   `extension-problem` composes only the consequence it can justify.
+
+   **`head` and `tail` are the caller's, not this function's.** What a missing
+   extension costs is not derivable from its name — `open-lake!` has no lake and
+   is failing at boot, `ensure-remote!` is refusing one source while everything
+   else keeps working — so each caller composes the sentences it can justify and
+   this composes the paragraph they share. `ext` is still interpolated into both
+   heads at the call site, so neither can name an extension other than the one
+   that failed."
+  [lk ext head tail]
+  (try (x! lk (str "LOAD " ext))
+       (catch Exception _
+         (try (x! lk (str "INSTALL " ext))
+              (x! lk (str "LOAD " ext))
+              (catch Exception e
+                (throw (ex-info (extension-problem head e tail)
+                                {:dir (extension-dir) :extension ext} e)))))))
+
+;; `ensured` holds the set of one-per-connection preparations already done —
+;; `#{:httpfs :s3}`, see `ensure-remote!`. An atom ON THE RECORD rather than a
+;; memo keyed by the connection, because the fact it records is a fact about
+;; the connection and dies with it: `sample-cache` below is the memo shape, and
+;; its own docstring records the cost — "the key holds the `Lake` it was asked
+;; about, so an entry pins a JDBC connection", which a test run that opens many
+;; lakes leaks one of each. That is a price worth paying for samples and not
+;; for a boolean. It is also why this is not a global atom: `with-lake` makes a
+;; fresh lake per test, and a global one would leak across them and make
+;; "issued once" depend on test order.
+(defrecord Lake [conn dir ensured])
 
 (defn open-lake!
   "Open (or create) the DuckLake catalog in `dir`. Defaults to <data-dir>/lake.
@@ -307,14 +381,322 @@
          _     (when-let [ext (extension-dir)]
                  (.setProperty props "extension_directory" ext))
          conn  (.connect (org.duckdb.DuckDBDriver.) "jdbc:duckdb:" props)
-         lk    (->Lake conn dir)]
+         lk    (->Lake conn dir (atom #{}))]
      (try
-       (ensure-extension! lk)
+       (ensure-extension! lk "ducklake"
+                          "loci cannot load DuckDB's ducklake extension, so the lake cannot open."
+                          "\nFailing here rather than at the first table read.")
        (x! lk (str "ATTACH 'ducklake:" dir "/catalog.duckdb' AS lake"
                    " (DATA_PATH '" dir "/files/', OVERRIDE_DATA_PATH true)"))
        (x! lk "USE lake")
        lk
        (catch Throwable t (.close conn) (throw t))))))
+
+(def ^:private s3-prefix
+  "The one remote scheme that costs a trip through the AWS credential chain.
+
+   Deliberately not `ssp/remote?` and not a copy of `ssp/remote-schemes`. Those
+   answer *does DuckDB fetch this*, and every scheme in that set answers yes;
+   the question here is *does this location need a credential*, which `http://`
+   and `https://` answer no to — so the two predicates staying apart is the
+   point rather than a duplication to be tidied away.
+
+   **The scheme is the secret's own SCOPE, and that is the argument — the cost
+   only says how much it hurts.** An s3 secret created without an explicit
+   SCOPE takes the default `[s3://, s3n://, s3a://]`; measured 2026-08-23 on
+   DuckDB 1.5.5, `duckdb_secrets()` reports exactly that, and
+   `which_secret('https://h/x.csv', 's3')` returns **zero rows** against it
+   while `which_secret('s3://bucket/x.csv', 's3')` returns the secret. So the
+   secret `ensure-remote!` issues *cannot apply* to an `https://` url at all.
+   Widening this prefix would spend the six seconds measured there — on every
+   plaintext read, on every machine without AWS credentials — to obtain a
+   credential DuckDB would then decline to consult.
+
+   That also answers the S3-compatible question rather than deferring it. MinIO
+   and R2 are reached as `https://minio.internal/bucket/x.csv`, so they get
+   httpfs and no credential, and they could not have used one from this secret
+   even if it were issued: an endpoint like that needs its own secret carrying
+   an ENDPOINT and an explicit SCOPE, which is an operator's `CREATE PERSISTENT
+   SECRET` and is the escape hatch `ensure-remote!` now checks for and leaves
+   alone.
+
+   It is a prefix and not a set because there is one of it. `gs://` and `az://`
+   are not here for the same reason they are not in `remote-schemes`: they
+   arrive the day someone has one, and each brings its own secret type."
+  "s3://")
+
+(defn- credential-problem
+  "One paragraph naming the location, DuckDB's own error and the fix —
+   `extension-problem`'s job, for the other thing a remote read needs.
+
+   Without it the reader gets DuckDB's, which does not say the word
+   credentials, names no variable and offers nothing to do — measured
+   2026-08-23 on DuckDB 1.5.5:
+
+     Invalid Configuration Error: Secret Validation Failure: during `create`
+     using the following:
+     Credential Chain: 'config'
+
+   `'config'` there is the CHAIN's name — the AWS SDK's default provider chain
+   — and not a file's, so a reader who goes looking for a config loci wrote is
+   looking for something that does not exist. That is the sentence this
+   replaces, and DuckDB's own text is kept below it rather than hidden, the
+   same way `extension-problem` keeps it.
+
+   It says what loci will NOT do, because that is a decision and a reader
+   deserves to see it as one rather than as a missing feature: there is no
+   paste-a-key box and no `secrets.edn`. loci has nowhere to put a credential —
+   the substrate is an append-only log, so a secret written into it would be
+   recoverable forever by design.
+
+   And it names the way out that does exist, which is the one thing the
+   previous text left the reader to guess at. Everything it listed —
+   environment variables, `~/.aws/credentials`, an instance profile, IRSA — is
+   an input to the chain, so a reader whose chain cannot be made to work read a
+   paragraph with no option in it. `CREATE PERSISTENT SECRET` is DuckDB's own
+   answer and `ensure-remote!` now honours it, so it belongs here: it is the
+   difference between \"fix your environment\" and \"here is a thing you can
+   do\"."
+  [uri ^Throwable cause]
+  (str "loci cannot get AWS credentials for " uri ".\n"
+       "  running as " (sub/running-as) "\n"
+       "  DuckDB said: " (.getMessage cause) "\n"
+       "\n"
+       "  loci stores no credentials and has nowhere to put one. It asks DuckDB's\n"
+       "  credential chain, which reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,\n"
+       "  ~/.aws/credentials, an EC2 instance profile, or an IRSA role. Give the\n"
+       "  loci process one of those and connect the source again.\n"
+       "\n"
+       "  Or give DuckDB the secret directly and loci will not ask the chain at\n"
+       "  all: in the duckdb CLI, CREATE PERSISTENT SECRET (TYPE s3, KEY_ID '…',\n"
+       "  SECRET '…') writes it under ~/.duckdb, and loci checks for a secret\n"
+       "  covering the location before it issues its own. That one is DuckDB's to\n"
+       "  store, not loci's.\n"
+       "\n"
+       "  Only s3:// needs this — an http:// or https:// location is fetched with\n"
+       "  no credential and never reaches here."))
+
+(defn- secret-covers?
+  "Does a secret DuckDB already holds apply to `uri`? If so `ensure-remote!`
+   issues none, and the operator's is the one that gets used.
+
+   **This is what makes the escape hatch the spec promises actually work.** The
+   spec says a bucket the chain cannot reach \"fails with an auth error, and the
+   user fixes it outside loci\", and DuckDB's documented way to do that is
+   `CREATE PERSISTENT SECRET`. Without this check the fix does not take — two
+   measurements from 2026-08-23 on DuckDB 1.5.5, and what they leave the
+   operator holding:
+
+   - a persistent `loci_s3` and a temporary one **coexist with no error**, and
+     at equal scope the TEMPORARY wins: `which_secret` named the operator's
+     secret, then named loci's the moment it existed. So loci silently
+     overrode a working credential with one from a chain that had already
+     failed.
+   - worse on the machine that actually needs the hatch. `CREATE SECRET …
+     PROVIDER credential_chain` throws when the chain is empty, so the source
+     is refused **before any read**, with the operator's working keys sitting
+     unused in `~/.duckdb/stored_secrets`.
+   - `credential-problem` listed environment variables, `~/.aws/credentials`,
+     an instance profile and IRSA — every one of them an input to the chain,
+     and not one of them the thing that was already set up.
+
+   **Cheap enough that it is not a trade.** ~2 ms against the 6,000 ms
+   `CREATE SECRET` it can skip, and it needs neither `httpfs` nor `aws`:
+   measured on a bare connection with httpfs `loaded false`, `which_secret`
+   answered. So it also removes the six seconds on a machine that has a secret,
+   which is the deployment where a lake gets connected most often.
+
+   **12.7 ms was the number here until 2026-08-23 and it was a first call.**
+   Re-measured in a cold JVM: 5.8 and 5.3 ms for the first `which_secret` of a
+   process, 2.1 and 1.9 ms after; warm, five calls gave 2.3 / 7.4 / 2.1 / 2.4 /
+   2.6 ms. Corrected rather than left, because a reader deciding whether to add
+   a cache in front of this should see the real figure — there is nothing here
+   to cache.
+
+   `which_secret` and not `duckdb_secrets()` because the question is about THIS
+   uri, not about the secret table: it takes the path and the type and returns
+   the secret that would be consulted for it, scope matching included — an
+   operator's secret scoped to one bucket answers for that bucket and not for
+   another. Zero rows means nothing covers it, measured rather than assumed.
+
+   The uri is escaped into the literal and that is not decoration. Unlike
+   `ensure-extension!`'s `ext`, which is loci's own literal and whose docstring
+   argues at length that a closed caller set is what closes the seam, this
+   argument is a location a person typed into the ＋ Data panel."
+  [lk uri]
+  (boolean (seq (q lk (str "SELECT name FROM which_secret('"
+                           (str/replace (str uri) "'" "''")
+                           "', 's3')")))))
+
+(defn ensure-remote!
+  "Make this connection able to read `uri`, once per connection: load `httpfs`,
+   and for an `s3://` location issue the credential secret unless a secret
+   DuckDB already holds covers it. Returns :ok.
+
+   **Precondition: `uri` is one `ssp/remote?` answers true to.** The LOAD below
+   is unconditional, so calling this for a `loci://` or `file://` location
+   issues `LOAD httpfs` for a file on local disk — and on a machine without the
+   extension that falls through to `ensure-extension!`'s `INSTALL`, the one
+   statement here that reaches the network, which under `--network none` dies
+   and refuses a local CSV with a sentence about httpfs. The only caller,
+   `loci.source/describe`, holds the guard and says why; a second caller must
+   too. It is not asserted here because `describe` is where the scheme is
+   already known and where a reader of the call needs to see it.
+
+   **Called on the first remote read, not from `open-lake!`.** `open-lake!`
+   calls `ensure-extension!` inside a `try` that closes the connection and
+   rethrows, which is right for `ducklake` — no extension, no lake, and loci
+   should say so at boot. It would be wrong here: a loci that never touches a
+   remote source must not fail to start because an extension it does not need
+   is missing. So this fails one source at connect time, not the store at boot
+   — and says so: `extension-problem` composes the directory, the uid and the
+   fix but cannot know the consequence, so this caller hands `ensure-extension!`
+   the head and tail only it can compose: which source cannot be read, and that
+   nothing else is affected.
+
+   **The secret is `PROVIDER credential_chain`, so loci hands DuckDB a provider
+   and never a key.** The AWS SDK chain reads environment variables,
+   `~/.aws/credentials`, an EC2 instance profile or IRSA. Nothing is stored,
+   nothing is committed, and `undo!` cannot resurrect a credential because none
+   was ever written — which matters here more than anywhere else in loci, since
+   the substrate is an append-only log and a secret in it would be recoverable
+   forever by design. The secret is also TEMPORARY, which is DuckDB's default
+   and is kept: a `PERSISTENT` one is written unencrypted under `~/.duckdb`, so
+   the one word would move loci from storing no credential to storing one.
+
+   **Only `s3://` gets the secret, and that is measured rather than tidy.**
+   `CREATE SECRET … PROVIDER credential_chain` is validated when it is
+   *created*: DuckDB's `aws` extension walks the whole chain then and there,
+   and on a machine the chain cannot satisfy it does not hand back an unused
+   secret, it throws. Measured 2026-08-23 on DuckDB 1.5.5 with no AWS
+   credentials present: **10.5 s** the first time and **6.0 s** every time
+   after. Issuing it for
+   every remote scheme would therefore put six seconds and a hard failure in
+   front of every `https://` read on every machine without AWS credentials —
+   most laptops, and the whole test suite — to obtain a credential that scheme
+   never uses. See `s3-prefix`.
+
+   **The first time is not the autoinstall, corrected 2026-08-23 after
+   re-measuring.** The sentence here used to say the extra four seconds were
+   `aws` arriving over the network. They are not: with `aws` already installed
+   AND explicitly `LOAD`ed first, a cold JVM still paid 10,022 ms on its first
+   CREATE and 6,018 ms on its second, twice, while the `LOAD` itself cost
+   46 ms. It is a once-per-process cost inside the chain's first walk — a warm
+   process that had already paid it opened a brand-new lake connection and got
+   6,028 ms on that connection's first CREATE. So an **offline image pays the
+   four seconds too**, which is the opposite of what the autoinstall story
+   predicts, and the reason to correct it rather than round it away.
+
+   That measurement also said what the `aws` extension costs, which is a fact
+   about the image rather than about this function: `credential_chain` needs
+   `aws` as well as `httpfs`, and on a laptop it arrives by autoinstall over
+   the network. **The image ships both as of 2026-08-23** — `ensure-extension!`
+   records what they weigh — and `docker run --network none` connecting an
+   `s3://` source is the control that proves it rather than a claim: *before*,
+   it died at 509 ms with `IO Error: Failed to download extension \"httpfs\"`
+   and never reached the secret at all; *after*, it reaches the secret and
+   fails at **62 ms** with `credential-problem`.
+
+   Keep those 62 ms beside the 6.0 s above, because the two read as a
+   contradiction and are not. With no route out the AWS chain gives up at once;
+   the six seconds on a networked host are spent waiting on IMDS. **Fast here
+   means unreachable, not configured** — an operator timing a container against
+   this docstring should find that here rather than conclude one of the two
+   numbers is wrong.
+
+   **The LOAD looks dead, and against a networked machine it is.** loci sets
+   neither `autoload_known_extensions` nor `autoinstall_known_extensions`, and
+   `duckdb_settings()` reports both `true` on a lake this file opened — so a
+   read loads httpfs by itself. Measured 2026-08-23 against a loopback port
+   nothing is listening on, which keeps it off the network: a fresh lake
+   reports httpfs `loaded false`, `read_csv('https://127.0.0.1:1/x.csv')`
+   fails on the connection, and httpfs is `loaded true` afterwards with no
+   LOAD from loci at all. That is the same trap `ensure-extension!`'s own
+   docstring records for `ducklake` and ATTACH, where it defeated the sabotage
+   that should have proven the tests bite. Two things autoload does not cover.
+   The **secret** is one: no read triggers a `CREATE SECRET`, so without this an
+   `s3://` read goes out anonymous and comes back 403. The other is **where the
+   failure lands** — an autoload that cannot reach the network fails inside a
+   read with DuckDB's own message, where this fails at connect with
+   `extension-problem`'s paragraph naming the directory, the uid and the fix,
+   which is the entire reason that function exists.
+
+   **An operator's own secret is left alone.** `secret-covers?` asks
+   `which_secret` before anything is created, and a `CREATE PERSISTENT SECRET`
+   the operator made outside loci therefore wins instead of being silently
+   shadowed by a temporary one — which is what happened before, measured, and
+   which broke the escape hatch the spec promises for a bucket the chain cannot
+   reach. See `secret-covers?` for the three measurements and for why the check
+   is not a trade — it costs about 2 ms against the 6,000 ms it can skip.
+
+   **A failure is not remembered.** The flag moves only after the statement
+   returns, so a machine that grows credentials, or an extension directory that
+   grows the extension, is one reconnect away rather than one restart. The
+   guard is not decoration either: `CREATE SECRET` without `OR REPLACE` refuses
+   a name that already exists, so dropping it would make the second remote read
+   of a connection throw.
+
+   **The guard and the statement are one critical section, on the `ensured`
+   atom's own monitor.** Read-then-write across a six-second statement is a
+   race with an observable wrong answer, not a theoretical one: two threads
+   both find `:s3` absent, both issue the CREATE, and the loser gets
+   `Invalid Input Error: Temporary secret with name 'loci_s3' already exists!`
+   — measured 2026-08-23 on DuckDB 1.5.5 — which the `catch` below dresses as
+   `credential-problem`, telling a machine whose credentials are **fine** to go
+   set AWS_ACCESS_KEY_ID. It is reachable on the real paths: `describe` is
+   deliberately outside `loci.source/connect-lock` and `refresh!` takes no lock
+   at all, both on http-kit worker threads, so two tabs connecting `s3://`
+   sources — or a connect racing a refresh — inside the first six seconds of s3
+   use is the whole of what it takes.
+
+   Serialising is the fix and `CREATE SECRET IF NOT EXISTS` is not: measured,
+   it still walks the chain (6,079 ms) before it looks at the name, so the
+   loser pays the six seconds instead of throwing. Under the monitor the loser
+   waits, then finds the guard set and does nothing.
+
+   The monitor is the `ensured` atom because its lifetime is exactly right —
+   per connection, born with the record, dying with it — and a new field would
+   be a second object saying the same thing. It is a **leaf**: nothing called
+   from inside it re-enters this namespace, and `connect-lock` is never held
+   over a call to here, since `describe` is outside it and `land!` relies on
+   the preparation `describe` already did rather than repeating it. So there is
+   no lock order to get wrong.
+
+   **A `credential_chain` secret resolves ONCE, at CREATE — write the number
+   down and build nothing.** That is what the throws-on-create measurement
+   above proves. `lake` is a `defonce` delay, one connection per process, so
+   `:s3` is set at most once ever; on the deployments named above — an EC2
+   instance profile, IRSA — the chain hands out a session token that typically
+   expires in an hour, after which every `s3://` read 403s and nothing here
+   re-issues. The platform has the facility if it is ever wanted: `REFRESH
+   auto` **parses on 1.5.5**, measured — `CREATE SECRET chk (TYPE s3, PROVIDER
+   credential_chain, REFRESH auto)` failed on chain validation at 6,179 ms, not
+   on a parse or binder error. Nobody has hit this, so it is one word in a
+   docstring and not a mechanism; the day someone does, that word is the fix
+   and a restart is the workaround."
+  [lk uri]
+  (let [ensured (:ensured lk)]
+    (locking ensured
+      (when-not (contains? @ensured :httpfs)
+        (try (ensure-extension!
+              lk "httpfs"
+              (str "loci cannot read " uri " — DuckDB's httpfs extension is not available.")
+              (str "\n"
+                   "  This source cannot be read; nothing else is affected. The extension is\n"
+                   "  loaded only for a remote location, so loci is running, the store is open,\n"
+                   "  every loci:// and file:// source still reads, and every table already in\n"
+                   "  the lake is unchanged. Connect this one again once the extension is there."))
+             (catch clojure.lang.ExceptionInfo e
+               (throw (ex-info (.getMessage e) (assoc (ex-data e) :uri uri) e))))
+        (swap! ensured conj :httpfs))
+      (when (and (str/starts-with? (str uri) s3-prefix)
+                 (not (contains? @ensured :s3)))
+        (when-not (secret-covers? lk uri)
+          (try (x! lk "CREATE SECRET loci_s3 (TYPE s3, PROVIDER credential_chain)")
+               (catch Exception e
+                 (throw (ex-info (credential-problem uri e) {:uri uri} e)))))
+        (swap! ensured conj :s3))))
+  :ok)
 
 (defn close! [lk] (when-let [c (conn-of lk)] (.close c)))
 

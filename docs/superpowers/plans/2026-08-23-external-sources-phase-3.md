@@ -424,13 +424,55 @@ The `(> (count @seen) n1)` assertion is the load-bearing one. Ask what the row-c
 **Files:**
 - Modify: `Dockerfile`
 
-- [ ] **Step 1:** Add `INSTALL httpfs` beside `INSTALL ducklake` in the build-stage `RUN` at `Dockerfile:152`, and extend the `test -f` guard to cover it. Read the surrounding comment block first — it explains why the line is raw JDBC with no alias (so the extension version matches the driver that will load it) and why the guard exists (*"a silently empty /duckdb-ext produces an image"*).
+**`INSTALL aws` as well as `INSTALL httpfs`** — measured 2026-08-23 during Task 4, and the plan did not know it. `CREATE SECRET (TYPE s3, PROVIDER credential_chain)` is validated at CREATE time by the **`aws`** extension, which walks the whole chain there and then. httpfs alone is not enough: on a first call `aws` autoinstalls over the network (10.5 s), which is exactly what an offline image cannot do. An image shipping only httpfs reads `https://` and fails on `s3://`.
+
+- [ ] **Step 1:** Add `INSTALL httpfs` and `INSTALL aws` beside `INSTALL ducklake` in the build-stage `RUN` at `Dockerfile:152`, and extend the `test -f` guard to cover both. Read the surrounding comment block first — it explains why the line is raw JDBC with no alias (so the extension version matches the driver that will load it) and why the guard exists (*"a silently empty /duckdb-ext produces an image"*).
 
 - [ ] **Step 2:** Build the image. Report the size delta against the previous image — httpfs is not free and the number belongs in the commit message.
 
 - [ ] **Step 3:** `docker run --network none` and connect a `file://` source, to prove the image still opens a lake offline. This is the check that caught the ducklake packaging problem twice.
 
+- [ ] **Step 3b:** Still offline, connect an `s3://` source and confirm it fails on **credentials** rather than on a missing extension. That is the assertion that separates "the image carries aws" from "the image reaches the network to get it" — and it is the only way to see the Task 4 measurement from outside.
+
 - [ ] **Step 4:** Commit with the size delta.
+
+---
+
+### Task 9: the ＋ Data panel gets a door for a remote location
+
+**Files:**
+- Modify: `resources/public/index.html`
+- Test: `test/browser/sources.test.mjs`
+
+**Why this exists.** The spec asserted the panel *"already accepts a typed URI"*. It does not — `dataFileTab` renders an `<input type="file">` and a list of `.filerow` buttons from `GET /api/source/files`, and every uri it can produce is `loci://files/<hash>`. There is no text input in it. **So without this task phase 3 is reachable only by `curl` or a REPL**, which is the state phase 2 opened by naming as unfinished.
+
+- [ ] **Step 1: Write the failing test**
+
+Against the loopback server the browser harness can already serve, not the internet. `sources.test.mjs` boots a real loci; add a small static route or reuse the fixture directory over `http://127.0.0.1:<port>/…` so the URL is genuinely remote to DuckDB while never leaving the machine.
+
+```javascript
+test('a remote URL typed into the ＋ Data panel becomes a table', async () => {
+  // type the loopback CSV's URL, preview it, connect it, assert the table is
+  // materialised — a remote source has no other mode.
+});
+```
+
+Write the body against the file's own helpers (`withPage(browser, name, fn)`, `enterCosmos`, the `SOURCES_FIXTURE` server) — the sketch above is the shape, not the code. Assert on **scoped elements you created**, never a substring of the page: phase 2's `/takings/` check passed against a block that fetched nothing because DuckDB's error already contained the string.
+
+- [ ] **Step 2: Run, confirm FAIL** — there is no input to type into.
+
+- [ ] **Step 3: Implement.** A URL field in the file tab, feeding the **existing** `dataPreview` → Connect flow. `dataPreview` takes `{file, name, uri, bytes, connectedAs}`; a typed URL has no `bytes` and no `connectedAs`, so decide what it shows for those and say why. Do not write a second preview or a second connect — `srcFormat(uri)` already derives the format from the extension, and the mode control already exists.
+
+- [ ] **Step 4: Run, confirm PASS.**
+
+- [ ] **Step 5: Two things a remote preview does that a local one does not.** Both are measured, and a thin door is worst exactly here:
+
+  - **An `s3://` describe costs ~6 s on a machine without credentials** (measured 6,069 ms; 62 ms in a container with no route out, because the chain gives up rather than timing out on IMDS). There is no timeout and no cancel anywhere in loci. A field that looks idle for six seconds reads as broken.
+  - **The failure is an eight-line paragraph.** `credential-problem` and `extension-problem` both compose multi-line prose with an indented fix; `esc()` leaves the newlines and `<p>` collapses them into one run-on line. This task is what first routes a multi-line paragraph onto the preview path. Check how it actually renders before deciding whether it needs `white-space: pre-line`.
+
+- [ ] **Step 6: Prove it bites**, then read the printed output. Ask what each assertion reports when the mechanism is absent — the plan's sketches were wrong on six tasks of this phase, including an assertion that failed against working code.
+
+- [ ] **Step 7:** both suites, commit.
 
 ---
 
@@ -448,6 +490,7 @@ The `(> (count @seen) n1)` assertion is the load-bearing one. Ask what the row-c
 
 ## Definition of done
 
+- [ ] A remote URL can be typed into the ＋ Data panel, previewed and connected — the feature is reachable without `curl`
 - [ ] `http://`, `https://` and `s3://` locations resolve verbatim; `gs://`, `az://` and unknown schemes are refused by name
 - [ ] `unreadable-because` never claims a local file for a remote uri
 - [ ] A remote CSV materialises into the lake and the rows are right, and nothing lands in `<LOCI_DATA>/files/`

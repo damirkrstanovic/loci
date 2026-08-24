@@ -57,10 +57,191 @@
   (doseq [bad ["loci://../etc/passwd" "loci://files/../../etc/passwd" "loci:///abs" "loci://"]]
     (is (thrown? clojure.lang.ExceptionInfo (ssp/locate bad)) (str "must refuse " bad))))
 
-(deftest locate-names-the-phase-when-it-does-not-know-a-scheme
-  (let [e (try (ssp/locate "s3://bucket/x.csv") nil (catch clojure.lang.ExceptionInfo e e))]
-    (is (some? e))
-    (is (re-find #"loci://" (.getMessage e)) "the error must say what it DOES know")))
+(deftest locate-refuses-an-unknown-scheme-by-naming-the-ones-it-knows
+  ;; One test where phase 3 grew four, one per review finding about the prose:
+  ;; `locate-lists-every-scheme-it-knows-when-it-does-not-know-one`,
+  ;; `locate-composes-both-halves-of-its-scheme-list-from-one-set`,
+  ;; `locate-refuses-a-scheme-whose-case-is-wrong-by-naming-the-spelling` and
+  ;; `locate-tells-a-path-from-a-location` — 60 assertions between them, nearly
+  ;; all of them readings of a sentence that is allowed to change. Three
+  ;; properties are worth defending and they are all still here.
+  ;;
+  ;; Measured 2026-08-23 by replacing both composed scheme lists in `locate`
+  ;; with the literal they equal today: of the four tests, ONLY the composition
+  ;; assertion went red. That is the sabotage this test exists for, and it is
+  ;; the one that ships green the day `remote-schemes` changes.
+  ;;
+  ;; The scheme-list probe runs under `with-redefs`, because the composed list
+  ;; and the literal are the same five strings until `remote-schemes` moves — so
+  ;; a plain probe cannot tell "names the schemes it knows" from "recites five
+  ;; schemes". `remote-schemes` is `def`'d, so `with-redefs` reaches it and
+  ;; `locate` derefs it per call. The probe is `ftp://` and not `gs://` because
+  ;; the message quotes the uri back: over `gs://bucket/…` the string `gs://`
+  ;; would be present whether or not the sentence composed it.
+  (with-redefs [ssp/remote-schemes (conj @#'ssp/remote-schemes "gs://")]
+    (let [e   (try (ssp/locate "ftp://h/x.csv") nil (catch clojure.lang.ExceptionInfo e e))
+          ;; `str`/`some->` rather than a bare `.getMessage`, for the reason the
+          ;; tests above already give: when this fails it is because `e` is nil,
+          ;; and `(.getMessage nil)` turns the assertion below into an NPE stack
+          ;; trace instead of a sentence.
+          msg (str (some-> e .getMessage))]
+      (is (some? e) "a scheme loci does not know must be refused")
+      ;; As ONE substring, in order: `(includes? msg "gs://")` alone is satisfied
+      ;; by the deferred clause of a fully hardcoded message, which is exactly
+      ;; the sabotage this has to fail against.
+      (is (str/includes? msg (str/join ", " (concat ["loci://" "file://"]
+                                                    (sort @#'ssp/remote-schemes))))
+          (str "the schemes it knows are the set it reads, in order: " msg))))
+  ;; A case-only miss names the SPELLING, and not the word "case": the `:else`
+  ;; message contains `s3://` too, and only a message that echoes the whole
+  ;; corrected location contains `s3://bucket/Q3-Sales.csv` — with the path's
+  ;; own case intact, because an S3 key is case-sensitive and a lower-cased
+  ;; `q3-sales.csv` is a different object.
+  (let [e   (try (ssp/locate "S3://bucket/Q3-Sales.csv") nil
+                 (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (str/includes? msg "s3://bucket/Q3-Sales.csv")
+        (str "S3:// is refused by naming the spelling loci reads: " msg)))
+  ;; Folded from `locate-tells-a-path-from-a-location`, because it is otherwise
+  ;; the only test the no-scheme branch has at all: an uploaded file is the
+  ;; common case, and `loci://` is where it lives.
+  (let [e   (try (ssp/locate "sales.csv") nil (catch clojure.lang.ExceptionInfo e e))
+        msg (str (some-> e .getMessage))]
+    (is (str/includes? msg "loci://sales.csv")
+        (str "a bare filename is told where an upload lives: " msg))))
+
+(deftest locate-answers-a-remote-uri-verbatim
+  (is (= "s3://bucket/sales.csv" (ssp/locate "s3://bucket/sales.csv")))
+  (is (= "https://example.com/a/b.csv" (ssp/locate "https://example.com/a/b.csv")))
+  (is (= "http://127.0.0.1:8080/x.csv" (ssp/locate "http://127.0.0.1:8080/x.csv"))
+      "plaintext too — httpfs reads it, and loci does not police the transport of a
+       location a person typed, exactly as file:// is unrestricted by decision")
+  (is (= "s3://bucket/a b.csv" (ssp/locate "s3://bucket/a b.csv"))
+      "verbatim means verbatim: no re-encoding, no URI round trip. DuckDB is handed
+       the string the user gave, quoted by sql-str, and it is DuckDB's job to parse it")
+  ;; Mixed case in the PATH, and it is the only assertion here that a
+  ;; NORMALISING locate fails. The four above are all lower-case with no edge
+  ;; whitespace, so `(str/lower-case uri)` and `(str/trim uri)` ship green
+  ;; through every one of them — measured 2026-08-23 against eight candidate
+  ;; wrong `locate`s, and those two were the pair nothing caught. Task 1's own
+  ;; sabotage lower-cased `remote?`'s ARGUMENT, which the `HTTPS://` assertions
+  ;; do catch; lower-casing the ANSWER was the gap.
+  ;;
+  ;; It matters at fetch time and not before: S3 object keys are case-sensitive
+  ;; and so is most of an HTTP path, so a normalised `Q3-Sales.csv` becomes a
+  ;; NoSuchKey against a bucket that has the object — from an edit that looks
+  ;; like tidying.
+  (is (= "s3://bucket/Q3-Sales.csv" (ssp/locate "s3://bucket/Q3-Sales.csv"))
+      "the path's case survives, because the object's name is case-sensitive"))
+
+(deftest locate-still-refuses-a-scheme-it-does-not-know
+  ;; A THROW and not a nil: a locate that fell off the end of the cond and
+  ;; answered nil would satisfy an `(is (nil? …))` assertion while handing every
+  ;; caller a location it never checked. Only refusing distinguishes them.
+  ;;
+  ;; `(is (thrown? …))` says that too, and the plan's sketch used it — but it
+  ;; binds `e` to whatever `do-report` RETURNS when nothing was thrown, which is
+  ;; nil only because clojure.test's default reporter happens to return nil.
+  ;; Measured 2026-08-23 under a reporter that returns its accumulator instead:
+  ;; the next line became `No matching field found: getMessage for class
+  ;; PersistentVector` — a stack trace where a sentence should be. That is the
+  ;; failure `locate-refuses-a-file-uri-whose-first-segment-reads-as-a-host`
+  ;; already has a comment about, so this uses the same try/catch shape as the
+  ;; rest of the file rather than depending on a reporter's return value.
+  ;;
+  ;; `HTTPS://` is in the list because `remote?` is case-sensitive by decision,
+  ;; and this is where locate has to agree with it — a case-insensitive remote?
+  ;; passes this uri through verbatim and this line is what notices.
+  (doseq [u ["gs://bucket/x.csv" "az://c/x.csv" "ftp://h/x.csv" "redis://h/1"
+             "HTTPS://h/x.csv"]]
+    (let [e (try (ssp/locate u) nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e) (str u " must be refused, not resolved"))
+      (is (re-find #"loci does not know this location" (str (some-> e .getMessage)))
+          (str u " must be refused by name")))))
+
+(deftest remote?-is-about-the-scheme-and-nothing-else
+  (is (true?  (ssp/remote? "s3://b/x.csv")))
+  (is (true?  (ssp/remote? "https://h/x.csv")))
+  (is (true?  (ssp/remote? "http://h/x.csv")))
+  (is (false? (ssp/remote? "loci://files/x.csv")))
+  (is (false? (ssp/remote? "file:///data/x.csv")))
+  (is (false? (ssp/remote? "gs://b/x.csv"))
+      "a scheme loci does not know is not remote — it is unknown, and locate says so")
+  ;; `false?` and not `nil?`: the callers branch on this, and a nil that reads as
+  ;; falsey in an `if` is not the same var as one that answers a boolean. This is
+  ;; the assertion that fails if the `boolean` wrapper is dropped.
+  (is (false? (ssp/remote? nil)) "nil is not a location")
+  (is (false? (ssp/remote? "HTTPS://h/x.csv"))
+      ;; The RULE is documented on `remote?` itself, which is where a refactor
+      ;; will read it — a rule that lives only in an assertion message gets
+      ;; refactored away. It is consistency with the `loci://` and `file://`
+      ;; branches, and NOT "every uri loci mints is lower-case": loci mints no
+      ;; remote uri at all, they are typed.
+      "case-sensitive by decision — see remote?'s docstring for the reason"))
+
+(deftest unreadable-because-names-a-remote-uri-and-claims-no-filesystem
+  ;; Task 1 made `locate` answer a remote uri verbatim; this function then built
+  ;; a `java.io.File` out of that answer, whose `.exists` is false, and said
+  ;; "there is no file at s3:/bucket/sales.csv" — a filesystem it never
+  ;; consulted, with the scheme's slashes collapsed by `File`, on the path whose
+  ;; own docstring says a second error must never be raised over the first.
+  ;;
+  ;; **The assertions are POSITIVE on purpose.** The plan sketched
+  ;; `(is (not (re-find #"there is no file at" msg)))`, and that passes for three
+  ;; different absences of a remote branch: a function that returns nil, one that
+  ;; returns "", and one that throws past a caller who `str`s the result.
+  ;; Measured 2026-08-23 with `unreadable-because` stubbed to `(constantly nil)`
+  ;; — the negative assertion passed for all four uris below. So `string?` and
+  ;; `includes?` carry this test; the negative one is kept because it names the
+  ;; regression, and it is never the only one looking.
+  (doseq [u ["s3://bucket/sales.csv" "https://example.com/x.csv"
+             "http://127.0.0.1:1/x.csv" "s3://bucket/a b.csv"]]
+    (let [msg (ssp/unreadable-because u)]
+      (is (string? msg)
+          (str "a remote uri gets a PHRASE, not nil. nil is this function's word for
+                \"readable\", and answering it for " u " asserts a filesystem loci
+                never looked at — tablestore/hydrate reads nil as DRIFT. Got: "
+               (pr-str msg)))
+      (is (str/includes? (str msg) u)
+          (str "and the phrase carries the uri VERBATIM — java.io.File collapses
+                s3:// to s3:/, which is exactly how the old sentence went wrong. Got: "
+               (pr-str msg)))
+      (is (re-find #"remote" (str msg))
+          (str "and it says WHY loci has nothing of its own to add, rather than
+                borrowing the sentence of a branch that did look at something.
+                Got: " (pr-str msg)))
+      (is (re-find #"could not read" (str msg))
+          (str "and it STATES THE FAILURE. `tbl/unusable` composes this under
+                \"its source is unreachable — \", and the first phrasing —
+                \"loci cannot tell whether it can be read without fetching it\" —
+                retracted that heading at the one instant loci had fetched it and
+                knew: this function is reached from hydrate's catch, after a read
+                that already failed. Got: " (pr-str msg)))
+      (is (not (re-find #"there is no file at" (str msg)))
+          (str "it claimed a missing local file for " u ": " (pr-str msg))))))
+
+(deftest unreadable-because-does-not-call-a-missing-upload-remote
+  ;; What is left of `unreadable-because-still-tells-the-local-states-apart`,
+  ;; which also re-asserted the two local branches phase 3 did not touch —
+  ;; `loci.source-test` already has both, on `unreadable-because` directly and
+  ;; through `hydrate`. This is the part that is not a duplicate: the control
+  ;; that keeps the test above from being vacuous.
+  ;;
+  ;; `loci://` and not only `file://`, because it is the scheme most sources
+  ;; actually have — `index.html` strips `loci://files/` for display precisely
+  ;; because that is the common shape — and because every other assertion
+  ;; in the test above is written over `file://`. A remote branch spelled
+  ;; `(not (str/starts-with? uri "file://"))` is a plausible inversion and it
+  ;; passes every one of them, while reporting a missing uploaded file as a
+  ;; remote location. Measured again 2026-08-23 with the local half of this test
+  ;; gone: the test above stayed GREEN under that inversion, and these two lines
+  ;; are what went red.
+  (let [msg (str (ssp/unreadable-because (str "loci://files/ubc-" (System/nanoTime) ".csv")))]
+    (is (re-find #"there is no file at" msg)
+        (str "a loci:// upload that is not there is a MISSING FILE, and loci
+              resolved it under the data directory to find that out: " msg))
+    (is (not (re-find #"remote" msg))
+        (str "and it is not remote — nothing fetches it: " msg))))
 
 (deftest relation-builds-one-reader-call-per-format
   (is (= "read_csv('/tmp/a.csv')"
@@ -96,7 +277,11 @@
   (let [e (try (ssp/relation {:format :xlsx} "/tmp/a.xlsx") nil
                (catch clojure.lang.ExceptionInfo e e))]
     (is (some? e))
-    (is (re-find #"csv" (.getMessage e)) "the error must list the formats it knows")))
+    ;; `str`/`some->`, like every other refusal test in this file: when this one
+    ;; fails it fails because `e` is nil, and a bare `.getMessage` turns the
+    ;; line below into an NPE stack trace where a sentence should be.
+    (is (re-find #"csv" (str (some-> e .getMessage)))
+        "the error must list the formats it knows")))
 
 (deftest relation-refuses-a-bad-option-name-even-beside-a-good-one
   ;; `sort-by key` is a partial comparator: a string key and a keyword key in
