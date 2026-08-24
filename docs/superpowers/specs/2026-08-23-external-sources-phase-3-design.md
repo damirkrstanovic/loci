@@ -487,3 +487,92 @@ The alternatives were considered and rejected for stated reasons:
 **The deployment answer is not to expose the port.** That was already true; this phase is the point at
 which it stops being only about confidentiality of the substrate and starts being about the
 credentials of the host.
+
+## Cleanup 2026-08-24: what a review of the finished phase changed
+
+A code review of the whole branch on 2026-08-24. The **code** came out lean — 148 of 829 added lines
+in `src/` are code, the rest docstrings and comments — and nothing in it was over-built. What had
+gone wrong was the prose around it, in exactly the way the volume predicts, plus one wrapper that had
+produced a duplicated sentence a person reads on screen.
+
+**One correction had landed in two of its four homes.** `11ad7e7` re-measured `secret-covers?` at
+~2 ms and retracted the story that the first `CREATE SECRET`'s extra four seconds were the `aws`
+extension autoinstalling. Both corrections reached `secret-covers?`'s docstring and this document;
+neither reached `ensure-remote!`'s docstring, which still said *"the check costs 12.7 ms"*, or
+`lake_test.clj`, which still carried the retracted autoinstall explanation as a comment. Fixed in
+`34537d1`. The cause is structural rather than careless: every measured number in this phase is
+written down in two to four places — `36,436,086` was in `lake.clj`, this spec, the `Dockerfile` and
+a test — with nothing keeping them in agreement. `e9b82bf` gives each number one home, at the
+decision it supports, and leaves a pointer everywhere else. The image figures now live only in the
+`Dockerfile` beside the `COPY` that pays for them, and here.
+
+**A remote extension failure drew two headlines for one failure.** Rendered on 2026-08-24, a missing
+`httpfs` said `loci cannot read <uri> — DuckDB's httpfs extension is not available.` and then, one
+blank line later, `loci cannot load DuckDB's httpfs extension.` — both drawn in the ＋ Data panel
+under `.srcerr`. The cause was one concern implemented twice: `extension-problem` derived
+`required? (= "ducklake" ext)` to gate two ducklake-only sentences, and `ensure-remote!` then wrapped
+the whole message in a *second* composer to add its own, which also had to `str/trimr` a newline the
+flag left behind and read the extension name back off the cause's `ex-data`. `dc0b88c` gives
+`extension-problem` a `head` and a `tail` its caller supplies and deletes the wrapper, the flag, the
+fix-up and the read-back. The ducklake boot message is byte-identical to a capture taken before the
+change (543 bytes both ways); `the-ducklake-paragraph-did-not-move` pins it with the directory and
+uid stubbed so it holds on any machine.
+
+**Sixty assertions that read a sentence went, and one that measures a shape stayed.** 46 % of this
+phase's Clojure assertions were `str/includes?` readings of an error message — 28 of 40 in
+`sourcespec_test`. Four `locate` prose tests folded into one in `1cac901`; the sabotage that proves
+what is left still bites is recorded in the test's own comment and was re-run. The same pass had also
+deleted `a preview failure keeps the shape of the paragraph loci wrote`, the only coverage anywhere
+for `.reclaimed p.srcerr{white-space:pre-wrap}`; that deletion was not taken, because a count of line
+boxes passes under `pre-line` too and the glyph-position measurement is what separates them.
+
+### Measured 2026-08-24: the 32 MB preview prefix, pinned
+
+The phase's most surprising cost was prose only. It now has a test, and the figure reproduced exactly.
+One `describe` against a 40 MiB loopback fixture (41,943,042 bytes):
+
+```
+  Range: bytes=0-1                    2 bytes   (httpfs learning the object's size)
+  Range: bytes=0-31999999    32,000,000 bytes
+                             ----------
+                             32,000,002 bytes over the wire
+```
+
+It is **fixed, not proportional** — measured across four sizes plus one lie:
+
+| object | ranges requested |
+|---|---|
+| 20 MiB | `bytes=0-1`, `bytes=0-20971538` — the whole thing |
+| 40 MiB | `bytes=0-1`, `bytes=0-31999999` |
+| 60 MiB | `bytes=0-1`, `bytes=0-31999999` |
+| 100 MiB | `bytes=0-1`, `bytes=0-31999999` |
+| 2 GiB, *claimed* by a stub holding 40 MiB | `bytes=0-1`, `bytes=0-31999999` |
+
+**And the second preview pays it again.** Same URL, same connection, back to back:
+`["bytes=0-1" "bytes=0-31999999" "bytes=0-1" "bytes=0-31999999"]` — with
+`enable_external_file_cache` reading `true` on that connection, so this is not a disabled cache.
+Preview, ‹ back, preview really is 64 MB.
+
+**Two bytes of that total are the harness, and the number must not be quoted back without them.**
+http-kit cannot answer a HEAD truthfully: `HttpUtils.HttpEncode` forces `content-length: 0` on any
+nil-bodied response and there is no HEAD special case, so the obvious stub tells httpfs the object is
+empty and httpfs answers with one plain un-ranged GET — the vacuous-rather-than-red trap. The stub
+therefore answers **405** to HEAD, which is what httpfs's own fallback exists for (a 404 does not
+fall back; it fails the read outright), and the fallback costs the extra `bytes=0-1` probe. That the
+fallback is otherwise faithful was measured separately, by provoking a truthful HEAD through a
+`Transfer-Encoding: chunked` bypass of the `putOrReplace` guard: `HEAD` + `GET bytes=0-31999999`,
+nothing else, same prefix. **So production against a HEAD-answering host pays 32,000,000 and the test
+asserts 32,000,002.**
+
+What this establishes: that the cost is **real and bounded**, and that it does not scale with the
+object. What it does not establish is anything about wall clock — loopback zeroes the term that
+matters, exactly as the 2026-08-23 measurement above says.
+
+The two tests add **1.03 s** to `clojure -M:test` (2113 ms for `loci.source-test` with them, 1087 ms
+without), generate one shared 40 MiB fixture and push 128 MB over loopback. Written down because a
+suite nobody will run is worse than a test nobody wrote.
+
+### Both suites, on this tree
+
+`clojure -M:test` — **874 tests, 4704 assertions, 0 failures, 0 errors**, 71 s.
+`npm run test:browser` — **159/159**, no `outline` flake.
