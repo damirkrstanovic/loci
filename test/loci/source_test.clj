@@ -702,8 +702,10 @@
 ;; requests off 127.0.0.1", which an earlier commit message claimed flatly and
 ;; which is only true on a machine that already has the DuckDB extensions:
 ;; `LOAD ducklake` in this namespace's `:once` fixture, and `LOAD httpfs` under
-;; `a-remote-csv-materialises-into-the-lake` and
-;; `refresh-of-a-remote-source-re-fetches-the-object`, both fall through to
+;; `a-remote-csv-materialises-into-the-lake`,
+;; `refresh-of-a-remote-source-re-fetches-the-object`,
+;; `a-remote-preview-fetches-a-fixed-prefix-and-not-the-object` and
+;; `a-second-preview-pays-the-prefix-again`, all fall through to
 ;; `ensure-extension!`'s `INSTALL` when the extension directory does not hold
 ;; them — which reaches the DuckDB extension repository, once, and then never
 ;; again on that machine. The plan's ground rules allow that one install; the
@@ -737,12 +739,14 @@
 (defn- with-stub
   "Start `handler` on an ephemeral loopback port, call `(f port seen)`, stop the
    server. `seen` holds every request received, so a test can assert on what
-   actually went over the wire — including that nothing did."
+   actually went over the wire — including that nothing did, and including the
+   `range` header, which is the only instrument that can tell a prefix fetch
+   from a whole-object one."
   [handler f]
   (let [seen (atom [])
         srv  (httpd/run-server
               (fn [req]
-                (swap! seen conj (select-keys req [:uri :request-method]))
+                (swap! seen conj (select-keys req [:uri :request-method :headers]))
                 (handler req))
               {:port 0 :ip "127.0.0.1" :legacy-return-value? false})]
     (try (f (httpd/server-port srv) seen)
@@ -925,6 +929,242 @@
                 "and it went over the wire again — a refresh that answered from the
                  lake would give the same row count as a re-fetch of unchanged bytes,
                  so the request count is the only thing that separates them")))))))
+
+;; ---------------------------------------------------------------------------
+;; what a preview COSTS — the phase's most surprising number, in bytes
+;; ---------------------------------------------------------------------------
+
+(defn- csv-of-at-least
+  "A CSV of at least `want` bytes, as a byte array. Two columns and a counter, so
+   DuckDB has a real schema to describe rather than one fabricated column.
+
+   A `ByteArrayOutputStream` and not the `StringBuilder` this was first drafted
+   as: 40 MiB of `StringBuilder` is an 80 MiB `char[]`, and `.toString` then
+   `.getBytes` copy it twice more — ~200 MiB transient against the ~120 MiB
+   here, in a JVM whose test alias sets no `-Xmx`. Measured 2026-08-24: 0.77 s
+   for 40 MiB."
+  ^bytes [want]
+  (let [out (java.io.ByteArrayOutputStream. (+ ^long want 64))
+        put (fn [^String s] (let [b (.getBytes s "UTF-8")] (.write out b 0 (alength b))))]
+    (put "region,revenue\n")
+    (loop [i 0]
+      (when (< (.size out) ^long want)
+        (put (str "EMEA-" i "," i "\n"))
+        (recur (inc i))))
+    (.toByteArray out)))
+
+(def ^:private big-csv
+  "The 40 MiB fixture both tests below read, built once.
+
+   In a delay rather than at load time so a run that reaches neither test never
+   pays for it, and shared rather than per-test because it is read-only and the
+   second 0.77 s buys nothing. 40 MiB retained for the rest of a suite run is
+   noise against the ~4 GB default heap on this machine."
+  (delay (csv-of-at-least (* 40 1024 1024))))
+
+(defn- range-bytes
+  "How many bytes a `Range` header asked for, over an object of `n` bytes.
+   An open-ended `bytes=<a>-` means everything from `a` to the end."
+  [^String r ^long n]
+  (let [[_ a b] (re-matches #"bytes=(\d+)-(\d*)" r)]
+    (inc (- (if (seq b) (Long/parseLong b) (dec n)) (Long/parseLong a)))))
+
+(defn- ranges-of
+  "Every `Range` a `with-stub` `seen` atom recorded, in order."
+  [seen]
+  (vec (keep #(get-in % [:headers "range"]) @seen)))
+
+(defn- ranged-stub
+  "Serve `body` with the Range support httpfs needs, reporting the object's size
+   as `claim` bytes: `206` with a truthful `Content-Range` for a `Range` GET,
+   and — the part that had to be measured — **405 to a HEAD**.
+
+   `claim` is what the stub SAYS the object weighs. Pass `(alength body)` for an
+   honest object; pass more to present the same bytes as a bigger one, which is
+   how the fixed half of the claim below is tested without generating 2 GB. The
+   lie only runs one way and it is the safe way: httpfs never asks past the
+   prefix today, and a regression that made it ask for MORE would be served
+   fewer bytes than the `Content-Range` promised and go red, not green. Not an
+   argument — measured 2026-08-24 by shrinking the fixture below the prefix,
+   which is the same thing from the other side, and DuckDB says so itself:
+
+     HTTP Error: The size reported by HEAD for '…/two-gigabytes.csv' was
+     2147483648 bytes, but the full GET downloaded 20971539 bytes.
+
+   So the stub cannot serve a claim it does not hold, and this test cannot pass
+   by being lied to on the reader's behalf.
+
+   **Without the 405 this test is vacuous rather than red**, which is the trap
+   the plan warned about and which turned out to be live. http-kit's
+   `HttpUtils.HttpEncode` does `headers.putOrReplace(\"content-length\", \"0\")`
+   for any response whose body is nil, and there is no HEAD special case
+   anywhere in it — so a stub answering HEAD with `{:status 200 :headers
+   {\"content-length\" \"41943042\" \"accept-ranges\" \"bytes\"}}` puts
+   `Content-Length: 0` on the wire. Measured with curl 2026-08-24, verbatim:
+
+     HTTP/1.1 200 OK
+     Content-Type: text/csv
+     Content-Length: 0
+     Accept-Ranges: bytes
+
+   httpfs reads that as an object it cannot seek in and falls back to one plain
+   GET with no `Range` at all — `[[:head nil] [:get nil]]`, measured — i.e. a
+   whole-object download, from which this test would have concluded that loci
+   does not range-read, the exact opposite of what the spec recorded. There is
+   no way to hand http-kit a `Content-Length` it did not compute, so the way out
+   is to refuse the method, which is what httpfs's own fallback exists for.
+   Measured 2026-08-24: HEAD 405 makes httpfs learn the size from a two-byte
+   `bytes=0-1` GET and then fetch the same `bytes=0-31999999` a HEAD-answering
+   server gets — the two-byte probe is the only difference, and it is why the
+   totals below read 32,000,002 rather than the spec's 32,000,000.
+
+   405 and not 404: a 404 HEAD is not a fallback, it is a failure. Measured the
+   same day, `describe` threw `HTTP GET error … (HTTP 404 Not Found)` after a
+   single HEAD and never issued a GET."
+  [^bytes body ^long claim]
+  (fn [req]
+    (if (= :head (:request-method req))
+      {:status 405 :headers {"content-type" "text/plain"} :body "this stub does not do HEAD"}
+      (if-let [r (get-in req [:headers "range"])]
+        (let [[_ a b] (re-matches #"bytes=(\d+)-(\d*)" r)
+              from    (Long/parseLong a)
+              to      (min (dec claim) (if (seq b) (Long/parseLong b) (dec claim)))
+              ;; `have` is what the stub actually HOLDS for that range, which is
+              ;; the whole range whenever `claim` is honest. When it is not, a
+              ;; short read is precisely the red this stub wants to be able to
+              ;; produce — see the docstring.
+              have    (min (inc (- to from)) (- (alength body) from))]
+          {:status  206
+           :headers {"content-type"  "text/csv"
+                     "content-range" (str "bytes " from "-" to "/" claim)
+                     "accept-ranges" "bytes"}
+           ;; A `ByteBuffer` and not the sketch's `ByteArrayInputStream`:
+           ;; http-kit's `bodyBuffer` reads an InputStream into a fresh
+           ;; `DynamicBytes`, so 32 MB would be copied on every request, while a
+           ;; ByteBuffer is passed to the socket with no copy at all — its own
+           ;; comment says "makes ultimate optimization possible: no copy".
+           :body    (java.nio.ByteBuffer/wrap body from have)})
+        {:status  200
+         :headers {"content-type"   "text/csv"
+                   "accept-ranges"  "bytes"}
+         :body    (java.nio.ByteBuffer/wrap body)}))))
+
+(deftest a-remote-preview-fetches-a-fixed-prefix-and-not-the-object
+  ;; The phase's most surprising measurement, and until now prose only: a
+  ;; DESCRIBE of a remote CSV downloads a FIXED 32,000,000-byte prefix whatever
+  ;; the object weighs — so a preview of a 2 GB table costs the same 32 MB as a
+  ;; preview of a 40 MB one, and the ＋ Data panel's default path pays it before
+  ;; anyone presses Connect.
+  ;;
+  ;; **The fixture has to exceed the prefix or the test is vacuous**, which is
+  ;; what every other remote test in this file cannot do at three rows: over a
+  ;; 3 KB object "the prefix" and "the whole object" are the same bytes, and no
+  ;; assertion can separate them. Measured 2026-08-24, and this is the shape of
+  ;; the vacuity rather than an argument for it — one describe, three objects:
+  ;;
+  ;;   20 MiB (20,971,539 B)  →  bytes=0-1, bytes=0-20971538   the whole thing
+  ;;   40 MiB (41,943,042 B)  →  bytes=0-1, bytes=0-31999999
+  ;;   60 MiB (62,914,566 B)  →  bytes=0-1, bytes=0-31999999
+  ;;  100 MiB (104,857,614 B) →  bytes=0-1, bytes=0-31999999
+  ;;
+  ;; 40 MiB is generated here rather than committed.
+  ;;
+  ;; **One size cannot show that a prefix is FIXED**, only that it is capped, so
+  ;; the second half serves the same 40 MiB of bytes while reporting the object
+  ;; as 2 GiB. That is the sentence the spec actually makes — a 2 GB table costs
+  ;; what a 40 MB one costs — and it is measurable for the price of the 40 MiB
+  ;; already in hand.
+  ;;
+  ;; Asserted on the RANGE HEADERS and not on wall clock: the number this pins
+  ;; is bytes over the wire, and a loopback server measures no network anyway.
+  (let [body @big-csv
+        n    (alength ^bytes body)]
+    (is (> n 32000000)
+        (str "the fixture is " n " bytes, which is not larger than the prefix — "
+             "every assertion below would then be true of a whole-object fetch too"))
+    ;; Half one: an honest 40 MiB object. The prefix is smaller than it.
+    (with-stub (ranged-stub body n)
+      (fn [port seen]
+        (reset! (:ensured @lake/lake) #{})
+        (src/describe @lake/lake {:uri (str "http://127.0.0.1:" port "/big.csv") :format :csv})
+        (let [ranges (ranges-of seen)
+              asked  (reduce + 0 (map #(range-bytes % n) ranges))]
+          (is (seq ranges)
+              (str "no Range was sent at all, so httpfs downloaded the whole object — "
+                   "either the stub stopped advertising ranges or the reader changed: "
+                   (pr-str @seen)))
+          (is (< asked n)
+              (str "a preview pulled " asked " of " n " bytes, which is the whole object: "
+                   (pr-str ranges)))
+          (is (= ["bytes=0-1" "bytes=0-31999999"] ranges)
+              (str "the prefix is no longer 32,000,000 bytes. That is not a test failure "
+                   "so much as a cost changing under the ＋ Data panel — update the spec's "
+                   "Measured section and this test together, with the date. "
+                   "(`bytes=0-1` is httpfs asking how big the object is, because this stub "
+                   "refuses HEAD; a HEAD-answering server is asked once and the prefix GET "
+                   "is the same.) " (pr-str ranges)))
+          ;; The same fact as the line above, in the unit the cost is felt in,
+          ;; and it CANNOT fail on its own — over this fixture those two ranges
+          ;; are 32,000,002 bytes and nothing else. Kept anyway, and the reason
+          ;; is written down rather than left for a reader to wonder at: the
+          ;; deliverable of this test is a number of bytes, and a number nobody
+          ;; states is a number nobody can grep for when the spec is next
+          ;; rewritten. It is a restatement, not a second measurement.
+          (is (= 32000002 asked)
+              (str "a preview pulled " asked " bytes, not 32,000,002 — 32,000,000 of prefix "
+                   "and 2 of length probe: " (pr-str ranges))))))
+    ;; Half two: the SAME bytes, reported as a 2 GiB object. If the prefix
+    ;; tracked the object at all, this fetch would be larger than the one above,
+    ;; and the stub would run out of bytes to serve rather than agreeing.
+    (with-stub (ranged-stub body (* 2 1024 1024 1024))
+      (fn [port seen]
+        (src/describe @lake/lake {:uri (str "http://127.0.0.1:" port "/two-gigabytes.csv")
+                                  :format :csv})
+        (is (= ["bytes=0-1" "bytes=0-31999999"] (ranges-of seen))
+            (str "a 2 GiB object was previewed for something other than the 32,000,000 bytes "
+                 "a 40 MiB one costs, so the prefix is not fixed after all and the spec's "
+                 "claim that previewing a 2 GB table is free of its size needs rewriting: "
+                 (pr-str (ranges-of seen))))))))
+
+(deftest a-second-preview-pays-the-prefix-again
+  ;; The other half of the same measurement, and the one a reader would guess
+  ;; wrong: DuckDB's external file cache does NOT save the second describe. Two
+  ;; consecutive DESCRIBEs each issued HEAD + GET bytes=0-31999999, 71.4 and
+  ;; 68.3 ms — so a person who previews, presses ‹ back, and previews again has
+  ;; downloaded 64 MB.
+  ;;
+  ;; It is not that the cache is off. `enable_external_file_cache` is `true` on
+  ;; this lake's connection — measured 2026-08-24 out of `duckdb_settings()` —
+  ;; and both describes below run on that one connection, against one URL. It
+  ;; re-fetches anyway.
+  ;;
+  ;; The COUNT of prefix fetches is the load-bearing assertion, not the count of
+  ;; requests: a second describe that re-probed the length and then answered
+  ;; from cache would still push `(count ranges)` up while costing nothing, and
+  ;; the thing being pinned is the 32 MB.
+  (let [body @big-csv]
+    (with-stub (ranged-stub body (alength ^bytes body))
+      (fn [port seen]
+        (reset! (:ensured @lake/lake) #{})
+        (let [uri (str "http://127.0.0.1:" port "/big.csv")]
+          (src/describe @lake/lake {:uri uri :format :csv})
+          (let [after-one (ranges-of seen)]
+            (is (pos? (count after-one)) "the first describe ranged, so the comparison has a floor")
+            (is (= 1 (count (filter #{"bytes=0-31999999"} after-one)))
+                (str "the first describe did not fetch the prefix, so the count below "
+                     "cannot mean what it says: " (pr-str after-one)))
+            (src/describe @lake/lake {:uri uri :format :csv})
+            (let [after-two (ranges-of seen)]
+              (is (> (count after-two) (count after-one))
+                  (str "the second describe was served from a cache, which would be good news
+                        and would mean the panel's second preview is free — check
+                        duckdb_settings() for enable_external_file_cache and update the spec
+                        before believing it: " (pr-str after-two)))
+              (is (= 2 (count (filter #{"bytes=0-31999999"} after-two)))
+                  (str "the second preview did not pay the 32,000,000 bytes again. If that is
+                        real it is the panel getting cheaper, not this test getting wrong —
+                        measure it and rewrite the spec's Measured section: "
+                       (pr-str after-two))))))))))
 
 (deftest a-local-connect-asks-for-no-httpfs
   ;; `ensure-remote!` LOADs httpfs for whatever uri it is handed, and `describe`
