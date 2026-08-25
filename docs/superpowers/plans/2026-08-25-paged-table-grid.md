@@ -20,6 +20,7 @@
 - **Two suites.** `clojure -M:test` does not mean all the tests. Phases 2 and 3 are shell changes and `npm run test:browser` is the only thing that sees them.
 - **Say what you measured, and which of two things it establishes** — that the mechanism works, or that a cost is real. A 250-row fixture can only ever establish the first.
 - **`data/` is test data.** Use a throwaway `LOCI_DATA` because tests that share a store interfere, not because `data/` needs protecting.
+- **A namespaced payload key reaches the shell with its namespace GONE.** `clojure.data.json/write-str` renders `:table/total` as `"total"`, `:table/cols` as `"cols"` and `:page/next` as `"next"`. The shell reads `m.total`, `m.cols`, `m.next` — never `m['table/total']`. This is established convention, already documented at `resources/public/index.html:2038` and `:2149` where `reclaimedHTML` reads the same two keys. Corrected here 2026-08-25 after Task 3 measured the actual wire format; the plan had it wrong in Tasks 7 and 9, and it would have been `undefined` at runtime.
 
 ---
 
@@ -1123,7 +1124,7 @@ function tableHTML(rows,m){
 }
 function pagerHTML(m){
   const p=pagingOf(m.id), from=p.page*p.limit+1, to=from+((m.rendered||[]).length)-1;
-  const total=m['table/total'];
+  const total=m.total;
   return '<div data-pager style="display:flex;align-items:center;gap:12px;margin-top:8px;'+
     'font-size:11px;color:var(--muted);font-family:var(--mono)">'+
     '<span class="pgcap">showing '+from+'–'+to+(total!=null?' of '+fmtNum(total):'')+'</span>'+
@@ -1132,7 +1133,7 @@ function pagerHTML(m){
       [25,50,100,200].map(n=>'<option value="'+n+'"'+(n===p.limit?' selected':'')+'>'+n+' rows</option>').join('')+
     '</select>'+
     '<button class="btn ghost sm" data-a="page-prev"'+(p.page===0?' disabled':'')+'>‹ Prev</button>'+
-    '<button class="btn ghost sm" data-a="page-next"'+(m['page/next']?'':' disabled')+'>Next ›</button>'+
+    '<button class="btn ghost sm" data-a="page-next"'+(m.next?'':' disabled')+'>Next ›</button>'+
     '</div>';
 }
 ```
@@ -1175,7 +1176,7 @@ Add `data-mold-root` where `renderMold(m)`'s output is inserted — **both place
 
 ```js
   '<div data-mold-root="'+esc(m.id)+'" data-mold-view="'+esc(m.view||'')+'"'+
-  ' data-mold-next="'+esc(m['page/next']||'')+'">'+renderMold(m)+'</div>'
+  ' data-mold-next="'+esc(m.next||'')+'">'+renderMold(m)+'</div>'
 ```
 
 The next cursor rides on the wrapper as a string the shell only ever hands back, never opens.
@@ -1425,7 +1426,7 @@ function colsHTML(m,cols){
   // The FULL column list comes off the handle, not off the rendered page —
   // a page molded with `cols` set no longer contains the hidden ones, so
   // reading them back from the rows would make hiding a column one-way.
-  const all=m['table/cols']||cols;
+  const all=m.cols||cols;
   return '<details class="colpick"><summary class="btn ghost sm" data-a="cols">'+
     (hidden.size?('columns · '+(all.length-hidden.size)+'/'+all.length):'columns')+'</summary>'+
     '<div class="colpick-b">'+all.map(c=>
@@ -1454,7 +1455,7 @@ The handler, beside the pager's:
   }));
 ```
 
-`data-mold-cols` joins `data-mold-root` and `data-mold-view` on the wrapper, as `JSON.stringify(m['table/cols'])`.
+`data-mold-cols` joins `data-mold-root` and `data-mold-view` on the wrapper, as `JSON.stringify(m.cols||[])`.
 
 - [ ] **Step 4: Green.** **Step 5: Prove they bite** — filter the columns in `tableHTML` instead of sending `cols` (the request assertion fails while the page still looks right, which is the whole point of asserting on the URL); remove the `try` from `loadPaging` (the storage test fails with a blank panel).
 
