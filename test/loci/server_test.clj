@@ -5576,3 +5576,31 @@
     (is (= 250 (count (:rendered p)))
         "the whole mold-cap sample, not a default-limit page")
     (is (nil? (:next p)))))
+
+;; ---------------------------------------------------------------------------
+;; a notebook ships one page per cell
+;;
+;; `notebook-payload` merges a whole `mold-payload` into every `:ref` cell, so a
+;; notebook with five table cells carried five `mold-cap` samples in one
+;; response. Measured on the real substrate before this change: one 36-column ×
+;; 2,000-row cell was 5,428,753 bytes.
+;;
+;; The table lands in `@lake/lake` for the same reason the window tests above do:
+;; `mold-payload` resolves `lake/lake` itself.
+;; ---------------------------------------------------------------------------
+
+(deftest a-notebook-cell-carries-one-page-and-not-the-whole-sample
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :tx :events
+                     [{:op :put :id "tbl:n"
+                       :value (tbl/table-object @lake/lake "tbl:n" "T" rs {})}
+                      {:op :put :id "space:n"
+                       :value {:id "space:n" :kind :space :title "N"
+                               :value {:intent "one table cell"
+                                       :cells [{:ref "tbl:n"}]}}}]})
+    (with-redefs [mem/memory no-memory]
+      (let [cell (first (:cells (srv/notebook-payload st "space:n")))]
+        (is (= 100 (count (:rendered cell))) "a cell is a page, not a sample")
+        (is (= 250 (:table/total cell))      "and it still says how big the table is")
+        (is (some? (:page/next cell)))))))

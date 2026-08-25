@@ -979,7 +979,12 @@
                                 :also-in (get also-in (:ref c))
                                 :from (:from (sub/object st (:ref c)))
                                 :via  (:via (sub/object st (:ref c)))}
-                               (mold-payload st mem/memory (:ref c) (:view c)))
+                               ;; A window with only a limit: a cell opens on page
+                               ;; one and pages from there like the molder does.
+                               ;; Passing nil here is what shipped five copies of
+                               ;; a mold-cap sample in one response.
+                               (mold-payload st mem/memory (:ref c) (:view c)
+                                             {:limit tbl/default-limit}))
                         :else {:i i :type "missing" :ref (:ref c)}))
                     (nb/cells-of o)))]
     {:id id :title (:title o) :intent (get-in o [:value :intent])
