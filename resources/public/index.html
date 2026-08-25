@@ -8,6 +8,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Serif&display=swap" rel="stylesheet">
+<!-- SPIKE 2026-08-25 — the ClojureScript shell, opt-in via ?cljs. Loaded but
+     inert unless the flag is set, so every existing path is byte-identical. -->
+<script defer src="/js/grid.js"></script>
 <style>
   :root{
     --paper:#ECEEEA; --panel:#F7F8F5; --white:#fff;
@@ -608,6 +611,7 @@
 <div class="modal" id="modal"></div>
 
 <script>
+const SPIKE_CLJS = new URLSearchParams(location.search).has('cljs');
 const POST = (url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
 const API = {
   state: at => fetch('/api/state'+(at!=null?'?at='+at:'')).then(r=>r.json()),
@@ -1957,7 +1961,12 @@ function renderMold(m){
     return '<div class="srcblock" data-src="'+esc(m.id)+'">'+sourceHTML(m,SRCNOW[m.id])+'</div>';
   }
   switch(m.kind){
-    case 'table':  return liveBadge(m)+tableHTML(d);
+    // SPIKE: `?cljs` swaps the hand-written table for the ClojureScript one.
+    // A div and an id is the ENTIRE integration surface — the payload is fetched
+    // by the CLJS side over Transit, so nothing here needs to know its shape.
+    case 'table':  return liveBadge(m)+(SPIKE_CLJS
+                     ? '<div data-cljs-grid="'+esc(m.id)+'"></div>'
+                     : tableHTML(d));
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
     case 'text':   return '<div class="moldtext">'+mdToHtml(d)+'</div>';
     case 'chart':  return chartSVG(d);
@@ -2209,6 +2218,15 @@ function panelIdx(el){ const p=el.closest('.panel'); return p?+p.dataset.i:focus
 // The id travels on the button rather than in `openId`: a cell's block is not
 // the open object, and in a notebook `openId` is null.
 function wireSourceButtons(root,i){
+  // SPIKE: mount the ClojureScript grid into any node the payload asked for.
+  // `wireSourceButtons` already exists to attach behaviour after every render,
+  // which is exactly the hook a mounted component needs — so the seam costs
+  // four lines and no new lifecycle.
+  root.querySelectorAll('[data-cljs-grid]').forEach(el=>{
+    if(!el.dataset.mounted && window.loci && loci.grid){
+      el.dataset.mounted='1'; loci.grid.mount(el, el.dataset.cljsGrid);
+    }
+  });
   root.querySelectorAll('[data-a="refresh"]').forEach(el=>el.addEventListener('click',async ev=>{
     ev.stopPropagation();
     if(TIME){ showToast('time mode — ↩ now to refresh'); return; }

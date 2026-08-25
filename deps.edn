@@ -2,6 +2,9 @@
  :deps {org.clojure/clojure    {:mvn/version "1.12.0"}
         http-kit/http-kit      {:mvn/version "2.8.0"}
         org.clojure/data.json  {:mvn/version "2.5.0"}
+        ;; SPIKE 2026-08-25 — Transit on one route, to see whether a namespaced
+        ;; keyword survives the wire. JSON silently renames :table/total to "total".
+        com.cognitect/transit-clj {:mvn/version "1.0.333"}
         ;; org.clojure/data.csv is gone as of 2026-08-20. DuckDB's `read_csv` is
         ;; the only CSV reader loci has; `loci.corpus` was the last namespace
         ;; parsing one itself, and it now imports through the file connector.
@@ -92,6 +95,25 @@
           :extra-deps  {io.github.nextjournal/clerk {:mvn/version "0.17.1102"}}
           :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]
           :exec-fn     user/start}
+
+  ;; SPIKE 2026-08-25 — ClojureScript shell. Does the seam work?
+  ;;   compile:  clojure -M:cljs -m shadow.cljs.devtools.cli release grid
+  ;;   watch:    clojure -M:cljs -m shadow.cljs.devtools.cli watch grid
+  ;; `src-cljs` is its own root so the Clojure compiler never sees a .cljs file
+  ;; on `src`, and so this alias is the only thing that knows CLJS exists.
+  ;; `:replace-deps`, NOT `:extra-deps`. The CLJS build has no business loading
+  ;; Datalevin or DuckDB — and one of them bites: `datalevin/datalevin 1.0.0`
+  ;; pulls `io.github.nextjournal/markdown`, whose jar carries a `deps.cljs`
+  ;; declaring npm dependencies, so shadow-cljs ran `npm install --save` for
+  ;; Clerk's whole markdown-it stack and rewrote package.json. Measured
+  ;; 2026-08-25: six packages added to a project whose shell has none, for a
+  ;; namespace the shell never requires. A clean classpath removes it at source.
+  :cljs  {:replace-paths ["src-cljs"]
+          :replace-deps  {org.clojure/clojure        {:mvn/version "1.12.0"}
+                          thheller/shadow-cljs       {:mvn/version "3.2.0"}
+                          no.cjohansen/replicant     {:mvn/version "2025.06.21"}
+                          com.cognitect/transit-cljs {:mvn/version "0.8.280"}}
+          :jvm-opts      ["-Djava.io.tmpdir=.tmp"]}
 
   ;; the uberjar:  clojure -T:build uber   ->  target/loci-standalone.jar
   :build {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.5"}}

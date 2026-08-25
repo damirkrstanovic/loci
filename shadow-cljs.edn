@@ -1,0 +1,8 @@
+;; SPIKE 2026-08-25. Reads deps.edn rather than owning its own dependency set —
+;; the same arrangement Clerk uses (`{:deps {:aliases [:sci]}}` in its own file).
+{:deps    {:aliases [:cljs]}
+ :nrepl   false
+ :builds  {:grid {:target     :browser
+                  :output-dir "resources/public/js"
+                  :asset-path "/js"
+                  :modules    {:grid {:init-fn loci.grid/init}}}}}

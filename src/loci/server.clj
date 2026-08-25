@@ -4,7 +4,8 @@
    The HTTP boundary is the substrate/assistance seam — everything the frontend
    shows is molded by `loci.mold` on the Clojure side; the frontend just lays it
    out. (Same code path the headless demo exercises.)"
-  (:require [clojure.data.json :as json]
+  (:require [cognitect.transit :as transit]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
@@ -48,6 +49,26 @@
   {:status 200
    :headers {"Content-Type" "application/json; charset=utf-8"}
    :body (json/write-str data)})
+
+;; SPIKE 2026-08-25 — Transit beside JSON, chosen per request by `?wire=transit`.
+;; The one thing it is here to settle: `json/write-str` renders a NAMESPACED
+;; keyword key by its bare name, so `:table/total` reaches the shell as "total"
+;; and `:page/next` as "next". That is not a preference — it silently broke two
+;; tasks of the paging plan, and `index.html` has carried a comment about it
+;; since `reclaimedHTML` was written. Transit round-trips the keyword whole.
+(defn- transit-resp [data]
+  (let [out (java.io.ByteArrayOutputStream. 4096)]
+    (transit/write (transit/writer out :json) data)
+    {:status 200
+     :headers {"Content-Type" "application/transit+json; charset=utf-8"}
+     :body (.toString out "UTF-8")}))
+
+(defn- wire-resp
+  "`?wire=transit` opts one request into Transit. Every existing caller is
+   untouched and still gets JSON — the spike has to prove the seam, not migrate
+   the shell."
+  [params data]
+  (if (= "transit" (params "wire")) (transit-resp data) (json-resp data)))
 
 (defn- parse-query [qs]
   (into {} (for [pair (some-> qs (str/split #"&")) :when (seq pair)]
@@ -3436,7 +3457,7 @@
       (= uri "/")            {:status 200 :headers {"Content-Type" "text/html; charset=utf-8"}
                               :body (slurp (io/resource "public/index.html"))}
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
-      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) mem/memory
+      (= uri "/api/mold")    (wire-resp params (mold-payload (store-at st (params "at")) mem/memory
                                                      (params "id") (params "view")
                                                      (window-params params)))
       (= uri "/api/events")  (json-resp (events-payload st))
@@ -3572,6 +3593,16 @@
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
+      ;; SPIKE 2026-08-25 — the compiled ClojureScript. One static route, under a
+      ;; fixed prefix, reading only from the classpath resource tree: `uri` is
+      ;; caller-supplied, so a `..` in it must not be able to leave `public/js`.
+      ;; `io/resource` on a name with no slash after the prefix is the whole
+      ;; guard, and the `re-matches` is what makes that true.
+      (re-matches #"/js/[A-Za-z0-9._-]+\.js" uri)
+      (if-let [r (io/resource (str "public" uri))]
+        {:status 200 :headers {"Content-Type" "application/javascript; charset=utf-8"} :body (slurp r)}
+        {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})
+
       :else {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})))
 
 (defonce server (atom nil))

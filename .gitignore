@@ -38,3 +38,7 @@ loci.env.bak-*
 # the directory has to exist on a fresh clone.
 .tmp/*
 !.tmp/.gitkeep
+
+# SPIKE: compiled ClojureScript — build output, not source
+resources/public/js/
+.shadow-cljs/
