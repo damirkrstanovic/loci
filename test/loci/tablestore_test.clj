@@ -396,6 +396,26 @@
     (is (= 50  (count (:rows p3))))
     (is (nil?  (:next p3)) "the last page says so, and nothing asks for a fourth")))
 
+(deftest inline-page-says-next-exists-when-one-more-row-remains
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:boundary" (mapv #(hash-map :id %) (range 101)))]
+    (is (some? (:next (tbl/page ts h {:limit 100})))
+        "101 rows, limit 100 — exactly one row remains")))
+
+(deftest inline-page-says-no-next-when-exactly-full
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:exact" (mapv #(hash-map :id %) (range 100)))]
+    (is (nil? (:next (tbl/page ts h {:limit 100})))
+        "exactly limit rows means no next page, not just a short one")))
+
+(deftest a-cursor-with-a-wrong-typed-field-is-page-one-not-a-crash
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:big" many)
+        p  (tbl/page ts h {:limit 100 :cursor (tbl/encode-cursor {:i "not-a-number"})})]
+    (is (= 100 (count (:rows p))))
+    (is (= 0   (:id (first (:rows p))))
+        "a crafted cursor with a wrong-typed field restarts at page 1, not a crash")))
+
 (deftest a-window-projects-only-the-columns-it-asks-for
   (let [ts (tbl/inline-table)
         h  (tbl/put-rows! ts "tbl:big" many)]

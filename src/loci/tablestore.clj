@@ -331,8 +331,8 @@
   "A window's `:limit`, clamped to 1..`max-limit` with `default-limit` for
    absent. Takes a string too, because a window arrives in a query string."
   [n]
-  (let [n (if (string? n) (parse-long (str n)) n)]
-    (max 1 (min max-limit (or n default-limit)))))
+  (let [n (if (string? n) (parse-long n) n)]
+    (long (max 1 (min max-limit (or n default-limit))))))
 
 (defn encode-cursor
   "A store's internal page key, as one opaque URL-safe string.
@@ -347,19 +347,39 @@
                    (.getBytes (pr-str m) "UTF-8")))
 
 (defn decode-cursor
-  "The map `encode-cursor` made, or **nil** for nil, blank, or anything
-   malformed.
+  "The map `encode-cursor` made, or **nil** for nil, non-string, blank, or
+   anything malformed.
 
    nil means page 1, so a bookmarked cursor that no longer parses reopens the
    table at the top rather than throwing. A 500 on a URL somebody saved is the
-   worse failure: the table looks broken when only the position was."
+   worse failure: the table looks broken when only the position was. The
+   whole body runs inside the `try` — `str/blank?` is type-hinted and throws
+   on a non-string, so checking it outside would defeat the point.
+
+   Validates only that the decoded value IS a map — not what its fields hold.
+   This function does not know a store's cursor shape, so a wrong-typed field
+   (`{:i \"nope\"}`) passes here; `cursor-int` below is where a store that
+   DOES know the shape catches it."
   [s]
-  (when-not (str/blank? s)
-    (try
+  (try
+    (when-not (str/blank? s)
       (let [m (edn/read-string (String. (.decode (java.util.Base64/getUrlDecoder) ^String s)
                                         "UTF-8"))]
-        (when (map? m) m))
-      (catch Exception _ nil))))
+        (when (map? m) m)))
+    (catch Exception _ nil)))
+
+(defn cursor-int
+  "The non-negative integer at `k` in a decoded cursor, or **0** for anything
+   else — missing, negative, or the wrong type.
+
+   Split from `decode-cursor` on purpose: that function validates only that
+   the whole cursor is a map, because it does not know a store's cursor
+   shape. A per-field check belongs to the store that DOES — `InlineTable`
+   uses this for `:i`, and `Lake`'s `:k`/`:o` fields (Task 2) can share it
+   rather than reimplement \"a malformed field means page 1\"."
+  [cursor k]
+  (let [v (get cursor k)]
+    (if (and (integer? v) (not (neg? v))) v 0)))
 
 (defn project-cols
   "The columns a window asks for, in the **handle's** order, or all of them.
@@ -369,7 +389,7 @@
    neighbour's name. Unknown names are dropped, and dropping all of them means
    all columns — a table with no columns is not something the shell can draw."
   [h cols]
-  (if-let [want (some-> (seq cols) (->> (map name) set))]
+  (if-let [want (some->> (seq cols) (map name) set)]
     (let [kept (filterv #(contains? want (name %)) (:cols h))]
       (if (seq kept) kept (:cols h)))
     (:cols h)))
@@ -418,7 +438,7 @@
       true   vec))
   (page [_ h window]
     (let [lim  (page-limit (:limit window))
-          i    (or (:i (decode-cursor (:cursor window))) 0)
+          i    (cursor-int (decode-cursor (:cursor window)) :i)
           srt  (sort-spec h (:sort window))
           proj (project-cols h (:cols window))
           got  (->> (cond->> (:data h) srt (sort-rows srt))
