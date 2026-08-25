@@ -208,25 +208,44 @@ A new protocol method carries the window:
 
 ```clojure
 (page [ts h window]
-  "One page of rows for `handle`, plus the cursors either side of it.
-   => {:rows [...] :next <cursor-or-nil> :prev <cursor-or-nil> :from <n> :to <n>}")
+  "One page of rows for `handle`, plus the cursor that starts the next page.
+   => {:rows [...] :next <cursor-or-nil>}")
 ```
 
-Three implementations behind one opaque cursor:
+**Corrected 2026-08-25 while planning, twice, and both corrections shrink it.**
 
-| handle | cursor carries | query |
-|---|---|---|
-| Lake, materialised | the compound key `(sort-vals…, rowid)` | `WHERE (cols…) > (vals…) ORDER BY … LIMIT n` |
-| Lake, `:source` passthrough | an offset | `[ORDER BY …] LIMIT n OFFSET m` |
-| `InlineTable` / literal vector | an index | `drop`/`take` |
+`:prev` is gone. §2.4 gives the shell a stack of the cursors that began each page it has visited,
+which is exact; a server-computed `:prev` would be a second source of truth able to disagree with
+it. `:from` and `:to` are gone for the same reason: the shell knows its own page index, so
+`from = page-index × limit + 1` is exact and needs nothing from the server. `:table/total` — which
+comes off the handle as `(:rows h)`, not from a `COUNT(*)` — supplies the rest of
+`showing 101–200 of 10,000,000`.
 
-**The cursor is opaque to the shell in all three cases.** That is the whole reason one control
-works everywhere, and it is the one invariant in this section that a test must defend: the shell
-must never branch on cursor content.
+`:next` is produced by asking for `limit + 1` rows: if the extra row comes back there is another
+page, and the cursor is built from the last row actually returned.
 
-`:from`, `:to` and the existing `:table/total` — which comes off the handle as `(:rows h)`, not
-from a `COUNT(*)` — let the pager say `showing 101–200 of 10,000,000` under keyset, with no count
-query.
+**Keyset is for natural order only. A sort pages by offset.**
+
+| handle | sort | cursor carries | query |
+|---|---|---|---|
+| Lake, materialised | none | `rowid` | `WHERE rowid > k ORDER BY rowid LIMIT n+1` |
+| Lake, materialised | a column | an offset | `ORDER BY <col> <dir>, rowid LIMIT n+1 OFFSET m` |
+| Lake, `:source` passthrough | either | an offset | `[ORDER BY …] LIMIT n+1 OFFSET m` |
+| `InlineTable` / literal vector | either | an index | `drop`/`take` |
+
+The compound-key form **works** — §2.1 proves it — but taking it would mean solving two problems
+that natural-order keyset does not have: a mixed-direction tiebreak (`ORDER BY col DESC, rowid ASC`
+is not what `(col, rowid) < (v, k)` selects, and the probe could not see the difference because its
+fixture had no ties), and NULLs in the sort column, where a row comparison against NULL is NULL and
+silently drops rows. Both would be solved for a cost nobody has measured, because a sorted page
+over 10M rows is dominated by the `ORDER BY` however it is paginated. So: natural order gets the
+seek, a sort gets the simple thing, and the compound key stays written down here as the first thing
+to reach for if sorted deep pages are ever felt to be slow.
+
+**The cursor is opaque to the shell in every case.** That is the whole reason one control works
+everywhere — and it is what lets the table above change without the shell changing at all. It is
+the one invariant in this section that a test must defend: the shell must never branch on cursor
+content.
 
 ### 2.4 Previous
 
