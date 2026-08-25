@@ -47,6 +47,23 @@
    -newermt @<start>` after a run is how you find one."
   ["loci-" "src-" "api-src-" "empty-" "nomode-" "chunks-src-"])
 
+(def ^:private never
+  "Names PRODUCTION code creates in `java.io.tmpdir`. The reaper must not touch
+   one, even though `loci-` matches it.
+
+   **This cost half a day before it was found.** `lake/load-rows!` bulk-loads
+   through `(java.io.File/createTempFile \"loci-rows-\" \".ndjson\")` and then has
+   DuckDB read it back with `read_json_auto`. Delete the file in that window and
+   DuckDB answers `IO Error`, which surfaces as an intermittent 500 on a route
+   with nothing to do with the write. Measured 2026-08-26: three occurrences in
+   ten browser runs while a full `clojure -M:test` ran alongside, and not
+   reproducible in isolation, because the window is one file-write wide.
+
+   `put-rows!` is on every fixture path, so any suite that lands rows is exposed.
+
+   Re-derive with `rg -n 'createTempFile|java.io.tmpdir' src/`."
+  ["loci-rows-"])
+
 (defn- rm-rf [^java.io.File f]
   (when (.isDirectory f) (run! rm-rf (.listFiles f)))
   (.delete f))
@@ -60,7 +77,9 @@
   (let [tmp (io/file (System/getProperty "java.io.tmpdir"))]
     (count
      (for [^java.io.File f (or (.listFiles tmp) [])
-           :when (and (some #(.startsWith (.getName f) ^String %) prefixes)
+           :let [n (.getName f)]
+           :when (and (some #(.startsWith n ^String %) prefixes)
+                      (not-any? #(.startsWith n ^String %) never)
                       (>= (.lastModified f) started))
            :when (try (rm-rf f) (catch Throwable _ false))]
        f))))
