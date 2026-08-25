@@ -186,6 +186,31 @@
   table.mold td.txt{color:var(--ink-2)}
   table.mold tbody tr:first-child td{border-top:none}
   table.mold td:first-child{font-weight:500;color:var(--ink)}
+  /* ---- the ClojureScript grid. `table.mold`'s own rules still apply — this
+     adds only what the old renderer could not do. ---- */
+  /* A column as wide as what it holds. `table-layout:auto` is half of it and not
+     a detail: `fixed` above divides ONE width between the columns, which is the
+     arithmetic being replaced, and under it `max-content` means nothing. */
+  .grid table.mold{width:max-content;max-width:none;table-layout:auto}
+  /* …up to a cap, because content-sizing has no upper bound. Measured on the
+     36-column fixture in an 856px box: 6,646px uncapped, where one 900-character
+     `note` value is five sixths of the table, against 1,726px with the cap. The
+     cap is also what lets `table.mold td`'s `text-overflow:ellipsis` fire at all
+     — a cell that is never constrained never overflows. */
+  .grid table.mold th,.grid table.mold td{max-width:320px}
+  /* The header IS the column key: at 36 columns `fa` is decodable as `archived`
+     only while the header is on screen. `background` is not decoration — a
+     sticky element is painted over scrolling content and shows through without
+     one. */
+  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white)}
+  /* The first column is the row's identity, and a table wider than its panel
+     loses it on the first horizontal scroll. */
+  .grid th:first-child,.grid td:first-child{
+    position:sticky;left:0;z-index:1;background:var(--white);box-shadow:1px 0 0 var(--line)}
+  /* the corner is sticky on both axes and must outrank both. */
+  .grid thead th:first-child{z-index:3}
+  .grid .pager{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .grid .pgcap{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
   .moldtext{white-space:pre-wrap;font-size:13px;line-height:1.5} .moldlist{margin:0;padding-left:18px}
   /* a table whose rows the store reclaimed. --attn, like every other state the
      page raises rather than reports: the missing-object cell and a failed flow
