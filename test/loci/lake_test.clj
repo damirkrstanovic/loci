@@ -1412,3 +1412,28 @@
           reused     (tbl/page lk h {:limit 5 :cursor (:next p1) :sort ["grp" "asc"]})]
       (is (= (:rows new-sort-p) (:rows reused))
           "a cursor minted under a different sort restarts at page 1 of the new one, not a garbage offset into it"))))
+
+(deftest a-lake-page-reports-its-offset-in-both-modes
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:o" (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))})))]
+      ;; keyset: rowid is dense and 0-based, so the first row's rowid IS the ordinal
+      (let [p1 (tbl/page lk h {:limit 100})
+            p2 (tbl/page lk h {:limit 100 :cursor (:next p1)})]
+        (is (= 0 (:offset p1)))
+        (is (= 100 (:offset p2)) "keyset knows its ordinal from rowid"))
+      ;; offset mode, forced by a sort
+      (let [p1 (tbl/page lk h {:limit 100 :sort ["grp" "asc"]})
+            p2 (tbl/page lk h {:limit 100 :cursor (:next p1) :sort ["grp" "asc"]})]
+        (is (= 0 (:offset p1)))
+        (is (= 100 (:offset p2)))))))
+
+(deftest a-page-with-no-rows-in-it-has-no-offset
+  ;; `Lake/page`'s comment says an empty page has no first row and so no
+  ;; position. A cursor past the end is the only way to reach one — `:next` is
+  ;; nil on the last page, so an honest walk never asks — and it is reachable by
+  ;; hand, which makes the claim testable rather than decorative.
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:e" (vec (for [i (range 10)] {:i i})))
+          p (tbl/page lk h {:limit 5 :cursor (tbl/encode-cursor {:k 9999})})]
+      (is (= [] (:rows p)))
+      (is (nil? (:offset p)) "no first row, so nothing to report a position from"))))

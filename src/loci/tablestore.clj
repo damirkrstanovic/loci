@@ -24,7 +24,20 @@
      `window` may carry `:limit`, `:cursor` (opaque, nil for page 1), `:sort`
      (`[col dir]`) and `:cols` (the columns to project, nil for all).
 
-     => `{:rows [...] :next <cursor-or-nil>}`
+     => `{:rows [...] :offset <n-or-nil> :next <cursor-or-nil>}`
+
+     **`:offset` is how many rows precede this page**, and it is a fact every
+     implementation has to be able to state — the elision's caption reads
+     `showing 101–200 of 250` off it, and the alternative is the client
+     multiplying its own page index by a page size it may have changed mid-walk.
+
+     Two of the three ways of producing it are handed the number: `InlineTable`
+     drops `:i` rows and the lake's offset mode OFFSETs by `:o`. The lake's
+     keyset mode has no such number and derives it from the first row's `rowid`
+     — so **that mode alone answers nil for a page with no rows in it**, having
+     no first row to read a position off. Nothing downstream sees the
+     difference, because an empty page also carries no `:next` and it is
+     `:next` that decides whether a hole gets described at all.
 
      **Separate from `rows` rather than an option on it.** `rows` has twelve
      callers — agent digests, `tools.clj`, `describe` — that want a *sample* for
@@ -453,8 +466,12 @@
           got  (->> (cond->> (:data h) srt (sort-rows srt))
                     (drop i) (take (inc lim)) vec)
           more (> (count got) lim)]
-      {:rows (mapv #(select-keys % proj) (take lim got))
-       :next (when more (encode-cursor {:i (+ i lim)}))}))
+      {:rows   (mapv #(select-keys % proj) (take lim got))
+       ;; The index this page was asked to start at. `InlineTable` is handed its
+       ;; ordinal outright — `:i` IS the count of rows dropped — so unlike the
+       ;; lake's keyset branch there is nothing to derive it from.
+       :offset i
+       :next   (when more (encode-cursor {:i (+ i lim)}))}))
   (row-count [_ h] (:rows h))
   (reclaimed-at [_ _] nil)
   (column-samples [_ h per-col max-cols]
@@ -752,8 +769,9 @@
   "`hydrate`, but for one page of a table rather than a `mold-cap` sample.
 
    Returns the hydrated object with `:value` set to the page's rows,
-   `:table/total`, `:table/cols` set from the handle's FULL column list, and
-   `:page/next` set to the cursor for the next page, or nil on the last one.
+   `:table/total`, `:table/cols` set from the handle's FULL column list,
+   `:page/offset` set to how many rows precede this page, and `:page/next` set
+   to the cursor for the next page, or nil on the last one.
 
    **`:table/cols` is the handle's own list, not the page's.** A window may
    narrow `:cols`, so the rows in `:value` can carry fewer keys than the table
@@ -772,9 +790,10 @@
     (let [ts (force ts)
           h  (:value o)]
       (try
-        (let [{:keys [rows next]} (page ts h window)]
+        (let [{:keys [rows next offset]} (page ts h window)]
           (cond-> (assoc o :value rows :table/total (row-count ts h)
-                           :table/cols (:cols h) :page/next next)
+                           :table/cols (:cols h)
+                           :page/offset offset :page/next next)
             (= :source (:store h)) (assoc :table/passthrough true)))
         (catch Exception _
           ;; one classifier, not two: a page that throws is the same broken

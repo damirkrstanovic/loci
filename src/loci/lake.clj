@@ -1364,11 +1364,17 @@
           got   (q-as lk sql (vec ks))
           more  (> (count got) lim)
           kept  (vec (take lim got))]
-      {:rows (mapv #(dissoc % :rowid) kept)
-       :next (when more
-               (tbl/encode-cursor (if seek?
-                                    {:k (:rowid (peek kept))}
-                                    {:o (+ off lim) :s srt})))}))
+      {:rows   (mapv #(dissoc % :rowid) kept)
+       ;; **`:offset` is a fact in both modes, and it is not the same fact.**
+       ;; Offset mode was handed one. Keyset mode derives it from the first row's
+       ;; `rowid`, which is the ordinal only because a DuckLake table's rowid is
+       ;; dense and 0-based — the same property `WHERE rowid > k` already relies
+       ;; on. An empty page has no first row and no position to report, so nil.
+       :offset (if seek? (:rowid (first kept)) off)
+       :next   (when more
+                 (tbl/encode-cursor (if seek?
+                                      {:k (:rowid (peek kept))}
+                                      {:o (+ off lim) :s srt})))}))
 
   (row-count [_ h] (:rows h))
 

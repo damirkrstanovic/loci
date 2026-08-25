@@ -453,3 +453,14 @@
         vals #(mapv :v (:rows (tbl/page ts h {:limit 10 :sort %})))]
     (is (= [1 2 nil]  (vals ["v" "asc"])))
     (is (= [2 1 nil]  (vals ["v" "desc"])) "nulls stay last when the sort flips")))
+
+(deftest a-page-reports-where-it-starts
+  ;; The elision's caption reads `showing 101–200 of 250`, and the 101 is a fact
+  ;; the store knows rather than arithmetic the caller does over a page size it
+  ;; may have changed mid-walk.
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:big" many)
+        p1 (tbl/page ts h {:limit 100})
+        p2 (tbl/page ts h {:limit 100 :cursor (:next p1)})]
+    (is (= 0   (:offset p1)) "page one starts at row zero")
+    (is (= 100 (:offset p2)) "and page two says so without the caller counting")))

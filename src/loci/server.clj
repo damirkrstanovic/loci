@@ -503,7 +503,7 @@
    **The 5-arity takes a window, and it is used on the rows/cards branch only.**
    `unusable`, `entity`, `flow`, `applet` and `view:` render nothing a pager
    applies to, so `window` reaches only the `:else` branch's own guard — see its
-   comment for why a `table/summary` view must not carry `:page/next` even
+   comment for why a `table/summary` view must not carry an `:elision` even
    though it was molded with a window."
   ([st m id view] (mold-payload st m id view nil))
   ([st m id view window]
@@ -592,11 +592,42 @@
           ;; convenience.
           (:table/total o) (assoc :table/total (:table/total o))
           (:table/cols o) (assoc :table/cols (:table/cols o))
-          ;; `:page/next` ONLY for a viewer that renders rows. `table/summary`
-          ;; over a window would draw a pager under a chart computed from
-          ;; something else — a window is for rows, not for a chart.
+          ;; **The elision, and ONLY for a viewer that renders rows.** A hole is
+          ;; a statement about omitted rows; `table/summary` renders a chart
+          ;; computed from something else and a pager under it would be a lie.
+          ;;
+          ;; Absent when nothing was omitted — `page` returns no cursor on the
+          ;; last page, and a hole describing zero missing rows is not a hole.
+          ;;
+          ;; **This is Clerk's SHAPE and not Clerk's SEMANTICS, deliberately.**
+          ;; Clerk's elision APPENDS: clicking `1,975 more` joins the fetched
+          ;; rows to the ones on screen, which is right for an inspector drilling
+          ;; into one value. loci's REPLACES. At the 10M-row scale this design
+          ;; targets, forty clicks of an accreting `more` puts four thousand rows
+          ;; in the DOM, and a bounded DOM was half of what paging was for — the
+          ;; superseded spec's §1.5 records the browser being the place the
+          ;; problem got moved to. So the caption reads `showing 101–200 of
+          ;; 10,000,000` rather than `1,975 more`, and there is a Prev control an
+          ;; append model would have no use for. Design §3.1; the next reader
+          ;; will find Clerk's protocol and wonder why this one differs.
+          ;;
+          ;; `:offset` is here because it is the SERVER's, and the shell's page
+          ;; index must yield to it: the shell's is arithmetic over a page size a
+          ;; person can change mid-walk, and this is where the rows actually
+          ;; start.
+          ;;
+          ;; `:path` is `[:rendered]` and single-element by construction:
+          ;; `normalize-rows` refuses a vector or a map in a column, so a table
+          ;; payload has exactly one hole and it is at the end. The field is here
+          ;; rather than omitted so that a nested elision needs no second shape —
+          ;; see §3 of the design.
           (and (:page/next o) (#{:table/rows :table/cards} (:view mv)))
-          (assoc :page/next (:page/next o))))))))
+          (assoc :elision {:n          (tbl/page-limit (:limit window))
+                           :offset     (:page/offset o)
+                           :total      (:table/total o)
+                           :unbounded? (boolean (:table/unbounded o))
+                           :path       [:rendered]
+                           :cursor     (:page/next o)})))))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;

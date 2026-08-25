@@ -5512,14 +5512,16 @@
     (let [p1 (srv/mold-payload st no-memory "tbl:w" nil {:limit 100 :cols ["i"]})]
       (is (= 100 (count (:rendered p1))))
       (is (= 250 (:table/total p1)) "the true count is not the page's count")
-      (is (some? (:page/next p1)))
+      ;; The cursor rides inside the elision now, not beside it — see
+      ;; `a-rows-mold-carries-an-elision-and-not-a-bare-cursor`.
+      (is (some? (get-in p1 [:elision :cursor])))
       (is (= [:i :j] (:table/cols p1))
           "the window projected only :i, but :table/cols still names every column on the
            handle — hiding a column must stay reversible, not one-way")
       (is (= [:i] (keys (first (:rendered p1))))
           "and the rendered row really was narrowed to what the window asked for")
       (let [p2 (srv/mold-payload st no-memory "tbl:w" nil
-                                 {:limit 100 :cursor (:page/next p1)})]
+                                 {:limit 100 :cursor (get-in p1 [:elision :cursor])})]
         (is (= 100 (:i (first (:rendered p2)))))))))
 
 (deftest a-mold-with-no-window-is-what-it-always-was
@@ -5530,16 +5532,21 @@
     (let [m (srv/mold-payload st no-memory "tbl:w" nil)]
       (is (= 250 (count (:rendered m)))
           "every caller that does not ask for a page still gets mold-cap")
-      (is (nil? (:page/next m))))))
+      (is (nil? (:elision m))
+          "no window means no page, so there is no hole to describe"))))
 
-(deftest an-aggregate-view-is-not-paged
+(deftest an-aggregate-view-has-no-elision
+  ;; Was `an-aggregate-view-is-not-paged`, asserting on the bare `:page/next`
+  ;; the elision replaced. Same fixture, same claim, read off the shape that
+  ;; now carries it.
   (let [st (sub/fresh-store)
         rs (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))]
     (sub/commit! st {:op :put :id "tbl:w"
                      :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
     (let [m (srv/mold-payload st no-memory "tbl:w" "table/summary" {:limit 10})]
-      (is (nil? (:page/next m))
-          "a summary has no next page — a window is for rows, not for a chart"))))
+      (is (nil? (:elision m))
+          "a summary is not a window over rows — a pager under a chart computed
+           from something else would be a lie"))))
 
 (deftest a-hostile-sort-and-cols-still-page
   ;; `window-params`' docstring claims neither field is trusted, because
@@ -5554,15 +5561,17 @@
         get! (fn [qs] (with-redefs [c/store (delay st) mem/memory no-memory]
                         (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
                                        :key-fn keyword)))
-        ;; `:total` and `:next`, not `:table/total`/`:page/next` — `json/write-str`
-        ;; renders a namespaced keyword KEY by its bare name, so `:table/total`
-        ;; and `:page/next` cross the wire as `"total"` and `"next"` and read
-        ;; back unnamespaced. That is the existing wire format, unrelated to
-        ;; this task; the assertions below read what actually arrives.
+        ;; `:total` and `:cols`, not `:table/total`/`:table/cols` —
+        ;; `json/write-str` renders a namespaced keyword KEY by its bare name,
+        ;; so they cross this route unnamespaced. That is the JSON wire format,
+        ;; and `transit-keeps-a-namespaced-keyword-and-json-does-not` is where it
+        ;; is measured rather than assumed; the assertions below read what
+        ;; actually arrives. `:elision` is already unnamespaced and survives
+        ;; either way, its own keys included.
         p (get! "id=tbl:w&limit=100&sort=nope,desc&cols=ghost,also-ghost")]
     (is (= 100 (count (:rendered p))))
     (is (= 250 (:total p)))
-    (is (some? (:next p)))
+    (is (some? (get-in p [:elision :cursor])))
     (is (= ["i"] (:cols p))
         "cols named nothing the table has, so project-cols fell back to every column")))
 
@@ -5586,7 +5595,7 @@
         p (get! "id=tbl:w")]
     (is (= 250 (count (:rendered p)))
         "the whole mold-cap sample, not a default-limit page")
-    (is (nil? (:next p)))))
+    (is (nil? (:elision p)) "and nothing describing a hole, because none was cut")))
 
 ;; ---------------------------------------------------------------------------
 ;; a notebook ships one page per cell
@@ -5614,7 +5623,8 @@
       (let [cell (first (:cells (srv/notebook-payload st "space:n")))]
         (is (= 100 (count (:rendered cell))) "a cell is a page, not a sample")
         (is (= 250 (:table/total cell))      "and it still says how big the table is")
-        (is (some? (:page/next cell)))))))
+        (is (some? (get-in cell [:elision :cursor]))
+            "and the rows it did not ship are reachable")))))
 
 ;; ---------------------------------------------------------------------------
 ;; the wire format: Transit beside JSON on /api/mold
@@ -5678,3 +5688,63 @@
           t (size "id=tbl:wide&limit=100&wire=transit")]
       (is (< t (* 0.8 j))
           (str "transit " t " vs json " j " — key caching should pay on a wide table")))))
+
+;; ---------------------------------------------------------------------------
+;; the elision: a hole that knows it is a hole
+;;
+;; Design §3.1. The payload's bare `:page/next` becomes a labelled hole carrying
+;; everything the caption and the next request need. `@lake/lake` and not a
+;; `with-lake` of this test's own, for the reason the window tests above give.
+;; ---------------------------------------------------------------------------
+
+(deftest a-rows-mold-carries-an-elision-and-not-a-bare-cursor
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [{:keys [elision] :as m} (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})]
+      (is (nil? (:page/next m)) "the bare cursor is gone")
+      (is (= 100 (:n elision)))
+      (is (= 0   (:offset elision)))
+      (is (= 250 (:total elision)))
+      (is (false? (:unbounded? elision)))
+      (is (= [:rendered] (:path elision)))
+      (is (string? (:cursor elision)) "opaque, and present because there IS a next page"))))
+
+(deftest an-elision-on-page-two-says-where-page-two-starts
+  ;; `:offset` is the server's fact and the caption's arithmetic runs off it, so
+  ;; a page that is not page one has to carry its own ordinal — not zero, and not
+  ;; the client's page index times a limit the client may have changed.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [p1 (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})
+          p2 (srv/mold-payload st no-memory "tbl:w" nil
+                               {:limit 100 :cursor (get-in p1 [:elision :cursor])})]
+      (is (= 100 (:offset (:elision p2))))
+      (is (= 100 (:i (first (:rendered p2)))) "and the rows really are the ones it names"))))
+
+(deftest the-last-page-has-no-elision
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 30)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (is (nil? (:elision (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})))
+        "nothing was omitted, so there is no hole to describe")))
+
+(deftest an-elision-survives-the-transit-wire-whole
+  ;; The two halves of this plan meet here: the elision is a map of UNnamespaced
+  ;; keys inside a payload whose own keys are namespaced, and the grid reads
+  ;; `:table/cols` and `:elision` out of the same map. JSON would hand it
+  ;; `"cols"`; Transit hands it both as written.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [m (transit-read (wire-body st "id=tbl:w&limit=100&wire=transit"))]
+      (is (= [:i] (:table/cols m)))
+      (is (= {:n 100 :offset 0 :total 250 :unbounded? false :path [:rendered]}
+             (dissoc (:elision m) :cursor))
+          "every field of the hole crosses the wire as itself")
+      (is (string? (:cursor (:elision m)))))))
