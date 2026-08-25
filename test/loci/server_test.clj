@@ -5483,3 +5483,96 @@
                                  :key-fn keyword)]
             (is (re-find #"X-Loci-Upload" (:error r))
                 "a request with no header is told what it is missing, not handed a stack trace")))))))
+
+;; ---------------------------------------------------------------------------
+;; /api/mold reads a window
+;;
+;; Tables land through `@lake/lake` — the suite's shared `:once` fixture lake —
+;; and not a separately opened `with-lake`, because `mold-payload` resolves
+;; `lake/lake` itself; rows put into a different lake instance would be
+;; unreachable through the route this exercises.
+;; ---------------------------------------------------------------------------
+
+(deftest a-mold-of-a-table-carries-one-page-and-a-cursor
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i :j (* i 2)}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [p1 (srv/mold-payload st no-memory "tbl:w" nil {:limit 100 :cols ["i"]})]
+      (is (= 100 (count (:rendered p1))))
+      (is (= 250 (:table/total p1)) "the true count is not the page's count")
+      (is (some? (:page/next p1)))
+      (is (= [:i :j] (:table/cols p1))
+          "the window projected only :i, but :table/cols still names every column on the
+           handle — hiding a column must stay reversible, not one-way")
+      (is (= [:i] (keys (first (:rendered p1))))
+          "and the rendered row really was narrowed to what the window asked for")
+      (let [p2 (srv/mold-payload st no-memory "tbl:w" nil
+                                 {:limit 100 :cursor (:page/next p1)})]
+        (is (= 100 (:i (first (:rendered p2)))))))))
+
+(deftest a-mold-with-no-window-is-what-it-always-was
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [m (srv/mold-payload st no-memory "tbl:w" nil)]
+      (is (= 250 (count (:rendered m)))
+          "every caller that does not ask for a page still gets mold-cap")
+      (is (nil? (:page/next m))))))
+
+(deftest an-aggregate-view-is-not-paged
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [m (srv/mold-payload st no-memory "tbl:w" "table/summary" {:limit 10})]
+      (is (nil? (:page/next m))
+          "a summary has no next page — a window is for rows, not for a chart"))))
+
+(deftest a-hostile-sort-and-cols-still-page
+  ;; `window-params`' docstring claims neither field is trusted, because
+  ;; `sort-spec` and `project-cols` validate both against the handle downstream.
+  ;; Proven end to end, through the actual route: a sort naming a column the
+  ;; table does not have and a cols list of nothing but unknown names must both
+  ;; come back as an ordinary first page — not an error, and not an empty table.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        _  (sub/commit! st {:op :put :id "tbl:w"
+                            :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory no-memory]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))
+        ;; `:total` and `:next`, not `:table/total`/`:page/next` — `json/write-str`
+        ;; renders a namespaced keyword KEY by its bare name, so `:table/total`
+        ;; and `:page/next` cross the wire as `"total"` and `"next"` and read
+        ;; back unnamespaced. That is the existing wire format, unrelated to
+        ;; this task; the assertions below read what actually arrives.
+        p (get! "id=tbl:w&limit=100&sort=nope,desc&cols=ghost,also-ghost")]
+    (is (= 100 (count (:rendered p))))
+    (is (= 250 (:total p)))
+    (is (some? (:next p)))
+    (is (= ["i"] (:cols p))
+        "cols named nothing the table has, so project-cols fell back to every column")))
+
+(deftest the-mold-route-with-no-window-params-is-not-paged
+  ;; `window-params` must answer nil for an ordinary request — no limit, cursor,
+  ;; sort or cols anywhere in the query string — because `mold-payload` branches
+  ;; on nil vs. a map to choose `hydrate` over `hydrate-page`. A `window-params`
+  ;; that answered `{}` here would page every plain `/api/mold` read down to
+  ;; `default-limit` rows, and no OTHER test in this file would catch it: every
+  ;; other route-level mold test either supplies a window param of its own or
+  ;; reads a table under `default-limit` anyway. Proven by breaking the guard in
+  ;; `window-params` to always return a map: this is the one assertion, of the
+  ;; whole suite, that went red.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        _  (sub/commit! st {:op :put :id "tbl:w"
+                            :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory no-memory]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))
+        p (get! "id=tbl:w")]
+    (is (= 250 (count (:rendered p)))
+        "the whole mold-cap sample, not a default-limit page")
+    (is (nil? (:next p)))))

@@ -747,3 +747,37 @@
                 (assoc gone :table/reclaimed at)
                 (throw e)))))))
     o))
+
+(defn hydrate-page
+  "`hydrate`, but for one page of a table rather than a `mold-cap` sample.
+
+   Returns the hydrated object with `:value` set to the page's rows,
+   `:table/total`, `:table/cols` set from the handle's FULL column list, and
+   `:page/next` set to the cursor for the next page, or nil on the last one.
+
+   **`:table/cols` is the handle's own list, not the page's.** A window may
+   narrow `:cols`, so the rows in `:value` can carry fewer keys than the table
+   has — and reading the column list back out of those rows would make hiding a
+   column one-way, since an unhidden one would have vanished from what a reader
+   could ever ask for again.
+
+   **Beside `hydrate` rather than a flag on it.** `hydrate` is reached from
+   thirteen places and twelve of them want the sample — its failure handling,
+   its `:table/unavailable` and `:table/source-drift` classification and its
+   `:table/passthrough` marker are all shared, so this delegates for a non-handle
+   value and for the failure paths and differs only in which read it issues."
+  [ts o window]
+  (if-not (and o (handle? (:value o)))
+    (hydrate ts o)
+    (let [ts (force ts)
+          h  (:value o)]
+      (try
+        (let [{:keys [rows next]} (page ts h window)]
+          (cond-> (assoc o :value rows :table/total (row-count ts h)
+                           :table/cols (:cols h) :page/next next)
+            (= :source (:store h)) (assoc :table/passthrough true)))
+        (catch Exception _
+          ;; one classifier, not two: a page that throws is the same broken
+          ;; table a sample would have been, and `hydrate` already knows how to
+          ;; say which way it is broken.
+          (hydrate ts o))))))

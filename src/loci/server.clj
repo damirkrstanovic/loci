@@ -54,6 +54,30 @@
              (let [[k v] (str/split pair #"=" 2)]
                [k (some-> v (java.net.URLDecoder/decode "UTF-8"))]))))
 
+(defn- window-params
+  "The window a query string asks for, or nil for none.
+
+   nil and not an empty map: `mold-payload` branches on it to choose
+   `hydrate-page` over `hydrate`, and every caller that is not the shell's Rows
+   view must keep getting the `mold-cap` sample it gets today.
+
+   `cols` is comma-separated. Every value here is validated downstream against
+   the handle — `page-limit` clamps, `sort-spec` and `project-cols` drop what the
+   table does not have — so nothing this function returns is trusted. Verified
+   end to end in `a-hostile-sort-and-cols-still-page`: a `sort` naming an unknown
+   column and a `cols` list of nothing but unknown names both come back as an
+   ordinary first page rather than an error or an empty table."
+  [params]
+  (let [limit  (params "limit")
+        cursor (params "cursor")
+        sort   (params "sort")
+        cols   (params "cols")]
+    (when (or limit cursor sort cols)
+      {:limit  limit
+       :cursor cursor
+       :sort   (when (seq sort) (str/split sort #"," 2))
+       :cols   (when (seq cols) (str/split cols #","))})))
+
 (defn- body-json [req] (when-let [b (:body req)] (json/read-str (slurp b) :key-fn keyword)))
 
 ;; ---- time travel: ?at=N freezes any read at a log prefix; /api/events
@@ -437,9 +461,18 @@
    `clojure.core/force` is identity on anything that is not a delay, so a caller
    already holding a memory — every entity test, and anything that would rather
    read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
-   pass it."
-  [st m id view]
-  (let [o (tbl/hydrate lake/lake (sub/object st id))]
+   pass it.
+
+   **The 5-arity takes a window, and it is used on the rows/cards branch only.**
+   `unusable`, `entity`, `flow`, `applet` and `view:` render nothing a pager
+   applies to, so `window` reaches only the `:else` branch's own guard — see its
+   comment for why a `table/summary` view must not carry `:page/next` even
+   though it was molded with a window."
+  ([st m id view] (mold-payload st m id view nil))
+  ([st m id view window]
+   (let [o (if window
+             (tbl/hydrate-page lake/lake (sub/object st id) window)
+             (tbl/hydrate lake/lake (sub/object st id)))]
     (cond
       ;; UNUSABLE — first, and before the view branches, because such a table
       ;; can still have a viewspec pointed at it and `vs/interpret` over `[]`
@@ -511,9 +544,22 @@
       ;; above just stopped being able to make for the function as a whole.
       :else
       (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
-        {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
-         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)
-         :source (source-block o)}))))
+        (cond-> {:id id :title (:title o) :kind (name (:kind mv))
+                 :view (when (:view mv) (kw->str (:view mv)))
+                 :label (:label mv) :rendered (:rendered mv)
+                 :alternatives (alternatives st o) :source (source-block o)}
+          ;; `:table/total` and `:table/cols` only when `hydrate`/`hydrate-page`
+          ;; actually put them on `o` — a doc, a report or a metric molds
+          ;; through this same branch and has neither, and a nil-valued key
+          ;; those payloads never carried before would be a regression, not a
+          ;; convenience.
+          (:table/total o) (assoc :table/total (:table/total o))
+          (:table/cols o) (assoc :table/cols (:table/cols o))
+          ;; `:page/next` ONLY for a viewer that renders rows. `table/summary`
+          ;; over a window would draw a pager under a chart computed from
+          ;; something else — a window is for rows, not for a chart.
+          (and (:page/next o) (#{:table/rows :table/cards} (:view mv)))
+          (assoc :page/next (:page/next o))))))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -3386,7 +3432,8 @@
                               :body (slurp (io/resource "public/index.html"))}
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
       (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) mem/memory
-                                                     (params "id") (params "view")))
+                                                     (params "id") (params "view")
+                                                     (window-params params)))
       (= uri "/api/events")  (json-resp (events-payload st))
       ;; `?deep=1` is the pause/Enter request, and the ONLY one that embeds. The
       ;; chunk singleton is forced here rather than in the params map so a
