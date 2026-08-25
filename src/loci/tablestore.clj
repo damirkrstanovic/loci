@@ -369,17 +369,26 @@
     (catch Exception _ nil)))
 
 (defn cursor-int
-  "The non-negative integer at `k` in a decoded cursor, or **0** for anything
-   else — missing, negative, or the wrong type.
+  "The integer at `k` in a decoded cursor, or `default` for anything else —
+   missing, the wrong type, or below `default`. The 2-arity defaults to 0.
 
    Split from `decode-cursor` on purpose: that function validates only that
    the whole cursor is a map, because it does not know a store's cursor
-   shape. A per-field check belongs to the store that DOES — `InlineTable`
-   uses this for `:i`, and `Lake`'s `:k`/`:o` fields (Task 2) can share it
-   rather than reimplement \"a malformed field means page 1\"."
-  [cursor k]
-  (let [v (get cursor k)]
-    (if (and (integer? v) (not (neg? v))) v 0)))
+   shape. A per-field check belongs to the store that DOES.
+
+   **`default` is not always 0, and passing it explicitly is the point.**
+   `InlineTable`'s `:i` is an index — page 1 starts at row 0, so the 2-arity
+   is right for it, and a future `Lake`'s `:o` (an OFFSET, Task 2) is the same
+   shape. `Lake`'s `:k` is a different thing: a bound on a 0-based `rowid`,
+   read back as `WHERE rowid > k`, so ITS start-of-table is `-1`, not `0` —
+   `rowid > 0` skips row 0 of every table. Call `(cursor-int cursor :k -1)`
+   for it; the 2-arity would silently reintroduce that off-by-one, and it is
+   also the reason the floor below is `default` and not a hardcoded `0` — a
+   `:k` of `-1` is the valid, empty-page-so-far case, not a malformed one."
+  ([cursor k] (cursor-int cursor k 0))
+  ([cursor k default]
+   (let [v (get cursor k)]
+     (if (and (integer? v) (>= v default)) v default))))
 
 (defn project-cols
   "The columns a window asks for, in the **handle's** order, or all of them.

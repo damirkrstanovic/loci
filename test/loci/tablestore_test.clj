@@ -416,6 +416,19 @@
     (is (= 0   (:id (first (:rows p))))
         "a crafted cursor with a wrong-typed field restarts at page 1, not a crash")))
 
+(deftest a-cursor-field-falls-back-to-what-its-store-means-by-the-start
+  ;; `:i`/`:o` are indices — page 1 starts at row 0. `:k` (Lake, Task 2) is a
+  ;; bound on a 0-based rowid read back as `WHERE rowid > k`, so ITS start is
+  ;; -1: `rowid > 0` would skip row 0 of every table. The 2-arity's hardcoded
+  ;; 0 is right for the first pair and wrong for the second, which is why
+  ;; cursor-int takes the default explicitly rather than assuming it.
+  (is (= 0  (tbl/cursor-int nil :i))     "an index starts at 0")
+  (is (= 0  (tbl/cursor-int {:i "x"} :i)) "and a wrong-typed one restarts")
+  (is (= -1 (tbl/cursor-int nil :k -1))
+      "a keyset bound starts BEFORE the first rowid — 0 would skip row 0")
+  (is (= -1 (tbl/cursor-int {:k "x"} :k -1))
+      "and a wrong-typed bound restarts at the same place"))
+
 (deftest a-window-projects-only-the-columns-it-asks-for
   (let [ts (tbl/inline-table)
         h  (tbl/put-rows! ts "tbl:big" many)]
