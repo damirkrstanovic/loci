@@ -5748,3 +5748,85 @@
              (dissoc (:elision m) :cursor))
           "every field of the hole crosses the wire as itself")
       (is (string? (:cursor (:elision m)))))))
+
+;; ---------------------------------------------------------------------------
+;; `:unbounded?` is a claim about the total, and a notebook budgets its response
+;;
+;; The `lf/with-temp-lake` + `with-temp-data-dir` pair is the idiom the source
+;; tests above already use: `connect!` resolves `@lake/lake` and writes through
+;; `sub/data-dir`, so both have to be the test's own.
+;; ---------------------------------------------------------------------------
+
+(deftest a-live-sources-total-is-marked-unbounded
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "live.csv")
+                _   (spit f (apply str "region,amount\n"
+                                   (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+                r   (src/connect! st {:uri (str "loci://files/" (.getName f)) :format :csv
+                                      :mode :passthrough :title "Live"})
+                e   (:elision (srv/mold-payload st no-memory (:id r) nil {:limit 100}))]
+            (is (= 250 (:total e)) "the count recorded at connect is still what it reports")
+            (is (true? (:unbounded? e))
+                "a passthrough total was recorded at connect and the file can have moved since")))))))
+
+(deftest a-materialised-tables-total-is-not-unbounded
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (is (false? (:unbounded? (:elision (srv/mold-payload st no-memory "tbl:w" nil {:limit 100}))))
+        "loci wrote these rows and nothing else can have changed them")))
+
+;; The budget: eight cells, not five.
+;;
+;; **Five is the fixture that cannot fail.** `notebook-budget` is 500 and
+;; `tbl/default-limit` is 100, so with five `:ref` cells the share IS the
+;; default — the test would report 500 rows against a 500 budget with the budget
+;; removed entirely, certifying a mechanism that was not there. Eight cells makes
+;; the share 62 and the unbudgeted number 800, which is the only arrangement in
+;; which the assertion is about anything.
+(def ^:private budget-cells ["tbl:a" "tbl:b" "tbl:c" "tbl:d" "tbl:e" "tbl:f" "tbl:g" "tbl:h"])
+
+(defn- notebook-of-tables
+  "A store holding one space whose cells are `ids`, each a 250-row table."
+  [ids]
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        mk (fn [id] {:op :put :id id :value (tbl/table-object @lake/lake id id rs {})})]
+    (sub/commit! st {:op :tx :events
+                     (conj (mapv mk ids)
+                           {:op :put :id "space:n"
+                            :value {:id "space:n" :kind :space :title "N"
+                                    :value {:intent "tables" :cells (mapv (fn [i] {:ref i}) ids)}}})})
+    st))
+
+(deftest a-notebooks-cells-share-one-budget
+  (let [st (notebook-of-tables budget-cells)]
+    (with-redefs [mem/memory no-memory]
+      (let [cells (:cells (srv/notebook-payload st "space:n"))
+            rows  (reduce + (map #(count (:rendered %)) cells))]
+        (is (= 8 (count cells)))
+        (is (<= rows srv/notebook-budget)
+            (str "eight cells shipped " rows " rows; the budget is the response, not the table"))
+        (is (every? #(pos? (count (:rendered %))) cells)
+            "and every cell still draws — a budget divides, it does not starve")))))
+
+(deftest a-notebook-with-more-cells-than-budget-still-draws-every-one
+  ;; The `(max 1 …)` floor. A budget smaller than the cell count would divide to
+  ;; zero, and a payload of eight empty grids is worse than a payload of eight
+  ;; single rows: it looks like eight empty tables. Redefining the budget rather
+  ;; than building a 501-cell notebook — the arithmetic is the same and the
+  ;; fixture costs eight tables instead of five hundred.
+  (let [st (notebook-of-tables budget-cells)]
+    (with-redefs [mem/memory no-memory srv/notebook-budget 3]
+      ;; Counts and not the cells themselves: `is` prints the whole failing
+      ;; value, and eight molded 100-row cells is a wall of output nobody reads.
+      (let [counts (mapv #(count (:rendered %)) (:cells (srv/notebook-payload st "space:n")))]
+        (is (= 8 (count counts)))
+        (is (= [1 1 1 1 1 1 1 1] counts)
+            "a share of zero is floored at one row, not at an empty grid")))))

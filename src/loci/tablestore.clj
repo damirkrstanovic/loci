@@ -773,6 +773,10 @@
    `:page/offset` set to how many rows precede this page, and `:page/next` set
    to the cursor for the next page, or nil on the last one.
 
+   A `:source` handle additionally gets `:table/unbounded`, because its
+   `:table/total` is a count taken at connect over a file that can have been
+   rewritten since — see the assoc below.
+
    **`:table/cols` is the handle's own list, not the page's.** A window may
    narrow `:cols`, so the rows in `:value` can carry fewer keys than the table
    has — and reading the column list back out of those rows would make hiding a
@@ -794,7 +798,15 @@
           (cond-> (assoc o :value rows :table/total (row-count ts h)
                            :table/cols (:cols h)
                            :page/offset offset :page/next next)
-            (= :source (:store h)) (assoc :table/passthrough true)))
+            ;; A `:source` handle's row count was recorded at connect and the
+            ;; file it counted can have been rewritten since with no event
+            ;; anywhere — the same reason `:table/passthrough` exists. So the
+            ;; total is a claim, and the caption has to say so: `1,975+` rather
+            ;; than a confident wrong number. Clerk's `bounded-count` reaches
+            ;; the same label from the other direction, refusing to force a lazy
+            ;; sequence to find a total it can only bound.
+            (= :source (:store h)) (assoc :table/passthrough true
+                                          :table/unbounded true)))
         (catch Exception _
           ;; one classifier, not two: a page that throws is the same broken
           ;; table a sample would have been, and `hydrate` already knows how to

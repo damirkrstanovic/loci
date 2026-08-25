@@ -1035,9 +1035,47 @@
 
 ;; ---- notebook payload: cells hydrated (each ref molded by its chosen view),
 ;; rail links and also-in chips computed fresh every time ----
+
+(def notebook-budget
+  "How many rows a whole notebook payload may carry, across every `:ref` cell.
+
+   **The response is the thing that was too big, not the table.** Measured on
+   the real substrate before this work: one 36-column, 2,000-row cell was
+   5,428,753 bytes, and `notebook-payload` merges one mold per cell — so five
+   such cells were five copies of that in a single response. `mold-cap` bounds a
+   table; nothing bounded the response.
+
+   Clerk's `:!budget` is the same idea and defaults to 200 items. 500 here
+   because loci's cells are tables rather than arbitrary nested values, and a
+   notebook of five tables showing 100 rows each is an ordinary page."
+  500)
+
 (defn notebook-payload [st id]
   (let [o (sub/object st id)
         {:keys [connected also-in]} (nb/links st id)
+        cs   (nb/cells-of o)
+        ;; Counted BEFORE anything is molded, because the share has to be the
+        ;; same for every cell — a budget spent greedily by whichever cell is
+        ;; first is a page whose last table is empty for no reason a reader can
+        ;; see.
+        refs (count (filter :ref cs))
+        ;; A share each, but **never more than an ordinary page**, and floored
+        ;; at one row.
+        ;;
+        ;; The `min` is the half that is easy to leave out and wrong to. A
+        ;; budget is a ceiling on the response, not a target to spend: without
+        ;; it a notebook of ONE table cell claims the whole 500, `page-limit`
+        ;; clamps that to its 200-row `max-limit`, and a single-table notebook
+        ;; silently doubles its page — a bound that makes the common case bigger
+        ;; is not a bound. `a-notebook-cell-carries-one-page-and-not-the-whole-sample`
+        ;; is the test that says so, in rows.
+        ;;
+        ;; The `max 1` at the front is the crowded end: six hundred table cells
+        ;; divide to zero, and a payload of six hundred empty grids reads as six
+        ;; hundred empty tables rather than as a crowded notebook. The inner
+        ;; `max 1` is only against division by zero, for a notebook of nothing
+        ;; but text.
+        per  (max 1 (min tbl/default-limit (quot notebook-budget (max 1 refs))))
         cells (vec (map-indexed
                     (fn [i c]
                       (cond
@@ -1051,10 +1089,17 @@
                                ;; one and pages from there like the molder does.
                                ;; Passing nil here is what shipped five copies of
                                ;; a mold-cap sample in one response.
+                               ;;
+                               ;; `per` and not `tbl/default-limit`: `mold-cap`
+                               ;; bounds a table and this bounds the RESPONSE,
+                               ;; which is what was actually too big. Every cell
+                               ;; keeps its own elision, so a cell squeezed by a
+                               ;; crowded notebook is still a page one you can
+                               ;; walk forward from.
                                (mold-payload st mem/memory (:ref c) (:view c)
-                                             {:limit tbl/default-limit}))
+                                             {:limit per}))
                         :else {:i i :type "missing" :ref (:ref c)}))
-                    (nb/cells-of o)))]
+                    cs))]
     {:id id :title (:title o) :intent (get-in o [:value :intent])
      :spawned-by (get-in o [:value :spawned-by])
      :cells cells :connected connected :events (count (sub/history st))}))
