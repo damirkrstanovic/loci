@@ -291,6 +291,26 @@ dominates a passthrough read. Nobody has measured it at the scale this design is
 fixture cannot say. It is here because Task 8 makes every column header a sort control on every
 table, so a person sorting a live CSV by a repeated value is an ordinary act and not an edge case.
 
+### 2.3.2 What the unsorted passthrough branch depends on, named rather than assumed
+
+An unsorted `:source` page carries **no `ORDER BY` at all** — and that is the most ordinary thing a
+person will do with a connected CSV, so the walk's "none lost, none served twice" contract rests on
+`read_csv` scanning the file the same way across separate queries at different offsets.
+
+**That rests on `preserve_insertion_order`, which is DuckDB's own default of `true`, and loci sets it
+nowhere.** Established from DuckDB's documentation — with the setting on, the system does not
+re-order results that carry no `ORDER BY` — and confirmed as the live value on the lake's
+connection. It is named here and in `page` so that it is a documented dependency rather than an
+assumption, and so that anyone who turns it off knows what they are turning off.
+
+**A failed reproduction is recorded here as a failed reproduction, not as safety.** With the setting
+forced to `false`, a walk at 250 rows and two different probes at 200,000 rows produced no lost or
+duplicated row. That is a negative result. It does not establish the contract holds at the 10M-row
+parallel-scan scale this design targets — it only says the hazard did not appear where it was
+looked for, which is worth less than the tie hazard's positive reproduction at 250 rows in §2.3.1.
+No `ORDER BY` was added to the unsorted branch on the strength of it: putting a full sort on the
+common path is a cost nobody has felt.
+
 ### 2.4 Previous
 
 Keyset has no natural backwards step. The shell keeps a stack of the cursors that began each page
