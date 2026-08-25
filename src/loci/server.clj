@@ -50,13 +50,23 @@
    :headers {"Content-Type" "application/json; charset=utf-8"}
    :body (json/write-str data)})
 
-;; SPIKE 2026-08-25 — Transit beside JSON, chosen per request by `?wire=transit`.
-;; The one thing it is here to settle: `json/write-str` renders a NAMESPACED
-;; keyword key by its bare name, so `:table/total` reaches the shell as "total"
-;; and `:page/next` as "next". That is not a preference — it silently broke two
-;; tasks of the paging plan, and `index.html` has carried a comment about it
-;; since `reclaimedHTML` was written. Transit round-trips the keyword whole.
-(defn- transit-resp [data]
+(defn- transit-resp
+  "`data` as Transit-JSON, the alternative wire format `wire-resp` selects.
+
+   **The one thing it is here to settle: a namespaced keyword survives.**
+   `json/write-str` renders a namespaced keyword KEY by its bare name, so
+   `:table/total` reaches the shell as `\"total\"`. That is not a preference — it
+   silently broke two tasks of the paging plan, and `index.html` has carried a
+   comment about it since `reclaimedHTML` was written. Measured in
+   `transit-keeps-a-namespaced-keyword-and-json-does-not`, which asserts both
+   halves: the JSON body really does lose the namespace, and the Transit body
+   really does read back as the keyword.
+
+   `:json` and not `:json-verbose`, which matters for more than taste — the
+   compact form caches a repeated map key, so a wide table writes each column
+   name once rather than once per row. Measured 2026-08-25 on a 36-column,
+   100-row page: 100,460 bytes of JSON against 58,873 of Transit."
+  [data]
   (let [out (java.io.ByteArrayOutputStream. 4096)]
     (transit/write (transit/writer out :json) data)
     {:status 200
@@ -64,9 +74,15 @@
      :body (.toString out "UTF-8")}))
 
 (defn- wire-resp
-  "`?wire=transit` opts one request into Transit. Every existing caller is
-   untouched and still gets JSON — the spike has to prove the seam, not migrate
-   the shell."
+  "`?wire=transit` opts one request into Transit; anything else gets `json-resp`.
+
+   **Only `/api/mold` is routed through here.** Every other route in `handler`
+   calls `json-resp` directly, so `wire=transit` on one of them is an ignored
+   query parameter rather than a second format — the switch is per-request only
+   within the one route that offers it. That is deliberate: the ClojureScript
+   grid is the only client that needs the namespace back, and a request with no
+   `wire` param is byte-for-byte the JSON every existing caller reads
+   (`a-request-without-wire-transit-is-byte-identical-to-today`)."
   [params data]
   (if (= "transit" (params "wire")) (transit-resp data) (json-resp data)))
 

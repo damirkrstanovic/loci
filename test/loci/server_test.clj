@@ -3,6 +3,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
+            [cognitect.transit :as transit]
             [loci.agent :as agent]
             [loci.content :as c]
             [loci.embed :as embed]
@@ -72,6 +73,16 @@
    and `rerun-writes-a-handle-and-not-the-refreshed-rows`."
   [st id]
   (:value (tbl/hydrate lake/lake (sub/object st id))))
+
+(defn- transit-read
+  "Read a Transit response body back into Clojure data.
+
+   The point of reading rather than only grepping the string: `~:table/total` in
+   the body proves the writer emitted a namespaced keyword, and this proves a
+   reader turns it back into one. Those are two halves of the same claim and the
+   shell only benefits from both."
+  [^String s]
+  (transit/read (transit/reader (java.io.ByteArrayInputStream. (.getBytes s "UTF-8")) :json)))
 
 (deftest exit-closes-a-lake-that-was-opened
   (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-hook-" (System/nanoTime))
@@ -5604,3 +5615,66 @@
         (is (= 100 (count (:rendered cell))) "a cell is a page, not a sample")
         (is (= 250 (:table/total cell))      "and it still says how big the table is")
         (is (some? (:page/next cell)))))))
+
+;; ---------------------------------------------------------------------------
+;; the wire format: Transit beside JSON on /api/mold
+;;
+;; **The lake is `@lake/lake`, not a `with-lake` of this test's own**, for the
+;; same reason the window tests above say so: `mold-payload` resolves
+;; `lake/lake` itself, so rows landed in a separately opened lake would be
+;; unreachable through the route under test. **And `c/store` is redefined**,
+;; because `handler` reads the store through `(store)` — a test that skips that
+;; asks the user's real data directory for `tbl:w`.
+;; ---------------------------------------------------------------------------
+
+(defn- wire-body
+  "The raw body `/api/mold` answers `qs` with, against `st`."
+  [st qs]
+  (with-redefs [c/store (delay st) mem/memory no-memory]
+    (:body (srv/handler {:uri "/api/mold" :query-string qs}))))
+
+(deftest transit-keeps-a-namespaced-keyword-and-json-does-not
+  ;; The bug this exists to end: `clojure.data.json` renders a namespaced
+  ;; keyword KEY by its bare name, so `:table/total` reaches the shell as
+  ;; "total". Two tasks of the previous plan read `m['table/total']` and would
+  ;; have found undefined; `a-hostile-sort-and-cols-still-page` above reads
+  ;; `:total` and `:next` for exactly this reason.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 30)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [json    (wire-body st "id=tbl:w&limit=5")
+          transit (wire-body st "id=tbl:w&limit=5&wire=transit")]
+      (is (str/includes? json "\"total\"")
+          "JSON strips the namespace — this is the behaviour being routed around")
+      (is (not (str/includes? json "table/total")))
+      (is (str/includes? transit "~:table/total")
+          "Transit writes the keyword whole")
+      (is (= 30 (:table/total (transit-read transit)))
+          "and it reads back as the keyword, not as a string key"))))
+
+(deftest a-request-without-wire-transit-is-byte-identical-to-today
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "doc:d"
+                     :value {:id "doc:d" :kind :doc :title "D" :value "hello"}})
+    (with-redefs [c/store (delay st) mem/memory no-memory]
+      (let [r (srv/handler {:uri "/api/mold" :query-string "id=doc:d"})]
+        (is (= "application/json; charset=utf-8" (get-in r [:headers "Content-Type"])))
+        (is (= (json/write-str (srv/mold-payload st no-memory "doc:d" nil)) (:body r))
+            "no `wire` param means the JSON body every existing caller reads")))))
+
+(deftest transit-is-smaller-than-json-on-a-wide-page
+  ;; Transit caches repeated map keys, so a wide table writes each column name
+  ;; once rather than once per row. Asserting a RATIO and not a byte count — the
+  ;; count is one fixture's arithmetic, the ratio is the mechanism.
+  (let [st   (sub/fresh-store)
+        cols (mapv #(keyword (str "column_name_" %)) (range 36))
+        rs   (vec (for [i (range 200)]
+                    (into {} (map (fn [c] [c (str "value-" i)])) cols)))
+        size (fn [qs] (count (.getBytes ^String (wire-body st qs) "UTF-8")))]
+    (sub/commit! st {:op :put :id "tbl:wide"
+                     :value (tbl/table-object @lake/lake "tbl:wide" "Wide" rs {})})
+    (let [j (size "id=tbl:wide&limit=100")
+          t (size "id=tbl:wide&limit=100&wire=transit")]
+      (is (< t (* 0.8 j))
+          (str "transit " t " vs json " j " — key caching should pay on a wide table")))))
