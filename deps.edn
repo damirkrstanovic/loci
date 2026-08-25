@@ -103,7 +103,7 @@
   ;; sees a .cljs file on `src` or `test`, and so this alias is the only thing
   ;; that knows CLJS exists. `test-cljs` is here and not on `:test` because
   ;; `cljs.test` runs in Node, not in the JVM suite:
-  ;;   clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
+  ;;   npm run test:cljs   (the raw compile+node reports a zero-test run as green)
   ;; `:replace-deps`, NOT `:extra-deps`. The CLJS build has no business loading
   ;; Datalevin or DuckDB — and one of them bites: `datalevin/datalevin 1.0.0`
   ;; pulls `io.github.nextjournal/markdown`, whose jar carries a `deps.cljs`

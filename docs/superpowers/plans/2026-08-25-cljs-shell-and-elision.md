@@ -19,7 +19,7 @@
 - **Measure, don't assert.** A browser test that checks a CSS rule is present passes while the header scrolls away. Assert on measured positions and sizes.
 - **`rg -n`, never `rg -rn`** — `-r` is *replace* and silently rewrites every match in the output. Plain `grep` is unreliable on `index.html` because of its long lines.
 - **Everything FOREGROUND**, timeout up to 900000 ms. Never background a command; two subagents have already parked on a backgrounded browser run in this project.
-- **Two Clojure suites and one JS suite.** `clojure -M:test`, `npm run test:browser`, and from Task 2 also `clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs`.
+- **Two Clojure suites and one JS suite.** `clojure -M:test`, `npm run test:browser`, and from Task 2 also `npm run test:cljs`. **Always the npm script, never the raw `compile test && node …`** — a `:node-test` build whose `:ns-regexp` matches nothing prints `Ran 0 tests` and exits 0, so the raw form reports a suite that is not there as green. The script is the guard.
 
 ## What the spike already left in place
 
@@ -237,17 +237,21 @@ Without this, every ClojureScript change is verified by a Playwright run measure
 - [ ] **Step 4: Run it.**
 
 ```
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
+npm run test:cljs
 ```
 
 Expected: `Testing loci.cljs-smoke-test` … `Ran 1 tests containing 1 assertions. 0 failures, 0 errors.` **Report the wall-clock time** — it is the number that justifies this task.
+
+Add it to `package.json`'s `scripts` beside `test:browser`, **with a guard on the test count**, and quote `npm run test:cljs` everywhere after this. A `:node-test` build whose `:ns-regexp` matches nothing compiles, prints `Ran 0 tests containing 0 assertions` and **exits 0**, while a real failure exits 1 — so the raw `compile test && node …` cannot tell a suite that passed from a suite that was not there, and Tasks 6–10 put every ClojureScript test in this plan behind it.
+
+POSIX `case` on the captured transcript, not `grep` in a pipeline: a pipeline's exit status is its LAST stage's, so `node … | grep …` discards node's. Measured 2026-08-25 against GNU grep 3.12, `node … | tee /dev/stderr | grep -qv 'Ran 0 tests'` exits **0 on a failing run and 0 on a zero-test run** — it catches neither of the two things it was for, because `-qv` asks "is any line NOT this?", which every transcript answers yes to.
 
 - [ ] **Step 5: Prove it bites.** `:ns-regexp` matches the *namespace*, so rename the file to `test-cljs/loci/cljs_smoke.cljs` and its ns to `loci.cljs-smoke` (shadow-cljs requires the two to agree), recompile, and confirm the runner reports **0 tests** rather than passing. Measured 2026-08-25: the build drops from 79 compiled files to 51, prints `Ran 0 tests containing 0 assertions`, and **exits 0** — while a real failure exits 1. Nothing downstream can tell those apart, which is the whole reason this file exists. Restore, then break the assertion too (`(def ^:export mount 42)` in `loci.grid`) and confirm `expected: (fn? grid/mount) / actual: (not (fn? 42))`.
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add shadow-cljs.edn deps.edn test-cljs/loci/cljs_smoke_test.cljs
+git add shadow-cljs.edn deps.edn package.json test-cljs/loci/cljs_smoke_test.cljs
 git commit -m "test: ClojureScript runs in Node, so the shell stops being Playwright-only"
 ```
 
@@ -725,7 +729,7 @@ The spike's 77 lines are replaced. Two namespaces: `grid` owns state and effects
 - [ ] **Step 2: Run, watch fail.**
 
 ```
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
+npm run test:cljs
 ```
 
 - [ ] **Step 3: Implement `src-cljs/loci/grid.cljs`.**
@@ -1118,7 +1122,7 @@ test('a long value is clipped in the tooltip', async () => {
 
 ```
 npm run test:browser
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
+npm run test:cljs
 ```
 
 ```bash
@@ -1543,6 +1547,6 @@ git commit -m "feat: the ClojureScript grid is the table, and tableHTML is gone"
 
 ## Finishing
 
-- [ ] `clojure -M:test`, `node target/cljs-test.cjs` and `npm run test:browser`, all green, all foreground.
+- [ ] `clojure -M:test`, `npm run test:cljs` and `npm run test:browser`, all green, all foreground.
 - [ ] Update the spec's Status to **built and measured, 2026-08-25**, and record what building changed — in particular the Replicant event-placeholder spelling from Task 8, the real per-cell budget arithmetic from Task 5, and how many browser tests Task 11 had to rewrite.
 - [ ] `superpowers:finishing-a-development-branch` to decide how `spike-cljs` lands, and whether it merges into `paged-table-grid` or replaces it.

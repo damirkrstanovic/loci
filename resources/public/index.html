@@ -611,8 +611,8 @@
 <div class="modal" id="modal"></div>
 
 <script>
-// The ClojureScript grid, opt-in until it reaches parity with tableHTML (Task
-// 12, which deletes both this flag and tableHTML). `?cljs` on the URL, so a
+// The ClojureScript grid, opt-in until it reaches parity with tableHTML — at
+// which point both this flag and tableHTML go. `?cljs` on the URL, so a
 // reviewer can put the two renderers side by side in two tabs.
 const CLJS_GRID = new URLSearchParams(location.search).has('cljs');
 const POST = (url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
