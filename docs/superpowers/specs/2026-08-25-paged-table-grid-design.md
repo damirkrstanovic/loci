@@ -247,6 +247,50 @@ everywhere — and it is what lets the table above change without the shell chan
 the one invariant in this section that a test must defend: the shell must never branch on cursor
 content.
 
+### 2.3.1 Measured 2026-08-25 while building: the tie hazard is real, and OFFSET has one of its own
+
+Two findings from implementing §2.3, both measured over the 250-row / 5-group fixture. Per the
+working agreement: at that size they **establish that the mechanisms behave as described**, and say
+nothing about cost at scale.
+
+**The tie hazard §2.3 asserts is real, and now has a number.** Keyset on the sort column alone —
+`WHERE grp > '<last>' ORDER BY grp`, cursor carrying the last sort value — walked over 5 groups of
+50 at a limit of 40 returns **200 of 250 rows. 50 lost, 20%**: each page boundary lands inside a
+tied run and the `>` predicate skips whatever remains of it. That is the evidence for this
+section's decision to page a sort by offset, and until 2026-08-25 the decision rested on reasoning
+alone.
+
+**The plan's own sabotage for this could not have shown it, and said it would.** Dropping
+`(nil? srt)` from `seek?` loses **zero** rows: the SQL `cond` takes the `seek?` branch first, so the
+sort never reaches the query and the walk is a complete rowid walk in the wrong order. It fails on
+*"the walk is in sort order"* and on nothing else. A sabotage that fails for a different reason than
+the one written next to it is the failure mode the whole discipline exists to catch, and it was
+caught by tracing the branch rather than by reading the table.
+
+**`ORDER BY … LIMIT … OFFSET …` is not stable across pages when the sort column has ties.**
+Measured: the same query at `OFFSET 0` and at `OFFSET 40` do not slice one consistent order —
+DuckDB's top-N pushdown resolves a tie differently depending on how many rows the plan must
+materialise, so two pages can both return a row and both skip another. This defeated the tie test
+**on the unsabotaged implementation**, at 205 distinct rows out of 250 walked.
+
+So the offset branch needs a tiebreaker that makes the order **total**, and the two handle modes get
+different ones:
+
+| handle | sorted `ORDER BY` |
+|---|---|
+| Lake, materialised | `<col> <dir> NULLS LAST, rowid ASC` — a unique key, so the order is total outright |
+| Lake, `:source` | `<col> <dir> NULLS LAST, <every other projected column>` — no `rowid` exists, so the widest available key |
+
+A `:source` handle's fix is total on the row's **values** rather than on its identity. Two rows
+identical in every projected column are indistinguishable to any caller, so the concatenation of
+pages still yields the correct multiset — which is all that can be observed.
+
+**The `:source` fix is a correctness fix whose cost is unmeasured.** A wider sort key makes each
+comparison more expensive; it does not change the algorithmic class, and the `ORDER BY` already
+dominates a passthrough read. Nobody has measured it at the scale this design is for, and the
+fixture cannot say. It is here because Task 8 makes every column header a sort control on every
+table, so a person sorting a live CSV by a repeated value is an ordinary act and not an edge case.
+
 ### 2.4 Previous
 
 Keyset has no natural backwards step. The shell keeps a stack of the cursors that began each page

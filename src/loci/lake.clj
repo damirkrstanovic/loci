@@ -753,6 +753,33 @@
 
 (defn- select-cols [cols] (str/join ", " (map ident cols)))
 
+(defn- tiebreak-order
+  "ORDER BY terms for every column in `proj` other than `sort-col` — a total
+   order on the row's *values*, for a handle with no `rowid` to fall back on.
+
+   Two rows identical in every projected column are indistinguishable to any
+   caller, so this is the widest tiebreaker that can matter: once it is
+   exhausted, the multiset a paged walk returns is correct even though no two
+   rows can be told apart by position. Cost is unmeasured — a wider sort key
+   makes each comparison do more work, though it does not change the
+   algorithmic class, since the sort already dominates the query either way.
+
+   Excludes `sort-col` itself so it is not named twice in one ORDER BY — the
+   second mention would be dead weight, since the first already resolves every
+   tie it could break.
+
+   `NULLS LAST` on each term explicitly, even though a plain `ASC`/`DESC`
+   already measured as NULLS-last by default here (DuckDB's own default —
+   `(VALUES (1),(NULL),(3),(2))` ordered `ASC` came back `1 2 3 nil`, and
+   `DESC` came back `3 2 1 nil`, both nulls-last with no clause at all).
+   Written out anyway because the guarantee this function exists for should
+   not depend on a server default nobody here controls."
+  [proj sort-col]
+  (->> proj
+       (remove #(= (name sort-col) (name %)))
+       (map #(str ", " (ident %) " ASC NULLS LAST"))
+       (apply str)))
+
 (defn- current-snapshot
   "The snapshot id the lake's write head is at.
 
@@ -1265,10 +1292,22 @@
     ;; sabotage. Appending `, rowid ASC` after the requested column — for a
     ;; `:lake` handle only, since `:source` has no `rowid` to append — measured
     ;; stable across the same two offsets: the 0-offset and 40-offset windows
-    ;; now agree with a plain full-table sort sliced in memory. A `:source`
-    ;; handle sorted with ties has the identical nondeterminism and no fix
-    ;; available here; nothing in this task's tests exercises that combination,
-    ;; so it is left as a known gap rather than patched blind.
+    ;; now agree with a plain full-table sort sliced in memory. Checked
+    ;; separately for `DESC` — a `DESC` primary term with an `ASC` tiebreaker
+    ;; is a mixed direction and not something the `ASC` result can be assumed
+    ;; to cover: without the tiebreaker, `ORDER BY "grp" DESC NULLS LAST` at
+    ;; OFFSET 0 and OFFSET 40 over these same 250 rows disagreed with a
+    ;; full-table DESC sort sliced in memory, same as the `ASC` case; with
+    ;; `, rowid ASC` appended, both offsets agreed with it.
+    ;;
+    ;; A `:source` handle has the identical nondeterminism and no `rowid` —
+    ;; this is reachable the moment a person sorts a live passthrough table by
+    ;; a column with repeats, which Task 8 makes routine, so `tiebreak-order`
+    ;; is the fallback: every OTHER projected column, appended to the ORDER BY.
+    ;; Two rows tied in every projected column are what a caller can no longer
+    ;; tell apart anyway, so exhausting the projection is a total order on
+    ;; everything that could matter. See its docstring for the NULLS-LAST and
+    ;; cost notes.
     (let [lim   (tbl/page-limit (:limit window))
           proj  (tbl/project-cols h (:cols window))
           srt   (tbl/sort-spec h (:sort window))
@@ -1283,7 +1322,9 @@
                            srt   (str " ORDER BY " (ident (first srt))
                                       (if (= "desc" (second srt)) " DESC" " ASC")
                                       " NULLS LAST"
-                                      (when (not= :source (:store h)) ", rowid ASC")))
+                                      (if (= :source (:store h))
+                                        (tiebreak-order proj (first srt))
+                                        ", rowid ASC")))
                      " LIMIT " (inc lim)
                      (when-not seek? (str " OFFSET " (long off))))
           got   (q-as lk sql (vec ks))

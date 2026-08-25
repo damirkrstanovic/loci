@@ -1274,6 +1274,32 @@
         (is (= [:region :amount] (vec (keys (first (:rows p1))))))
         (finally (lf/rm-rf dir))))))
 
+(deftest a-passthrough-source-continues-across-a-tie-in-the-sort-column
+  ;; The lake-table twin of this is `a-sorted-page-continues-across-a-tie-in-
+  ;; the-sort-column`; this is the same 250-row, 5-group shape over a `:source`
+  ;; handle, which has no `rowid` to fall back on for a tiebreaker. Not
+  ;; theoretical: Task 8 puts a sort control on every column header of every
+  ;; table, including a live passthrough source, so a person sorting a CSV by
+  ;; a repeated-value column hits this the first time they try it.
+  (with-lake [lk]
+    (let [dir  (str (System/getProperty "java.io.tmpdir") "/loci-page-src-sort-" (System/nanoTime))
+          _    (.mkdirs (java.io.File. dir))
+          csv  (java.io.File. dir "rows.csv")
+          _    (spit csv (apply str "region,amount\n"
+                                (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+          h    {:store :source :uri (str "file://" (.getAbsolutePath csv)) :format :csv
+                :cols [:region :amount] :raw ["region" "amount"] :rows 250}
+          walk (fn [] (loop [c nil acc []]
+                        (let [p (tbl/page lk h {:limit 40 :cursor c :sort ["region" "asc"]})
+                              acc (into acc (:rows p))]
+                          (if (:next p) (recur (:next p) acc) acc))))
+          all  (walk)]
+      (try
+        (is (= 250 (count all)) "no row is lost at a boundary inside a tie")
+        (is (= 250 (count (distinct (map :amount all)))) "and none is served twice")
+        (is (= (sort (map :region all)) (map :region all)) "the walk is in sort order")
+        (finally (lf/rm-rf dir))))))
+
 (deftest a-window-that-hides-a-column-hides-it-in-the-sql
   (with-lake [lk]
     (let [h (tbl/put-rows! lk "tbl:c" [{:a 1 :b 2 :c 3}])]
