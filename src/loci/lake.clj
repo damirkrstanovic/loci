@@ -780,6 +780,45 @@
        (map #(str ", " (ident %) " ASC NULLS LAST"))
        (apply str)))
 
+(defn- source-handle?
+  "A `:source` handle names a `read_csv`/passthrough relation rather than a
+   materialised table — no `rowid`, no key of any kind. One predicate rather
+   than `(= :source (:store h))` at one site and `(not= …)` at another: the
+   two used to disagree in *form* (a double negative in `page`'s `seek?` and
+   its mirror in the tiebreak dispatch), which is the kind of thing a later
+   edit inverts by accident."
+  [h]
+  (= :source (:store h)))
+
+(defn- sorted-order-by
+  "The ` ORDER BY …` clause for a sorted page, including the tiebreaker that
+   makes the order total.
+
+   Needed because `ORDER BY <col> … LIMIT … OFFSET …` is not guaranteed
+   stable across separate queries that differ only in OFFSET once the sort
+   column ties — DuckDB's own top-N pushdown can resolve a tie differently
+   depending on how many rows it has to materialise, so two pages of one
+   query can both return a row and both skip another. Checked for ASC and
+   DESC, and for both handle kinds — see §2.3.1 of
+   `docs/superpowers/specs/2026-08-25-paged-table-grid-design.md` for the
+   measurements this rests on: the size of the failure on the unsabotaged
+   code, and the size of the fix below.
+
+   `:lake` gets `, rowid ASC` — a unique key, so the order is total outright.
+   `:source` has no rowid, so the fallback is `tiebreak-order`: every OTHER
+   projected column, appended to the ORDER BY. Two rows tied in every
+   projected column are what a caller can no longer tell apart anyway, so
+   exhausting the projection is a total order on everything that could
+   matter — see `tiebreak-order`'s own docstring for the NULLS-LAST and cost
+   notes."
+  [h proj srt]
+  (str " ORDER BY " (ident (first srt))
+       (if (= "desc" (second srt)) " DESC" " ASC")
+       " NULLS LAST"
+       (if (source-handle? h)
+         (tiebreak-order proj (first srt))
+         ", rowid ASC")))
+
 (defn- current-snapshot
   "The snapshot id the lake's write head is at.
 
@@ -1273,58 +1312,53 @@
     ;; nullable sort column vanish. Both would be paid to speed up a query that
     ;; is dominated by its ORDER BY however it is paginated, and nobody has
     ;; measured that. §2.3 keeps the compound key written down as the first thing
-    ;; to reach for the day someone feels it.
+    ;; to reach for the day someone feels it. `sorted-order-by` is where the
+    ;; ORDER BY itself — and the tiebreaker an offset needs to stay correct —
+    ;; gets built.
     ;;
     ;; A `:source` handle has no key of any kind — `rowid` is a binder error over
     ;; `read_csv` and `file_row_number` is not a valid `read_csv` parameter — so
     ;; it is always the offset branch. Its scan is not new: `read_csv` in a FROM
     ;; clause re-parses the file on every read, including page 1's.
     ;;
-    ;; **The sorted OFFSET branch needs its own tiebreaker, and this is a fix to
-    ;; the plan, not a restatement of it.** Measured directly against this
-    ;; table: `ORDER BY grp ASC NULLS LAST LIMIT 41 OFFSET 0` and the same query
-    ;; with `OFFSET 40` do NOT slice one consistent order — DuckDB's top-N
-    ;; pushdown for `ORDER BY … LIMIT … OFFSET …` resolves a tie differently
-    ;; depending on how many rows the plan has to materialise, so two pages of
-    ;; the identical query differing only in OFFSET can both return row 25 and
-    ;; both skip another. That is `a-sorted-page-continues-across-a-tie-in-the-
-    ;; sort-column` failing on its own "none is served twice" long before any
-    ;; sabotage. Appending `, rowid ASC` after the requested column — for a
-    ;; `:lake` handle only, since `:source` has no `rowid` to append — measured
-    ;; stable across the same two offsets: the 0-offset and 40-offset windows
-    ;; now agree with a plain full-table sort sliced in memory. Checked
-    ;; separately for `DESC` — a `DESC` primary term with an `ASC` tiebreaker
-    ;; is a mixed direction and not something the `ASC` result can be assumed
-    ;; to cover: without the tiebreaker, `ORDER BY "grp" DESC NULLS LAST` at
-    ;; OFFSET 0 and OFFSET 40 over these same 250 rows disagreed with a
-    ;; full-table DESC sort sliced in memory, same as the `ASC` case; with
-    ;; `, rowid ASC` appended, both offsets agreed with it.
+    ;; An UNSORTED `:source` page carries no `ORDER BY` at all, so it leans on
+    ;; something loci itself never sets: `preserve_insertion_order`. Checked,
+    ;; not assumed — `current_setting('preserve_insertion_order')` on this
+    ;; connection is `true`, and DuckDB's docs name that as the default and say
+    ;; what it buys: with it on, "the system" does NOT "re-order any results
+    ;; that do not contain ORDER BY clauses", `read_csv` included, so separate
+    ;; OFFSET queries against one file agree on a row's position. loci relies
+    ;; on that default rather than setting it, so the guarantee ends the moment
+    ;; anyone turns it off — nothing here would notice.
     ;;
-    ;; A `:source` handle has the identical nondeterminism and no `rowid` —
-    ;; this is reachable the moment a person sorts a live passthrough table by
-    ;; a column with repeats, which Task 8 makes routine, so `tiebreak-order`
-    ;; is the fallback: every OTHER projected column, appended to the ORDER BY.
-    ;; Two rows tied in every projected column are what a caller can no longer
-    ;; tell apart anyway, so exhausting the projection is a total order on
-    ;; everything that could matter. See its docstring for the NULLS-LAST and
-    ;; cost notes.
+    ;; A cursor also has to be checked against the CURRENT request's ordering
+    ;; before its `:o` is trusted, below. Both offset modes — an unsorted
+    ;; `:source` and a sorted page on either handle — share one cursor shape,
+    ;; so nothing about `{:o 5}` says which order it was minted under; reread
+    ;; against a changed `:sort` it is still a valid-looking cursor for the
+    ;; WRONG walk, landing on whatever row offset 5 happens to be this time.
+    ;; That is not a crafted cursor — `decode-cursor` and `cursor-int` are for
+    ;; that — it is an ordinary caller paging forward and then changing the
+    ;; sort mid-walk, which a sort control on every column header makes routine
+    ;; rather than rare.
     (let [lim   (tbl/page-limit (:limit window))
           proj  (tbl/project-cols h (:cols window))
           srt   (tbl/sort-spec h (:sort window))
-          seek? (and (nil? srt) (not= :source (:store h)))
+          seek? (and (nil? srt) (not (source-handle? h)))
           cur   (tbl/decode-cursor (:cursor window))
           after (tbl/cursor-int cur :k -1)
-          off   (tbl/cursor-int cur :o 0)
+          ;; `:o` is only meaningful if THIS cursor was minted under THIS same
+          ;; ordering — otherwise it is a valid-shaped number pointing into a
+          ;; different order entirely, and the safe read is the same one a
+          ;; cursor that fails to decode at all gets: restart at page 1. `=` is
+          ;; safe against any decoded value, crafted or not — a mismatch of any
+          ;; kind just fails the check rather than throwing.
+          off   (if (= srt (:s cur)) (tbl/cursor-int cur :o 0) 0)
           ks    (cond->> proj seek? (cons :rowid))
           sql   (str "SELECT " (when seek? "rowid, ") (select-cols proj)
                      " FROM " (from-of h)
                      (cond seek? (str " WHERE rowid > " (long after) " ORDER BY rowid")
-                           srt   (str " ORDER BY " (ident (first srt))
-                                      (if (= "desc" (second srt)) " DESC" " ASC")
-                                      " NULLS LAST"
-                                      (if (= :source (:store h))
-                                        (tiebreak-order proj (first srt))
-                                        ", rowid ASC")))
+                           srt   (sorted-order-by h proj srt))
                      " LIMIT " (inc lim)
                      (when-not seek? (str " OFFSET " (long off))))
           got   (q-as lk sql (vec ks))
@@ -1334,7 +1368,7 @@
        :next (when more
                (tbl/encode-cursor (if seek?
                                     {:k (:rowid (peek kept))}
-                                    {:o (+ off lim)})))}))
+                                    {:o (+ off lim) :s srt})))}))
 
   (row-count [_ h] (:rows h))
 

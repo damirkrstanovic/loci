@@ -1244,6 +1244,25 @@
       (is (= 250 (count (distinct (map :i all)))) "and none is served twice")
       (is (= (sort (map :grp all)) (map :grp all)) "the walk is in sort order"))))
 
+(deftest a-descending-sorted-page-continues-across-a-tie-in-the-sort-column
+  ;; `, rowid ASC` was checked by hand against a DESCENDING primary sort while
+  ;; building this — a `DESC` primary term with an `ASC` tiebreaker is a mixed
+  ;; direction, and the ASC tie test above cannot stand in for it. A one-off
+  ;; manual check is exactly the thing this project's working agreement says
+  ;; becomes a test rather than staying a comment.
+  (with-lake [lk]
+    (let [rs   (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))
+          h    (tbl/put-rows! lk "tbl:dt" rs)
+          walk (fn [] (loop [c nil acc []]
+                        (let [p (tbl/page lk h {:limit 40 :cursor c :sort ["grp" "desc"]})
+                              acc (into acc (:rows p))]
+                          (if (:next p) (recur (:next p) acc) acc))))
+          all  (walk)]
+      (is (= 250 (count all)) "no row is lost at a boundary inside a tie")
+      (is (= 250 (count (distinct (map :i all)))) "and none is served twice")
+      (is (= (reverse (sort (map :grp all))) (map :grp all))
+          "the walk is in descending sort order"))))
+
 (deftest a-descending-sort-pages-in-descending-order
   (with-lake [lk]
     (let [h (tbl/put-rows! lk "tbl:d" (vec (for [i (range 30)] {:i i})))
@@ -1274,6 +1293,35 @@
         (is (= [:region :amount] (vec (keys (first (:rows p1))))))
         (finally (lf/rm-rf dir))))))
 
+(deftest an-unsorted-passthrough-source-pages-to-completion
+  ;; `a-passthrough-source-pages-with-no-rowid-in-sight` above only checks two
+  ;; pages and a couple of values; this walks the whole 250-row fixture to
+  ;; completion, which is what a "none lost, none served twice" contract
+  ;; actually claims. The unsorted branch carries no `ORDER BY` at all, so this
+  ;; is only as strong as `preserve_insertion_order` — see the comment on
+  ;; `page` — and this fixture can only ESTABLISH THE MECHANISM WORKS at 250
+  ;; rows read single-threaded. It says nothing about a 10M-row file DuckDB
+  ;; scans in parallel, which is the scale this design is actually for; that
+  ;; would need data and a measurement at that size, not an assumption drawn
+  ;; from here.
+  (with-lake [lk]
+    (let [dir  (str (System/getProperty "java.io.tmpdir") "/loci-page-src-unsorted-" (System/nanoTime))
+          _    (.mkdirs (java.io.File. dir))
+          csv  (java.io.File. dir "rows.csv")
+          _    (spit csv (apply str "region,amount\n"
+                                (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+          h    {:store :source :uri (str "file://" (.getAbsolutePath csv)) :format :csv
+                :cols [:region :amount] :raw ["region" "amount"] :rows 250}
+          walk (fn [] (loop [c nil acc []]
+                        (let [p (tbl/page lk h {:limit 40 :cursor c})
+                              acc (into acc (:rows p))]
+                          (if (:next p) (recur (:next p) acc) acc))))
+          all  (walk)]
+      (try
+        (is (= 250 (count all)) "no row is lost across the walk")
+        (is (= 250 (count (distinct (map :amount all)))) "and none is served twice")
+        (finally (lf/rm-rf dir))))))
+
 (deftest a-passthrough-source-continues-across-a-tie-in-the-sort-column
   ;; The lake-table twin of this is `a-sorted-page-continues-across-a-tie-in-
   ;; the-sort-column`; this is the same 250-row, 5-group shape over a `:source`
@@ -1300,10 +1348,47 @@
         (is (= (sort (map :region all)) (map :region all)) "the walk is in sort order")
         (finally (lf/rm-rf dir))))))
 
-(deftest a-window-that-hides-a-column-hides-it-in-the-sql
+(deftest a-descending-passthrough-source-continues-across-a-tie-in-the-sort-column
+  ;; The `:source` twin of `a-descending-sorted-page-continues-across-a-tie-
+  ;; in-the-sort-column` — `tiebreak-order` doesn't care about the primary
+  ;; column's direction, but that is exactly the kind of claim that should be
+  ;; a test and not a comment.
   (with-lake [lk]
-    (let [h (tbl/put-rows! lk "tbl:c" [{:a 1 :b 2 :c 3}])]
-      (is (= [:a :c] (vec (keys (first (:rows (tbl/page lk h {:limit 1 :cols ["a" "c"]}))))))))))
+    (let [dir  (str (System/getProperty "java.io.tmpdir") "/loci-page-src-desc-" (System/nanoTime))
+          _    (.mkdirs (java.io.File. dir))
+          csv  (java.io.File. dir "rows.csv")
+          _    (spit csv (apply str "region,amount\n"
+                                (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+          h    {:store :source :uri (str "file://" (.getAbsolutePath csv)) :format :csv
+                :cols [:region :amount] :raw ["region" "amount"] :rows 250}
+          walk (fn [] (loop [c nil acc []]
+                        (let [p (tbl/page lk h {:limit 40 :cursor c :sort ["region" "desc"]})
+                              acc (into acc (:rows p))]
+                          (if (:next p) (recur (:next p) acc) acc))))
+          all  (walk)]
+      (try
+        (is (= 250 (count all)) "no row is lost at a boundary inside a tie")
+        (is (= 250 (count (distinct (map :amount all)))) "and none is served twice")
+        (is (= (reverse (sort (map :region all))) (map :region all))
+            "the walk is in descending sort order")
+        (finally (lf/rm-rf dir))))))
+
+(deftest a-window-that-hides-a-column-hides-it-in-the-sql
+  ;; Asserting on the RETURNED keys alone would pass identically for a
+  ;; `SELECT *` that drops the hidden column in Clojure afterwards — a
+  ;; materially more expensive query on a wide DuckLake table, and the
+  ;; opposite of the point of `:cols` travelling in the window at all. So this
+  ;; captures the SQL `q-as` actually receives and checks the hidden column's
+  ;; quoted name is not in it, alongside the existing key assertion.
+  (with-lake [lk]
+    (let [h        (tbl/put-rows! lk "tbl:c" [{:a 1 :b 2 :c 3}])
+          captured (atom nil)
+          real     @#'lake/q-as]
+      (with-redefs [lake/q-as (fn [lk sql ks] (reset! captured sql) (real lk sql ks))]
+        (let [p (tbl/page lk h {:limit 1 :cols ["a" "c"]})]
+          (is (= [:a :c] (vec (keys (first (:rows p))))))
+          (is (not (str/includes? @captured "\"b\""))
+              (str "the hidden column must not reach the SELECT list: " @captured)))))))
 
 (deftest a-crafted-lake-cursor-is-page-one-not-a-crash
   (with-lake [lk]
@@ -1311,3 +1396,19 @@
       (is (= 0 (:i (first (:rows (tbl/page lk h {:limit 5
                                                  :cursor (tbl/encode-cursor {:k "nope"})})))))
           "a cursor field of the wrong type restarts the table rather than throwing"))))
+
+(deftest a-cursor-from-a-different-sort-restarts-at-page-1
+  ;; The one combination that used to silently degrade rather than restart:
+  ;; both an unsorted offset page and a sorted one carry `{:o N}`, so a cursor
+  ;; minted under one sort and reread under another looked like a perfectly
+  ;; valid continuation of the WRONG walk — landing on whatever row offset N
+  ;; happens to be under the new ordering, neither page 1 nor a meaningful
+  ;; continuation.
+  (with-lake [lk]
+    (let [rs         (vec (for [i (range 30)] {:i i :grp (str "g" (mod i 5))}))
+          h          (tbl/put-rows! lk "tbl:mix" rs)
+          p1         (tbl/page lk h {:limit 5 :sort ["i" "asc"]})
+          new-sort-p (tbl/page lk h {:limit 5 :sort ["grp" "asc"]})
+          reused     (tbl/page lk h {:limit 5 :cursor (:next p1) :sort ["grp" "asc"]})]
+      (is (= (:rows new-sort-p) (:rows reused))
+          "a cursor minted under a different sort restarts at page 1 of the new one, not a garbage offset into it"))))
