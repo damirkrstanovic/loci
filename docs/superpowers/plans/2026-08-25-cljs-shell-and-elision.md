@@ -12,6 +12,27 @@
 
 ---
 
+## A note on this plan's form, 2026-08-26
+
+**Tasks 1–6 carry implementation code. Tasks 7–12 deliberately do not.**
+
+Measured after Phase 2: 3,459 lines of plan had produced 709 lines of shipped code, and
+implementers had found **thirteen defects in the plan** — three tests that could not fail, a
+budget calculation that silently doubled the common case, tests that would have read the real
+data directory, an output path unrunnable under `"type": "module"`, a signature that changed
+between tasks, and a sabotage that cannot detect what it claims to. Almost every one was in
+*code written into the plan* rather than in prose: the implementation, written badly by someone
+who could not run it, and then written again properly by someone who could.
+
+So from Task 7 on, a task states its **files**, the **decision and why**, what each test must
+**establish**, and the **sabotage** that proves the test bites. The implementer writes the code,
+at the REPL, with the file open.
+
+**The sabotage stays.** It costs little, it lives inside implementation time, and it produced
+every genuine finding in this work: the DuckDB `ORDER BY … OFFSET` tie instability that broke
+the plan's own test on unsabotaged code, a cursor crashable by editing a URL, a ClojureScript
+suite that exits 0 while running zero tests.
+
 ## Ground rules for every task
 
 - **The REPL is the execution surface.** `ToolSearch` for `select:mcp__clojure-mcp__clojure_eval` against the nREPL on port 7888; `:reload` after every edit. Never `clojure -M -e` to iterate — a cold JVM costs ~25 s. `clojure -M:test` is for one final full-suite run per task.
@@ -904,650 +925,124 @@ git commit -m "feat: the grid's state is data, and a page replaces rather than a
 
 ## Task 7: the table it draws
 
-**Files:**
-- Modify: `src-cljs/loci/grid/view.cljs`
-- Modify: `resources/public/index.html` — grid CSS only
-- Modify: `test/browser/harness.mjs` — `GRID_FIXTURE`
-- Create: `test/browser/grid.test.mjs`
+**Files:** `src-cljs/loci/grid/view.cljs` · `resources/public/index.html` (CSS only) · `test/browser/harness.mjs` (`GRID_FIXTURE`) · `test/browser/grid.test.mjs` (new)
 
-- [ ] **Step 1: Add the fixture.** In `test/browser/harness.mjs`, beside `STORAGE_FIXTURE`:
+**Partly done already.** Phase 3 was stopped mid-task; `git status` shows uncommitted work in all four files. Read it first and decide whether to finish or restart it — say which and why.
 
-```javascript
-// 36 columns, because that is the width at which the old renderer collapsed
-// every column to under one character. 250 rows, so at limit 100 there are three
-// pages and a short last one — the only way to see the elision go absent.
-//
-// `grp` has five values, 50 rows each, so a page boundary under a sort by `grp`
-// lands inside a run of equal values. `note` is one long value, for the tooltip
-// clip. `maybe` is null every third row, for NULLS LAST.
-//
-// Above DuckLake's ~10–20 row inlining threshold, so this is a real Parquet
-// table with a real rowid and the keyset branch is what is under test.
-export const GRID_FIXTURE = `
-(let [st @c/store
-      lk @lake/lake
-      row (fn [i] (into {:id (str "row-" i)
-                         :grp (str "g" (mod i 5))
-                         :note (apply str (repeat 900 "x"))
-                         :maybe (when (pos? (mod i 3)) i)}
-                        (for [c (range 32)] [(keyword (str "c" c)) (* i (inc c))])))
-      h   (tbl/put-rows! lk "tbl:grid" (mapv row (range 250)))]
-  (assert (= 36 (count (:cols h))) "the grid fixture stopped being 36 columns wide")
-  (sub/commit! st {:op :tx :events
-                   [{:op :put :id "tbl:grid"
-                     :value {:id "tbl:grid" :kind :table :title "Grid fixture" :value h}}
-                    {:op :put :id "space:grid"
-                     :value {:id "space:grid" :kind :space :title "Grid fixture"
-                             :value {:intent "a table 36 columns wide"
-                                     :cells [{:ref "tbl:grid"}]}}}]}))
-`;
-```
+**What it must do.** Render rows as a table using the *existing* `table.mold` styling, with: the table sized `width: max-content` so it is as wide as its columns and the wrapper scrolls; a header that stays put vertically; a first column that stays put horizontally; numeric columns right-aligned from the values, not from the column name; and a `title` tooltip clipped to ~500 characters.
 
-- [ ] **Step 2: Write the failing tests.** Create `test/browser/grid.test.mjs`:
+**Why `max-content` and not per-column arithmetic.** The old renderer computed a character width per column and then normalised those to percentages of a `width:100%` table, which throws the scale away — at 36 columns the 7-character floor became 0.7 characters, and the horizontal scrollbar was `.toFixed(2)` rounding drift with nothing behind it. One CSS property replaces the arithmetic. Clerk reaches the same result the same way.
 
-```javascript
-// The ClojureScript grid, measured in a real browser. Every assertion here reads
-// a measured position or size off the DOM. Asserting that `position:sticky` is
-// in the stylesheet passes while the header scrolls away; asserting a column
-// "is readable" passes at 0.7 characters.
-import { test, before, after } from 'node:test';
-import assert from 'node:assert/strict';
-import { startServer, launchBrowser, withPage, bootedShell, GRID_FIXTURE } from './harness.mjs';
+**The fixture.** 36 columns and 250 rows, in its own notebook. 36 because that is the width at which the old renderer collapsed. 250 because at limit 100 that is three pages with a short last one — the only way to see the elision go absent. Give it a `grp` column with five values (50 rows each, so a page boundary lands inside a tied run), a `note` column with one 900-character value, and a `maybe` column null every third row. Assert in the fixture that it really is 36 columns wide, so it cannot silently stop being the thing under test. It must exceed DuckLake's ~10–20 row inlining threshold or the keyset branch is not what is being exercised.
 
-let server, browser;
-before(async () => {
-  server = await startServer({ fresh: true, extra: GRID_FIXTURE });
-  browser = await launchBrowser();
-});
-after(async () => { await browser?.close(); await server?.stop(); });
+**Tests — all four measure the DOM, none inspect a stylesheet.**
 
-const openGrid = async (page) => {
-  await bootedShell(page, server.url + '?cljs');
-  await page.goto(server.url + '?cljs#space:grid');
-  await page.waitForSelector('.grid table tbody tr');
-};
-
-test('a 36-column table is wider than its panel and has somewhere to scroll', async () => {
-  await withPage(browser, 'cljs-grid-scrolls', async (page) => {
-    await openGrid(page);
-    const m = await page.evaluate(() => {
-      const box = document.querySelector('.grid [data-grid-scroll]');
-      return { table: box.querySelector('table').getBoundingClientRect().width,
-               box: box.clientWidth, scrollWidth: box.scrollWidth };
-    });
-    assert.ok(m.table > m.box * 1.5,
-      `36 columns should overflow; table ${m.table}px in a ${m.box}px box`);
-    assert.ok(m.scrollWidth > m.box + 50,
-      `${m.scrollWidth - m.box}px of scroll is rounding, not somewhere to go`);
-  });
-});
-
-test('a narrow column shows its whole value', async () => {
-  await withPage(browser, 'cljs-grid-widths', async (page) => {
-    await openGrid(page);
-    const t = await page.evaluate(() => {
-      const heads = [...document.querySelectorAll('.grid thead th')];
-      const i = heads.findIndex(h => h.textContent.trim().startsWith('grp'));
-      return document.querySelectorAll('.grid tbody tr')[0].children[i].textContent.trim();
-    });
-    assert.equal(t, 'g0', `grp rendered as ${JSON.stringify(t)}`);
-  });
-});
-
-test('the header stays put when the rows scroll', async () => {
-  await withPage(browser, 'cljs-grid-sticky', async (page) => {
-    await openGrid(page);
-    const move = await page.evaluate(async () => {
-      const box = document.querySelector('.grid [data-grid-scroll]');
-      const th = document.querySelector('.grid thead th');
-      const before = th.getBoundingClientRect().top;
-      box.scrollTop = 300;
-      await new Promise(r => requestAnimationFrame(r));
-      return Math.abs(th.getBoundingClientRect().top - before);
-    });
-    assert.ok(move < 2, `the header moved ${move}px`);
-  });
-});
-
-test('the first column stays put, and is not transparent', async () => {
-  await withPage(browser, 'cljs-grid-frozen', async (page) => {
-    await openGrid(page);
-    const m = await page.evaluate(async () => {
-      const box = document.querySelector('.grid [data-grid-scroll]');
-      const td = document.querySelector('.grid tbody td');
-      const before = td.getBoundingClientRect().left;
-      box.scrollLeft = 600;
-      await new Promise(r => requestAnimationFrame(r));
-      const r2 = td.getBoundingClientRect();
-      return { move: Math.abs(r2.left - before),
-               onTop: td.contains(document.elementFromPoint(r2.left + 4, r2.top + 4)) };
-    });
-    assert.ok(m.move < 2, `the first column moved ${m.move}px`);
-    assert.ok(m.onTop, 'scrolled rows show through the frozen column');
-  });
-});
-
-test('a long value is clipped in the tooltip', async () => {
-  await withPage(browser, 'cljs-grid-tooltip', async (page) => {
-    await openGrid(page);
-    const len = await page.evaluate(() => {
-      const heads = [...document.querySelectorAll('.grid thead th')];
-      const i = heads.findIndex(h => h.textContent.trim().startsWith('note'));
-      return document.querySelectorAll('.grid tbody tr')[0].children[i]
-               .getAttribute('title').length;
-    });
-    assert.ok(len <= 520, `a 900-character value produced a ${len}-character tooltip`);
-  });
-});
-```
-
-- [ ] **Step 3: Run, watch fail.** Expected: no `.grid table` — Task 6 left `grid` a stub.
-
-- [ ] **Step 4: Implement the view.** Replace `grid` in `src-cljs/loci/grid/view.cljs`:
-
-```clojure
-(def ^:private tooltip-max
-  "How much of a value the `title` attribute carries. Measured on the real
-   substrate: a `description` column reached 16,344 characters, which is not a
-   tooltip — and a page of full values duplicated into attributes is a second
-   copy of the rows in the DOM."
-  500)
-
-(defn- clip [s] (if (> (count s) tooltip-max) (str (subs s 0 tooltip-max) "…") s))
-
-(defn- numeric-col?
-  "A column is numeric if its values say so — CSS cannot see that, so the markup
-   carries it. Blanks are not evidence either way: real tables have holes."
-  [rows c]
-  (let [vs (remove nil? (map #(get % c) rows))]
-    (and (seq vs) (every? number? vs))))
-
-(defn grid [el {:as s :keys [payload]}]
-  (let [{:keys [rendered table/cols]} payload
-        all-cols cols                       ; the table's full list, off the handle
-        cols     (vec (remove (:hidden s) all-cols))]
-    [:div.grid
-     ;; `width: max-content` and nothing else. The old renderer computed a
-     ;; per-column character width and then normalised it to percentages of a
-     ;; `width:100%` table, which discards the scale — at 36 columns the
-     ;; 7-character floor became 0.7 characters and the scrollbar was rounding.
-     ;; One property replaces that arithmetic; Clerk reaches the same result the
-     ;; same way.
-     [:div {:data-grid-scroll true
-            :style {:overflow "auto" :max-height "420px"}}
-      [:table.mold {:style {:width "max-content"}}
-       [:thead [:tr (for [c cols]
-                      [:th {:key c :title (name c)
-                            :class (when (numeric-col? rendered c) "num")}
-                       (name c)])]]
-       [:tbody
-        (for [[i row] (map-indexed vector rendered)]
-          [:tr {:replicant/key i}
-           (for [c cols]
-             (let [v (str (get row c))]
-               [:td {:key c :title (clip v)
-                     :class (if (numeric-col? rendered c) "num" "txt")}
-                v]))])]]]
-     [:div.pgcap (caption s)]]))
-```
-
-- [ ] **Step 5: Add the CSS.** In `resources/public/index.html`'s `<style>`, after the `table.mold` rules:
-
-```css
-  /* The ClojureScript grid. `table.mold`'s own rules still apply — this adds
-     only what the old renderer could not do. */
-  .grid table.mold{width:max-content}
-  /* The header IS the column key: at 36 columns `fa` is decodable as `archived`
-     only while the header is on screen. `background` is not decoration — a
-     sticky element is painted over scrolling content and shows through without
-     one. */
-  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white)}
-  /* The first column is the row's identity, and a table wider than its panel
-     loses it on the first horizontal scroll. */
-  .grid th:first-child,.grid td:first-child{
-    position:sticky;left:0;background:var(--white);box-shadow:1px 0 0 var(--line)}
-  /* the corner is sticky on both axes and must outrank both. */
-  .grid thead th:first-child{z-index:3}
-```
-
-- [ ] **Step 6: Green.** **Step 7: Prove they bite:**
-
-| break | test that must go red |
+| must establish | measured by |
 |---|---|
-| `{:style {:width "100%"}}` on the table | `a 36-column table is wider than its panel`, `a narrow column shows its whole value` |
-| remove `position:sticky` from `.grid thead th` | `the header stays put` |
-| remove `background` from the frozen column | the `onTop` assertion in `the first column stays put` |
-| drop `clip` | `a long value is clipped in the tooltip` — reports 900 |
+| 36 columns overflow the panel, and there is real scroll | table width vs `clientWidth`; `scrollWidth − clientWidth` well past rounding |
+| a narrow column shows its whole value | `grp`'s first cell reads `g0`, not `g…` |
+| the header survives scrolling | `th` bounding-rect top unchanged after `scrollTop = 300` |
+| the first column survives scrolling | first `td` bounding-rect left unchanged after `scrollLeft = 600` |
+| a long value does not become a long tooltip | the `note` cell's `title` length |
 
-- [ ] **Step 8: Both suites, then commit.**
+**Sabotage.** Restore `width:100%` — the first two must go red. Remove `position:sticky` from the header, then from the first column — one each. Drop the clip — the tooltip test reports 900.
 
-```
-npm run test:browser
-npm run test:cljs
-```
-
-```bash
-git add src-cljs resources/public/index.html test/browser/
-git commit -m "feat: a column as wide as what it holds, a header that stays, a column that stays"
-```
+**A sabotage that does NOT work, found 2026-08-25.** Removing the frozen column's `background` does not fail an `elementFromPoint` check: hit-testing returns the topmost element whether or not it is transparent. So a "the frozen column is opaque" assertion written that way passes while rows show through it. Either find an assertion that actually detects the transparency — a screenshot pixel comparison is the honest instrument — or **drop the claim and do not pretend to test it**. Say which you chose.
 
 ---
 
 ## Task 8: the pager
 
-**Files:**
-- Modify: `src-cljs/loci/grid/view.cljs`
-- Modify: `test/browser/grid.test.mjs`
+**Files:** `src-cljs/loci/grid/view.cljs` · `test/browser/grid.test.mjs`
 
-- [ ] **Step 1: Write the failing tests.** Append to `test/browser/grid.test.mjs`:
+**What it must do.** A caption reading `showing 101–200 of 250`, Prev and Next, and a page-size select of 25/50/100/200. Next is disabled when the payload carries no elision; Prev when the page index is zero.
 
-```javascript
-test('the pager walks to the last page and stops, and prev pops back', async () => {
-  await withPage(browser, 'cljs-grid-pager', async (page) => {
-    await openGrid(page);
-    const read = () => page.evaluate(() => ({
-      caption: document.querySelector('.grid .pgcap').textContent.trim(),
-      first: document.querySelector('.grid tbody td').textContent.trim(),
-      rows: document.querySelectorAll('.grid tbody tr').length,
-      nextOff: document.querySelector('[data-a="page-next"]').disabled,
-      prevOff: document.querySelector('[data-a="page-prev"]').disabled,
-    }));
+**The decision it embodies.** loci's elision **replaces** the page; Clerk's, which it borrows from, **appends**. Forty clicks of "more" on a 10M-row table would put four thousand rows in the DOM, and bounded DOM was half the point of paging. Task 6 already has `a-fetched-page-REPLACES-the-rows-it-does-not-append` guarding the state transition; this task's browser test guards the rendered result.
 
-    let s = await read();
-    assert.match(s.caption, /showing 1–100 of 250/);
-    assert.equal(s.first, 'row-0');
-    assert.ok(s.prevOff, 'there is no page before the first');
+**Prev is a stack pop.** `loci.grid` keeps the cursor that began each visited page. A server-computed `prev` would be a second source of truth able to disagree with it, and under keyset the store cannot compute one anyway.
 
-    await page.click('[data-a="page-next"]');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid tbody td').textContent.trim() === 'row-100');
-    s = await read();
-    assert.match(s.caption, /showing 101–200 of 250/);
-    assert.equal(s.rows, 100, 'a page REPLACES — 100 rows, not 200 accumulated');
+**Replicant's event-value API is unverified.** The dep is `no.cjohansen/replicant 2025.06.21`; its README is on the classpath. Find the current spelling for "the value of the event that fired". If you cannot confirm it in five minutes, dispatch with no argument and read the value off the DOM event in `set-dispatch!`. **Report which you used and how you confirmed it.**
 
-    await page.click('[data-a="page-next"]');
-    await page.waitForFunction(() =>
-      document.querySelectorAll('.grid tbody tr').length === 50);
-    s = await read();
-    assert.match(s.caption, /showing 201–250 of 250/);
-    assert.ok(s.nextOff, 'the last page has no hole, so there is nowhere to go');
+**Tests.**
 
-    await page.click('[data-a="page-prev"]');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid tbody td').textContent.trim() === 'row-100');
-    assert.match((await read()).caption, /showing 101–200 of 250/);
-  });
-});
-
-test('the page size is adjustable and restarts the walk', async () => {
-  await withPage(browser, 'cljs-grid-pagesize', async (page) => {
-    await openGrid(page);
-    await page.click('[data-a="page-next"]');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid .pgcap').textContent.includes('101–200'));
-    await page.selectOption('[data-a="page-size"]', '25');
-    await page.waitForFunction(() =>
-      document.querySelectorAll('.grid tbody tr').length === 25);
-    assert.match(await page.textContent('.grid .pgcap'), /showing 1–25 of 250/);
-    assert.ok(await page.$eval('[data-a="page-prev"]', b => b.disabled),
-      'a cursor names a position in a walk of a given size');
-    assert.deepEqual(
-      await page.$$eval('[data-a="page-size"] option', os => os.map(o => o.value)),
-      ['25', '50', '100', '200']);
-  });
-});
-
-test('the shell never reads a cursor', async () => {
-  // The invariant that lets three storage strategies share one control.
-  const fs = await import('node:fs/promises');
-  for (const f of ['../../src-cljs/loci/grid.cljs', '../../src-cljs/loci/grid/view.cljs']) {
-    const src = await fs.readFile(new URL(f, import.meta.url), 'utf8');
-    for (const probe of [':k ', ':o ', 'atob', 'js/JSON.parse']) {
-      assert.ok(!src.includes(probe), `${f} inspects a cursor: found ${probe}`);
-    }
-  }
-});
-```
-
-- [ ] **Step 2: Run, watch fail.**
-
-- [ ] **Step 3: Implement.** Append to `grid` in `src-cljs/loci/grid/view.cljs`, replacing the bare `.pgcap` div:
-
-```clojure
-     [:div.pager
-      [:span.pgcap (caption s)]
-      [:span {:style {:flex "1"}}]
-      [:select.btn.ghost.sm {:data-a "page-size"
-                             :on {:change [[:page/size el (js/parseInt (.. % -target -value))]]}}
-       (for [n [25 50 100 200]]
-         [:option {:key n :value n :selected (= n (:limit s))} (str n " rows")])]
-      [:button.btn.ghost.sm {:data-a "page-prev" :disabled (zero? (:page s))
-                             :on {:click [[:page/prev el]]}} "‹ Prev"]
-      [:button.btn.ghost.sm {:data-a "page-next" :disabled (not (has-next? s))
-                             :on {:click [[:page/next el]]}} "Next ›"]]
-```
-
-`grid` already takes `el` and `has-next?` already lives in `loci.grid.view` (both from Task 6), so neither signature moves here.
-
-**The `%` above is a guess and must not survive as one.** Replicant's spelling for "the value of the event that fired" needs checking in its README before you write it. **If you cannot confirm it in five minutes, take the fallback**: dispatch `[[:page/size el]]` with no argument and read the value off the DOM event, which `set-dispatch!` receives as its first parameter. Report which of the two you used.
-
-- [ ] **Step 4: Green.** **Step 5: Prove they bite:**
-
-| break | test that must go red |
+| must establish | measured by |
 |---|---|
-| `on-payload` appends instead of replacing | `the pager walks…` — 200 rows after one Next |
-| `prev-page` re-fetches from the elision rather than popping | the final Prev assertion |
-| `set-limit` keeps the stack | `the page size is adjustable and restarts the walk` |
-| add `(:k (t/read reader cursor))` anywhere in `grid.cljs` | `the shell never reads a cursor` |
+| the walk reaches the end and stops | captions across three Nexts; 50 rows on the last; Next disabled |
+| a page replaces rather than accretes | **100 rows after one Next, not 200** |
+| Prev is exact | after Next, Next, Prev the caption is page two's again |
+| page size restarts the walk | select 25 → caption `1–25`, Prev disabled |
+| the shell never reads a cursor | scan `src-cljs/` for `:k`, `:o`, `atob`, `JSON.parse` — none may appear |
 
-- [ ] **Step 6: Both suites, then commit.**
-
-```bash
-git add src-cljs test/browser/grid.test.mjs
-git commit -m "feat: a pager that replaces, and a stack that makes Prev exact"
-```
+**Sabotage.** Make `on-payload` append — the row count assertion goes red. Make Prev recompute rather than pop — the Prev caption goes red. Make `set-limit` keep the stack — the restart test goes red.
 
 ---
 
-# Phase 4 — sorting and the column chooser
-
 ## Task 9: click a header to sort
 
-**Files:**
-- Modify: `src-cljs/loci/grid/view.cljs`
-- Modify: `test-cljs/loci/grid_test.cljs`, `test/browser/grid.test.mjs`
+**Files:** `src-cljs/loci/grid/view.cljs` · `test-cljs/loci/grid_test.cljs` · `test/browser/grid.test.mjs`
 
-`toggle-sort` and the window plumbing exist from Task 6 and Task 1 of the previous plan. This is the control.
+`toggle-sort` exists from Task 6, and the window carries `:sort` to the server, which does the sorting. This is only the control.
 
-- [ ] **Step 1: Write the failing tests.** In `test-cljs/loci/grid_test.cljs`:
+**Three states, not two.** Ascending → descending → **the table's own order**. Natural order is the only order a lake table pages by *seeking* rather than by counting, so it has to be reachable rather than lost on the first click.
 
-```clojure
-(deftest sorting-cycles-through-three-states-and-the-third-is-natural-order
-  (let [s0 (grid/init-state "tbl:x")
-        s1 (grid/toggle-sort s0 :grp)
-        s2 (grid/toggle-sort s1 :grp)
-        s3 (grid/toggle-sort s2 :grp)]
-    (is (= [:grp "asc"]  (:sort s1)))
-    (is (= [:grp "desc"] (:sort s2)))
-    (is (nil? (:sort s3)) "natural order is the only order that pages by seeking")
-    (is (= [:grp "asc"] (:sort (grid/toggle-sort s2 :other)))
-        "a different column starts its own cycle")))
+**Sorting invalidates every cursor in the stack**, for the same reason changing the page size does: a cursor names a position in one ordering.
 
-(deftest sorting-restarts-the-walk
-  (let [s (grid/next-page (assoc (grid/init-state "tbl:x")
-                                 :payload {:elision {:cursor "C"}}))]
-    (is (= [nil] (:stack (grid/toggle-sort s :grp))))
-    (is (= 0 (:page (grid/toggle-sort s :grp))))))
-```
+**Tests.** In `cljs.test`: the three-state cycle, and that a different column starts its own cycle, and that sorting resets stack and page. In the browser: clicking `grp`'s header puts `g0` first, again puts `g4` first, a third time restores `row-0`; and sorting from page two returns to page one with Prev disabled.
 
-In `test/browser/grid.test.mjs`:
-
-```javascript
-test('clicking a header sorts, twice reverses, three times restores', async () => {
-  await withPage(browser, 'cljs-grid-sort', async (page) => {
-    await openGrid(page);
-    const head = '.grid thead th:nth-child(2)';   // grp
-    const col2 = () => page.$$eval('.grid tbody td:nth-child(2)',
-                                   c => c.map(x => x.textContent.trim()));
-    await page.click(head);
-    await page.waitForFunction(() =>
-      document.querySelector('.grid thead th:nth-child(2)').dataset.sort === 'asc');
-    assert.equal((await col2())[0], 'g0');
-
-    await page.click(head);
-    await page.waitForFunction(() =>
-      document.querySelector('.grid thead th:nth-child(2)').dataset.sort === 'desc');
-    assert.equal((await col2())[0], 'g4');
-
-    await page.click(head);
-    await page.waitForFunction(() =>
-      !document.querySelector('.grid thead th:nth-child(2)').dataset.sort);
-    assert.equal((await page.textContent('.grid tbody td')).trim(), 'row-0');
-  });
-});
-
-test('a sort restarts the walk at page one', async () => {
-  await withPage(browser, 'cljs-grid-sort-resets', async (page) => {
-    await openGrid(page);
-    await page.click('[data-a="page-next"]');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid .pgcap').textContent.includes('101–200'));
-    await page.click('.grid thead th:nth-child(2)');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid .pgcap').textContent.includes('showing 1–'));
-    assert.ok(await page.$eval('[data-a="page-prev"]', b => b.disabled));
-  });
-});
-```
-
-- [ ] **Step 2: Run, watch fail.** **Step 3: Implement** — the `th` gains the control:
-
-```clojure
-       [:thead [:tr (for [c cols]
-                      (let [[sc sd] (:sort s)
-                            dir (when (= sc c) sd)]
-                        [:th {:key c :title (name c)
-                              :data-sort dir
-                              :style {:cursor "pointer"}
-                              :class (when (numeric-col? rendered c) "num")
-                              :on {:click [[:sort/toggle el c]]}}
-                         (name c)
-                         (case dir "asc" " ▲" "desc" " ▼" nil)]))]]
-```
-
-- [ ] **Step 4: Green.** **Step 5: Prove they bite** — make the third click return `[col "asc"]` (the natural-order assertion fails); keep the stack across a sort (`a sort restarts the walk` fails).
-
-- [ ] **Step 6: Both suites, then commit.**
-
-```bash
-git add src-cljs test-cljs test/browser/grid.test.mjs
-git commit -m "feat: a header sorts three ways, and the third is the order that seeks"
-```
+**Sabotage.** Make the third click return to ascending — the natural-order assertion goes red. Keep the stack across a sort — the reset test goes red.
 
 ---
 
 ## Task 10: the column chooser, remembered
 
-**Files:**
-- Modify: `src-cljs/loci/grid.cljs`, `src-cljs/loci/grid/view.cljs`
-- Modify: `test-cljs/loci/grid_test.cljs`, `test/browser/grid.test.mjs`
+**Files:** `src-cljs/loci/grid.cljs` · `src-cljs/loci/grid/view.cljs` · `test-cljs/loci/grid_test.cljs` · `test/browser/grid.test.mjs`
 
-- [ ] **Step 1: Write the failing tests.** In `test-cljs/loci/grid_test.cljs`:
+**What it must do.** A `<details>` listing every column with a checkbox; unchecking one removes it from the **request**, not merely from the page. Sort, hidden columns and page size persist per object id.
 
-```clojure
-(deftest hiding-a-column-narrows-the-request-not-only-the-page
-  (let [s (grid/toggle-col (assoc (grid/init-state "tbl:x")
-                                  :payload {:table/cols [:a :b :c]}) :b)]
-    (is (= #{:b} (:hidden s)))
-    (is (= "a,c" (grid/cols-param s)) "the hidden column leaves the payload")
-    (is (nil? (grid/cols-param (grid/toggle-col s :b)))
-        "nothing hidden means no parameter — an empty cols list means ALL columns
-         server-side, and sending every column explicitly would silently drop one
-         added to the table later")))
-```
+**Two things that are easy to get wrong.**
 
-In `test/browser/grid.test.mjs`:
+The chooser lists the payload's `:table/cols`, which `hydrate-page` takes off the **handle**. A page projected with `:cols` no longer contains the hidden columns, so reading the list back from the rendered rows would make hiding one-way — you could never unhide.
 
-```javascript
-test('hiding a column removes it from the request', async () => {
-  await withPage(browser, 'cljs-grid-cols', async (page) => {
-    await openGrid(page);
-    const urls = [];
-    page.on('request', r => { if (r.url().includes('/api/mold')) urls.push(r.url()); });
-    await page.click('[data-a="cols"]');
-    await page.click('[data-colpick="note"]');
-    await page.waitForFunction(() =>
-      ![...document.querySelectorAll('.grid thead th')]
-        .some(h => h.textContent.trim().startsWith('note')));
-    assert.ok(urls.some(u => u.includes('cols=') && !u.includes('note')),
-      'the hidden column must be absent from the window, or the payload never shrank');
-  });
-});
+When nothing is hidden, send **no** `cols` parameter rather than the full list. Server-side an empty `cols` means all columns, and an explicit full list would silently drop a column added to the table later.
 
-test('sort, hidden columns and page size survive a reload', async () => {
-  await withPage(browser, 'cljs-grid-persist', async (page) => {
-    await openGrid(page);
-    await page.selectOption('[data-a="page-size"]', '25');
-    await page.waitForFunction(() => document.querySelectorAll('.grid tbody tr').length === 25);
-    await page.click('.grid thead th:nth-child(2)');
-    await page.waitForFunction(() =>
-      document.querySelector('.grid thead th:nth-child(2)').dataset.sort === 'asc');
-    await page.reload();
-    await page.waitForSelector('.grid tbody tr');
-    assert.equal(await page.$$eval('.grid tbody tr', r => r.length), 25);
-    assert.equal(await page.$eval('.grid thead th:nth-child(2)', h => h.dataset.sort), 'asc');
-  });
-});
+**Persistence is browser-local and never a substrate event.** The event log is what `?at=` rewinds and `undo!` reverses; a column-header click is fiddling with a lens, not an act on content, and every one becoming a point in history is noise in the one log that has to stay meaningful. (`:view` stays a substrate event, as today — chosen once, not a knob.) Use Transit for the stored value so a sort of `[:grp "asc"]` round-trips as keywords.
 
-test('a browser that refuses storage still draws the grid', async () => {
-  await withPage(browser, 'cljs-grid-no-storage', async (page) => {
-    await page.addInitScript(() => {
-      Object.defineProperty(window, 'localStorage',
-        { get() { throw new DOMException('denied', 'SecurityError'); } });
-    });
-    await openGrid(page);
-    assert.ok(await page.$$eval('.grid tbody tr', r => r.length) > 0,
-      'a private window must get a grid, not a blank panel');
-  });
-});
-```
+**Wrap every storage access.** A private window, cleared site data or a browser set to block storage throws on the **accessor itself**, so an unguarded read takes the whole panel down rather than returning nothing.
 
-- [ ] **Step 2: Run, watch fail.** **Step 3: Implement.**
+**Tests.** In `cljs.test`: hiding a column produces the right `cols` parameter, and hiding nothing produces none. In the browser: the request URL for a hidden column omits it — assert on the URL, because asserting on the rendered page passes when the filtering happens client-side; preferences survive a reload; and a browser whose `localStorage` accessor throws still draws rows.
 
-`cols-param` in `loci.grid`, extracted from the existing `url`:
-
-```clojure
-(defn cols-param
-  "The visible columns as the `cols` query parameter, or nil when nothing is
-   hidden. **nil and not the full list**: server-side an empty `cols` means all
-   columns, and sending every column explicitly would make a stale preference
-   silently drop a column added to the table later."
-  [s]
-  (when (seq (:hidden s))
-    (->> (get-in s [:payload :table/cols])
-         (remove (:hidden s)) (map name) (str/join ","))))
-```
-
-Persistence, in `loci.grid`:
-
-```clojure
-;; Per-object, in the browser, never in the substrate. The event log is what
-;; `?at=` rewinds and `undo!` reverses; clicking a column header is fiddling
-;; with a lens, not an act on content, and every such click becoming a point in
-;; history you can travel to is noise in the one log that has to stay meaningful.
-;; (`:view` stays a substrate event, as it is today — chosen once, not a knob.)
-;;
-;; Every access is wrapped: a private window, cleared site data or a browser set
-;; to block storage throws on the ACCESSOR itself, so an unguarded read takes the
-;; whole panel down rather than returning nothing.
-(defn- prefs-key [id] (str "loci.grid." id))
-
-(defn- load-prefs [s]
-  (try
-    (if-let [raw (.getItem js/localStorage (prefs-key (:id s)))]
-      (let [p (t/read reader raw)]
-        (merge s (select-keys p [:limit :sort :hidden])))
-      s)
-    (catch :default _ s)))
-
-(defn- save-prefs! [s]
-  (try
-    (.setItem js/localStorage (prefs-key (:id s))
-              (t/write (t/writer :json) (select-keys s [:limit :sort :hidden])))
-    (catch :default _ nil)))
-```
-
-`mount` calls `load-prefs`; `act!` calls `save-prefs!` after the swap. Transit for storage too, so a `:sort` of `[:grp "asc"]` round-trips as keywords rather than as strings.
-
-The chooser, in the pager row:
-
-```clojure
-      [:details.colpick
-       [:summary.btn.ghost.sm {:data-a "cols"}
-        (if (seq (:hidden s))
-          (str "columns · " (count cols) "/" (count all-cols))
-          "columns")]
-       [:div.colpick-b
-        ;; ALL columns, from the payload's `:table/cols`, which `hydrate-page`
-        ;; takes off the handle rather than off the rendered rows — a page
-        ;; projected with `:cols` no longer contains the hidden ones, and reading
-        ;; the list back from the rows would make hiding one-way.
-        (for [c all-cols]
-          [:label {:key c}
-           [:input {:type "checkbox" :data-colpick (name c)
-                    :checked (not (contains? (:hidden s) c))
-                    :on {:change [[:cols/toggle el c]]}}]
-           (name c)])]]
-```
-
-- [ ] **Step 4: Green.** **Step 5: Prove they bite** — filter the columns in the view instead of sending `cols` (the request assertion fails while the page still looks right, which is the point); remove the `try` from `load-prefs` (the storage test fails with a blank panel).
-
-- [ ] **Step 6: Both suites, then commit.**
-
-```bash
-git add src-cljs test-cljs test/browser/grid.test.mjs
-git commit -m "feat: hide a column and it leaves the payload, and the browser remembers"
-```
+**Sabotage.** Filter columns in the view instead of sending `cols` — the URL assertion goes red while the page still looks right, which is the point. Remove the storage `try` — the private-window test goes red with a blank panel.
 
 ---
 
-# Phase 5 — parity and the switch
-
 ## Task 11: the browser suite moves to the new markup
 
-**Files:**
-- Modify: every file in `test/browser/` that asserts on a table's DOM
+**Files:** whichever files in `test/browser/` assert on a table's DOM.
 
-This is the cost §7 of the spec names and does not minimise. Find them first:
+`rg -ln "table\.mold|tableHTML|thead|tbody" test/browser/` — **report the count before changing anything.**
 
-```bash
-rg -ln "table\.mold|tableHTML|thead|tbody" test/browser/
-```
+For each, decide and record which of two things it is: a test *about a table's markup* (rewrite against the grid), or a test that merely *uses a table to reach something else* (leave it — it will exercise whichever renderer is default). One file per commit, suite green after each.
 
-- [ ] **Step 1: List them and report the count** before changing anything.
-- [ ] **Step 2: For each, decide and record which of two things it is**: a test *about a table's markup* (rewrite against `.grid`), or a test that merely *uses a table to reach something else* (leave it — it will exercise whichever renderer is default).
-- [ ] **Step 3: Rewrite the first kind**, one file per commit, running `npm run test:browser` after each.
-- [ ] **Step 4: Report any test you could not port and why.** A test that cannot be expressed against the new markup is telling you something about the new markup.
-
-```bash
-git commit -m "test: the browser suite reads the ClojureScript grid"
-```
+**Report any test you could not port, and why.** A test that cannot be expressed against the new markup is telling you something about the new markup.
 
 ---
 
 ## Task 12: the flag goes, and so does `tableHTML`
 
-**Files:**
-- Modify: `resources/public/index.html`
-- Modify: `test/browser/cljsbuild.test.mjs`
+**Files:** `resources/public/index.html` · `test/browser/cljsbuild.test.mjs`
 
-- [ ] **Step 1: Make it the default.** Delete `CLJS_GRID` and its branch; `renderMold`'s table case becomes:
+Delete `CLJS_GRID` and its branch so the grid is simply what a table renders as. Then delete `tableHTML` and the `table.mold` rules the grid does not use.
 
-```js
-    case 'table':  return liveBadge(m)+'<div data-cljs-grid="'+esc(m.id)+'"></div>';
-```
+**`tableHTML` has two other callers** — `renderReport`'s table blocks and the ƒ preview's before/after. Neither is windowed and neither has an elision. **Recommended: give them a small local `staticTable(rows)`** rather than mounting a component per report block: they are a handful of rows inside prose, they need no pager, sort or chooser, and they already have their rows in hand. Take the markup and the numeric alignment; drop the width arithmetic and the 60-row cap. If you disagree, argue it rather than implementing it.
 
-- [ ] **Step 2: Delete `tableHTML`** and the `table.mold` CSS rules the grid does not use.
+`rg -n "tableHTML" resources/public/index.html` and **report every site** before deleting anything.
 
-**`renderReport` and the ƒ preview also call `tableHTML`** (around `index.html:1889` and the `case 'table'` inside `renderReport`). They render report blocks and before/after previews, which are *not* windowed and have no elision.
-
-**Recommended: keep a small local `staticTable(rows)` for them**, rather than mounting a grid per report block. Those tables are a handful of rows inside prose — they need no pager, no sort and no chooser, and mounting a Replicant component per block would put a fetch and a state entry behind something that already has its rows in hand. Take the *rendering* half of `tableHTML` (the `table.mold` markup and the numeric-column alignment) and drop the width arithmetic and the 60-row cap with it.
-
-If you disagree, argue it rather than implementing it. **Do not delete `tableHTML` until both call sites are handled** — `rg -n "tableHTML" resources/public/index.html` and report every site you found.
-
-- [ ] **Step 3: Update the build test.** `without ?cljs the shell renders its own table and mounts nothing` is now false. Replace it with one asserting the grid mounts *without* a flag.
-
-- [ ] **Step 4: Both suites green**, then commit.
-
-```bash
-git add resources/public/index.html test/browser/
-git commit -m "feat: the ClojureScript grid is the table, and tableHTML is gone"
-```
+The build test's "without `?cljs` the shell renders its own table" case is now false — replace it with one asserting the grid mounts with no flag.
 
 ---
 
 ## Finishing
 
 - [ ] `clojure -M:test`, `npm run test:cljs` and `npm run test:browser`, all green, all foreground.
-- [ ] Update the spec's Status to **built and measured, 2026-08-25**, and record what building changed — in particular the Replicant event-placeholder spelling from Task 8, the real per-cell budget arithmetic from Task 5, and how many browser tests Task 11 had to rewrite.
+- [ ] Update the spec's Status to **built and measured**, recording what building changed: the Replicant event form from Task 8, the frozen-column sabotage that could not work, and how many browser tests Task 11 had to rewrite.
 - [ ] `superpowers:finishing-a-development-branch` to decide how `spike-cljs` lands, and whether it merges into `paged-table-grid` or replaces it.
