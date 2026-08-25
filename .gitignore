@@ -39,6 +39,6 @@ loci.env.bak-*
 .tmp/*
 !.tmp/.gitkeep
 
-# SPIKE: compiled ClojureScript — build output, not source
+# compiled ClojureScript — build output, not source
 resources/public/js/
 .shadow-cljs/

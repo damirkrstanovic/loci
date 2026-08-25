@@ -96,7 +96,7 @@
           :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]
           :exec-fn     user/start}
 
-  ;; SPIKE 2026-08-25 — ClojureScript shell. Does the seam work?
+  ;; The ClojureScript shell.
   ;;   compile:  clojure -M:cljs -m shadow.cljs.devtools.cli release grid
   ;;   watch:    clojure -M:cljs -m shadow.cljs.devtools.cli watch grid
   ;; `src-cljs` is its own root so the Clojure compiler never sees a .cljs file
