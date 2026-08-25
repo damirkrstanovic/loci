@@ -822,7 +822,7 @@ test('a long value is clipped in the tooltip, not shipped whole', async () => {
 - [ ] **Step 3: Run, watch fail.**
 
 ```
-npm run test:browser -- --test-name-pattern=grid
+node --test test/browser/grid.test.mjs
 ```
 
 Expected: the first test fails because the table width equals the box width. **Report the two numbers** — they are the measurement this task is judged on.
@@ -875,7 +875,7 @@ In the CSS at `index.html:168`, drop `width:100%` and `table-layout:fixed`:
 - [ ] **Step 5: Green.**
 
 ```
-npm run test:browser -- --test-name-pattern=grid
+node --test test/browser/grid.test.mjs
 ```
 
 - [ ] **Step 6: Prove they bite.** Restore `width:100%;table-layout:fixed` and the `<colgroup>`: `a 36-column table is wider than its panel` and `a narrow column still shows its whole value` must both go red. Remove `clip`: the tooltip test must report 900.
@@ -1184,7 +1184,7 @@ The next cursor rides on the wrapper as a string the shell only ever hands back,
 - [ ] **Step 4: Green.**
 
 ```
-npm run test:browser -- --test-name-pattern=grid
+node --test test/browser/grid.test.mjs
 ```
 
 - [ ] **Step 5: Prove they bite.**

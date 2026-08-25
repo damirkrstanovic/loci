@@ -19,6 +19,7 @@
 - **Measure, don't assert.** A browser test that checks a CSS rule is present passes while the header scrolls away. Assert on measured positions and sizes.
 - **`rg -n`, never `rg -rn`** — `-r` is *replace* and silently rewrites every match in the output. Plain `grep` is unreliable on `index.html` because of its long lines.
 - **Everything FOREGROUND**, timeout up to 900000 ms. Never background a command; two subagents have already parked on a backgrounded browser run in this project.
+- **To iterate on ONE browser file, name the file — never `--test-name-pattern`.** Measured 2026-08-25: `--test-name-pattern` filters which *tests execute* and does **not** stop each file's `before` hook, so all seventeen files still boot a fixture server. One run had **six server JVMs up at once, 4.7 GB RSS on a 15 GB box**, to execute the tests in one of them. `node --test test/browser/<file>.test.mjs` boots one. The full `npm run test:browser` is still what you run at the end of a task.
 - **Two Clojure suites and one JS suite.** `clojure -M:test`, `npm run test:browser`, and from Task 2 also `npm run test:cljs`. **Always the npm script, never the raw `compile test && node …`** — a `:node-test` build whose `:ns-regexp` matches nothing prints `Ran 0 tests` and exits 0, so the raw form reports a suite that is not there as green. The script is the guard.
 
 ## What the spike already left in place
@@ -168,7 +169,7 @@ test('the build declares no npm dependencies', () => {
 - [ ] **Step 4: Run, watch the third test fail if you skipped Step 1.**
 
 ```
-npm run test:browser -- --test-name-pattern=cljs
+node --test test/browser/cljsbuild.test.mjs
 ```
 
 - [ ] **Step 5: Green, then prove the npm test bites.** Temporarily change `:replace-deps` to `:extra-deps` in `deps.edn`'s `:cljs` alias, run a clean release build (`rm -rf .shadow-cljs && clojure -M:cljs -m shadow.cljs.devtools.cli release grid`), and confirm `package.json` gains dependencies and the test goes red. **Report what it installed.** Restore `:replace-deps`, then restore `package.json` and `package-lock.json` **from copies taken before this step** — `git checkout` them and you restore the residue Step 1 removed and has not yet committed — then `rm -rf node_modules && npm ci` and rebuild.
