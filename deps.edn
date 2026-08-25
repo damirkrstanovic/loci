@@ -51,10 +51,15 @@
           :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; run the unit tests:  clojure -M:test
+  ;; `loci.test-main` and not `cognitect.test-runner` directly: it installs a
+  ;; shutdown hook that removes the fixture directories this JVM created, then
+  ;; delegates. 23 test namespaces build scratch dirs by hand at 40 call sites
+  ;; and most never clean up — measured 2026-08-25, `.tmp` held 18,718 of them.
+  ;; See the namespace docstring for why a hook rather than 40 edits.
   :test  {:extra-paths ["test"]
           :extra-deps  {io.github.cognitect-labs/test-runner
                         {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
-          :main-opts   ["-m" "cognitect.test-runner"]
+          :main-opts   ["-m" "loci.test-main"]
           :jvm-opts    ["--enable-native-access=ALL-UNNAMED" "-Djava.io.tmpdir=.tmp"]}
 
   ;; one-shot import of the old EDN log into Datalevin:  clojure -M:migrate
