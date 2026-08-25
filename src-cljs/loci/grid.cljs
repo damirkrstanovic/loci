@@ -1,77 +1,131 @@
 (ns loci.grid
-  "SPIKE 2026-08-25 — does the ClojureScript seam work?
+  "The ClojureScript grid: state, actions and the one effect.
 
-   Four things this is trying to establish, and nothing else:
+   Two namespaces on purpose. This one owns state and talks to the network;
+   `loci.grid.view` is a pure function of state to hiccup and requires nothing,
+   so every question about what gets drawn is answerable without a DOM.
 
-   1. shadow-cljs compiles against the existing `deps.edn` and the output can be
-      mounted into the existing vanilla shell without touching the other ~3,000
-      lines of it.
-   2. Replicant renders hiccup into a node handed to it by that shell.
-   3. **Transit preserves a namespaced keyword.** `:table/total` must arrive as
-      the keyword `:table/total`, not the string \"total\" — that silent rename is
-      what broke two tasks of the paging plan when the wire was JSON.
-   4. Clerk's elision shape reads naturally as data on this side: a row that IS
-      the hole, carrying what is needed to fill it.
+   **State lives on the server.** This atom holds the last payload plus the
+   view-local preferences a person set — the page they are on, the size, the
+   sort, the hidden columns. Nothing here is a second source of truth about
+   content: `undo!` and `?at=` work because the substrate owns that, and a
+   ratom-shaped cache of it is exactly what this design refuses.
 
-   It is a spike. It is not the design."
-  (:require [cognitect.transit :as t]
+   **A cursor is opaque.** It arrives on the payload and goes back out on the
+   query string untouched. Nothing in this namespace decodes one, and the
+   browser suite scans this file to keep it that way — three storage strategies
+   share one pager precisely because nothing above the store reads a cursor."
+  (:require [clojure.string :as str]
+            [cognitect.transit :as t]
+            [loci.grid.view :as view]
             [replicant.dom :as r]))
 
-(defonce !state (atom {}))
-
-(declare view)   ; fetch-page! renders, and view is defined below it
-
+(defonce !grids (atom {}))            ; DOM element -> state
 (def ^:private reader (t/reader :json))
 
-(defn- fetch-page!
-  "One page of a mold, over Transit. `cursor` is opaque — handed back untouched,
-   never read, which is the whole reason one control can front two different
-   storage strategies underneath."
-  [el id cursor]
-  (-> (js/fetch (str "/api/mold?id=" (js/encodeURIComponent id)
-                     "&wire=transit&limit=25"
-                     (when cursor (str "&cursor=" (js/encodeURIComponent cursor)))))
+(defn init-state [id]
+  ;; `:stack` holds the cursor that BEGAN each visited page, so Prev is a pop and
+  ;; is exact. A server-computed `prev` would be a second source of truth able to
+  ;; disagree with it, and the store cannot compute one under keyset anyway.
+  {:id id :payload nil :stack [nil] :page 0 :limit 100 :sort nil :hidden #{}})
+
+(defn current-cursor [s] (nth (:stack s) (:page s) nil))
+;; `has-next?` is `loci.grid.view/has-next?` — a pure question about a payload,
+;; and the view namespace is the one that requires nothing. Not duplicated here.
+
+(defn on-payload
+  "The fetched page REPLACES what was on screen; it does not join it.
+
+   Clerk's elision appends, which is right for an inspector drilling into one
+   value. At the 10M-row scale this targets it is wrong: forty clicks of an
+   accreting `more` puts four thousand rows in the DOM, and a bounded DOM was
+   half of what paging was for. Design §3.1."
+  [s payload] (assoc s :payload payload))
+
+(defn next-page [s]
+  (if-let [c (get-in s [:payload :elision :cursor])]
+    (-> s (assoc :stack (conj (vec (take (inc (:page s)) (:stack s))) c))
+          (update :page inc))
+    s))
+
+(defn prev-page [s] (cond-> s (pos? (:page s)) (update :page dec)))
+
+(defn set-limit [s n]
+  ;; A cursor names a position in a walk of a given size, so a new size
+  ;; invalidates every cursor in the stack. Back to page one, which is honest —
+  ;; the alternative is a caption whose arithmetic no longer matches the rows.
+  (assoc s :limit n :stack [nil] :page 0))
+
+(defn toggle-sort [s col]
+  ;; Three states, not two: ascending, descending, and back to the table's own
+  ;; order — which for a lake table is the only order that pages by seeking
+  ;; rather than by counting, so it must be reachable rather than lost on the
+  ;; first click. Reordering invalidates the stack for the same reason a resize
+  ;; does.
+  (let [[c d] (:sort s)
+        nxt   (cond (not= c col) [col "asc"] (= d "asc") [col "desc"] :else nil)]
+    (assoc s :sort nxt :stack [nil] :page 0)))
+
+(defn toggle-col [s col]
+  (assoc s :hidden (if (contains? (:hidden s) col)
+                     (disj (:hidden s) col)
+                     (conj (:hidden s) col))
+           :stack [nil] :page 0))
+
+(defn- visible-cols [s]
+  (let [all (get-in s [:payload :table/cols])]
+    (when (seq (:hidden s)) (vec (remove (:hidden s) all)))))
+
+(defn- url [s]
+  (str "/api/mold?wire=transit&id=" (js/encodeURIComponent (:id s))
+       "&limit=" (:limit s)
+       (when-let [c (current-cursor s)] (str "&cursor=" (js/encodeURIComponent c)))
+       (when-let [[c d] (:sort s)] (str "&sort=" (js/encodeURIComponent (str (name c) "," d))))
+       (when-let [cs (visible-cols s)]
+         (str "&cols=" (js/encodeURIComponent (str/join "," (map name cs)))))))
+
+(defn- render! [el]
+  (r/render el (view/grid el (get @!grids el))))
+
+(defn refresh!
+  "The one effect. Everything else in this namespace is a pure state transition."
+  [el]
+  (-> (js/fetch (url (get @!grids el)))
       (.then #(.text %))
       (.then (fn [body]
-               (let [m (t/read reader body)]
-                 (swap! !state assoc el m)
-                 (r/render el (view el m)))))))
+               (swap! !grids update el on-payload (t/read reader body))
+               (render! el)))))
 
-;; Replicant's data-driven handlers: a handler RETURNS an action as data rather
-;; than performing an effect. The dispatch below is the only place an effect
-;; happens — which is the same shape loci's substrate already has, where a click
-;; becomes an event rather than a mutation.
-(defn- view [el {:as m :keys [table/total table/cols page/next id rendered]}]
-  [:div.gridspike
-   [:div {:style {:overflow "auto" :max-height "420px"}}
-    [:table.mold {:style {:width "max-content" :max-width "none"}}
-     [:thead
-      [:tr (for [c cols]
-             [:th {:title (name c)} (name c)])]]
-     [:tbody
-      (for [[i row] (map-indexed vector rendered)]
-        [:tr {:replicant/key i}
-         (for [c cols] [:td (str (get row c))])])
-      ;; the elision: a row that IS the hole. Clerk's shape, loci's cursor.
-      (when next
-        [:tr.elision
-         [:td {:colSpan (count cols)
-               :on {:click [[:fetch-more el id next]]}}
-          (str (- total (count rendered)) " more")]])]]]
-   [:div.pgcap (str "showing " (count rendered)
-                    " of " total
-                    " · " (count cols) " columns")]])
+(defn- act! [el f & args]
+  (swap! !grids update el #(apply f % args))
+  (refresh! el))
+
+;; **Replicant hands the handler data back VERBATIM.** `replicant.core/
+;; get-event-handler` wraps the data in `(fn [e] (*dispatch* rd handler))` and
+;; interpolates nothing, so there is no placeholder spelling for "the value of
+;; the event that fired" — the plan's `%` was a guess and is not one. What the
+;; dispatch does get is the DOM event itself, on the `rd` map every dispatch
+;; receives first, and that is where a `<select>`'s value is read from.
+(defn- event-value [rd]
+  (some-> (or (:replicant/node rd)
+              (some-> ^js (:replicant/dom-event rd) .-target))
+          .-value))
 
 (r/set-dispatch!
- (fn [_ [[action el id cursor]]]
+ (fn [rd [[action el arg]]]
    (case action
-     :fetch-more (fetch-page! el id cursor)
-     (js/console.warn "unknown action" (pr-str action)))))
+     :page/next (act! el next-page)
+     :page/prev (act! el prev-page)
+     :page/size (act! el set-limit (js/parseInt (event-value rd) 10))
+     :sort/toggle (act! el toggle-sort arg)
+     :cols/toggle (act! el toggle-col arg)
+     (js/console.warn "loci.grid: unknown action" (pr-str action)))))
 
 (defn ^:export mount
-  "Called BY the existing vanilla shell, from `wireSourceButtons`, with the node
-   it just inserted. That is the whole integration surface."
+  "Called BY the vanilla shell from `wireSourceButtons`, with the node it just
+   inserted. That is the whole integration surface."
   [el id]
-  (fetch-page! el id nil))
+  (swap! !grids assoc el (init-state id))
+  (refresh! el))
 
-(defn init [] (js/console.log "loci.grid spike loaded"))
+(defn init [])
