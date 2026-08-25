@@ -23,13 +23,21 @@
 (defonce !grids (atom {}))            ; DOM element -> state
 (def ^:private reader (t/reader :json))
 
-(defn init-state [id]
-  ;; `:stack` holds the cursor that BEGAN each visited page, so Prev is a pop and
-  ;; is exact. A server-computed `prev` would be a second source of truth able to
-  ;; disagree with it, and the store cannot compute one under keyset anyway.
-  {:id id :payload nil :stack [nil] :page 0 :limit 100 :sort nil :hidden #{}})
+(def page-one
+  "Where a walk begins: no cursor, and no rows before it.
 
-(defn current-cursor [s] (nth (:stack s) (:page s) nil))
+   Both halves of one fact. The cursor is how the server is ASKED for a page and
+   is opaque; the offset is what the caption SAYS about it and is a number. They
+   are recorded together because they are learned together — see `next-page`."
+  {:cursor nil :offset 0})
+
+(defn init-state [id]
+  ;; `:stack` holds where each visited page began, so Prev is a pop and is exact.
+  ;; A server-computed `prev` would be a second source of truth able to disagree
+  ;; with it, and the store cannot compute one under keyset anyway.
+  {:id id :payload nil :stack [page-one] :page 0 :limit 100 :sort nil :hidden #{}})
+
+(defn current-cursor [s] (:cursor (nth (:stack s) (:page s) nil)))
 ;; `has-next?` is `loci.grid.view/has-next?` — a pure question about a payload,
 ;; and the view namespace is the one that requires nothing. Not duplicated here.
 
@@ -44,8 +52,18 @@
 
 (defn next-page [s]
   (if-let [c (get-in s [:payload :elision :cursor])]
-    (-> s (assoc :stack (conj (vec (take (inc (:page s)) (:stack s))) c))
-          (update :page inc))
+    ;; The offset recorded beside the cursor is not the client counting pages: it
+    ;; is the server's offset for the page on screen plus the rows the server
+    ;; actually sent. It exists because the LAST page carries no elision — a hole
+    ;; describing zero omitted rows is not a hole — and so carries no offset
+    ;; either. Without it the final caption reads `showing 1–50 of 250` over rows
+    ;; 201–250, which is the same class of defect as the spike's append label
+    ;; over replace behaviour: the number and the rows disagreeing.
+    (let [{:keys [offset]} (get-in s [:payload :elision])
+          start (+ (or offset 0) (count (get-in s [:payload :rendered])))]
+      (-> s (assoc :stack (conj (vec (take (inc (:page s)) (:stack s)))
+                                {:cursor c :offset start}))
+            (update :page inc)))
     s))
 
 (defn prev-page [s] (cond-> s (pos? (:page s)) (update :page dec)))
@@ -54,7 +72,7 @@
   ;; A cursor names a position in a walk of a given size, so a new size
   ;; invalidates every cursor in the stack. Back to page one, which is honest —
   ;; the alternative is a caption whose arithmetic no longer matches the rows.
-  (assoc s :limit n :stack [nil] :page 0))
+  (assoc s :limit n :stack [page-one] :page 0))
 
 (defn toggle-sort [s col]
   ;; Three states, not two: ascending, descending, and back to the table's own
@@ -64,13 +82,13 @@
   ;; does.
   (let [[c d] (:sort s)
         nxt   (cond (not= c col) [col "asc"] (= d "asc") [col "desc"] :else nil)]
-    (assoc s :sort nxt :stack [nil] :page 0)))
+    (assoc s :sort nxt :stack [page-one] :page 0)))
 
 (defn toggle-col [s col]
   (assoc s :hidden (if (contains? (:hidden s) col)
                      (disj (:hidden s) col)
                      (conj (:hidden s) col))
-           :stack [nil] :page 0))
+           :stack [page-one] :page 0))
 
 (defn- visible-cols [s]
   (let [all (get-in s [:payload :table/cols])]

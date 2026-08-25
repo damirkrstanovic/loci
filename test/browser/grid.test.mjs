@@ -4,6 +4,9 @@
 // "is readable" passes at 0.7 characters.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startServer, launchBrowser, withPage, bootedShell, GRID_FIXTURE } from './harness.mjs';
 
 let server, browser;
@@ -44,6 +47,25 @@ const cellText = (page, name, row = 0) => page.evaluate(([g, n, r]) => {
   const i = heads.findIndex(h => h.textContent.trim() === n);
   return document.querySelectorAll(`${g} tbody tr`)[r].children[i].textContent.trim();
 }, [G, name, row]);
+
+// ---- the pager ----
+const caption = (page) => page.textContent(`${G} .pgcap`);
+const rows = (page) => page.evaluate(g => document.querySelectorAll(`${g} tbody tr`).length, G);
+const dead = (page, what) =>
+  page.evaluate(([g, w]) => document.querySelector(`${g} [data-grid-${w}]`).disabled, [G, what]);
+
+// Click, then wait for the CAPTION to change rather than for a timeout: the
+// click dispatches an action, the action refetches, and the page is drawn when
+// the payload lands. Waiting on the caption waits on all three.
+const step = async (page, act) => {
+  const was = await caption(page);
+  await act();
+  await page.waitForFunction(
+    ([g, w]) => document.querySelector(`${g} .pgcap`)?.textContent !== w, [G, was],
+    { timeout: 10000 });
+};
+const clickNext = (page) => step(page, () => page.click(`${G} [data-grid-next]`));
+const clickPrev = (page) => step(page, () => page.click(`${G} [data-grid-prev]`));
 
 test('a 36-column table is wider than its panel and has somewhere to scroll', async () => {
   await withPage(browser, 'cljs-grid-scrolls', async (page) => {
@@ -266,4 +288,112 @@ test('a long value is clipped in the tooltip', async () => {
       .children[n].getAttribute('title').length, [G, i]);
     assert.ok(len <= 520, `a 900-character value produced a ${len}-character tooltip`);
   });
+});
+
+// **The decision in §3.1, measured on the rendered page.** loci's elision
+// REPLACES the rows it fetched over; Clerk's, whose shape it borrows, appends.
+// Task 6 guards the state transition; these guard what a person actually sees —
+// a caption that counts, a Prev control an append model would have no use for,
+// and a DOM that does not grow. The spike shipped the two disagreeing: an
+// elision labelled `1 more` over replace behaviour.
+test('the walk reaches the end and stops there', async () => {
+  await withPage(browser, 'cljs-grid-walk', async (page) => {
+    await openGrid(page);
+    assert.equal(await caption(page), 'showing 1–100 of 250');
+    assert.equal(await rows(page), 100);
+    assert.equal(await dead(page, 'prev'), true, 'nothing precedes page one');
+    assert.equal(await dead(page, 'next'), false, 'there are 150 rows still to come');
+
+    await clickNext(page);
+    assert.equal(await caption(page), 'showing 101–200 of 250');
+
+    await clickNext(page);
+    // 250 rows at 100 a page is THREE pages, so the walk ends after two Nexts —
+    // the plan said three. The last page is the short one, and it is the only
+    // page on which the server sends no elision at all: no cursor, and no offset
+    // either, so this caption is also what proves the shell remembered where the
+    // page it asked for begins.
+    assert.equal(await caption(page), 'showing 201–250 of 250');
+    assert.equal(await rows(page), 50, 'the last page of 250 at 100 a page is 50 rows');
+    assert.equal(await dead(page, 'next'), true, 'the last page omitted nothing');
+    assert.equal(await dead(page, 'prev'), false);
+  });
+});
+
+test('a page REPLACES the one before it — 100 rows after a Next, not 200', async () => {
+  await withPage(browser, 'cljs-grid-replaces', async (page) => {
+    await openGrid(page);
+    assert.equal(await cellText(page, 'id'), 'row-0');
+    await clickNext(page);
+    const n = await rows(page);
+    assert.equal(n, 100,
+      `${n} rows after one Next: ${n === 200 ? 'the page was APPENDED, which is ' +
+       'Clerk\'s semantics and not loci\'s — design §3.1' : 'unexpected'}`);
+    assert.equal(await cellText(page, 'id'), 'row-100',
+      'page two starts at row 100, so page one is gone rather than scrolled past');
+  });
+});
+
+test('Prev is exact — it pops the cursor that began the page', async () => {
+  await withPage(browser, 'cljs-grid-prev', async (page) => {
+    await openGrid(page);
+    await clickNext(page);
+    await clickNext(page);
+    assert.equal(await caption(page), 'showing 201–250 of 250');
+    await clickPrev(page);
+    assert.equal(await caption(page), 'showing 101–200 of 250');
+    // The caption alone would pass on a recomputed cursor that fetched the wrong
+    // slice, which is the whole reason Prev is a stack pop. The rows are what
+    // say it landed where it said it did.
+    assert.equal(await cellText(page, 'id'), 'row-100');
+    assert.equal(await rows(page), 100);
+  });
+});
+
+test('changing the page size restarts the walk', async () => {
+  await withPage(browser, 'cljs-grid-size', async (page) => {
+    await openGrid(page);
+    // Before anything else: the select shows the size actually in force. It is
+    // built with `:selected` on the options because Replicant sets a node's
+    // attributes before appending its children, so a `:value` on the select
+    // itself would be assigned to a select with no options and vanish.
+    assert.equal(await page.inputValue(`${G} [data-grid-size]`), '100');
+    await clickNext(page);
+    assert.equal(await caption(page), 'showing 101–200 of 250');
+    await step(page, () => page.selectOption(`${G} [data-grid-size]`, '25'));
+    // A cursor names a position in a walk of a given size, so every cursor in
+    // the stack is void. Page one, and Prev dead.
+    assert.equal(await caption(page), 'showing 1–25 of 250');
+    assert.equal(await rows(page), 25);
+    assert.equal(await dead(page, 'prev'), true, 'the walk restarted, so there is no back');
+    assert.equal(await cellText(page, 'id'), 'row-0');
+  });
+});
+
+// No browser, no server: a question about the source, asked of the source.
+//
+// **The cursor is opaque, and that is what lets one pager serve three storage
+// strategies.** A lake table pages by keyset (`{"k": <rowid>}`), a source by
+// offset (`{"o": <n>, "s": <sort>}`), and the shell must not be able to tell —
+// the moment it reads a cursor's contents, changing how the store pages becomes
+// a change to the shell. Base64 makes peeking easy enough to do by accident,
+// which is why this is a test rather than a comment.
+test('nothing in src-cljs/ can read a cursor', () => {
+  const dir = join(dirname(dirname(dirname(fileURLToPath(import.meta.url)))), 'src-cljs');
+  const files = [];
+  const walk = (d) => readdirSync(d, { withFileTypes: true }).forEach(e =>
+    e.isDirectory() ? walk(join(d, e.name)) : files.push(join(d, e.name)));
+  walk(dir);
+  assert.ok(files.length >= 2, `only ${files.length} files under src-cljs/ — the scan found nothing to scan`);
+  // `atob`/`js/atob` decode it, `JSON.parse` reads what came out, and `"k"` or
+  // `"o"` is what someone who decoded it would go looking for. `:keys` is not a
+  // false positive here: the quotes are required.
+  const banned = [/\batob\b/, /JSON\.parse/, /js\/JSON/, /"k"/, /"o"/, /\.-k\b/, /\.-o\b/];
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8');
+    for (const re of banned) {
+      assert.ok(!re.test(src), `${f} matches ${re} — the shell is reading inside a cursor`);
+    }
+  }
+  console.log(`  MEASURED: ${files.length} files under src-cljs/, none of them peek`);
 });

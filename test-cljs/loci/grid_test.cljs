@@ -2,7 +2,8 @@
   "State transitions and the view's DATA. What needs a real DOM — sticky
    positions, scroll width — is measured by test/browser/grid.test.mjs, because
    a headless DOM answers those questions wrongly rather than not at all."
-  (:require [cljs.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [cljs.test :refer [deftest is]]
             [loci.grid :as grid]
             [loci.grid.view :as view]))
 
@@ -15,7 +16,8 @@
 (deftest a-fresh-grid-is-on-page-one-with-an-empty-stack
   (let [s (grid/init-state "tbl:x")]
     (is (= "tbl:x" (:id s)))
-    (is (= [nil] (:stack s)) "the cursor that began page one is no cursor at all")
+    (is (= [grid/page-one] (:stack s))
+        "page one begins at no cursor and at row zero")
     (is (= 0 (:page s)))
     (is (= 100 (:limit s)))))
 
@@ -23,7 +25,8 @@
   (let [s0 (assoc (grid/init-state "tbl:x") :payload payload)
         s1 (grid/next-page s0)
         s2 (grid/prev-page s1)]
-    (is (= [nil "CUR1"] (:stack s1)))
+    (is (= [{:cursor nil :offset 0} {:cursor "CUR1" :offset 2}] (:stack s1))
+        "the cursor and where it lands are learned together and recorded together")
     (is (= 1 (:page s1)))
     (is (= "CUR1" (grid/current-cursor s1)) "the next request asks from the hole")
     (is (= 0 (:page s2)))
@@ -39,7 +42,7 @@
   (let [s1 (grid/next-page (assoc (grid/init-state "tbl:x") :payload payload))
         s2 (grid/set-limit s1 25)]
     (is (= 25 (:limit s2)))
-    (is (= [nil] (:stack s2)))
+    (is (= [grid/page-one] (:stack s2)))
     (is (= 0 (:page s2)))))
 
 (deftest a-fetched-page-REPLACES-the-rows-it-does-not-append
@@ -68,3 +71,45 @@
     (is (not (view/has-next? s)))
     (is (= "showing 1–2 of 2" (view/caption s))
         "with no hole, the total is what is on screen")))
+
+(deftest the-last-page-counts-from-where-the-walk-left-off
+  ;; A final page carries NO elision — a hole describing zero omitted rows is not
+  ;; a hole — so it carries no offset either, and the caption has nothing from the
+  ;; server to count from. Without the offset `next-page` recorded, this reads
+  ;; "showing 1–3 of 5" over the last three rows of five.
+  (let [s1 (grid/on-payload (grid/init-state "tbl:x") payload)
+        s2 (grid/next-page s1)
+        s3 (grid/on-payload s2 {:table/cols [:a :b] :table/total 5
+                                :rendered [{:a 3} {:a 4} {:a 5}]})]
+    (is (= "showing 3–5 of 5" (view/caption s3)))
+    (is (not (view/has-next? s3)) "there is no hole, so there is nowhere to go")))
+
+(defn- els
+  "Every hiccup element in `tree` whose tag begins with `tag`. The pager is
+   private, so the tests reach it the way a reader does — through what `grid`
+   returns, which is data."
+  [tree tag]
+  (filter #(and (vector? %) (keyword? (first %))
+                (str/starts-with? (name (first %)) tag))
+          (tree-seq coll? seq tree)))
+
+(deftest prev-is-dead-on-page-one-and-next-is-dead-at-the-end
+  (let [on-1  (grid/on-payload (grid/init-state "tbl:x") payload)
+        [prev nxt] (els (view/grid nil on-1) "button")
+        last-p (grid/on-payload (grid/next-page on-1) (dissoc payload :elision))
+        [prev2 nxt2] (els (view/grid nil last-p) "button")]
+    (is (true? (:disabled (second prev))) "nothing precedes page one")
+    (is (false? (:disabled (second nxt))) "the payload carries a hole")
+    (is (false? (:disabled (second prev2))) "page two can go back")
+    (is (true? (:disabled (second nxt2))) "the last page omitted nothing")))
+
+(deftest the-size-select-shows-the-size-in-force
+  ;; Not a formality: Replicant sets an element's attributes before appending its
+  ;; children, so `:value` on the `<select>` itself would be assigned to a select
+  ;; with no options and silently do nothing. The selection is on the options.
+  (let [s (grid/set-limit (grid/on-payload (grid/init-state "tbl:x") payload) 50)
+        opts (els (view/grid nil s) "option")]
+    (is (= [25 50 100 200] (map #(js/parseInt (:value (second %)) 10) opts)))
+    (is (= [50] (keep #(when (:selected (second %))
+                         (js/parseInt (:value (second %)) 10)) opts))
+        "exactly one option is selected, and it is the size in force")))

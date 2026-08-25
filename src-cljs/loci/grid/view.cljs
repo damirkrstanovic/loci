@@ -6,16 +6,30 @@
    that is the whole reason the split exists. `loci.grid` owns state and the one
    effect; this owns what a person sees, as data.")
 
+(defn- page-start
+  "How many rows precede the page on screen.
+
+   The elision's `:offset` whenever there is one, because it is the SERVER's and
+   the server's is a fact — the client's page index is arithmetic over a page
+   size a person can change mid-walk.
+
+   The fallback is for the LAST page, which carries no elision — a hole
+   describing zero omitted rows is not a hole — and therefore no offset. It is
+   still not the client counting pages: `loci.grid/next-page` recorded it when
+   Next was pressed, as the server's offset for the page then on screen plus the
+   rows the server actually sent. Without it the last caption of the 250-row
+   fixture reads `showing 1–50 of 250` over rows 201–250."
+  [{:keys [payload stack page]}]
+  (or (get-in payload [:elision :offset])
+      (:offset (nth stack page nil))
+      0))
+
 (defn caption
   "`showing 401–402 of 10000000`, or `… of 10000000+` when the total is a claim
-   rather than a fact.
-
-   **Counted from the server's `:offset`, never from the client's page index.**
-   The client's is arithmetic over a page size it may have changed; the server's
-   is where the rows it just sent actually start."
-  [{:keys [payload]}]
+   rather than a fact."
+  [{:as s :keys [payload]}]
   (let [{:keys [rendered elision table/total]} payload
-        off   (or (:offset elision) 0)
+        off   (page-start s)
         n     (count rendered)
         total (or (:total elision) total n)]
     (str "showing " (inc off) "–" (+ off n) " of " total
@@ -50,11 +64,55 @@
                         (and (seq vs) (every? number? vs)))))
         cols))
 
+(def ^:private page-sizes
+  "What a person can ask for, not what the server will honour: `page-limit`
+   clamps, and the elision reports the size it actually used."
+  [25 50 100 200])
+
+(defn- pager
+  "Prev, Next, a size, and a caption that counts.
+
+   **A Prev control is the visible half of §3.1.** Clerk's elision appends, so
+   `more` is the only control it needs — there is nowhere to go back to when
+   nothing was replaced. loci's REPLACES, so a walk needs both directions and a
+   caption saying which slice is on screen. If someone ever deletes Prev, they
+   have quietly turned this back into Clerk's protocol.
+
+   The actions carry `el`, because `!grids` is keyed by the mounted element and a
+   page may hold more than one grid.
+
+   **`data-grid-*` and not `data-a`**, which the vanilla shell already wires by
+   value in `wireSourceButtons` — two owners of one attribute is a collision
+   waiting for whoever adds `data-a=\"prev\"` to the shell."
+  [el s]
+  [:div.pager
+   [:button.btn.ghost.sm {:data-grid-prev true
+                          ;; `false` REMOVES the attribute — Replicant's
+                          ;; `update-attr` treats any falsy value as absence —
+                          ;; so this is a real enable, not `disabled=\"false\"`,
+                          ;; which HTML reads as disabled.
+                          :disabled (not (pos? (:page s)))
+                          :on {:click [[:page/prev el]]}} "‹ Prev"]
+   [:button.btn.ghost.sm {:data-grid-next true
+                          :disabled (not (has-next? s))
+                          :on {:click [[:page/next el]]}} "Next ›"]
+   ;; **`:selected` on the options, never `:value` on the select.** Replicant sets
+   ;; an element's attributes BEFORE appending its children (`core/create-node`),
+   ;; and `value` on a `<select>` is a property assignment — so a `:value` here
+   ;; would be applied to a select with no options yet, silently do nothing, and
+   ;; then never be re-applied because the vdom sees no change. The browser suite
+   ;; measures the select's value on first paint for exactly this reason.
+   [:select {:data-grid-size true :on {:change [[:page/size el]]}}
+    (for [n page-sizes]
+      [:option {:replicant/key n :value (str n) :selected (= n (:limit s))}
+       (str n " rows")])]
+   [:div.pgcap (caption s)]])
+
 ;; `grid` takes the element as well as the state, from the start: the pager, the
 ;; sort headers and the column chooser all dispatch actions that must name WHICH
 ;; grid they act on, and a signature that grows between tasks is one two call
 ;; sites disagree about for a commit.
-(defn grid [_el {:as s :keys [payload]}]
+(defn grid [el {:as s :keys [payload]}]
   (let [{:keys [rendered table/cols]} payload
         cols (vec (remove (:hidden s) cols))
         nums (numeric-cols rendered cols)]
@@ -87,4 +145,4 @@
                [:td {:replicant/key c :title (clip v)
                      :class (if (nums c) "num" "txt")}
                 v]))])]]]
-     [:div.pgcap (caption s)]]))
+     (pager el s)]))
