@@ -99,8 +99,11 @@
   ;; The ClojureScript shell.
   ;;   compile:  clojure -M:cljs -m shadow.cljs.devtools.cli release grid
   ;;   watch:    clojure -M:cljs -m shadow.cljs.devtools.cli watch grid
-  ;; `src-cljs` is its own root so the Clojure compiler never sees a .cljs file
-  ;; on `src`, and so this alias is the only thing that knows CLJS exists.
+  ;; `src-cljs` and `test-cljs` are their own roots so the Clojure compiler never
+  ;; sees a .cljs file on `src` or `test`, and so this alias is the only thing
+  ;; that knows CLJS exists. `test-cljs` is here and not on `:test` because
+  ;; `cljs.test` runs in Node, not in the JVM suite:
+  ;;   clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
   ;; `:replace-deps`, NOT `:extra-deps`. The CLJS build has no business loading
   ;; Datalevin or DuckDB — and one of them bites: `datalevin/datalevin 1.0.0`
   ;; pulls `io.github.nextjournal/markdown`, whose jar carries a `deps.cljs`
@@ -108,7 +111,7 @@
   ;; Clerk's whole markdown-it stack and rewrote package.json. Measured
   ;; 2026-08-25: six packages added to a project whose shell has none, for a
   ;; namespace the shell never requires. A clean classpath removes it at source.
-  :cljs  {:replace-paths ["src-cljs"]
+  :cljs  {:replace-paths ["src-cljs" "test-cljs"]
           :replace-deps  {org.clojure/clojure        {:mvn/version "1.12.0"}
                           thheller/shadow-cljs       {:mvn/version "3.2.0"}
                           no.cjohansen/replicant     {:mvn/version "2025.06.21"}

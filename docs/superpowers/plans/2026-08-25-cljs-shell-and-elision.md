@@ -19,7 +19,7 @@
 - **Measure, don't assert.** A browser test that checks a CSS rule is present passes while the header scrolls away. Assert on measured positions and sizes.
 - **`rg -n`, never `rg -rn`** — `-r` is *replace* and silently rewrites every match in the output. Plain `grep` is unreliable on `index.html` because of its long lines.
 - **Everything FOREGROUND**, timeout up to 900000 ms. Never background a command; two subagents have already parked on a backgrounded browser run in this project.
-- **Two Clojure suites and one JS suite.** `clojure -M:test`, `npm run test:browser`, and from Task 2 also `clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.js`.
+- **Two Clojure suites and one JS suite.** `clojure -M:test`, `npm run test:browser`, and from Task 2 also `clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs`.
 
 ## What the spike already left in place
 
@@ -123,19 +123,35 @@ let server, browser;
 before(async () => { server = await startServer(); browser = await launchBrowser(); });
 after(async () => { await browser?.close(); await server?.stop(); });
 
-test('the compiled module is served and defines its mount function', async () => {
+// Both halves of the flag, because the flag is renamed in this task and nothing
+// else would notice a typo in one of its three sites.
+test('the compiled module is served, and ?cljs puts its seam in the DOM', async () => {
   await withPage(browser, 'cljs-loads', async (page) => {
     await bootedShell(page, server.url + '?cljs');
     await page.waitForFunction(() => window.loci && typeof window.loci.grid.mount === 'function',
                                null, { timeout: 15000 });
+    await page.evaluate(() => openObject('tbl:planets'));
+    await page.waitForSelector('#moldsel');
+    assert.equal(await page.locator('.molder-b [data-cljs-grid]').count(), 1,
+      'with ?cljs the table mold must be the ClojureScript seam');
   });
 });
 
 test('without ?cljs the shell renders its own table and mounts nothing', async () => {
   await withPage(browser, 'cljs-off', async (page) => {
     await bootedShell(page, server.url);
-    const n = await page.evaluate(() => document.querySelectorAll('[data-cljs-grid]').length);
-    assert.equal(n, 0, 'the ClojureScript seam must be inert without the flag');
+    // A table has to be ON SCREEN for this to mean anything: counting zero seams
+    // on a page with no table is an assertion that cannot fail — with the flag
+    // forced permanently on it still read zero. `tbl:planets` is in the
+    // deterministic seed and several other files open it the same way.
+    await page.evaluate(() => openObject('tbl:planets'));
+    await page.waitForSelector('#moldsel');
+    const m = await page.evaluate(() => ({
+      seams: document.querySelectorAll('[data-cljs-grid]').length,
+      tables: document.querySelectorAll('.molder-b table.mold').length,
+    }));
+    assert.equal(m.tables, 1, 'the vanilla renderer must still draw the table');
+    assert.equal(m.seams, 0, 'the ClojureScript seam must be inert without the flag');
   });
 });
 
@@ -155,7 +171,7 @@ test('the build declares no npm dependencies', () => {
 npm run test:browser -- --test-name-pattern=cljs
 ```
 
-- [ ] **Step 5: Green, then prove the npm test bites.** Temporarily change `:replace-deps` to `:extra-deps` in `deps.edn`'s `:cljs` alias, run a clean release build (`rm -rf .shadow-cljs && clojure -M:cljs -m shadow.cljs.devtools.cli release grid`), and confirm `package.json` gains dependencies and the test goes red. **Report what it installed.** Restore `:replace-deps`, `git checkout package.json package-lock.json`, rebuild.
+- [ ] **Step 5: Green, then prove the npm test bites.** Temporarily change `:replace-deps` to `:extra-deps` in `deps.edn`'s `:cljs` alias, run a clean release build (`rm -rf .shadow-cljs && clojure -M:cljs -m shadow.cljs.devtools.cli release grid`), and confirm `package.json` gains dependencies and the test goes red. **Report what it installed.** Restore `:replace-deps`, then restore `package.json` and `package-lock.json` **from copies taken before this step** — `git checkout` them and you restore the residue Step 1 removed and has not yet committed — then `rm -rf node_modules && npm ci` and rebuild.
 
 - [ ] **Step 6: Commit.**
 
@@ -171,7 +187,7 @@ git commit -m "build: the ClojureScript build is deliberate, and a test says it 
 **Files:**
 - Modify: `shadow-cljs.edn`
 - Modify: `deps.edn` — `:cljs` alias gains the test path
-- Create: `test-cljs/loci/smoke_test.cljs`
+- Create: `test-cljs/loci/cljs_smoke_test.cljs`
 
 Without this, every ClojureScript change is verified by a Playwright run measured in minutes, in a project whose working agreement makes the REPL the execution surface. `:node-test` runs `cljs.test` in Node in seconds.
 
@@ -189,8 +205,13 @@ Without this, every ClojureScript change is verified by a Playwright run measure
            ;; data. What needs a real DOM — sticky positions, scroll widths — is
            ;; measured by the Playwright suite instead, because a headless DOM
            ;; would answer those questions wrongly rather than not at all.
+           ;;
+           ;; **`.cjs`, not `.js`.** `package.json` says `"type": "module"` for
+           ;; the Playwright suite, so Node reads a bare `.js` as ESM while
+           ;; shadow-cljs emits CommonJS: `ReferenceError: __dirname is not
+           ;; defined in ES module scope`, before the first test runs.
            :test {:target    :node-test
-                  :output-to "target/cljs-test.js"
+                  :output-to "target/cljs-test.cjs"
                   :ns-regexp "-test$"}}}
 ```
 
@@ -200,10 +221,10 @@ Without this, every ClojureScript change is verified by a Playwright run measure
   :cljs  {:replace-paths ["src-cljs" "test-cljs"]
 ```
 
-- [ ] **Step 3: Write the failing test.** Create `test-cljs/loci/smoke_test.cljs`:
+- [ ] **Step 3: Write the failing test.** Create `test-cljs/loci/cljs_smoke_test.cljs`. **`cljs-smoke-test`, not `smoke-test`** — `test/loci/smoke_test.clj` is already the JVM suite's canary, and two namespaces of one name make `Testing loci.smoke-test` ambiguous in the one place it is read:
 
 ```clojure
-(ns loci.smoke-test
+(ns loci.cljs-smoke-test
   "Proves the ClojureScript test loop exists at all. If this file stops running,
    every other cljs test in this plan is silently not running either."
   (:require [cljs.test :refer [deftest is]]
@@ -216,17 +237,17 @@ Without this, every ClojureScript change is verified by a Playwright run measure
 - [ ] **Step 4: Run it.**
 
 ```
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.js
+clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
 ```
 
-Expected: `Testing loci.smoke-test` … `1 tests, 1 assertions, 0 failures.` **Report the wall-clock time** — it is the number that justifies this task.
+Expected: `Testing loci.cljs-smoke-test` … `Ran 1 tests containing 1 assertions. 0 failures, 0 errors.` **Report the wall-clock time** — it is the number that justifies this task.
 
-- [ ] **Step 5: Prove it bites.** Rename `the-cljs-test-runner-runs` to `the-cljs-test-runner` (no `-test` suffix on the *namespace* is what `:ns-regexp` matches, so instead: temporarily rename the file's ns to `loci.smoke`), recompile, and confirm the runner reports **0 tests** rather than passing. A test build that silently runs nothing is the failure mode this step exists to catch. Restore.
+- [ ] **Step 5: Prove it bites.** `:ns-regexp` matches the *namespace*, so rename the file to `test-cljs/loci/cljs_smoke.cljs` and its ns to `loci.cljs-smoke` (shadow-cljs requires the two to agree), recompile, and confirm the runner reports **0 tests** rather than passing. Measured 2026-08-25: the build drops from 79 compiled files to 51, prints `Ran 0 tests containing 0 assertions`, and **exits 0** — while a real failure exits 1. Nothing downstream can tell those apart, which is the whole reason this file exists. Restore, then break the assertion too (`(def ^:export mount 42)` in `loci.grid`) and confirm `expected: (fn? grid/mount) / actual: (not (fn? 42))`.
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add shadow-cljs.edn deps.edn test-cljs/loci/smoke_test.cljs
+git add shadow-cljs.edn deps.edn test-cljs/loci/cljs_smoke_test.cljs
 git commit -m "test: ClojureScript runs in Node, so the shell stops being Playwright-only"
 ```
 
@@ -704,7 +725,7 @@ The spike's 77 lines are replaced. Two namespaces: `grid` owns state and effects
 - [ ] **Step 2: Run, watch fail.**
 
 ```
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.js
+clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
 ```
 
 - [ ] **Step 3: Implement `src-cljs/loci/grid.cljs`.**
@@ -1097,7 +1118,7 @@ test('a long value is clipped in the tooltip', async () => {
 
 ```
 npm run test:browser
-clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.js
+clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs
 ```
 
 ```bash
@@ -1522,6 +1543,6 @@ git commit -m "feat: the ClojureScript grid is the table, and tableHTML is gone"
 
 ## Finishing
 
-- [ ] `clojure -M:test`, `node target/cljs-test.js` and `npm run test:browser`, all green, all foreground.
+- [ ] `clojure -M:test`, `node target/cljs-test.cjs` and `npm run test:browser`, all green, all foreground.
 - [ ] Update the spec's Status to **built and measured, 2026-08-25**, and record what building changed — in particular the Replicant event-placeholder spelling from Task 8, the real per-cell budget arithmetic from Task 5, and how many browser tests Task 11 had to rewrite.
 - [ ] `superpowers:finishing-a-development-branch` to decide how `spike-cljs` lands, and whether it merges into `paged-table-grid` or replaces it.
