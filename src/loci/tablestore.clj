@@ -6,7 +6,8 @@
    table was before 2026-08-16 — and stays as the parity reference and as the
    store a test uses when it has nothing to say about DuckLake, the same role
    `substrate/PersistentStore` plays next to `dlv/DatalevinStore`."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]))
 
@@ -17,6 +18,22 @@
      for one table.")
   (rows [this handle opts]
     "A page of rows for `handle`. `opts` may carry :offset and :limit.")
+  (page [this handle window]
+    "One page of rows for `handle`, plus the cursor that starts the next page.
+
+     `window` may carry `:limit`, `:cursor` (opaque, nil for page 1), `:sort`
+     (`[col dir]`) and `:cols` (the columns to project, nil for all).
+
+     => `{:rows [...] :next <cursor-or-nil>}`
+
+     **Separate from `rows` rather than an option on it.** `rows` has twelve
+     callers — agent digests, `tools.clj`, `describe` — that want a *sample* for
+     a summary, not a page, and `mold-cap` is their default. Teaching `rows` to
+     page would push a paging concept into every one of them.
+
+     `:next` is produced by asking storage for `limit + 1` rows: if the extra one
+     comes back there is another page, and the cursor is built from the last row
+     actually returned. So the last page is known without a count.")
   (row-count [this handle] "How many rows `handle` names, without fetching them.")
   (reclaimed-at [this handle]
     "When this handle's rows were reclaimed, or nil if they were not.
@@ -299,6 +316,96 @@
                     {:column k :type (.getName (class v)) :value v})))
   (mapv (fn [r] (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)) rows))
 
+(def default-limit
+  "Rows per page when a window does not say. 100 rather than 60 — the old
+   client-side cap — because a page is now the whole of what the browser holds."
+  100)
+
+(def max-limit
+  "The ceiling a window may ask for. A design decision and not a measured one:
+   it is how many rows a person can look at, and 200 of a 36-column table is
+   already 7,200 cells."
+  200)
+
+(defn page-limit
+  "A window's `:limit`, clamped to 1..`max-limit` with `default-limit` for
+   absent. Takes a string too, because a window arrives in a query string."
+  [n]
+  (let [n (if (string? n) (parse-long (str n)) n)]
+    (max 1 (min max-limit (or n default-limit)))))
+
+(defn encode-cursor
+  "A store's internal page key, as one opaque URL-safe string.
+
+   **Opaque is the contract; base64-of-EDN is only today's encoding.** The key's
+   shape differs per handle and per sort — a rowid here, an offset there — and
+   the shell has one pager because it never looks. `clojure.edn/read-string`
+   and not `read-string`: a cursor arrives from a query string, so it is hostile
+   input, and `edn` evaluates nothing."
+  [m]
+  (.encodeToString (java.util.Base64/getUrlEncoder)
+                   (.getBytes (pr-str m) "UTF-8")))
+
+(defn decode-cursor
+  "The map `encode-cursor` made, or **nil** for nil, blank, or anything
+   malformed.
+
+   nil means page 1, so a bookmarked cursor that no longer parses reopens the
+   table at the top rather than throwing. A 500 on a URL somebody saved is the
+   worse failure: the table looks broken when only the position was."
+  [s]
+  (when-not (str/blank? s)
+    (try
+      (let [m (edn/read-string (String. (.decode (java.util.Base64/getUrlDecoder) ^String s)
+                                        "UTF-8"))]
+        (when (map? m) m))
+      (catch Exception _ nil))))
+
+(defn project-cols
+  "The columns a window asks for, in the **handle's** order, or all of them.
+
+   Handle order and not the caller's, because `lake/q-as` names a result set
+   positionally: a reordered projection would label every value with its
+   neighbour's name. Unknown names are dropped, and dropping all of them means
+   all columns — a table with no columns is not something the shell can draw."
+  [h cols]
+  (if-let [want (some-> (seq cols) (->> (map name) set))]
+    (let [kept (filterv #(contains? want (name %)) (:cols h))]
+      (if (seq kept) kept (:cols h)))
+    (:cols h)))
+
+(defn sort-spec
+  "A window's `:sort`, validated against the handle's own columns, or nil.
+
+   **Validation is not politeness.** `:sort` arrives in a query string and
+   reaches an `ORDER BY`. `lake/ident` quotes it, so a name cannot break out of
+   the identifier — but an unknown one reaches DuckDB as a binder error in the
+   middle of a render, and a table that throws because a stale bookmark named a
+   dropped column is worse than one that ignores the sort."
+  [h [col dir]]
+  (when (some? col)
+    (let [known (set (map name (:cols h)))]
+      (when (contains? known (name col))
+        [(name col) (if (= "desc" (str dir)) "desc" "asc")]))))
+
+(defn sort-rows
+  "`rows` ordered by a validated `sort-spec`, **nulls last in both directions**.
+
+   Nulls last matches the lake's `ORDER BY … NULLS LAST`. `InlineTable` is the
+   parity reference for `Lake`, so a difference here would be a difference every
+   paging test has to encode twice."
+  [[col dir] rows]
+  (let [k    (sub/col-kw col)
+        desc (= "desc" dir)]
+    (vec (sort-by #(get % k)
+                  (fn [a b]
+                    (cond (and (nil? a) (nil? b)) 0
+                          (nil? a)  1
+                          (nil? b) -1
+                          desc     (compare b a)
+                          :else    (compare a b)))
+                  rows))))
+
 (defrecord InlineTable []
   TableStore
   (put-rows! [_ _ rs]
@@ -309,6 +416,16 @@
       offset (drop offset)
       limit  (take limit)
       true   vec))
+  (page [_ h window]
+    (let [lim  (page-limit (:limit window))
+          i    (or (:i (decode-cursor (:cursor window))) 0)
+          srt  (sort-spec h (:sort window))
+          proj (project-cols h (:cols window))
+          got  (->> (cond->> (:data h) srt (sort-rows srt))
+                    (drop i) (take (inc lim)) vec)
+          more (> (count got) lim)]
+      {:rows (mapv #(select-keys % proj) (take lim got))
+       :next (when more (encode-cursor {:i (+ i lim)}))}))
   (row-count [_ h] (:rows h))
   (reclaimed-at [_ _] nil)
   (column-samples [_ h per-col max-cols]

@@ -365,3 +365,58 @@
         ;; nothing at all, which is the other way this can be broken.
         "only a :put and an :assoc at exactly [:value] name the object's value — a handle
          at [:value :preview] or inside an appended cell must yield no entry at all")))
+
+(def ^:private many (mapv (fn [i] {:id i :grp (str "g" (mod i 5)) :note nil}) (range 250)))
+
+(deftest a-window-limit-is-clamped-and-defaulted
+  (is (= 100 (tbl/page-limit nil))    "no limit means 100")
+  (is (= 100 (tbl/page-limit "")) "a blank query-string limit means 100")
+  (is (= 200 (tbl/page-limit 5000))   "200 is the ceiling")
+  (is (= 1   (tbl/page-limit 0))      "1 is the floor")
+  (is (= 25  (tbl/page-limit "25"))   "a query string arrives as a string"))
+
+(deftest a-cursor-round-trips-and-a-mangled-one-is-page-one
+  (is (= {:k 41} (tbl/decode-cursor (tbl/encode-cursor {:k 41}))))
+  (is (nil? (tbl/decode-cursor nil)))
+  (is (nil? (tbl/decode-cursor "")))
+  (is (nil? (tbl/decode-cursor "not-base64-at-all!!"))
+      "a bookmarked cursor that rotted restarts the table rather than 500ing")
+  (is (nil? (tbl/decode-cursor (tbl/encode-cursor [1 2 3])))
+      "a cursor that decodes to something other than a map is not a cursor"))
+
+(deftest inline-pages-forward-to-the-end
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:big" many)
+        p1 (tbl/page ts h {:limit 100})
+        p2 (tbl/page ts h {:limit 100 :cursor (:next p1)})
+        p3 (tbl/page ts h {:limit 100 :cursor (:next p2)})]
+    (is (= 100 (count (:rows p1))))
+    (is (= 0   (:id (first (:rows p1)))))
+    (is (= 100 (:id (first (:rows p2)))) "page 2 starts where page 1 stopped")
+    (is (= 50  (count (:rows p3))))
+    (is (nil?  (:next p3)) "the last page says so, and nothing asks for a fourth")))
+
+(deftest a-window-projects-only-the-columns-it-asks-for
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:big" many)]
+    (is (= [:id] (keys (first (:rows (tbl/page ts h {:limit 1 :cols ["id"]})))))
+        "hiding a column cuts the payload, not only the pixels")
+    (is (= [:id :grp :note] (tbl/project-cols h ["nope"]))
+        "an unknown column name leaves the projection alone")
+    (is (= [:id :grp] (tbl/project-cols h ["grp" "id"]))
+        "handle order, not the caller's — q-as names a result set positionally")))
+
+(deftest a-sort-is-validated-against-the-handle
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:big" many)]
+    (is (= ["id" "desc"] (tbl/sort-spec h ["id" "desc"])))
+    (is (= ["id" "asc"]  (tbl/sort-spec h ["id" "sideways"])) "an odd direction is asc")
+    (is (nil? (tbl/sort-spec h ["; DROP TABLE" "asc"]))
+        "a column the handle does not have is no sort at all")))
+
+(deftest inline-sorts-with-nulls-last-in-both-directions
+  (let [ts   (tbl/inline-table)
+        h    (tbl/put-rows! ts "tbl:n" [{:v 2} {:v nil} {:v 1}])
+        vals #(mapv :v (:rows (tbl/page ts h {:limit 10 :sort %})))]
+    (is (= [1 2 nil]  (vals ["v" "asc"])))
+    (is (= [2 1 nil]  (vals ["v" "desc"])) "nulls stay last when the sort flips")))
