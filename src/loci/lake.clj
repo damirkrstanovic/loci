@@ -1231,6 +1231,70 @@
                   (when offset (str " OFFSET " (long offset))))
           (:cols h)))
 
+  (page [lk h window]
+    ;; **Keyset in natural order; an offset for everything else.** A materialised
+    ;; DuckLake table exposes a dense `rowid`, so an unsorted page is a range
+    ;; predicate rather than a scan-and-discard — which is the whole reason
+    ;; paging is keyset-shaped at all.
+    ;;
+    ;; A SORT pages by offset even here, and that is a decision rather than a
+    ;; shortcut. The compound-key form works — the spec's §2.1 proves
+    ;; `WHERE (n, rowid) < (48, 2) ORDER BY n DESC, rowid` returns the exact
+    ;; continuation — but taking it costs two problems natural order does not
+    ;; have: `ORDER BY col DESC, rowid ASC` is not what `(col, rowid) < (v, k)`
+    ;; selects, and a row comparison against a NULL is NULL, so rows in a
+    ;; nullable sort column vanish. Both would be paid to speed up a query that
+    ;; is dominated by its ORDER BY however it is paginated, and nobody has
+    ;; measured that. §2.3 keeps the compound key written down as the first thing
+    ;; to reach for the day someone feels it.
+    ;;
+    ;; A `:source` handle has no key of any kind — `rowid` is a binder error over
+    ;; `read_csv` and `file_row_number` is not a valid `read_csv` parameter — so
+    ;; it is always the offset branch. Its scan is not new: `read_csv` in a FROM
+    ;; clause re-parses the file on every read, including page 1's.
+    ;;
+    ;; **The sorted OFFSET branch needs its own tiebreaker, and this is a fix to
+    ;; the plan, not a restatement of it.** Measured directly against this
+    ;; table: `ORDER BY grp ASC NULLS LAST LIMIT 41 OFFSET 0` and the same query
+    ;; with `OFFSET 40` do NOT slice one consistent order — DuckDB's top-N
+    ;; pushdown for `ORDER BY … LIMIT … OFFSET …` resolves a tie differently
+    ;; depending on how many rows the plan has to materialise, so two pages of
+    ;; the identical query differing only in OFFSET can both return row 25 and
+    ;; both skip another. That is `a-sorted-page-continues-across-a-tie-in-the-
+    ;; sort-column` failing on its own "none is served twice" long before any
+    ;; sabotage. Appending `, rowid ASC` after the requested column — for a
+    ;; `:lake` handle only, since `:source` has no `rowid` to append — measured
+    ;; stable across the same two offsets: the 0-offset and 40-offset windows
+    ;; now agree with a plain full-table sort sliced in memory. A `:source`
+    ;; handle sorted with ties has the identical nondeterminism and no fix
+    ;; available here; nothing in this task's tests exercises that combination,
+    ;; so it is left as a known gap rather than patched blind.
+    (let [lim   (tbl/page-limit (:limit window))
+          proj  (tbl/project-cols h (:cols window))
+          srt   (tbl/sort-spec h (:sort window))
+          seek? (and (nil? srt) (not= :source (:store h)))
+          cur   (tbl/decode-cursor (:cursor window))
+          after (tbl/cursor-int cur :k -1)
+          off   (tbl/cursor-int cur :o 0)
+          ks    (cond->> proj seek? (cons :rowid))
+          sql   (str "SELECT " (when seek? "rowid, ") (select-cols proj)
+                     " FROM " (from-of h)
+                     (cond seek? (str " WHERE rowid > " (long after) " ORDER BY rowid")
+                           srt   (str " ORDER BY " (ident (first srt))
+                                      (if (= "desc" (second srt)) " DESC" " ASC")
+                                      " NULLS LAST"
+                                      (when (not= :source (:store h)) ", rowid ASC")))
+                     " LIMIT " (inc lim)
+                     (when-not seek? (str " OFFSET " (long off))))
+          got   (q-as lk sql (vec ks))
+          more  (> (count got) lim)
+          kept  (vec (take lim got))]
+      {:rows (mapv #(dissoc % :rowid) kept)
+       :next (when more
+               (tbl/encode-cursor (if seek?
+                                    {:k (:rowid (peek kept))}
+                                    {:o (+ off lim)})))}))
+
   (row-count [_ h] (:rows h))
 
   (reclaimed-at [lk h]

@@ -1214,3 +1214,74 @@
           (is (string? (json/write-str r))
               "the whole row must survive json/write-str — this is the defect"))
         (finally (.delete f))))))
+
+(deftest a-lake-table-pages-forward-by-seeking-on-rowid
+  (with-lake [lk]
+    (let [rs (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))
+          h  (tbl/put-rows! lk "tbl:p" rs)
+          p1 (tbl/page lk h {:limit 100})
+          p2 (tbl/page lk h {:limit 100 :cursor (:next p1)})
+          p3 (tbl/page lk h {:limit 100 :cursor (:next p2)})]
+      (is (= (range 0 100)   (map :i (:rows p1))))
+      (is (= (range 100 200) (map :i (:rows p2))) "page 2 continues page 1 exactly")
+      (is (= 50 (count (:rows p3))))
+      (is (nil? (:next p3)))
+      (is (not-any? :rowid (:rows p1)) "rowid is how the page is found, not a column"))))
+
+(deftest a-sorted-page-continues-across-a-tie-in-the-sort-column
+  ;; 250 rows over 5 groups: every page boundary lands inside a run of 50 equal
+  ;; sort values. This is the case a naive keyset loses rows on and the reason
+  ;; §2.3 pages a sort by offset.
+  (with-lake [lk]
+    (let [rs   (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))
+          h    (tbl/put-rows! lk "tbl:t" rs)
+          walk (fn [] (loop [c nil acc []]
+                        (let [p (tbl/page lk h {:limit 40 :cursor c :sort ["grp" "asc"]})
+                              acc (into acc (:rows p))]
+                          (if (:next p) (recur (:next p) acc) acc))))
+          all  (walk)]
+      (is (= 250 (count all)) "no row is lost at a boundary inside a tie")
+      (is (= 250 (count (distinct (map :i all)))) "and none is served twice")
+      (is (= (sort (map :grp all)) (map :grp all)) "the walk is in sort order"))))
+
+(deftest a-descending-sort-pages-in-descending-order
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:d" (vec (for [i (range 30)] {:i i})))
+          p (tbl/page lk h {:limit 5 :sort ["i" "desc"]})]
+      (is (= [29 28 27 26 25] (map :i (:rows p))))
+      (is (= [24 23 22 21 20]
+             (map :i (:rows (tbl/page lk h {:limit 5 :cursor (:next p) :sort ["i" "desc"]}))))))))
+
+(deftest a-passthrough-source-pages-with-no-rowid-in-sight
+  (with-lake [lk]
+    (let [dir  (str (System/getProperty "java.io.tmpdir") "/loci-page-src-" (System/nanoTime))
+          _    (.mkdirs (java.io.File. dir))
+          csv  (java.io.File. dir "rows.csv")
+          _    (spit csv (apply str "region,amount\n"
+                                (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+          ;; `java.io.tmpdir` is relative in this project (deps.edn's
+          ;; `-Djava.io.tmpdir=.tmp`), so building the URI by string
+          ;; concatenation would read the first path segment as a HOST —
+          ;; `.getAbsolutePath` is the pattern `loci.source-test` already uses.
+          h    {:store :source :uri (str "file://" (.getAbsolutePath csv)) :format :csv
+                :cols [:region :amount] :raw ["region" "amount"] :rows 250}
+          p1   (tbl/page lk h {:limit 100})
+          p2   (tbl/page lk h {:limit 100 :cursor (:next p1)})]
+      (try
+        (is (= 100 (count (:rows p1))))
+        (is (= 100 (:amount (first (:rows p2))))
+            "the mode where keyset is impossible still pages, through the same method")
+        (is (= [:region :amount] (vec (keys (first (:rows p1))))))
+        (finally (lf/rm-rf dir))))))
+
+(deftest a-window-that-hides-a-column-hides-it-in-the-sql
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:c" [{:a 1 :b 2 :c 3}])]
+      (is (= [:a :c] (vec (keys (first (:rows (tbl/page lk h {:limit 1 :cols ["a" "c"]}))))))))))
+
+(deftest a-crafted-lake-cursor-is-page-one-not-a-crash
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:x" (vec (for [i (range 10)] {:i i})))]
+      (is (= 0 (:i (first (:rows (tbl/page lk h {:limit 5
+                                                 :cursor (tbl/encode-cursor {:k "nope"})})))))
+          "a cursor field of the wrong type restarts the table rather than throwing"))))
