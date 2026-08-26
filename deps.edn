@@ -10,7 +10,13 @@
         ;; parsing one itself, and it now imports through the file connector.
         org.babashka/sci       {:mvn/version "0.8.43"}
         datalevin/datalevin    {:mvn/version "1.0.0"}
-        org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}}
+        org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.1"}
+        ;; HoneySQL builds the SQL that `Lake/query` runs. 41,815 bytes, and its
+        ;; only dependency is Clojure — measured 2026-08-27 against a 166,940,673
+        ;; byte uberjar, so 0.025%. Chosen for the 2026-08-16 big-content spec's
+        ;; reason, not for size: a query expressed as data is storable, diffable,
+        ;; reviewable before it runs, and reversible.
+        com.github.seancorfield/honeysql {:mvn/version "2.7.1310"}}
 
  ;; **`-Djava.io.tmpdir=.tmp` on every alias that RUNS loci, and it is RELATIVE.**
  ;;
