@@ -1,8 +1,76 @@
 # The shell learns ClojureScript, and a hole that knows it is a hole
 
 Date: 2026-08-25
-Status: **designed, spiked, not built.** Every number marked *measured* was taken on 2026-08-25
-against this machine or this repository. The spike is commit `713568e` on `spike-cljs`.
+Status: **built and measured**, 2026-08-26, on `spike-cljs` — twelve tasks from the spike
+(`713568e`) to `bf6f44d`, where `CLJS_GRID` and `tableHTML` were both deleted and a molded table
+simply *is* the ClojureScript grid. Green at the end: `clojure -M:test` 915 tests / 4,817
+assertions, `npm run test:cljs` 30 / 78, `npm run test:browser` 180. Every number marked
+*measured* below was taken on 2026-08-25 against this machine or this repository.
+
+### What building it changed
+
+**The browser suite cost was over-estimated, and by a lot.** §7 predicted that "the tests that
+drive a table's DOM are written against `tableHTML`'s markup and will need rewriting". **Zero
+were rewritten.** Four files matched `rg -ln "table\.mold|tableHTML|thead|tbody" test/browser/`:
+one is the new grid's own test, one is the build's, and the two remaining — `reclaimed.test.mjs`
+and `sources.test.mjs` — turned out on inspection to *use* a table to reach something else
+rather than to be about a table's markup. Both kept their markup and their claims.
+
+What they needed instead was **synchronisation**, which the spec did not foresee at all. Under
+`tableHTML` the rows were in the string the shell built; the grid is mounted into a seam and
+filled by its own Transit request, so an instant now exists in which the panel is open and the
+rows are not there. Ten assertions were reading that instant. It was found by *measuring* rather
+than by reading: delaying `loci.grid.mount` by 300 ms — a fetch on a table of the size this
+design targets — turned seven tests in `sources.test.mjs` red, and 3 s turned an eighth. Across
+all 180 tests in seventeen files those eight, plus the flag's own build test, were the only
+casualties. Three of the eight name no table markup at all and the grep does not find them: they
+read `/EMEA/` and `/café/` out of the panel's text. One was worse than late — `doesNotMatch(body,
+/�/)` is satisfied by an empty panel, so it had been certifying that no replacement character
+reached a table it never waited for.
+
+The mirror image, in `reclaimed.test.mjs` and for the two broken-source blocks: "no `table.mold`
+on screen" is no longer the same claim as "no table is coming". Those count the **seam** as well.
+
+**A mounted grid does not survive a re-render of the surface it sits in**, and §6 did not say so.
+The grid's state is an atom keyed by the seam *element*, so when the shell redraws a notebook body
+the seam is a new node, `wireSourceButtons` mounts a new grid, and that grid fetches. Measured by
+stamping the cell's `.bd` element to see whether it was the same one: `enter(i)` replaces the body
+the boot had already filled, and for one 25 ms sample the cell holds a mounted seam and no table —
+table, then nothing, then table. So a re-render of a surface showing tables costs one `/api/mold`
+per table and flashes an empty one while it is in flight. Bounded and small, because the payload is
+one page — but it is the flip side of keeping all of the grid's state in the client, and the spec
+should have named it. Every browser assertion that reads a table now reads both counts in one
+`evaluate`, because sampling the two separately can catch that gap.
+
+**Replicant interpolates nothing into handler data** (§4.2 left this open, and Task 8 was told to
+find out rather than guess). `core/get-event-handler` wraps the handler in `(fn [e] (*dispatch* rd
+handler))` and hands the data back verbatim — there is no placeholder for "the value of the event
+that fired", so the `<select>`'s value is read off `:replicant/node`, which is `(.-target e)`. A
+second finding beside it: **`:selected` on the options, never `:value` on the select.**
+`core/create-node` sets attributes before appending children and `value` on a select is a property
+assignment, so a `:value` there leaves the control reading `25` while the size in force is 100.
+
+**One sabotage in the plan could not work, and was replaced rather than pretended.** "The frozen
+column is opaque" was to be checked with `elementFromPoint`, which hit-tests: a transparent cell
+wins a hit test exactly as an opaque one does, so the assertion passed while rows showed through.
+The claim is now made by the honest instrument — two screenshots of the same viewport rectangle,
+before and after scrolling, decoded through a canvas because Node has no PNG decoder. Measured: 0
+of 14,896 pixels differ with the background, 807 without it. A neighbouring one was wrong in the
+other direction: the sticky-header test measured the *first* `th`, which is sticky for the frozen
+column's sake, so deleting the header rule left it green. It measures the second `th` now.
+
+**And the port exposed a shell defect that predates it.** Making the sort header a real `<button>`
+so a keyboard can reach it revealed that Space did nothing: the global "type anywhere to search"
+handler tests `e.key.length===1`, which Space passes, so focus jumped to the LEAP field and the
+keypress a button's activation depends on landed on an input. Its field guard covered
+INPUT/TEXTAREA/SELECT — and so already covered the column chooser's checkboxes — but not BUTTON or
+SUMMARY. One key, one guard, and nothing to do with ClojureScript.
+
+**Two smaller ones.** The caption groups digits with a regex rather than `toLocaleString`, which
+answers with whatever the machine's locale says and would pass here and fail on a colleague's
+laptop. And `tableHTML`'s two non-molder callers became a local `staticTable` as §8 planned, minus
+the width arithmetic — `table-layout:auto` is the same answer in one CSS property — but **keeping**
+its 60-row cap, which is the only bound on how many rows a report block can put in the DOM.
 
 **Supersedes the shell half of `2026-08-25-paged-table-grid-design.md`.** That document's §1
 (the measured defect) and §2 (paging, `TableStore/page`, the opaque cursor) stand and are built.
@@ -289,6 +357,9 @@ flag is deleted then rather than kept as an option.
   pass when the CLJS grid becomes the default: the tests that drive a table's DOM are written
   against `tableHTML`'s markup and will need rewriting against the new markup. That is a real cost
   and it is not small.
+  *(Wrong, and left standing as the prediction it was — see the Status section. None were
+  rewritten. The cost was real but of a different kind: ten assertions across two files were
+  reading the panel before the grid's fetch filled it, and needed a wait, not new markup.)*
 - **A second language in the repository** — though it is the same language as the substrate, which
   is the argument for it rather than against.
 

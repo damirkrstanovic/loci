@@ -1043,6 +1043,6 @@ The build test's "without `?cljs` the shell renders its own table" case is now f
 
 ## Finishing
 
-- [ ] `clojure -M:test`, `npm run test:cljs` and `npm run test:browser`, all green, all foreground.
-- [ ] Update the spec's Status to **built and measured**, recording what building changed: the Replicant event form from Task 8, the frozen-column sabotage that could not work, and how many browser tests Task 11 had to rewrite.
+- [x] `clojure -M:test`, `npm run test:cljs` and `npm run test:browser`, all green, all foreground. 915/4,817 · 30/78 · 180.
+- [x] Update the spec's Status to **built and measured**, recording what building changed: the Replicant event form from Task 8, the frozen-column sabotage that could not work, and how many browser tests Task 11 had to rewrite. (**None**, which is the finding — see the spec's Status section.)
 - [ ] `superpowers:finishing-a-development-branch` to decide how `spike-cljs` lands, and whether it merges into `paged-table-grid` or replaces it.
