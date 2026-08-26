@@ -9,7 +9,9 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [honey.sql :as sql]
             [loci.config :as config]
+            [loci.honeyq :as hq]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
@@ -1278,6 +1280,54 @@
                                     " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
+(defn relation-of
+  "A handle as a HoneySQL FROM entry that pins its snapshot.
+
+   **A subquery map, not a bare `[:raw …]`, and the reason is measured.** DuckDB
+   refuses an alias directly on a versioned relation —
+   `FROM t AT (VERSION => 1) AS x` is `Parser Error: syntax error at or near
+   \"AS\"` — so the relation has to be wrapped to be aliasable at all, which is
+   also what lets one query join two tables. Verified 2026-08-27: the quoted,
+   the bare and the subquery-wrapped forms all read; only the aliased bare form
+   does not.
+
+   `ident` quotes the table name. Names are minted by `table-name`, so this is
+   belt and braces rather than a fix."
+  [h]
+  {:select [:*]
+   :from   [[[:raw (str (ident (:table h))
+                        " AT (VERSION => " (long (:snapshot h)) ")")]]]})
+
+(defn create-from-sql!
+  "Materialise any SQL SELECT as a new lake table and return the handle.
+
+   `create-from-relation!`'s sibling for a QUERY rather than a file, and the
+   difference is `:cols`. `create-from-relation!` is given `describe`'s columns
+   because it is reading a file whose header it just read. A query's columns are
+   **not** the source's — `SELECT region, SUM(v) AS v` has two whatever the
+   source had — so they are read back off the result with `DESCRIBE`.
+
+   Getting this wrong writes a handle whose `:cols` name columns the table does
+   not have, and every later read of it fails with `Binder Error: Referenced
+   column not found` — the same failure `loci.source`'s docstring records for a
+   passthrough handle carrying half a recipe."
+  [lk id sql]
+  (let [table (table-name id (System/nanoTime))]
+    (x! lk (str "CREATE TABLE " table " AS " sql))
+    {:store :lake :table table :snapshot (current-snapshot lk)
+     :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
+     :cols  (mapv #(sub/col-kw (:column_name %))
+                  (q lk (str "DESCRIBE SELECT * FROM " table)))}))
+
+(defn- run-honey
+  "Format `hq` with values inlined and run it. One string, so `q` is unchanged.
+
+   Inlined rather than parameterised because loci is single-user and personal —
+   decided 2026-08-27. HoneySQL emits parameters separately if that ever changes,
+   so the work would be a JDBC path and not a rewrite."
+  [lk hq]
+  (q lk (first (sql/format hq {:inline true}))))
+
 (extend-type Lake
   tbl/TableStore
   (put-rows! [lk id rs]
@@ -1392,7 +1442,26 @@
 
   (column-samples [lk h per-col max-cols]
     (sample-cache lk (samples-version h) (from-of h)
-                  (vec (take max-cols (:cols h))) per-col)))
+                  (vec (take max-cols (:cols h))) per-col))
+
+  (query [this handle spec]
+    (let [rel   (relation-of handle)
+          base  (hq/->honey (dissoc spec :limit) rel)
+          ;; Count FIRST, always. Measured 2026-08-27 over 1,000,000 rows: the
+          ;; GROUP BY costs 20 ms and this costs 6 ms, because DuckDB answers a
+          ;; grouped count from the cardinality and never computes the sums.
+          ;; It is also the PARSE CHECK — HoneySQL emits wrong SQL rather than
+          ;; raising, and this is where DuckDB says so before any result is
+          ;; trusted.
+          total (long (:n (first (run-honey this (hq/->count base)))))
+          lim   (or (:limit spec) tbl/max-query-rows)
+          rows  (vec (run-honey this (assoc base :limit lim)))]
+      {:rows rows :total total :capped (> total (count rows))}))
+
+  (create-from-spec [this handle spec id _title]
+    (create-from-sql! this id
+                      (first (sql/format (hq/->honey (dissoc spec :limit) (relation-of handle))
+                                         {:inline true})))))
 
 (defn sweep!
   "Automatic table GC. Disabled, deliberately, and it reports that rather than

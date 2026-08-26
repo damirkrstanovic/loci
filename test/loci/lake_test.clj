@@ -1437,3 +1437,91 @@
           p (tbl/page lk h {:limit 5 :cursor (tbl/encode-cursor {:k 9999})})]
       (is (= [] (:rows p)))
       (is (nil? (:offset p)) "no first row, so nothing to report a position from"))))
+
+;; ---------------------------------------------------------------------------
+;; the lake answers a question in SQL (Task 3)
+;; ---------------------------------------------------------------------------
+
+(deftest lake-query-groups-over-every-row
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0}))
+          h    (tbl/put-rows! lk "tbl:big" rows)
+          r    (tbl/query lk h {:group_by "region" :measure "v" :agg "sum"})]
+      (is (= 5 (:total r)))
+      (is (= 2500.0 (double (reduce + (map :v (:rows r)))))
+          "the sum must cover 2,500 rows — 2,000 would mean the sample came back"))))
+
+(deftest lake-query-total-is-the-answer-not-the-page
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:big" (vec (for [n (range 2500)] {:n n})))
+          r (tbl/query lk h {:limit 10})]
+      (is (= 10 (count (:rows r))))
+      (is (= 2500 (:total r)))
+      (is (true? (:capped r))))))
+
+(deftest lake-query-pins-the-handles-snapshot
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:v" (vec (for [n (range 2500)] {:n n})))]
+      (lake/x! lk (str "DELETE FROM " (:table h) " WHERE n < 1000"))
+      (is (= 2500 (:total (tbl/query lk h {})))
+          "the handle names a snapshot; a later write must not change its answer"))))
+
+(deftest lake-query-returns-keyword-keys
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:big"
+                           (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+      (doseq [spec [{:group_by "region" :measure "v" :agg "sum"} {}]]
+        (is (every? keyword? (keys (first (:rows (tbl/query lk h spec)))))
+            (str "non-keyword keys for " (pr-str spec)))))))
+
+(deftest lake-and-inline-agree-on-rows-not-just-counts
+  ;; Comparing only :total is what let a key-type mismatch through in Task 2.
+  ;; This compares the ANSWERS: same key set, same values as a multiset, with
+  ;; numbers normalised to double because DuckDB may hand back DECIMAL where
+  ;; Clojure held a Double.
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)]
+                      {:region (str "r" (mod n 5)) :v (double (mod n 7))}))
+          hl   (tbl/put-rows! lk "tbl:p" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:p" rows)
+          norm (fn [rs] (set (map (fn [r]
+                                    (into {} (for [[k v] r]
+                                               [k (if (number? v) (double v) v)])))
+                                  rs)))]
+      (doseq [spec [{:group_by "region" :measure "v" :agg "sum"}
+                    {:group_by "region" :measure "v" :agg "count"}
+                    {:group_by "region" :measure "v" :agg "min"}
+                    {:group_by "region" :measure "v" :agg "max"}
+                    {:filter {:col "region" :op "=" :val "r0"} :limit 5}
+                    {:filter {:col "region" :op "≠" :val "r0"} :limit 5}]]
+        (let [a (tbl/query ii hi spec)
+              b (tbl/query lk hl spec)]
+          (is (= (:total a) (:total b)) (str "totals differ for " (pr-str spec)))
+          (is (= (norm (:rows a)) (norm (:rows b)))
+              (str "rows differ for " (pr-str spec)
+                   "\n  inline: " (pr-str (first (:rows a)))
+                   "\n  lake:   " (pr-str (first (:rows b))))))))))
+
+(deftest lake-create-from-spec-keeps-every-matching-row
+  (with-lake [lk]
+    (let [h  (tbl/put-rows! lk "tbl:big" (vec (for [n (range 2500)] {:n n :v 1.0})))
+          h2 (tbl/create-from-spec lk h {:filter {:col "n" :op ">" :val 499}}
+                                   "tbl:derived-1" "Filtered")]
+      (is (tbl/handle? h2))
+      (is (= :lake (:store h2)))
+      (is (= 2000 (:rows h2)) "2,000 matching rows — 1,500 would mean a sample was filtered"))))
+
+(deftest lake-create-from-spec-names-the-results-columns-not-the-sources
+  ;; An aggregate's columns are NOT the source's. A handle whose :cols name
+  ;; columns the table does not have fails every later read with a binder error.
+  (with-lake [lk]
+    (let [h  (tbl/put-rows! lk "tbl:big"
+                            (vec (for [n (range 2500)]
+                                   {:region (str "r" (mod n 5)) :v 1.0 :extra "x"})))
+          h2 (tbl/create-from-spec lk h {:group_by "region" :measure "v" :agg "sum"}
+                                   "tbl:derived-2" "By region")]
+      (is (= #{:region :v} (set (:cols h2)))
+          (str "handle :cols must come from the RESULT, got " (pr-str (:cols h2))))
+      (is (= 5 (count (tbl/rows lk h2 {})))
+          "and the table must actually be readable through those cols"))))

@@ -531,6 +531,18 @@
    today is 1,000 rows, so this changes nothing about what currently renders."
   2000)
 
+(def max-query-rows
+  "How many rows a `query` returns when the spec sets no `:limit`.
+
+   **A latency budget, not a memory one.** Measured 2026-08-27: crossing JDBC into
+   Clojure maps costs about 5 µs a row plus 3.7 µs a cell, so 1,000,000 rows of
+   four columns is 27 s and 220 MB. The heap is fine on any modern box; 27 s is
+   not. 10,000 rows of that shape is 0.8 s.
+
+   A result above this is not an error. It comes back capped, with the true
+   `:total`, and `create-from-spec` is how a caller keeps all of it."
+  10000)
+
 (defn table-value
   "Rows, landed in `ts`, as a table object's `:value` — a handle, or `[]` for no
    rows.
