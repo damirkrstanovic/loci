@@ -220,6 +220,30 @@
         "the cell kept a handler of its own — a mouse would still work and a keyboard would not")
     (is (= ["a" "b"] (map last btns)) "the label is the column name, and the arrow is not in it")))
 
+;; ---- the caption's digits ----
+
+(deftest a-total-is-grouped-so-it-can-be-read
+  ;; Design §3.1 shows `showing 101–200 of 10,000,000`. Eight ungrouped digits
+  ;; are not readable at a glance, and at the scale this design targets that is
+  ;; the common case rather than the exotic one.
+  (is (= "10,000,000" (view/group-digits 10000000)))
+  (is (= "1,000" (view/group-digits 1000)) "exactly a thousand is the first grouped number")
+  (is (= "999" (view/group-digits 999)) "and 999 is the last ungrouped one")
+  (is (= "0" (view/group-digits 0)))
+  (is (= "-1,000" (view/group-digits -1000))
+      "the gap after a minus sign is a word boundary, so no comma lands in it"))
+
+(deftest the-caption-groups-every-number-in-it
+  ;; Not only the total: at ten million rows the offsets are seven digits too,
+  ;; and a grouped total beside an ungrouped offset reads as two different kinds
+  ;; of number.
+  (let [s (grid/on-payload (grid/init-state "tbl:x")
+                           (-> payload
+                               (assoc :rendered (repeat 100 {:a 1}))
+                               (assoc-in [:elision :offset] 9999900)
+                               (assoc-in [:elision :total] 10000000)))]
+    (is (= "showing 9,999,901–10,000,000 of 10,000,000" (view/caption s)))))
+
 ;; ---- Task 10: the column chooser, remembered ----
 
 (deftest hiding-nothing-sends-no-cols-parameter-at-all

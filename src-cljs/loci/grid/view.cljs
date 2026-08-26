@@ -4,7 +4,8 @@
 
    If a function here reaches for `js/document`, it is in the wrong namespace —
    that is the whole reason the split exists. `loci.grid` owns state and the one
-   effect; this owns what a person sees, as data.")
+   effect; this owns what a person sees, as data."
+  (:require [clojure.string :as str]))
 
 (defn- page-start
   "How many rows precede the page on screen.
@@ -24,15 +25,35 @@
       (:offset (nth stack page nil))
       0))
 
+(defn group-digits
+  "`10000000` → `10,000,000`. Design §3.1 shows the caption grouped, and at the
+   scale this design targets an ungrouped eight-digit number is genuinely hard
+   to read — `10000000` and `1000000` differ by a glance.
+
+   **A regex and not `toLocaleString`.** The caption is asserted on by two
+   suites, and `toLocaleString` answers with whatever the machine's locale says:
+   `10.000.000` under de-DE, a narrow no-break space under fr-FR, `1,00,00,000`
+   under en-IN. The same source would pass here and fail on a colleague's
+   laptop. This groups one way, everywhere, and is a property of loci rather
+   than of the box it runs on.
+
+   `\\B` is what keeps a comma out of position zero — and out of the gap after a
+   minus sign, which IS a word boundary, so `-1000` groups as `-1,000` rather
+   than as `-,1000`. The lookahead fires only where the digits remaining to the
+   end are a multiple of three, so `999` is left alone and `1000` is not."
+  [n]
+  (str/replace (str n) #"\B(?=(\d{3})+$)" ","))
+
 (defn caption
-  "`showing 401–402 of 10000000`, or `… of 10000000+` when the total is a claim
-   rather than a fact."
+  "`showing 401–402 of 10,000,000`, or `… of 10,000,000+` when the total is a
+   claim rather than a fact."
   [{:as s :keys [payload]}]
   (let [{:keys [rendered elision table/total]} payload
         off   (page-start s)
         n     (count rendered)
         total (or (:total elision) total n)]
-    (str "showing " (inc off) "–" (+ off n) " of " total
+    (str "showing " (group-digits (inc off)) "–" (group-digits (+ off n))
+         " of " (group-digits total)
          (when (:unbounded? elision) "+"))))
 
 (defn has-next?
