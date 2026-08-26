@@ -25,6 +25,21 @@ before(async () => {
 });
 after(async () => { await browser?.close(); await server?.stop(); });
 
+// **Two things, because a table now arrives late.** The ClojureScript grid is
+// mounted into a `[data-cljs-grid]` node the shell renders, and fills it a fetch
+// later — so counting only `table.mold` answers "none" for a page that is about
+// to draw one, and this file's whole claim is that no table is coming. The seam
+// is what the shell DECIDED; the table is what arrived. Under the old renderer
+// the two were the same instant, which is why one count was enough then.
+//
+// Nothing in this file is a test about a table's markup: it asks whether the
+// reclaimed block replaced the table, and this is how it reaches that.
+const drewNoTable = async (page, scope, why) => {
+  assert.equal(await page.locator(`${scope} table.mold`).count(), 0, why);
+  assert.equal(await page.locator(`${scope} [data-cljs-grid]`).count(), 0,
+    `${why} — and the shell asked for a grid, which would have drawn one`);
+};
+
 test('a reclaimed table says so rather than drawing an empty table', async () => {
   await withPage(browser, 'reclaimed-molder', async (page) => {
     await bootedShell(page, server.url);
@@ -49,7 +64,7 @@ test('a reclaimed table says so rather than drawing an empty table', async () =>
     assert.match(molder, /100 rows/, 'it does not say what was there');
     assert.match(molder, /region/, 'it does not name the columns that were there');
     assert.doesNotMatch(molder, /^\s*empty\s*$/i, 'still drawing the italic word "empty"');
-    assert.equal(await page.locator('.molder-b table.mold').count(), 0,
+    await drewNoTable(page, '.molder-b',
       'a table with no rows in it is the answer this page exists not to give');
 
     // The date is drawn, and drawn as a DATE — the wire carries ISO-UTC because
@@ -69,7 +84,8 @@ test('a reclaimed table says so rather than drawing an empty table', async () =>
     assert.match(cell, /reclaimed/i,
       `the notebook cell does not say it — it drew: ${JSON.stringify(cell)}`);
     assert.match(cell, /100 rows/, 'the cell does not say what was there');
-    assert.equal(await page.locator(`#body${i} .cellmold .bd table.mold`).count(), 0);
+    await drewNoTable(page, `#body${i} .cellmold .bd`,
+      'the notebook cell drew the table the molder refused to');
 
     // The ✦ and ƒ affordances are gone, because there is nothing to make a view
     // of — `alternatives` is empty, so `mkable` is false. Asserted rather than
