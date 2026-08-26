@@ -9,7 +9,8 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [loci.sourcespec :as ssp]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.viewspec :as vs]))
 
 (defprotocol TableStore
   (put-rows! [this id rows]
@@ -81,7 +82,36 @@
 
      This is what a table's chunk is built from. It exists so that describing a
      10M-row table costs nine values rather than a page of rows, and so that the
-     description covers the whole column rather than its first `mold-cap` rows."))
+     description covers the whole column rather than its first `mold-cap` rows.")
+  (query [this handle spec]
+    "Run `spec`'s question half — `group_by` / `measure` / `agg` / `filter` /
+     `sort` / `limit` — against `handle`.
+
+     => `{:rows [...] :total <n> :capped <bool>}`
+
+     **`:total` is the size of the ANSWER, before `:limit`**, and it is not
+     optional. It is what lets a caller say \"200 of 900,000\" rather than
+     implying 200 is all there is — the same rule the entity page follows with
+     `\"50 of 137\"`, for the same reason.
+
+     **`:capped` is true when the store returned fewer rows than `:total`.** A
+     capped result is NOT an error. A large answer is a table, and this design
+     has `create-from-spec` for exactly that.
+
+     **Rows carry KEYWORD keys from every implementation.** `loci.viewspec`
+     builds a grouped row with `(array-map (name gb) …)`, which is a String key,
+     while the lake's come back through `sub/col-kw` as keywords. One protocol
+     method must not answer in two shapes, so `InlineTable` normalizes.
+
+     Specified by the 2026-08-16 big-content spec and never built. Its absence is
+     why five callers read a `mold-cap` sample and treated it as the table.")
+  (create-from-spec [this handle spec id title]
+    "The same question, materialised as a new table under `id`. => a handle.
+
+     Named after `loci.lake/create-from-relation!`, which is what the lake
+     implementation calls. Measured 2026-08-27: `CREATE TABLE … AS <spec>` over a
+     927,830-row answer costs **81 ms and 0 MB of heap**, where pulling the same
+     rows through JDBC into Clojure maps costs about 25,000 ms and 214 MB."))
 
 (def sample-max-chars
   "How long one sample value may be, in **Unicode code points**.
@@ -478,7 +508,19 @@
     (let [rs (:data h)]
       (into {} (for [c (take max-cols (:cols h))]
                  [c (->> rs (keep #(get % c)) (map str) (map clip-sample)
-                         distinct sort (take per-col) vec)])))))
+                         distinct sort (take per-col) vec)]))))
+  (query [this handle spec]
+    ;; The inline store folds in Clojure, which is what it has always done and is
+    ;; correct here: its rows are IN the handle, so there is nothing to push down
+    ;; to. It is the parity reference — `Lake` must agree with it.
+    (let [all (vec (rows this handle {}))
+          out (mapv #(update-keys % (fn [k] (if (string? k) (keyword k) k)))
+                    (vs/question spec all))]
+      {:rows   (if-let [l (:limit spec)] (vec (take l out)) out)
+       :total  (count out)
+       :capped (boolean (and (:limit spec) (> (count out) (:limit spec))))}))
+  (create-from-spec [this handle spec id _title]
+    (put-rows! this id (:rows (query this handle (dissoc spec :limit))))))
 
 (defn inline-table [] (->InlineTable))
 
