@@ -22,6 +22,7 @@
 
 (defonce !grids (atom {}))            ; DOM element -> state
 (def ^:private reader (t/reader :json))
+(def ^:private writer (t/writer :json))
 
 (def page-one
   "Where a walk begins: no cursor, and no rows before it.
@@ -84,23 +85,157 @@
         nxt   (cond (not= c col) [col "asc"] (= d "asc") [col "desc"] :else nil)]
     (assoc s :sort nxt :stack [page-one] :page 0)))
 
-(defn toggle-col [s col]
-  (assoc s :hidden (if (contains? (:hidden s) col)
-                     (disj (:hidden s) col)
-                     (conj (:hidden s) col))
-           :stack [page-one] :page 0))
+(defn toggle-col
+  "Show or hide one column.
 
-(defn- visible-cols [s]
-  (let [all (get-in s [:payload :table/cols])]
-    (when (seq (:hidden s)) (vec (remove (:hidden s) all)))))
+   Hiding narrows the REQUEST — see `cols-param` — so the rows come back a
+   different shape, and every cursor in the stack named a walk over the old one.
+   Back to page one, for the reason `set-limit` says.
+
+   **The last visible column cannot be hidden.** Server-side an empty projection
+   means EVERY column: `project-cols` says so outright, because a table with no
+   columns is not something the shell can draw. So unticking the thirty-sixth
+   box would bring all thirty-six back — a control whose result is the opposite
+   of what was asked of it. It declines instead, and the view disables that last
+   checkbox so the refusal is visible before the click rather than after it."
+  [s col]
+  (let [hidden  (:hidden s)
+        hiding? (not (contains? hidden col))
+        left    (remove (conj hidden col) (get-in s [:payload :table/cols]))]
+    (if (and hiding? (empty? left))
+      s
+      (assoc s :hidden (if hiding? (conj hidden col) (disj hidden col))
+               :stack [page-one] :page 0))))
+
+(defn cols-param
+  "The `cols` value for the next request, or **nil for no parameter at all**.
+
+   Nil and not the full list when nothing is hidden. Server-side an absent or
+   empty `cols` means every column the handle has, so sending the full list
+   explicitly would pin the request to the columns this page happened to know
+   about — and a column added to the table later would silently never arrive.
+
+   The list is the payload's `:table/cols`, which `hydrate-page` takes off the
+   HANDLE and not off the projected rows. Off the rows, hiding would be one-way:
+   a hidden column is absent from every page that follows, so there would be
+   nothing left to ask for again.
+
+   **`:prior-cols` is the cold-start fallback, and it is used exactly once.**
+   What is stored is which columns a person turned OFF; what the server takes is
+   which to turn ON, so the difference needs a list — and on the first request of
+   a session there is no payload to take one from. So the list the preference was
+   recorded against is remembered beside it. Without that, the one request in a
+   session that is a cold read is also the one that ships all thirty-six columns
+   of a table someone narrowed to five. The moment a payload lands the handle's
+   own list supersedes it, so a column added to the table since is asked for from
+   the second request on rather than being hidden forever."
+  [s]
+  (when (seq (:hidden s))
+    (some->> (or (seq (get-in s [:payload :table/cols])) (seq (:prior-cols s)))
+             (remove (:hidden s))
+             seq
+             (map name)
+             (str/join ","))))
 
 (defn- url [s]
   (str "/api/mold?wire=transit&id=" (js/encodeURIComponent (:id s))
        "&limit=" (:limit s)
        (when-let [c (current-cursor s)] (str "&cursor=" (js/encodeURIComponent c)))
        (when-let [[c d] (:sort s)] (str "&sort=" (js/encodeURIComponent (str (name c) "," d))))
-       (when-let [cs (visible-cols s)]
-         (str "&cols=" (js/encodeURIComponent (str/join "," (map name cs)))))))
+       (when-let [cs (cols-param s)] (str "&cols=" (js/encodeURIComponent cs)))))
+
+;; ---- remembering a lens, browser-side and never as an event ----
+;;
+;; **A column-header click is not an act on content.** The event log is what
+;; `?at=` rewinds and `undo!` reverses; every hidden column becoming a point in
+;; history is noise in the one log that has to stay meaningful. So these live in
+;; the browser, per object id. (`:view` stays a substrate event, as today — it is
+;; chosen once, not a knob.)
+
+(def ^:private prefs-prefix "loci.grid/")
+
+(defn- storage
+  "`localStorage`, or nil where this browser will not give one up.
+
+   **The accessor itself throws** — a private window, cleared site data, or a
+   browser set to block storage raises on `window.localStorage` before any
+   `getItem` is reached. So an unguarded read here does not return nothing, it
+   takes the whole panel down before the first row is drawn.
+
+   **This `try` is redundant against the two call sites below and is kept
+   anyway.** Measured 2026-08-26 by deleting it: the browser suite stayed green,
+   because `load-prefs` and `save-prefs!` each wrap the whole expression and
+   catch the accessor as readily as their own operation. It is here so that the
+   function's contract — a store or nil, never a throw — is true of the function
+   and not only of its present callers, and this note is here so the next reader
+   does not mistake it for load-bearing."
+  []
+  (try (.-localStorage js/window) (catch :default _ nil)))
+
+(defn load-prefs
+  "What was remembered for `id`, or nil. Never throws.
+
+   Transit and not JSON, so a sort of `[:grp \"asc\"]` and a hidden set of
+   keywords come back as what they went in as.
+
+   **Its `try` is load-bearing and covers more than the accessor.** `getItem`
+   has its own refusals, and the stored VALUE is hand-editable, survives
+   upgrades of loci, and can have been truncated by a write that did not finish —
+   so `t/read` is a second thing that throws, in a place nothing above `mount` is
+   watching. Measured by removing this one alone: the browser reports
+   `SyntaxError: Expected property name or '}' in JSON at position 1` out of
+   `openObject`, and the panel never draws."
+  [id]
+  (try
+    (when-let [raw (some-> (storage) (.getItem (str prefs-prefix id)))]
+      (t/read reader raw))
+    (catch :default _ nil)))
+
+(defn save-prefs!
+  "Remember `prefs` for `id`. Never throws — `setItem` has its own failures
+   (a full quota, a store that reads but will not write) and none of them is
+   worth a broken panel."
+  [id prefs]
+  (try
+    (some-> (storage) (.setItem (str prefs-prefix id) (t/write writer prefs)))
+    (catch :default _ nil))
+  nil)
+
+(defn- prefs-of
+  "The slice of state that is a PREFERENCE rather than a position.
+
+   `:page` and `:stack` are deliberately absent. Where someone had walked to is
+   not something to restore into a table whose rows may have changed under them,
+   and a cursor minted against an older snapshot is not a thing to hand back to
+   a server a week later.
+
+   `:cols` is not a preference but the evidence one was recorded against — the
+   table's column list at the time. `cols-param` needs it to turn a set of hidden
+   columns into a list of wanted ones before the first payload arrives; see its
+   docstring."
+  [s]
+  (cond-> (select-keys s [:sort :hidden :limit])
+    (seq (get-in s [:payload :table/cols]))
+    (assoc :cols (vec (get-in s [:payload :table/cols])))))
+
+(defn with-prefs
+  "`s` with remembered preferences applied — and `s` unchanged where there is
+   nothing remembered, or where what was remembered is not the shape this
+   version expects.
+
+   **Every field is checked rather than merged.** The value comes out of a store
+   this code does not own: it survives upgrades, it is editable by hand, and it
+   can carry whatever some earlier loci wrote. A `:hidden` that arrived as a
+   vector is used as a predicate by `cols-param` and throws on the first
+   render — a blank panel, which is a far worse outcome than a forgotten
+   preference."
+  [s prefs]
+  (let [{:keys [sort hidden limit cols]} prefs]
+    (cond-> s
+      (and (vector? sort) (= 2 (count sort)) (keyword? (first sort))) (assoc :sort sort)
+      (set? hidden)                                                   (assoc :hidden hidden)
+      (and (int? limit) (pos? limit))                                 (assoc :limit limit)
+      (vector? cols)                                                  (assoc :prior-cols cols))))
 
 (defn- render! [el]
   (r/render el (view/grid el (get @!grids el))))
@@ -115,8 +250,14 @@
                (render! el)))))
 
 (defn- act! [el f & args]
-  (swap! !grids update el #(apply f % args))
-  (refresh! el))
+  (let [was (prefs-of (get @!grids el))
+        s   (get (swap! !grids update el #(apply f % args)) el)
+        now (prefs-of s)]
+    ;; Written only when a preference actually moved. Next is by far the most
+    ;; common action here and stores nothing, and a synchronous storage write per
+    ;; page turn is a cost paid for no new fact.
+    (when (not= was now) (save-prefs! (:id s) now))
+    (refresh! el)))
 
 ;; **Replicant hands the handler data back VERBATIM.** `replicant.core/
 ;; get-event-handler` wraps the data in `(fn [e] (*dispatch* rd handler))` and
@@ -143,7 +284,11 @@
   "Called BY the vanilla shell from `wireSourceButtons`, with the node it just
    inserted. That is the whole integration surface."
   [el id]
-  (swap! !grids assoc el (init-state id))
+  ;; The preferences are in force BEFORE the first request, not applied to the
+  ;; page after it lands: otherwise the shell asks the server for a hundred rows
+  ;; of all thirty-six columns in the wrong order, throws that away, and asks
+  ;; again — and on a 10M-row table that first request is not free.
+  (swap! !grids assoc el (with-prefs (init-state id) (load-prefs id)))
   (refresh! el))
 
 (defn init [])

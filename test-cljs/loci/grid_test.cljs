@@ -181,3 +181,103 @@
   (let [ths (els (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload)) "th")]
     (is (= [[[:sort/toggle ::el :a]] [[:sort/toggle ::el :b]]]
            (map #(get-in (second %) [:on :click]) ths)))))
+
+;; ---- Task 10: the column chooser, remembered ----
+
+(deftest hiding-nothing-sends-no-cols-parameter-at-all
+  ;; **nil, not the full list.** Server-side an absent or empty `cols` means
+  ;; every column the handle has, so an explicit full list would pin the request
+  ;; to the columns this page happened to know about — and a column added to the
+  ;; table tomorrow would silently never arrive.
+  (let [s (grid/on-payload (grid/init-state "tbl:x") payload)]
+    (is (nil? (grid/cols-param s)))))
+
+(deftest hiding-a-column-narrows-the-request
+  ;; The request, not the render. Filtering in the view would leave the page
+  ;; looking exactly right while the server still shipped every column of a
+  ;; 10M-row table across the wire, which is the whole point missed.
+  (let [s (grid/toggle-col (grid/on-payload (grid/init-state "tbl:x") payload) :a)]
+    (is (= #{:a} (:hidden s)))
+    (is (= "b" (grid/cols-param s)) "the request asks for what is left")
+    (is (= [grid/page-one] (:stack s)) "the rows come back a different shape, so the cursors are void")
+    (is (= 0 (:page s)))))
+
+(deftest a-hidden-column-is-still-on-the-list-it-came-from
+  ;; The chooser reads `:table/cols`, which `hydrate-page` takes off the HANDLE.
+  ;; Read back out of the projected rows instead, hiding would be one-way: the
+  ;; column is missing from every page that follows, so nothing would be left to
+  ;; tick.
+  (let [s0 (grid/on-payload (grid/init-state "tbl:x") payload)
+        s1 (grid/toggle-col s0 :a)
+        ;; the page that comes back carries only `b` — and still every column name
+        s2 (grid/on-payload s1 (assoc payload :rendered [{:b "x"}]))
+        s3 (grid/toggle-col s2 :a)]
+    (is (= "b" (grid/cols-param s2)))
+    (is (= #{} (:hidden s3)))
+    (is (nil? (grid/cols-param s3)) "unticking the last hidden column drops the parameter again")))
+
+(deftest the-last-visible-column-cannot-be-hidden
+  (let [s1 (grid/toggle-col (grid/on-payload (grid/init-state "tbl:x") payload) :a)
+        s2 (grid/toggle-col s1 :b)]
+    (is (= s1 s2) "the second hide was refused outright, state and all")
+    (is (= "b" (grid/cols-param s2))
+        "because an empty projection means ALL columns, so it would show thirty-six")))
+
+(deftest the-chooser-lists-every-column-and-ticks-the-visible-ones
+  (let [s     (grid/toggle-col (grid/on-payload (grid/init-state "tbl:x") payload) :a)
+        boxes (els (view/grid nil s) "input")]
+    (is (= 2 (count boxes)) "a hidden column keeps its box — that is how it comes back")
+    (is (= [false true] (map #(:checked (second %)) boxes)))
+    (is (= [false true] (map #(:disabled (second %)) boxes))
+        "the last visible column's box is dead, and says so before the click")))
+
+(deftest a-chooser-click-names-the-grid-and-the-column
+  (let [boxes (els (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload)) "input")]
+    (is (= [[[:cols/toggle ::el :a]] [[:cols/toggle ::el :b]]]
+           (map #(get-in (second %) [:on :change]) boxes)))))
+
+(deftest preferences-are-restored-and-a-position-is-not
+  (let [s (grid/with-prefs (grid/init-state "tbl:x")
+                           {:sort [:grp "desc"] :hidden #{:note} :limit 25})]
+    (is (= [:grp "desc"] (:sort s)))
+    (is (= #{:note} (:hidden s)))
+    (is (= 25 (:limit s)))
+    (is (= 0 (:page s)) "where someone had walked to is not a preference")
+    (is (= [grid/page-one] (:stack s))
+        "and a cursor minted against an older snapshot is not a thing to hand back")))
+
+(deftest a-stored-value-of-the-wrong-shape-is-ignored-rather-than-applied
+  ;; The value comes out of a store this code does not own: it survives upgrades,
+  ;; it is editable by hand, and it can carry whatever an earlier loci wrote. A
+  ;; `:hidden` that arrived as a VECTOR is used as a predicate by `cols-param`,
+  ;; which throws on the first render — a blank panel, not a forgotten preference.
+  (let [d (grid/init-state "tbl:x")]
+    (is (= d (grid/with-prefs d nil)) "nothing remembered")
+    (is (= d (grid/with-prefs d {})) "remembered, but empty")
+    (is (= d (grid/with-prefs d {:hidden [:a] :limit "25" :sort "grp"})) "three wrong types")
+    (is (= d (grid/with-prefs d {:sort ["grp" "asc"]}))
+        "a sort of strings would apply and then match no header — the columns are keywords")))
+
+(deftest a-browser-with-no-storage-is-not-an-error
+  ;; Node has no `window` at all, which fails in the same PLACE a private
+  ;; window's `localStorage` does: on the accessor, before any get. Unguarded,
+  ;; this throws straight out of `mount` and the panel never draws — so this is a
+  ;; test of the `try` and not of the storage.
+  (is (nil? (grid/load-prefs "tbl:x")))
+  (is (nil? (grid/save-prefs! "tbl:x" {:limit 25}))))
+
+(deftest a-hidden-column-narrows-the-very-first-request-of-a-session
+  ;; `cols-param` turns a set of columns turned OFF into the list of columns to
+  ;; turn ON, which needs the table's column list — and on a cold mount there is
+  ;; no payload to take one from. So the list the preference was recorded against
+  ;; is stored beside it. Without it the one request in a session that is a cold
+  ;; read is also the one that ships every column of a table someone narrowed.
+  (let [s (grid/with-prefs (grid/init-state "tbl:x") {:hidden #{:a} :cols [:a :b]})]
+    (is (nil? (:payload s)) "nothing has been fetched yet")
+    (is (= "b" (grid/cols-param s)))
+    ;; and it is used exactly once: the handle's own list wins the moment one
+    ;; arrives, so a column added to the table since is asked for rather than
+    ;; hidden forever by a stale memory.
+    (let [s2 (grid/on-payload s (assoc payload :table/cols [:a :b :c]))]
+      (is (= "b,c" (grid/cols-param s2))
+          "a column the table grew since is not one anybody hid"))))

@@ -127,15 +127,56 @@
        (str n " rows")])]
    [:div.pgcap (caption s)]])
 
+(defn- chooser
+  "Every column the TABLE has, ticked or not — never only the ones on screen.
+
+   The list is the payload's `:table/cols`, which `hydrate-page` takes off the
+   handle rather than off the projected rows. Off the rows it would be one-way:
+   a hidden column is missing from every page that follows, so there would be
+   nothing left to tick back on.
+
+   **Unticking narrows the REQUEST and not just the page.** `loci.grid/url`
+   sends what is left as `cols`; the server projects. A chooser that filtered
+   here instead would look identical and would still be shipping every column
+   of a 10M-row table across the wire, which is the whole point missed.
+
+   `<details>` and not a popup: it is a disclosure, the browser owns opening and
+   closing it, and Replicant never writes `open` — so a re-render after a fetch
+   leaves it exactly as the person left it."
+  [el s cols]
+  (let [hidden (:hidden s)
+        shown  (remove hidden cols)]
+    [:details.colpick {:data-grid-cols true}
+     [:summary (str (count shown) " of " (count cols) " columns")]
+     [:div.colpick-list
+      (for [c cols]
+        (let [on? (not (contains? hidden c))]
+          [:label {:replicant/key c :data-grid-col (name c)}
+           [:input {:type "checkbox"
+                    ;; Replicant sets `checked` as a PROPERTY — `(set! (.-checked
+                    ;; el) v)` in `replicant.dom` — and not as an attribute, so
+                    ;; this survives the browser's own dirty-checkedness flag and
+                    ;; a re-render cannot leave a box disagreeing with the state.
+                    :checked on?
+                    ;; The last one standing cannot be unticked: an empty
+                    ;; projection means ALL columns server-side, so the click
+                    ;; would bring every column back. `toggle-col` declines as
+                    ;; well; this is the half that says so before the click.
+                    :disabled (and on? (= 1 (count shown)))
+                    :on {:change [[:cols/toggle el c]]}}]
+           (name c)]))]]))
+
 ;; `grid` takes the element as well as the state, from the start: the pager, the
 ;; sort headers and the column chooser all dispatch actions that must name WHICH
 ;; grid they act on, and a signature that grows between tasks is one two call
 ;; sites disagree about for a commit.
 (defn grid [el {:as s :keys [payload]}]
   (let [{:keys [rendered table/cols]} payload
-        cols (vec (remove (:hidden s) cols))
+        all  (vec cols)
+        cols (vec (remove (:hidden s) all))
         nums (numeric-cols rendered cols)]
     [:div.grid
+     (chooser el s all)
      ;; `width: max-content` and nothing else. The old renderer computed a
      ;; per-column character width and then normalised it to percentages of a
      ;; `width:100%` table, which discards the scale — at 36 columns the

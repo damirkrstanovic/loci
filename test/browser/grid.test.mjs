@@ -527,3 +527,172 @@ test('sorting restarts the walk at page one', async () => {
     assert.deepEqual(uniq((await colValues(page, 'grp')).slice(0, 50)), ['g0']);
   });
 });
+
+// ---- the column chooser ----
+
+const headerCount = (page) =>
+  page.evaluate(g => document.querySelectorAll(`${g} thead th`).length, G);
+
+const summary = (page) => page.textContent(`${G} [data-grid-cols] > summary`);
+
+// **Every `/api/mold` this page asked FOR THIS TABLE, in order.** The assertion
+// that matters in this task is about the request and not about the render:
+// filtering the columns in the view would leave the page looking exactly right
+// while the server still shipped all 36 across the wire, which is the whole
+// point missed. So the instrument has to be the URL.
+//
+// Filtered by id, because with `?cljs` on the seeded `space:cosmos` notebook
+// mounts a grid of its own for `tbl:planets` and its requests interleave with
+// these. `js/encodeURIComponent` writes the colon as `%3A`.
+const moldRequests = (page) => {
+  const seen = [];
+  page.on('request', r => {
+    const u = r.url();
+    if (u.includes('/api/mold') && u.includes('id=tbl%3Agrid')) seen.push(u);
+  });
+  return seen;
+};
+
+const openChooser = async (page) => {
+  if (await page.evaluate(g => document.querySelector(`${g} [data-grid-cols]`).open, G)) return;
+  await page.click(`${G} [data-grid-cols] > summary`);
+  await page.waitForFunction(g => document.querySelector(`${g} [data-grid-cols]`).open, G,
+                             { timeout: 5000 });
+};
+
+// Tick or untick one box and wait for the refetch. The header COUNT changing is
+// the whole round trip: the click dispatches, the dispatch refetches with a
+// narrower `cols`, and the table is redrawn when the payload lands.
+const toggleColumn = async (page, name) => {
+  await openChooser(page);
+  const before = await headerCount(page);
+  await page.click(`${G} [data-grid-cols] label[data-grid-col="${name}"] input`);
+  await page.waitForFunction(([g, n]) =>
+    document.querySelectorAll(`${g} thead th`).length !== n, [G, before], { timeout: 10000 });
+};
+
+test('unticking a column narrows the REQUEST, not merely the page', async () => {
+  await withPage(browser, 'cljs-grid-cols', async (page) => {
+    const asked = moldRequests(page);
+    await openGrid(page);
+
+    // **Page one asks for no `cols` at all.** Server-side an absent or empty
+    // `cols` means every column the handle has, so an explicit full list would
+    // pin the request to the 36 this build knew about and silently drop a 37th
+    // added to the table later.
+    const first = asked.at(-1);
+    assert.ok(first, 'no /api/mold request was captured at all');
+    assert.equal(new URL(first).searchParams.get('cols'), null, `page one asked ${first}`);
+    assert.equal(await summary(page), '36 of 36 columns');
+
+    await toggleColumn(page, 'grp');
+
+    const after = new URL(asked.at(-1)).searchParams.get('cols');
+    assert.ok(after, `no cols parameter after unticking a column: ${asked.at(-1)}`);
+    const names = after.split(',');
+    assert.equal(names.length, 35, `the request asked for ${names.length} columns`);
+    assert.ok(!names.includes('grp'),
+      'the hidden column is still in the request — the filtering is happening in the view');
+    // and the page agrees with the request it made
+    assert.equal(await headerCount(page), 35);
+    assert.equal(await colIndex(page, 'grp'), -1);
+    assert.equal(await summary(page), '35 of 36 columns');
+
+    // The hidden column is still ON THE LIST, which is how it comes back. The
+    // chooser reads `:table/cols` off the HANDLE; read back off the projected
+    // rows, hiding would be one-way.
+    assert.equal(await page.locator(`${G} [data-grid-cols] label`).count(), 36);
+    await toggleColumn(page, 'grp');
+    assert.equal(await headerCount(page), 36);
+    assert.equal(new URL(asked.at(-1)).searchParams.get('cols'), null,
+      'with nothing hidden the parameter goes away again rather than listing all 36');
+  });
+});
+
+test('a hidden column, a sort and a page size survive a reload', async () => {
+  await withPage(browser, 'cljs-grid-prefs', async (page) => {
+    const asked = moldRequests(page);
+    await openGrid(page);
+    await toggleColumn(page, 'grp');
+    await sortBy(page, 'id', 'ascending');
+    await step(page, () => page.selectOption(`${G} [data-grid-size]`, '25'));
+    const n = asked.length;
+
+    // A real reload: the whole shell boots again and the grid is mounted from
+    // nothing. Preferences live in `localStorage` and never in the event log —
+    // fiddling with a lens is not an act on content, and every column-header
+    // click becoming a point in history is noise in the one log `?at=` rewinds.
+    await openGrid(page);
+
+    // **The FIRST request after the reload, and that is the whole assertion.**
+    // Preferences applied after the payload landed would end up showing the same
+    // page — having first asked the server for a hundred rows of all thirty-six
+    // columns in the wrong order and thrown them away. On a 10M-row table that
+    // request is not free.
+    const u = new URL(asked[n]);
+    assert.equal(u.searchParams.get('limit'), '25', `the first request back was ${asked[n]}`);
+    assert.equal(u.searchParams.get('sort'), 'id,asc');
+    const cols = u.searchParams.get('cols');
+    // Named rather than dereferenced: a cold mount has no payload to take a
+    // column list from, so this is the assertion that goes red if the list the
+    // preference was recorded against stops being remembered beside it — and
+    // `null.split` reports a TypeError rather than saying that.
+    assert.ok(cols, `the first request back carried no cols at all: ${asked[n]}`);
+    const names = cols.split(',');
+    assert.equal(names.length, 35);
+    assert.ok(!names.includes('grp'));
+
+    assert.equal(await rows(page), 25);
+    assert.equal(await headerCount(page), 35);
+    assert.equal(await page.inputValue(`${G} [data-grid-size]`), '25');
+    assert.equal((await sortState(page, 'id')).aria, 'ascending');
+    assert.equal(await summary(page), '35 of 36 columns');
+  });
+});
+
+test('a browser that refuses localStorage still draws the grid', async () => {
+  await withPage(browser, 'cljs-grid-nostorage', async (page, diag) => {
+    // A private window, cleared site data, or a browser set to block storage
+    // throws on the ACCESSOR — `window.localStorage` itself, before any getItem
+    // is reached. So an unguarded read does not return nothing, it takes the
+    // whole panel down before a row is drawn.
+    await page.addInitScript(() => {
+      Object.defineProperty(window, 'localStorage', {
+        configurable: true,
+        get() { throw new DOMException('storage is blocked', 'SecurityError'); },
+      });
+    });
+    await openGrid(page);
+
+    // **Prove the environment really is sabotaged first.** If `defineProperty`
+    // had failed, everything below would pass on an ordinary browser and this
+    // test would certify a `try` that was never exercised.
+    assert.ok(await page.evaluate(() => {
+      try { void window.localStorage; return false; } catch { return true; }
+    }), 'localStorage did not throw — this test would pass on an unguarded read');
+
+    assert.equal(await rows(page), 100, 'no rows: the storage read took the panel down');
+    assert.equal(await headerCount(page), 36);
+    // and the controls still work; they simply do not remember
+    await toggleColumn(page, 'grp');
+    assert.equal(await headerCount(page), 35);
+    assert.deepEqual(diag.pageErrors, [], 'the page threw');
+  });
+});
+
+test('a stored preference that will not decode is ignored, not fatal', async () => {
+  await withPage(browser, 'cljs-grid-badprefs', async (page, diag) => {
+    // The other half of the storage guard, and a different failure from a
+    // refused accessor: the value itself. It is hand-editable, it survives
+    // upgrades of loci, and a truncated write leaves a string Transit cannot
+    // read — so `t/read` throws inside `mount`, where nothing above it is
+    // watching. A forgotten preference is the right outcome; a dead panel is not.
+    await openGrid(page);
+    await page.evaluate(() => localStorage.setItem('loci.grid/tbl:grid', '{not transit'));
+    await openGrid(page);
+    assert.equal(await rows(page), 100, 'the grid did not draw at all');
+    assert.equal(await headerCount(page), 36, 'and it fell back to no preferences rather than none');
+    assert.equal(await page.inputValue(`${G} [data-grid-size]`), '100');
+    assert.deepEqual(diag.pageErrors, [], 'the page threw');
+  });
+});
