@@ -186,6 +186,17 @@
   table.mold td.txt{color:var(--ink-2)}
   table.mold tbody tr:first-child td{border-top:none}
   table.mold td:first-child{font-weight:500;color:var(--ink)}
+  /* ---- a table inside prose: `staticTable`, for report blocks and the ƒ
+     preview. `table-layout:auto` is what replaced the per-column character
+     arithmetic — `fixed` above splits one width evenly, so a 4-character year
+     got as much room as a 45-character region name, and the old renderer wrote
+     a <colgroup> of percentages to undo that. The browser already does it. ---- */
+  .stable{max-height:360px;overflow:auto}
+  .stable table.mold{table-layout:auto}
+  /* …with the same cap the grid uses, for the same reason: content-sizing has
+     no upper bound, and an unconstrained cell never overflows, so
+     `text-overflow:ellipsis` above would never fire. */
+  .stable table.mold th,.stable table.mold td{max-width:320px}
   /* ---- the ClojureScript grid. `table.mold`'s own rules still apply — this
      adds only what the old renderer could not do. ---- */
   /* A column as wide as what it holds. `table-layout:auto` is half of it and not
@@ -697,10 +708,6 @@
 <div class="modal" id="modal"></div>
 
 <script>
-// The ClojureScript grid, opt-in until it reaches parity with tableHTML — at
-// which point both this flag and tableHTML go. `?cljs` on the URL, so a
-// reviewer can put the two renderers side by side in two tabs.
-const CLJS_GRID = new URLSearchParams(location.search).has('cljs');
 const POST = (url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
 const API = {
   state: at => fetch('/api/state'+(at!=null?'?at='+at:'')).then(r=>r.json()),
@@ -1979,8 +1986,8 @@ async function openFnPalette(i, id, anchor){
       let r; try{ r=await API.fnPreview(id,f.id,collect()); }catch(e){ if(tok!==pvSeq) return; prev.innerHTML=''; showToast('preview: network error'); return; }
       if(tok!==pvSeq) return;
       if(r.error){ prev.innerHTML='<div style="color:var(--attn);font-size:12px">'+esc(r.error)+'</div>'; return; }
-      prev.innerHTML='<div class="fnba"><div><div class="sec-h">before</div>'+tableHTML(r.before)+'</div>'+
-        '<div class="fnarrow">→</div><div><div class="sec-h">after · '+r.count+' rows</div>'+tableHTML(r.after)+'</div></div>'+
+      prev.innerHTML='<div class="fnba"><div><div class="sec-h">before</div>'+staticTable(r.before)+'</div>'+
+        '<div class="fnarrow">→</div><div><div class="sec-h">after · '+r.count+' rows</div>'+staticTable(r.after)+'</div></div>'+
         '<div style="font-size:11px;color:var(--faint);margin-top:4px">first 8 rows each — nothing is committed until you Apply</div>';
     };
     body.querySelector('[data-a="pv"]').addEventListener('click',preview);
@@ -2053,9 +2060,7 @@ function renderMold(m){
     // A div and an id is the ENTIRE integration surface: the ClojureScript side
     // fetches its own payload over Transit, so nothing here needs to know the
     // payload's shape. That is what keeps this seam one line wide.
-    case 'table':  return liveBadge(m)+(CLJS_GRID
-                     ? '<div data-cljs-grid="'+esc(m.id)+'"></div>'
-                     : tableHTML(d));
+    case 'table':  return liveBadge(m)+'<div data-cljs-grid="'+esc(m.id)+'"></div>';
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
     case 'text':   return '<div class="moldtext">'+mdToHtml(d)+'</div>';
     case 'chart':  return chartSVG(d);
@@ -2128,8 +2133,8 @@ function fmtNum(n){ return (+n).toLocaleString(); }
 // A table whose rows the store reclaimed — the page saying so, instead of
 // drawing the table that is no longer there.
 //
-// Without this the payload's `kind` is "table" and its `rendered` is [], so
-// tableHTML returned the italic word `empty` — which is what a table somebody
+// Without this the payload's `kind` is "table" and its `rendered` is [], so the
+// shell drew the italic word `empty` — which is what a table somebody
 // emptied on purpose looks like, and mold-payload's own comment calls the worst
 // available shape for this answer. The server ships `reclaimed`, `total` and
 // `cols` for no other reason than to let this say what was there. Note the keys:
@@ -2352,7 +2357,30 @@ function renderKPI(k){
     '<div style="font-size:13px;color:'+(up?'var(--accent)':'var(--attn)')+'">'+(up?'▲':'▼')+' '+fmtNum(Math.abs(k.delta))+' ('+k.pct+'%) vs prior</div></div>'+
     '<div style="font-size:12px;color:var(--muted);line-height:1.7">min '+fmtNum(k.min)+'<br>max '+fmtNum(k.max)+'<br>'+k.periods+' periods</div></div>';
 }
-function tableHTML(rows){
+// A table inside PROSE — a report block, and the ƒ preview's before/after.
+// Never a molded table: that is the ClojureScript grid, which pages, sorts and
+// hides columns because it may be looking at ten million rows.
+//
+// These two are the other thing. A report block's rows are authored into the
+// document they sit in (`content.clj`: eight planets, twenty-six economies,
+// eight categories); the ƒ preview asks for eight rows and says so underneath.
+// They have their rows in hand, so mounting a component per block would add a
+// second fetch, a state atom and a pager to a table that is part of a sentence.
+//
+// From `tableHTML`, which this replaces: the markup and the numeric alignment.
+// Gone with it: the per-column character arithmetic normalised to percentages
+// of a `width:100%` table. `table-layout:auto` in `.stable` is the same answer
+// in one CSS property, and without the `.toFixed(2)` drift that produced a
+// scrollbar with nothing behind it.
+//
+// **The 60-row cap stays**, against the plan, which grouped it with the width
+// arithmetic. They are not the same kind of thing: the arithmetic was a worse
+// way of doing something CSS does, and the cap is the only bound on how many
+// rows a block can put in the DOM. Every block in the seed is under it, so
+// keeping it changes nothing today and costs two lines — and `renderReport` is
+// a generic renderer, so the day a block arrives with a query's result set in
+// it, the cap and the line admitting to it are what stand there.
+function staticTable(rows){
   if(!rows||!rows.length) return '<i>empty</i>';
   const cols=Object.keys(rows[0]); const cap=60, shown=rows.slice(0,cap);
   // A column is numeric if the values say so — CSS cannot see that, so the
@@ -2368,18 +2396,7 @@ function tableHTML(rows){
     const v=r[c], s=(v===null||v===undefined)?'':String(v);
     return '<td class="'+(numeric[c]?'num':'txt')+'" title="'+esc(s)+'">'+esc(s)+'</td>';
   };
-  // fixed layout is what makes truncation possible, but it also splits the
-  // width evenly — so a 4-character year gets as much room as a 45-character
-  // region name. Size each column by what it actually holds, clamped so one
-  // long value cannot starve the rest.
-  const width=c=>{
-    const seg=Math.max(...c.split('_').map(w=>w.length));           // longest unbroken word
-    const longest=shown.reduce((m,r)=>Math.max(m,String(r[c]??'').length),seg);
-    return Math.min(Math.max(longest+2,7),28);   // +2 for the cell's padding
-  };
-  const widths=cols.map(width), total=widths.reduce((a,b)=>a+b,0);
-  let h='<div style="max-height:360px;overflow:auto"><table class="mold"><colgroup>'+
-    widths.map(w=>'<col style="width:'+(100*w/total).toFixed(2)+'%">').join('')+'</colgroup><thead><tr>'+
+  let h='<div class="stable"><table class="mold"><thead><tr>'+
     cols.map(c=>'<th class="'+(numeric[c]?'num':'txt')+'" title="'+esc(c)+'">'+
                 esc(c).replace(/_/g,'_<wbr>')+'</th>').join('')+'</tr></thead><tbody>'+
     shown.map(r=>'<tr>'+cols.map(c=>cell(r,c)).join('')+'</tr>').join('')+
@@ -2392,7 +2409,7 @@ function renderReport(blocks){
     switch(b.block){
       case 'heading': return '<h3 style="font-family:\'IBM Plex Serif\',serif;font-weight:400;font-size:18px;margin:18px 0 6px">'+esc(b.text)+'</h3>';
       case 'text':    return mdToHtml(b.text);
-      case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+tableHTML(b.rows);
+      case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+staticTable(b.rows);
       case 'chart':   return '<div style="margin:6px 0 14px">'+chartSVG(b.spec)+'</div>';
       default:        return '';
     }
