@@ -424,10 +424,23 @@ const uniq = (xs) => [...new Set(xs)];
 // it, which is what an eye sees. The second is not a stylesheet assertion — it
 // is the resolved value of the pseudo-element that is actually painted, so a
 // deleted rule reads `none` here.
+//
+// **The arrow moved onto the header's BUTTON**, because the button now fills the
+// cell — the padding is on it rather than on the `th`, so a whole header
+// rectangle is the control and the mouse still hits it. `th::after` would have
+// been an inline box after a block-level button and would have dropped onto a
+// line of its own. The selector is still `th[aria-sort] .colsort::after`, so
+// `aria-sort` remains the one place the state is written down.
 const sortState = (page, name) => page.evaluate(([g, n]) => {
   const th = [...document.querySelectorAll(`${g} thead th`)].find(h => h.textContent.trim() === n);
+  // Named rather than dereferenced. Measured 2026-08-26 by putting the click
+  // handler back on the `th`: `getComputedStyle(null, …)` reports
+  // `parameter 1 is not of type 'Element'` out of a helper, which says nothing
+  // about what is wrong; this reports the missing control in the diff.
+  const btn = th.querySelector('.colsort');
   return { aria: th.getAttribute('aria-sort'),
-           arrow: getComputedStyle(th, '::after').content,
+           arrow: btn ? getComputedStyle(btn, '::after').content
+                      : 'the header has no .colsort control in it at all',
            // the header must keep saying which column it is: the arrow is a
            // pseudo-element precisely so that it does not join this string.
            text: th.textContent.trim() };
@@ -525,6 +538,117 @@ test('sorting restarts the walk at page one', async () => {
     assert.equal(await dead(page, 'prev'), true, 'the walk restarted, so there is no back');
     assert.equal(await cellText(page, 'id'), 'row-0');
     assert.deepEqual(uniq((await colValues(page, 'grp')).slice(0, 50)), ['g0']);
+  });
+});
+
+// ---- the sort control, from a keyboard ----
+//
+// **Task 9 shipped this control with no keyboard access at all.** The handler
+// sat on the `th`, so `aria-sort` told a screen reader what the sort WAS while
+// nothing but a mouse could change it: a table cell takes no focus, is not in
+// the tab order and fires nothing on Enter. Publishing a state to someone who
+// cannot then reach the control is the worse half of that bargain.
+//
+// **What this instrument can and cannot tell apart.** It presses Tab and Enter
+// and nothing else — it never calls `.focus()` and it never clicks. So it
+// separates "reachable by keyboard" from "clickable", and also from "focusable
+// by script", which `tabindex="-1"` gives you and which is not the same thing:
+// `element.focus()` succeeds on a `tabindex="-1"` node that Tab can never land
+// on, so an instrument built on `page.focus` would certify one.
+//
+// It starts from the column chooser's `<summary>` — a control that is genuinely
+// focusable, sits immediately before the table in DOM order, and is not the
+// thing under test. Everything after that starting point is Tab presses.
+const tabToHeader = async (page, name, max = 60) => {
+  const start = `${G} [data-grid-cols] > summary`;
+  await page.focus(start);
+  assert.equal(await page.evaluate(s => document.activeElement === document.querySelector(s), start),
+    true, 'the walk never started — the chooser summary did not take focus');
+  for (let i = 1; i <= max; i++) {
+    await page.keyboard.press('Tab');
+    const at = await page.evaluate(([g, n]) => {
+      const a = document.activeElement;
+      const th = a?.closest ? a.closest(`${g} thead th`) : null;
+      return th ? th.textContent.trim() : null;
+    }, [G, name]);
+    if (at === name) return i;
+  }
+  assert.fail(`${max} Tab presses from the column chooser never put focus in the ${name} ` +
+              `header — the sort control cannot be reached without a mouse`);
+};
+
+// The same round trip `sortBy` waits for, driven from the keyboard: the key
+// dispatches, the dispatch refetches, and `aria-sort` is written by the render
+// that writes the rows.
+const pressSort = async (page, name, key) => {
+  const was = (await sortState(page, name)).aria;
+  await page.keyboard.press(key);
+  try {
+    await page.waitForFunction(([g, n, w]) => {
+      const th = [...document.querySelectorAll(`${g} thead th`)].find(h => h.textContent.trim() === n);
+      return th && th.getAttribute('aria-sort') !== w;
+    }, [G, name, was], { timeout: 10000 });
+  } catch {
+    // **Where focus ended up is the whole diagnosis.** A bare timeout says the
+    // sort did not change and nothing else; measured 2026-08-26, the shell's
+    // global "type anywhere to search" handler took the Space keydown and called
+    // `q.focus()`, so the keypress and keyup a button's activation depends on
+    // landed on the LEAP input. This line reports `INPUT` and names it.
+    const at = await page.evaluate(() =>
+      `${document.activeElement?.tagName}.${document.activeElement?.className}`);
+    assert.fail(`${key} on the focused ${name} header changed nothing — aria-sort is still ` +
+                `${JSON.stringify(was)} and focus is on ${at}. The key never reached the control.`);
+  }
+};
+
+const focusedHeader = (page) => page.evaluate(g => {
+  const a = document.activeElement;
+  const th = a?.closest ? a.closest(`${g} thead th`) : null;
+  return th ? { col: th.textContent.trim(), tag: a.tagName.toLowerCase() } : { col: null, tag: a?.tagName.toLowerCase() };
+}, G);
+
+test('a keyboard reaches the sort control and sorts with it', async () => {
+  await withPage(browser, 'cljs-grid-keyboard', async (page) => {
+    await openGrid(page);
+    // The tab walk comes FIRST, before anything that reads the header's shape.
+    // Measured 2026-08-26 by putting the handler back on the `th`: with the
+    // precondition first, this test reported a `getComputedStyle` TypeError out
+    // of a shared helper — a true failure that says nothing about reachability.
+    // Walking first, it reports the sentence in `tabToHeader`, which is the
+    // claim.
+    const presses = await tabToHeader(page, 'grp');
+    assert.equal((await focusedHeader(page)).tag, 'button',
+      'focus landed on the header cell itself rather than on a control inside it');
+    assert.equal((await sortState(page, 'grp')).aria, null,
+      'nothing is sorted yet, so the keyboard has something to change');
+
+    await pressSort(page, 'grp', 'Enter');
+    assert.equal((await sortState(page, 'grp')).aria, 'ascending');
+    // **The attribute alone is not the assertion.** A control that wrote
+    // `aria-sort` without reaching the server would pass on it. The rows are
+    // what say the request was made: 250 rows over five groups is 50 each, so an
+    // ascending page of 100 is the g0 block then the g1 block — a shape natural
+    // order cannot produce.
+    assert.deepEqual(uniq((await colValues(page, 'grp')).slice(0, 50)), ['g0']);
+
+    // **Focus survives the re-render, and that is not a nicety.** The cycle has
+    // three states, so reaching the table's own order takes three activations of
+    // the SAME control. A render that replaced the button would drop focus to
+    // the body after the first one, and a keyboard user would have to tab back
+    // through the whole header row between every click.
+    assert.deepEqual(await focusedHeader(page), { col: 'grp', tag: 'button' },
+      'the sort re-render threw focus away, so the second press goes nowhere');
+
+    // Space, because a real <button> answers to both and neither was written by
+    // hand. Reintroduce the `th` and this is unreachable along with Enter.
+    await pressSort(page, 'grp', 'Space');
+    assert.equal((await sortState(page, 'grp')).aria, 'descending');
+    assert.deepEqual(uniq((await colValues(page, 'grp')).slice(0, 50)), ['g4']);
+
+    await pressSort(page, 'grp', 'Enter');
+    assert.equal((await sortState(page, 'grp')).aria, null,
+      'the third activation must reach the table\'s own order from the keyboard too');
+    console.log(`  MEASURED: ${presses} Tab presses from the column chooser reach the grp header`);
   });
 });
 

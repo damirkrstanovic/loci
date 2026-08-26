@@ -202,21 +202,37 @@
      only while the header is on screen. `background` is not decoration — a
      sticky element is painted over scrolling content and shows through without
      one. */
-  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white);
-    cursor:pointer;user-select:none}
+  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white);padding:0}
   /* A header is a CONTROL, and it has three states rather than two: one click
      sorts ascending, a second descending, a third restores the table's own
-     order. `user-select:none` because a control you click three times in a row
+     order.
+     It is a real <button> inside the cell, and the padding moves off the cell
+     onto it so the button IS the whole header rectangle. A `th` with a click
+     handler cannot be reached without a mouse — it takes no focus, it is not in
+     the tab order and it fires nothing on Enter — and `aria-sort` publishing the
+     state to a screen reader that then cannot change it is the worse half of
+     that bargain. `font`/`color`/`text-align:inherit` because a button inherits
+     none of the three, and `text-align:inherit` in particular is what carries
+     `th.num`'s right-alignment through to the label.
+     `user-select:none` because a control you click three times in a row
      otherwise selects its own label on the second.
      The arrow is a pseudo-element and NOT text in the cell: the browser suite
      finds every column by its header's textContent, and a marker inside the
      cell would rename whichever of the 36 is sorted, halfway through a test.
-     Keyed off `aria-sort`, which is also what a screen reader reads and what
-     the suite asserts on — one attribute rather than a second data-* copy of
-     the same fact. */
-  .grid thead th[aria-sort]::after{margin-left:4px;font-size:9px;color:var(--accent)}
-  .grid thead th[aria-sort=ascending]::after{content:"\25b2"}
-  .grid thead th[aria-sort=descending]::after{content:"\25bc"}
+     Keyed off `aria-sort` on the th — the state stays written down in exactly
+     one place, which is also what a screen reader reads and what the suite
+     asserts on. */
+  .grid thead th .colsort{display:block;width:100%;padding:5px 8px 6px;
+    border:0;background:none;font:inherit;color:inherit;text-align:inherit;
+    white-space:normal;overflow-wrap:anywhere;line-height:1.25;
+    cursor:pointer;user-select:none}
+  /* A keyboard user has to be able to SEE where they are; `outline:none` here
+     would put the control back out of reach for the same people. Inset, because
+     an outline outside a sticky header cell is clipped by the scroll box. */
+  .grid thead th .colsort:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .grid thead th[aria-sort] .colsort::after{margin-left:4px;font-size:9px;color:var(--accent)}
+  .grid thead th[aria-sort=ascending] .colsort::after{content:"\25b2"}
+  .grid thead th[aria-sort=descending] .colsort::after{content:"\25bc"}
   /* The first column is the row's identity, and a table wider than its panel
      loses it on the first horizontal scroll. */
   .grid th:first-child,.grid td:first-child{
@@ -3900,6 +3916,17 @@ addEventListener('keydown',e=>{
     else if(overviewFilter||Object.keys(tagState).length){ clearAllFilters(); }
     else if(mode==='focus') overview(); return; }
   if(TIME) return;   // LEAP is disabled while viewing the past
+  // Space is how a keyboard PRESSES a focused control, so LEAP must not take it
+  // from one. Measured 2026-08-26 on the grid's sort headers: the keydown
+  // arrived at the button, `q.focus()` moved focus to the search field, and the
+  // keypress and keyup that a button's activation actually depends on landed on
+  // the input instead — so Enter worked and Space silently did nothing. The
+  // field guard above covers INPUT/TEXTAREA/SELECT and so already covers the
+  // column chooser's checkboxes; BUTTON and SUMMARY were the two it did not.
+  // Narrow on purpose: this is about one key, and every other character still
+  // reaches LEAP from anywhere.
+  if(e.key===' '){ const t=document.activeElement&&document.activeElement.tagName;
+                   if(t==='BUTTON'||t==='SUMMARY') return; }
   if(e.key.length===1 && !e.metaKey && !e.ctrlKey && !e.altKey) q.focus();
 });
 

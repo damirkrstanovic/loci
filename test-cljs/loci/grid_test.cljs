@@ -102,11 +102,25 @@
     (filter #(and (vector? %) (keyword? (first %)) (tag? (first %)))
             (tree-seq coll? seq tree))))
 
+(defn- ctl
+  "The one button carrying attribute `k`.
+
+   **By attribute and not by position, since Task 11.** The sort control became a
+   real `<button>` inside each `th`, so `(els tree \"button\")` now answers with
+   the header buttons first and the pager's two after them — and a destructuring
+   of `[prev nxt]` off the front silently started reading two column headers,
+   which have no `:disabled` at all. Both assertions would then have compared
+   nil against nil and passed."
+  [tree k]
+  (first (filter #(get (second %) k) (els tree "button"))))
+
 (deftest prev-is-dead-on-page-one-and-next-is-dead-at-the-end
   (let [on-1  (grid/on-payload (grid/init-state "tbl:x") payload)
-        [prev nxt] (els (view/grid nil on-1) "button")
+        prev  (ctl (view/grid nil on-1) :data-grid-prev)
+        nxt   (ctl (view/grid nil on-1) :data-grid-next)
         last-p (grid/on-payload (grid/next-page on-1) (dissoc payload :elision))
-        [prev2 nxt2] (els (view/grid nil last-p) "button")]
+        prev2 (ctl (view/grid nil last-p) :data-grid-prev)
+        nxt2  (ctl (view/grid nil last-p) :data-grid-next)]
     (is (true? (:disabled (second prev))) "nothing precedes page one")
     (is (false? (:disabled (second nxt))) "the payload carries a hole")
     (is (false? (:disabled (second prev2))) "page two can go back")
@@ -178,9 +192,33 @@
   ;; is the only thing that knows which one was pressed. Replicant hands handler
   ;; data back verbatim, so what is written here is exactly what `set-dispatch!`
   ;; receives — there is no placeholder interpolation to get wrong.
-  (let [ths (els (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload)) "th")]
+  (let [btns (els (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload))
+                  "button.colsort")]
     (is (= [[[:sort/toggle ::el :a]] [[:sort/toggle ::el :b]]]
-           (map #(get-in (second %) [:on :click]) ths)))))
+           (map #(get-in (second %) [:on :click]) btns)))))
+
+(deftest the-thing-a-header-activates-is-a-button-and-not-the-cell
+  ;; **Task 9 shipped a `th` with a click handler on it.** `aria-sort` published
+  ;; the state, so a screen reader could READ the sort — and nothing could change
+  ;; it without a mouse, because a table cell takes no focus, is not in the tab
+  ;; order and fires nothing on Enter.
+  ;;
+  ;; What actually proves a keyboard can reach it is the browser test
+  ;; `a keyboard reaches the sort control and sorts with it`, which tabs to the
+  ;; header from a known starting point and presses Enter — this one cannot see a
+  ;; tab order, and says so rather than pretending. It pins the STRUCTURE the
+  ;; browser test depends on: the activatable element is a real `<button>`, the
+  ;; cell itself has no handler left on it to be reached instead, and the header
+  ;; still reads as its column name with the arrow drawn rather than written.
+  (let [tree (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload))
+        ths  (els tree "th")
+        btns (els tree "button.colsort")]
+    (is (= 2 (count btns)) "one control per column")
+    (is (every? #(= "button" (:type (second %))) btns)
+        "type=button, or a header inside a form submits it")
+    (is (every? #(nil? (get-in (second %) [:on :click])) ths)
+        "the cell kept a handler of its own — a mouse would still work and a keyboard would not")
+    (is (= ["a" "b"] (map last btns)) "the label is the column name, and the arrow is not in it")))
 
 ;; ---- Task 10: the column chooser, remembered ----
 

@@ -76,12 +76,41 @@
    attribute whose value is falsy, so nil is what a *selector* can tell apart —
    `th[aria-sort]` is the sorted one, and there is exactly one.
 
-   The arrow itself is a `::after` pseudo-element in the stylesheet and NOT text
-   in the cell. The browser suite finds every column by its header's
-   `textContent`; a marker inside the cell would rename whichever of the 36 is
-   sorted, halfway through a test."
+   The arrow itself is a `::after` pseudo-element in the stylesheet — drawn on
+   the header's button, selected as `th[aria-sort] .colsort::after`, so it is
+   still this one attribute the stylesheet reads — and NOT text in the cell. The
+   browser suite finds every column by its header's `textContent`; a marker
+   inside the cell would rename whichever of the 36 is sorted, halfway through a
+   test. A pseudo-element is not in `textContent`, which is the whole reason it
+   is one."
   [[c d] col]
   (when (= c col) (if (= "desc" d) "descending" "ascending")))
+
+(defn- header
+  "One column's header: a `th` that carries the state, and inside it the control
+   a person actually presses.
+
+   **A `th` is not a control, and Task 9 shipped one as if it were.** The click
+   handler sat on the cell, so `aria-sort` let a screen reader READ the sort
+   while nothing could reach it without a mouse — a table is not in the tab
+   order, takes no focus and fires nothing on Enter. The fix is a real
+   `<button>`: the browser gives it the tab order, the focus ring, Enter and
+   Space, and the `button` role, none of which is worth reimplementing on a
+   cell with `tabindex` and a keydown handler.
+
+   **The button fills the cell.** `.grid thead th` drops its padding and the
+   button takes it, so the whole header rectangle is the control — a button
+   sitting inside a padded cell would leave the cell's margin clicking nothing,
+   which is how the mouse half of this control would have regressed.
+
+   `aria-sort` stays on the `th`, where `columnheader` is the role that takes
+   it, and stays the only place the sort state is written down."
+  [el s nums c]
+  [:th {:replicant/key c :title (name c)
+        :aria-sort (aria-sort (:sort s) c)
+        :class (when (nums c) "num")}
+   [:button.colsort {:type "button" :on {:click [[:sort/toggle el c]]}}
+    (name c)]])
 
 (def ^:private page-sizes
   "What a person can ask for, not what the server will honour: `page-limit`
@@ -197,17 +226,13 @@
        ;; descending, and back to the table's own order — which is the only
        ;; order a lake table pages by SEEKING (`WHERE rowid > k`) rather than by
        ;; counting, so it has to be reachable rather than lost on the first
-       ;; click. `loci.grid/toggle-sort` is the cycle; this is the control.
+       ;; click. `loci.grid/toggle-sort` is the cycle; `header` is the control,
+       ;; and it is a `<button>` so that a keyboard can reach it.
        ;;
        ;; The server does the sorting. This sends `[col dir]` on the window and
        ;; `sort-spec` validates it against the handle, so a header naming a
        ;; column the table has since lost is ignored rather than fatal.
-       [:thead [:tr (for [c cols]
-                      [:th {:replicant/key c :title (name c)
-                            :aria-sort (aria-sort (:sort s) c)
-                            :class (when (nums c) "num")
-                            :on {:click [[:sort/toggle el c]]}}
-                       (name c)])]]
+       [:thead [:tr (for [c cols] (header el s nums c))]]
        [:tbody
         (for [[i row] (map-indexed vector rendered)]
           [:tr {:replicant/key i}
