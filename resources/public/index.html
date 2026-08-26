@@ -8,8 +8,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Serif&display=swap" rel="stylesheet">
-<!-- The ClojureScript grid, opt-in via ?cljs. Loaded but inert unless the flag
-     is set, so every existing path without it is byte-identical. -->
+<!-- The ClojureScript grid. `renderMold` draws a `[data-cljs-grid]` seam for
+     every table and `wireSourceButtons` mounts this module into it, so a molded
+     table IS this file. It was opt-in behind a `?cljs` flag until the flag was
+     deleted; the mount is guarded on `window.loci`, so a shell whose module
+     failed to load still runs — with a hole where each table was. -->
 <script defer src="/js/grid.js"></script>
 <style>
   :root{

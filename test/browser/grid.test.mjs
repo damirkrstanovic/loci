@@ -16,8 +16,8 @@ before(async () => {
 });
 after(async () => { await browser?.close(); await server?.stop(); });
 
-// **`.molder`, not `.grid`.** With `?cljs` on, EVERY table the shell draws is a
-// ClojureScript grid — including the `tbl:planets` cell inside the seeded
+// **`.molder`, not `.grid`.** EVERY table the shell draws is a ClojureScript
+// grid — including the `tbl:planets` cell inside the seeded
 // `space:cosmos` notebook, which is on the page before this suite opens
 // anything. A bare `.grid` selector measured that one instead: 8 columns, 566px
 // wide, and four assertions about a table nobody asked for. The molder is the
@@ -25,11 +25,10 @@ after(async () => { await browser?.close(); await server?.stop(); });
 // of.
 const G = '.molder .grid';
 
-// `?cljs` is the flag, and `openObject` is the route: the shell has no hash
-// router — `enter(i)` and `openObject(id)` are how every other suite here
-// navigates.
+// `openObject` is the route: the shell has no hash router — `enter(i)` and
+// `openObject(id)` are how every other suite here navigates.
 const openGrid = async (page) => {
-  await bootedShell(page, server.url + '?cljs');
+  await bootedShell(page, server.url);
   await page.evaluate(() => openObject('tbl:grid'));
   await page.waitForSelector(`${G} table tbody tr`);
 };
@@ -665,9 +664,9 @@ const summary = (page) => page.textContent(`${G} [data-grid-cols] > summary`);
 // while the server still shipped all 36 across the wire, which is the whole
 // point missed. So the instrument has to be the URL.
 //
-// Filtered by id, because with `?cljs` on the seeded `space:cosmos` notebook
-// mounts a grid of its own for `tbl:planets` and its requests interleave with
-// these. `js/encodeURIComponent` writes the colon as `%3A`.
+// Filtered by id, because the seeded `space:cosmos` notebook mounts a grid of
+// its own for `tbl:planets` and its requests interleave with these.
+// `js/encodeURIComponent` writes the colon as `%3A`.
 const moldRequests = (page) => {
   const seen = [];
   page.on('request', r => {

@@ -59,20 +59,46 @@ after(async () => {
 // had been passing because a fetch to localhost is fast, not because anything
 // made them wait.
 //
-// `drewRows` waits for a row and then asserts the count, so `why` still says
-// what a missing table means rather than a bare timeout; `drewNoTable` is
-// reclaimed.test.mjs's, and counts the SEAM as well as the table, because "no
-// table on screen" is no longer the same claim as "no table is coming".
+// **And the table can go away again.** A grid is state in a JS atom keyed by the
+// seam element, so re-rendering the surface the seam sits in throws the mounted
+// grid away and mounts a new one, which fetches. Measured on the notebook cell
+// below, stamping the `.bd` element to see whether it was the same one: `enter(i)`
+// replaces the body the boot already drew, and for ONE 25 ms sample the cell holds
+// a mounted seam and no table at all — table, then nothing, then table. Under
+// `tableHTML` a re-render swapped one filled table for another in a single
+// innerHTML assignment and there was no gap to catch.
+//
+// So `drewRows` polls the two counts TOGETHER, in one `evaluate`, and rides over
+// a gap rather than sampling into it. `drewNoTable` is reclaimed.test.mjs's, and
+// counts the SEAM as well as the table, because "no table on screen" is no longer
+// the same claim as "no table is coming".
+//
 // A scope is a selector or an already-built locator — the notebook-cell test
 // reaches its cell by what it CONTAINS, which no selector string of ours names.
 const within = (page, scope) => (typeof scope === 'string' ? page.locator(scope) : scope);
 
 const drewRows = async (page, scope, why) => {
   const root = within(page, scope);
-  await until(async () => (await root.locator('table.mold tbody tr').count()) > 0,
-    async () => `${why} — no row ever landed in its table.mold, and the panel holds ` +
-      `${JSON.stringify((await root.textContent()).trim().slice(0, 200))}`, 8000);
-  assert.equal(await root.locator('table.mold').count(), 1, why);
+  // One round trip for both numbers: read separately, a re-render lands between
+  // them and reports a table with no rows, or rows with no table — a failure
+  // about the instrument rather than about the page.
+  const snap = () => root.evaluate(el => ({
+    tables: el.querySelectorAll('table.mold').length,
+    rows: el.querySelectorAll('table.mold tbody tr').length,
+    text: el.textContent.trim().slice(0, 200),
+  // A scope that is not on the page yet, or that matches more than one element,
+  // throws HERE rather than at the assertion — so it is carried into the message
+  // instead of arriving as a bare Playwright stack.
+  })).catch(e => ({ tables: 0, rows: 0, text: '(could not be read: ' + String(e.message).split('\n')[0] + ')' }));
+  const t0 = Date.now();
+  let m;
+  do {
+    m = await snap();
+    if (m.tables === 1 && m.rows > 0) return;
+    await new Promise(r => setTimeout(r, 50));
+  } while (Date.now() - t0 < 8000);
+  assert.fail(`${why} — after 8s it holds ${m.tables} table.mold and ${m.rows} rows, ` +
+              `and reads ${JSON.stringify(m.text)}`);
 };
 
 const drewNoTable = async (page, scope, why) => {

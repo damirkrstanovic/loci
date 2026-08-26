@@ -1,6 +1,6 @@
 // The build's own guarantees, which are easy to lose silently:
-//   - the compiled module is served and loads
-//   - `?cljs` absent leaves every existing path byte-identical
+//   - the compiled module is served, loads, and fills the seam it is mounted into
+//   - a table inside PROSE is still the shell's own, drawn from rows it has
 //   - the build installs nothing from npm
 // The last one is a test rather than a comment because `datalevin` pulls
 // `io.github.nextjournal/markdown`, whose jar declares npm dependencies, and a
