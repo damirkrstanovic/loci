@@ -1,5 +1,38 @@
 # loci — working agreements
 
+## Write in Simplified Technical English — and do not invent words
+
+We talk about complex things in simple words. **ASD-STE100** is the house style for
+everything you write: chat replies, docstrings, commit messages, specs, plans, and subagent
+prompts.
+
+The **dictionary is not the point**. You do not have the 900-word list, so do not stall over
+whether a word is approved, and never say that it is. Prefer the plain word — `use` not
+*utilize*, `about` not *approximately*, `make sure` not *ensure*, `start` not *initiate*,
+`before` not *prior to*. That habit gets most of the benefit and costs nothing.
+
+The rules are the point:
+
+- **One instruction per sentence.** Under 20 words for a step, under 25 for description.
+- **Imperative and active.** "Open the valve", not "the valve should be opened".
+- **Simple tenses.** No perfect, no progressive, no `-ing` forms outside a real name.
+- **Condition first, then the command.** "If the server is running, use the REPL facade."
+- **Keep the articles.** Dropped words are not brevity. They are ambiguity.
+- **Three nouns maximum** in a noun cluster.
+- **One term per thing, every time.** A synonym is a defect, not style.
+- **Warning** is injury. **Caution** is damage. **Note** is information. Put it before the step.
+
+And the rule that actually costs us here: **use the name the thing already has.** STE allows
+a technical name only when it *is* the name — the identifier in the code, the term in the
+docs, the word the user just said. You are prone to coining: a compound noun for a concept
+with no name, a capitalised phrase that reads like it points at something real, a metaphor
+promoted to a term of art. A coined word makes the reader hunt for a thing that does not
+exist.
+
+So: if the thing has a name in `src/`, in the docs, or in the last message, use that name.
+If it has no name, describe it in ordinary words — "the map we give to the renderer", not
+"the render envelope". Coin a term only when asked, and say that you are coining it.
+
 ## Always execute plans with subagents
 
 When a plan exists, execute it with **`superpowers:subagent-driven-development`** — a fresh
