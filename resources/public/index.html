@@ -8,6 +8,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Serif&display=swap" rel="stylesheet">
+<!-- The ClojureScript grid. `renderMold` draws a `[data-cljs-grid]` seam for
+     every table and `wireSourceButtons` mounts this module into it, so a molded
+     table IS this file. It was opt-in behind a `?cljs` flag until the flag was
+     deleted; the mount is guarded on `window.loci`, so a shell whose module
+     failed to load still runs — with a hole where each table was. -->
+<script defer src="/js/grid.js"></script>
 <style>
   :root{
     --paper:#ECEEEA; --panel:#F7F8F5; --white:#fff;
@@ -183,6 +189,103 @@
   table.mold td.txt{color:var(--ink-2)}
   table.mold tbody tr:first-child td{border-top:none}
   table.mold td:first-child{font-weight:500;color:var(--ink)}
+  /* ---- a table inside prose: `staticTable`, for report blocks and the ƒ
+     preview. `table-layout:auto` is what replaced the per-column character
+     arithmetic — `fixed` above splits one width evenly, so a 4-character year
+     got as much room as a 45-character region name, and the old renderer wrote
+     a <colgroup> of percentages to undo that. The browser already does it. ---- */
+  .stable{max-height:360px;overflow:auto}
+  .stable table.mold{table-layout:auto}
+  /* …with the same cap the grid uses, for the same reason: content-sizing has
+     no upper bound, and an unconstrained cell never overflows, so
+     `text-overflow:ellipsis` above would never fire. */
+  .stable table.mold th,.stable table.mold td{max-width:320px}
+  /* ---- the ClojureScript grid. `table.mold`'s own rules still apply — this
+     adds only what the old renderer could not do. ---- */
+  /* A column as wide as what it holds. `table-layout:auto` is half of it and not
+     a detail: `fixed` above divides ONE width between the columns, which is the
+     arithmetic being replaced, and under it `max-content` means nothing. */
+  .grid table.mold{width:max-content;max-width:none;table-layout:auto}
+  /* …up to a cap, because content-sizing has no upper bound. Measured on the
+     36-column fixture in an 856px box: 6,646px uncapped, where one 900-character
+     `note` value is five sixths of the table, against 1,726px with the cap. The
+     cap is also what lets `table.mold td`'s `text-overflow:ellipsis` fire at all
+     — a cell that is never constrained never overflows. */
+  .grid table.mold th,.grid table.mold td{max-width:320px}
+  /* The header IS the column key: at 36 columns `fa` is decodable as `archived`
+     only while the header is on screen. `background` is not decoration — a
+     sticky element is painted over scrolling content and shows through without
+     one. */
+  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white);padding:0}
+  /* A header is a CONTROL, and it has three states rather than two: one click
+     sorts ascending, a second descending, a third restores the table's own
+     order.
+     It is a real <button> inside the cell, and the padding moves off the cell
+     onto it so the button IS the whole header rectangle. A `th` with a click
+     handler cannot be reached without a mouse — it takes no focus, it is not in
+     the tab order and it fires nothing on Enter — and `aria-sort` publishing the
+     state to a screen reader that then cannot change it is the worse half of
+     that bargain. `font`/`color`/`text-align:inherit` because a button inherits
+     none of the three, and `text-align:inherit` in particular is what carries
+     `th.num`'s right-alignment through to the label.
+     `user-select:none` because a control you click three times in a row
+     otherwise selects its own label on the second.
+     The arrow is a pseudo-element and NOT text in the cell: the browser suite
+     finds every column by its header's textContent, and a marker inside the
+     cell would rename whichever of the 36 is sorted, halfway through a test.
+     Keyed off `aria-sort` on the th — the state stays written down in exactly
+     one place, which is also what a screen reader reads and what the suite
+     asserts on. */
+  .grid thead th .colsort{display:block;width:100%;padding:5px 8px 6px;
+    border:0;background:none;font:inherit;color:inherit;text-align:inherit;
+    white-space:normal;overflow-wrap:anywhere;line-height:1.25;
+    cursor:pointer;user-select:none}
+  /* A keyboard user has to be able to SEE where they are; `outline:none` here
+     would put the control back out of reach for the same people. Inset, because
+     an outline outside a sticky header cell is clipped by the scroll box. */
+  .grid thead th .colsort:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .grid thead th[aria-sort] .colsort::after{margin-left:4px;font-size:9px;color:var(--accent)}
+  .grid thead th[aria-sort=ascending] .colsort::after{content:"\25b2"}
+  .grid thead th[aria-sort=descending] .colsort::after{content:"\25bc"}
+  /* The first column is the row's identity, and a table wider than its panel
+     loses it on the first horizontal scroll. */
+  .grid th:first-child,.grid td:first-child{
+    position:sticky;left:0;z-index:1;background:var(--white);box-shadow:1px 0 0 var(--line)}
+  /* the corner is sticky on both axes and must outrank both. */
+  .grid thead th:first-child{z-index:3}
+  /* The column chooser. `<details>` because it is a disclosure and the browser
+     already owns opening and closing it — and because Replicant never writes
+     `open`, so the refetch after a tick leaves it as the person left it. */
+  .grid .colpick{margin-bottom:9px}
+  .grid .colpick>summary{display:inline-block;cursor:pointer;font-size:11.5px;
+    color:var(--muted);padding:3px 9px;border:1px solid var(--line);border-radius:7px;
+    user-select:none}
+  .grid .colpick>summary:hover{color:var(--ink)}
+  /* Thirty-six names in one column would be a scroll of its own. A grid of
+     tracks that fit their content, capped and scrollable, is the same shape the
+     table itself uses one rule up. */
+  .grid .colpick-list{margin-top:7px;padding:8px 10px;border:1px solid var(--line);
+    border-radius:9px;max-height:190px;overflow:auto;
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:2px 12px}
+  .grid .colpick-list label{display:flex;align-items:center;gap:6px;min-width:0;
+    font-size:11.5px;color:var(--ink-2);cursor:pointer}
+  .grid .colpick-list input{margin:0;cursor:pointer}
+  /* The last visible column's box is dead, because unticking it would ask the
+     server for no columns — which means ALL of them. It has to LOOK dead, or the
+     refusal reads as a bug. */
+  .grid .colpick-list input:disabled{cursor:default}
+  .grid .colpick-list label:has(input:disabled){cursor:default;color:var(--muted)}
+  .grid .pager{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .grid .pager select{padding:3px 8px;border-radius:7px;border:1px solid var(--line);
+    font:inherit;font-size:11.5px;color:var(--muted);background:var(--white)}
+  /* A control that cannot act should look like one. `[disabled]` and not a
+     class: the attribute is what actually stops the click, so styling anything
+     else could show a live button that does nothing, or a grey one that fires. */
+  .grid .pager .btn[disabled]{opacity:.35;cursor:default}
+  /* the caption sits at the far end, away from the controls — it reports, it is
+     not something to press. */
+  .grid .pgcap{margin-left:auto;font-size:11.5px;color:var(--muted);
+    font-variant-numeric:tabular-nums}
   .moldtext{white-space:pre-wrap;font-size:13px;line-height:1.5} .moldlist{margin:0;padding-left:18px}
   /* a table whose rows the store reclaimed. --attn, like every other state the
      page raises rather than reports: the missing-object cell and a failed flow
@@ -1886,8 +1989,8 @@ async function openFnPalette(i, id, anchor){
       let r; try{ r=await API.fnPreview(id,f.id,collect()); }catch(e){ if(tok!==pvSeq) return; prev.innerHTML=''; showToast('preview: network error'); return; }
       if(tok!==pvSeq) return;
       if(r.error){ prev.innerHTML='<div style="color:var(--attn);font-size:12px">'+esc(r.error)+'</div>'; return; }
-      prev.innerHTML='<div class="fnba"><div><div class="sec-h">before</div>'+tableHTML(r.before)+'</div>'+
-        '<div class="fnarrow">→</div><div><div class="sec-h">after · '+r.count+' rows</div>'+tableHTML(r.after)+'</div></div>'+
+      prev.innerHTML='<div class="fnba"><div><div class="sec-h">before</div>'+staticTable(r.before)+'</div>'+
+        '<div class="fnarrow">→</div><div><div class="sec-h">after · '+r.count+' rows</div>'+staticTable(r.after)+'</div></div>'+
         '<div style="font-size:11px;color:var(--faint);margin-top:4px">first 8 rows each — nothing is committed until you Apply</div>';
     };
     body.querySelector('[data-a="pv"]').addEventListener('click',preview);
@@ -1957,7 +2060,10 @@ function renderMold(m){
     return '<div class="srcblock" data-src="'+esc(m.id)+'">'+sourceHTML(m,SRCNOW[m.id])+'</div>';
   }
   switch(m.kind){
-    case 'table':  return liveBadge(m)+tableHTML(d);
+    // A div and an id is the ENTIRE integration surface: the ClojureScript side
+    // fetches its own payload over Transit, so nothing here needs to know the
+    // payload's shape. That is what keeps this seam one line wide.
+    case 'table':  return liveBadge(m)+'<div data-cljs-grid="'+esc(m.id)+'"></div>';
     case 'list':   return '<ul class="moldlist">'+d.map(s=>'<li>'+esc(s)+'</li>').join('')+'</ul>';
     case 'text':   return '<div class="moldtext">'+mdToHtml(d)+'</div>';
     case 'chart':  return chartSVG(d);
@@ -2030,8 +2136,8 @@ function fmtNum(n){ return (+n).toLocaleString(); }
 // A table whose rows the store reclaimed — the page saying so, instead of
 // drawing the table that is no longer there.
 //
-// Without this the payload's `kind` is "table" and its `rendered` is [], so
-// tableHTML returned the italic word `empty` — which is what a table somebody
+// Without this the payload's `kind` is "table" and its `rendered` is [], so the
+// shell drew the italic word `empty` — which is what a table somebody
 // emptied on purpose looks like, and mold-payload's own comment calls the worst
 // available shape for this answer. The server ships `reclaimed`, `total` and
 // `cols` for no other reason than to let this say what was there. Note the keys:
@@ -2209,6 +2315,15 @@ function panelIdx(el){ const p=el.closest('.panel'); return p?+p.dataset.i:focus
 // The id travels on the button rather than in `openId`: a cell's block is not
 // the open object, and in a notebook `openId` is null.
 function wireSourceButtons(root,i){
+  // Mount the ClojureScript grid into any node the payload asked for.
+  // `wireSourceButtons` already exists to attach behaviour after every render,
+  // which is exactly the hook a mounted component needs — so the seam costs
+  // four lines and no new lifecycle.
+  root.querySelectorAll('[data-cljs-grid]').forEach(el=>{
+    if(!el.dataset.mounted && window.loci && loci.grid){
+      el.dataset.mounted='1'; loci.grid.mount(el, el.dataset.cljsGrid);
+    }
+  });
   root.querySelectorAll('[data-a="refresh"]').forEach(el=>el.addEventListener('click',async ev=>{
     ev.stopPropagation();
     if(TIME){ showToast('time mode — ↩ now to refresh'); return; }
@@ -2245,7 +2360,30 @@ function renderKPI(k){
     '<div style="font-size:13px;color:'+(up?'var(--accent)':'var(--attn)')+'">'+(up?'▲':'▼')+' '+fmtNum(Math.abs(k.delta))+' ('+k.pct+'%) vs prior</div></div>'+
     '<div style="font-size:12px;color:var(--muted);line-height:1.7">min '+fmtNum(k.min)+'<br>max '+fmtNum(k.max)+'<br>'+k.periods+' periods</div></div>';
 }
-function tableHTML(rows){
+// A table inside PROSE — a report block, and the ƒ preview's before/after.
+// Never a molded table: that is the ClojureScript grid, which pages, sorts and
+// hides columns because it may be looking at ten million rows.
+//
+// These two are the other thing. A report block's rows are authored into the
+// document they sit in (`content.clj`: eight planets, twenty-six economies,
+// eight categories); the ƒ preview asks for eight rows and says so underneath.
+// They have their rows in hand, so mounting a component per block would add a
+// second fetch, a state atom and a pager to a table that is part of a sentence.
+//
+// From `tableHTML`, which this replaces: the markup and the numeric alignment.
+// Gone with it: the per-column character arithmetic normalised to percentages
+// of a `width:100%` table. `table-layout:auto` in `.stable` is the same answer
+// in one CSS property, and without the `.toFixed(2)` drift that produced a
+// scrollbar with nothing behind it.
+//
+// **The 60-row cap stays**, against the plan, which grouped it with the width
+// arithmetic. They are not the same kind of thing: the arithmetic was a worse
+// way of doing something CSS does, and the cap is the only bound on how many
+// rows a block can put in the DOM. Every block in the seed is under it, so
+// keeping it changes nothing today and costs two lines — and `renderReport` is
+// a generic renderer, so the day a block arrives with a query's result set in
+// it, the cap and the line admitting to it are what stand there.
+function staticTable(rows){
   if(!rows||!rows.length) return '<i>empty</i>';
   const cols=Object.keys(rows[0]); const cap=60, shown=rows.slice(0,cap);
   // A column is numeric if the values say so — CSS cannot see that, so the
@@ -2261,18 +2399,7 @@ function tableHTML(rows){
     const v=r[c], s=(v===null||v===undefined)?'':String(v);
     return '<td class="'+(numeric[c]?'num':'txt')+'" title="'+esc(s)+'">'+esc(s)+'</td>';
   };
-  // fixed layout is what makes truncation possible, but it also splits the
-  // width evenly — so a 4-character year gets as much room as a 45-character
-  // region name. Size each column by what it actually holds, clamped so one
-  // long value cannot starve the rest.
-  const width=c=>{
-    const seg=Math.max(...c.split('_').map(w=>w.length));           // longest unbroken word
-    const longest=shown.reduce((m,r)=>Math.max(m,String(r[c]??'').length),seg);
-    return Math.min(Math.max(longest+2,7),28);   // +2 for the cell's padding
-  };
-  const widths=cols.map(width), total=widths.reduce((a,b)=>a+b,0);
-  let h='<div style="max-height:360px;overflow:auto"><table class="mold"><colgroup>'+
-    widths.map(w=>'<col style="width:'+(100*w/total).toFixed(2)+'%">').join('')+'</colgroup><thead><tr>'+
+  let h='<div class="stable"><table class="mold"><thead><tr>'+
     cols.map(c=>'<th class="'+(numeric[c]?'num':'txt')+'" title="'+esc(c)+'">'+
                 esc(c).replace(/_/g,'_<wbr>')+'</th>').join('')+'</tr></thead><tbody>'+
     shown.map(r=>'<tr>'+cols.map(c=>cell(r,c)).join('')+'</tr>').join('')+
@@ -2285,7 +2412,7 @@ function renderReport(blocks){
     switch(b.block){
       case 'heading': return '<h3 style="font-family:\'IBM Plex Serif\',serif;font-weight:400;font-size:18px;margin:18px 0 6px">'+esc(b.text)+'</h3>';
       case 'text':    return mdToHtml(b.text);
-      case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+tableHTML(b.rows);
+      case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+staticTable(b.rows);
       case 'chart':   return '<div style="margin:6px 0 14px">'+chartSVG(b.spec)+'</div>';
       default:        return '';
     }
@@ -3809,6 +3936,17 @@ addEventListener('keydown',e=>{
     else if(overviewFilter||Object.keys(tagState).length){ clearAllFilters(); }
     else if(mode==='focus') overview(); return; }
   if(TIME) return;   // LEAP is disabled while viewing the past
+  // Space is how a keyboard PRESSES a focused control, so LEAP must not take it
+  // from one. Measured 2026-08-26 on the grid's sort headers: the keydown
+  // arrived at the button, `q.focus()` moved focus to the search field, and the
+  // keypress and keyup that a button's activation actually depends on landed on
+  // the input instead — so Enter worked and Space silently did nothing. The
+  // field guard above covers INPUT/TEXTAREA/SELECT and so already covers the
+  // column chooser's checkboxes; BUTTON and SUMMARY were the two it did not.
+  // Narrow on purpose: this is about one key, and every other character still
+  // reaches LEAP from anywhere.
+  if(e.key===' '){ const t=document.activeElement&&document.activeElement.tagName;
+                   if(t==='BUTTON'||t==='SUMMARY') return; }
   if(e.key.length===1 && !e.metaKey && !e.ctrlKey && !e.altKey) q.focus();
 });
 

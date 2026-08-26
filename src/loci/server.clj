@@ -4,7 +4,8 @@
    The HTTP boundary is the substrate/assistance seam — everything the frontend
    shows is molded by `loci.mold` on the Clojure side; the frontend just lays it
    out. (Same code path the headless demo exercises.)"
-  (:require [clojure.data.json :as json]
+  (:require [cognitect.transit :as transit]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
@@ -49,10 +50,70 @@
    :headers {"Content-Type" "application/json; charset=utf-8"}
    :body (json/write-str data)})
 
+(defn- transit-resp
+  "`data` as Transit-JSON, the alternative wire format `wire-resp` selects.
+
+   **The one thing it is here to settle: a namespaced keyword survives.**
+   `json/write-str` renders a namespaced keyword KEY by its bare name, so
+   `:table/total` reaches the shell as `\"total\"`. That is not a preference — it
+   silently broke two tasks of the paging plan, and `index.html` has carried a
+   comment about it since `reclaimedHTML` was written. Measured in
+   `transit-keeps-a-namespaced-keyword-and-json-does-not`, which asserts both
+   halves: the JSON body really does lose the namespace, and the Transit body
+   really does read back as the keyword.
+
+   `:json` and not `:json-verbose`, which matters for more than taste — the
+   compact form caches a repeated map key, so a wide table writes each column
+   name once rather than once per row. Measured 2026-08-25 on a 36-column,
+   100-row page: 100,460 bytes of JSON against 58,873 of Transit."
+  [data]
+  (let [out (java.io.ByteArrayOutputStream. 4096)]
+    (transit/write (transit/writer out :json) data)
+    {:status 200
+     :headers {"Content-Type" "application/transit+json; charset=utf-8"}
+     :body (.toString out "UTF-8")}))
+
+(defn- wire-resp
+  "`?wire=transit` opts one request into Transit; anything else gets `json-resp`.
+
+   **Only `/api/mold` is routed through here.** Every other route in `handler`
+   calls `json-resp` directly, so `wire=transit` on one of them is an ignored
+   query parameter rather than a second format — the switch is per-request only
+   within the one route that offers it. That is deliberate: the ClojureScript
+   grid is the only client that needs the namespace back, and a request with no
+   `wire` param is byte-for-byte the JSON every existing caller reads
+   (`a-request-without-wire-transit-is-byte-identical-to-today`)."
+  [params data]
+  (if (= "transit" (params "wire")) (transit-resp data) (json-resp data)))
+
 (defn- parse-query [qs]
   (into {} (for [pair (some-> qs (str/split #"&")) :when (seq pair)]
              (let [[k v] (str/split pair #"=" 2)]
                [k (some-> v (java.net.URLDecoder/decode "UTF-8"))]))))
+
+(defn- window-params
+  "The window a query string asks for, or nil for none.
+
+   nil and not an empty map: `mold-payload` branches on it to choose
+   `hydrate-page` over `hydrate`, and every caller that is not the shell's Rows
+   view must keep getting the `mold-cap` sample it gets today.
+
+   `cols` is comma-separated. Every value here is validated downstream against
+   the handle — `page-limit` clamps, `sort-spec` and `project-cols` drop what the
+   table does not have — so nothing this function returns is trusted. Verified
+   end to end in `a-hostile-sort-and-cols-still-page`: a `sort` naming an unknown
+   column and a `cols` list of nothing but unknown names both come back as an
+   ordinary first page rather than an error or an empty table."
+  [params]
+  (let [limit  (params "limit")
+        cursor (params "cursor")
+        sort   (params "sort")
+        cols   (params "cols")]
+    (when (or limit cursor sort cols)
+      {:limit  limit
+       :cursor cursor
+       :sort   (when (seq sort) (str/split sort #"," 2))
+       :cols   (when (seq cols) (str/split cols #","))})))
 
 (defn- body-json [req] (when-let [b (:body req)] (json/read-str (slurp b) :key-fn keyword)))
 
@@ -437,9 +498,18 @@
    `clojure.core/force` is identity on anything that is not a delay, so a caller
    already holding a memory — every entity test, and anything that would rather
    read like `/api/entity`'s `@mem/memory` neighbours in the router — may simply
-   pass it."
-  [st m id view]
-  (let [o (tbl/hydrate lake/lake (sub/object st id))]
+   pass it.
+
+   **The 5-arity takes a window, and it is used on the rows/cards branch only.**
+   `unusable`, `entity`, `flow`, `applet` and `view:` render nothing a pager
+   applies to, so `window` reaches only the `:else` branch's own guard — see its
+   comment for why a `table/summary` view must not carry an `:elision` even
+   though it was molded with a window."
+  ([st m id view] (mold-payload st m id view nil))
+  ([st m id view window]
+   (let [o (if window
+             (tbl/hydrate-page lake/lake (sub/object st id) window)
+             (tbl/hydrate lake/lake (sub/object st id)))]
     (cond
       ;; UNUSABLE — first, and before the view branches, because such a table
       ;; can still have a viewspec pointed at it and `vs/interpret` over `[]`
@@ -511,9 +581,53 @@
       ;; above just stopped being able to make for the function as a whole.
       :else
       (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
-        {:id id :title (:title o) :kind (name (:kind mv)) :view (when (:view mv) (kw->str (:view mv)))
-         :label (:label mv) :rendered (:rendered mv) :alternatives (alternatives st o)
-         :source (source-block o)}))))
+        (cond-> {:id id :title (:title o) :kind (name (:kind mv))
+                 :view (when (:view mv) (kw->str (:view mv)))
+                 :label (:label mv) :rendered (:rendered mv)
+                 :alternatives (alternatives st o) :source (source-block o)}
+          ;; `:table/total` and `:table/cols` only when `hydrate`/`hydrate-page`
+          ;; actually put them on `o` — a doc, a report or a metric molds
+          ;; through this same branch and has neither, and a nil-valued key
+          ;; those payloads never carried before would be a regression, not a
+          ;; convenience.
+          (:table/total o) (assoc :table/total (:table/total o))
+          (:table/cols o) (assoc :table/cols (:table/cols o))
+          ;; **The elision, and ONLY for a viewer that renders rows.** A hole is
+          ;; a statement about omitted rows; `table/summary` renders a chart
+          ;; computed from something else and a pager under it would be a lie.
+          ;;
+          ;; Absent when nothing was omitted — `page` returns no cursor on the
+          ;; last page, and a hole describing zero missing rows is not a hole.
+          ;;
+          ;; **This is Clerk's SHAPE and not Clerk's SEMANTICS, deliberately.**
+          ;; Clerk's elision APPENDS: clicking `1,975 more` joins the fetched
+          ;; rows to the ones on screen, which is right for an inspector drilling
+          ;; into one value. loci's REPLACES. At the 10M-row scale this design
+          ;; targets, forty clicks of an accreting `more` puts four thousand rows
+          ;; in the DOM, and a bounded DOM was half of what paging was for — the
+          ;; superseded spec's §1.5 records the browser being the place the
+          ;; problem got moved to. So the caption reads `showing 101–200 of
+          ;; 10,000,000` rather than `1,975 more`, and there is a Prev control an
+          ;; append model would have no use for. Design §3.1; the next reader
+          ;; will find Clerk's protocol and wonder why this one differs.
+          ;;
+          ;; `:offset` is here because it is the SERVER's, and the shell's page
+          ;; index must yield to it: the shell's is arithmetic over a page size a
+          ;; person can change mid-walk, and this is where the rows actually
+          ;; start.
+          ;;
+          ;; `:path` is `[:rendered]` and single-element by construction:
+          ;; `normalize-rows` refuses a vector or a map in a column, so a table
+          ;; payload has exactly one hole and it is at the end. The field is here
+          ;; rather than omitted so that a nested elision needs no second shape —
+          ;; see §3 of the design.
+          (and (:page/next o) (#{:table/rows :table/cards} (:view mv)))
+          (assoc :elision {:n          (tbl/page-limit (:limit window))
+                           :offset     (:page/offset o)
+                           :total      (:table/total o)
+                           :unbounded? (boolean (:table/unbounded o))
+                           :path       [:rendered]
+                           :cursor     (:page/next o)})))))))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -921,9 +1035,47 @@
 
 ;; ---- notebook payload: cells hydrated (each ref molded by its chosen view),
 ;; rail links and also-in chips computed fresh every time ----
+
+(def notebook-budget
+  "How many rows a whole notebook payload may carry, across every `:ref` cell.
+
+   **The response is the thing that was too big, not the table.** Measured on
+   the real substrate before this work: one 36-column, 2,000-row cell was
+   5,428,753 bytes, and `notebook-payload` merges one mold per cell — so five
+   such cells were five copies of that in a single response. `mold-cap` bounds a
+   table; nothing bounded the response.
+
+   Clerk's `:!budget` is the same idea and defaults to 200 items. 500 here
+   because loci's cells are tables rather than arbitrary nested values, and a
+   notebook of five tables showing 100 rows each is an ordinary page."
+  500)
+
 (defn notebook-payload [st id]
   (let [o (sub/object st id)
         {:keys [connected also-in]} (nb/links st id)
+        cs   (nb/cells-of o)
+        ;; Counted BEFORE anything is molded, because the share has to be the
+        ;; same for every cell — a budget spent greedily by whichever cell is
+        ;; first is a page whose last table is empty for no reason a reader can
+        ;; see.
+        refs (count (filter :ref cs))
+        ;; A share each, but **never more than an ordinary page**, and floored
+        ;; at one row.
+        ;;
+        ;; The `min` is the half that is easy to leave out and wrong to. A
+        ;; budget is a ceiling on the response, not a target to spend: without
+        ;; it a notebook of ONE table cell claims the whole 500, `page-limit`
+        ;; clamps that to its 200-row `max-limit`, and a single-table notebook
+        ;; silently doubles its page — a bound that makes the common case bigger
+        ;; is not a bound. `a-notebook-cell-carries-one-page-and-not-the-whole-sample`
+        ;; is the test that says so, in rows.
+        ;;
+        ;; The `max 1` at the front is the crowded end: six hundred table cells
+        ;; divide to zero, and a payload of six hundred empty grids reads as six
+        ;; hundred empty tables rather than as a crowded notebook. The inner
+        ;; `max 1` is only against division by zero, for a notebook of nothing
+        ;; but text.
+        per  (max 1 (min tbl/default-limit (quot notebook-budget (max 1 refs))))
         cells (vec (map-indexed
                     (fn [i c]
                       (cond
@@ -933,9 +1085,21 @@
                                 :also-in (get also-in (:ref c))
                                 :from (:from (sub/object st (:ref c)))
                                 :via  (:via (sub/object st (:ref c)))}
-                               (mold-payload st mem/memory (:ref c) (:view c)))
+                               ;; A window with only a limit: a cell opens on page
+                               ;; one and pages from there like the molder does.
+                               ;; Passing nil here is what shipped five copies of
+                               ;; a mold-cap sample in one response.
+                               ;;
+                               ;; `per` and not `tbl/default-limit`: `mold-cap`
+                               ;; bounds a table and this bounds the RESPONSE,
+                               ;; which is what was actually too big. Every cell
+                               ;; keeps its own elision, so a cell squeezed by a
+                               ;; crowded notebook is still a page one you can
+                               ;; walk forward from.
+                               (mold-payload st mem/memory (:ref c) (:view c)
+                                             {:limit per}))
                         :else {:i i :type "missing" :ref (:ref c)}))
-                    (nb/cells-of o)))]
+                    cs))]
     {:id id :title (:title o) :intent (get-in o [:value :intent])
      :spawned-by (get-in o [:value :spawned-by])
      :cells cells :connected connected :events (count (sub/history st))}))
@@ -3385,8 +3549,9 @@
       (= uri "/")            {:status 200 :headers {"Content-Type" "text/html; charset=utf-8"}
                               :body (slurp (io/resource "public/index.html"))}
       (= uri "/api/state")   (json-resp (state-payload (store-at st (params "at"))))
-      (= uri "/api/mold")    (json-resp (mold-payload (store-at st (params "at")) mem/memory
-                                                     (params "id") (params "view")))
+      (= uri "/api/mold")    (wire-resp params (mold-payload (store-at st (params "at")) mem/memory
+                                                     (params "id") (params "view")
+                                                     (window-params params)))
       (= uri "/api/events")  (json-resp (events-payload st))
       ;; `?deep=1` is the pause/Enter request, and the ONLY one that embeds. The
       ;; chunk singleton is forced here rather than in the params map so a
@@ -3520,6 +3685,16 @@
       (str/starts-with? uri "/api/object/")
       (json-resp (mold-payload (store-at st (params "at")) mem/memory
                                (java.net.URLDecoder/decode (subs uri (count "/api/object/")) "UTF-8") nil))
+      ;; SPIKE 2026-08-25 — the compiled ClojureScript. One static route, under a
+      ;; fixed prefix, reading only from the classpath resource tree: `uri` is
+      ;; caller-supplied, so a `..` in it must not be able to leave `public/js`.
+      ;; `io/resource` on a name with no slash after the prefix is the whole
+      ;; guard, and the `re-matches` is what makes that true.
+      (re-matches #"/js/[A-Za-z0-9._-]+\.js" uri)
+      (if-let [r (io/resource (str "public" uri))]
+        {:status 200 :headers {"Content-Type" "application/javascript; charset=utf-8"} :body (slurp r)}
+        {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})
+
       :else {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"})))
 
 (defonce server (atom nil))

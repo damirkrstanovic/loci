@@ -43,6 +43,71 @@ after(async () => {
   await browser?.close(); await server?.stop();
 });
 
+// **A table now arrives a fetch after the panel does.** Nothing in this file is
+// a test about a table's markup — every one of them uses a table to reach
+// something else: that a live badge sits BESIDE the rows rather than replacing
+// them, that a connected file brought its rows with it, that an accent survived
+// a chunk boundary. But the reach has to wait now. The ClojureScript grid is
+// mounted into a `[data-cljs-grid]` node the shell renders and filled by its own
+// Transit request, so reading `.molder-b` the instant the molder opens reads a
+// panel with a hole in it. Under `tableHTML` the rows were in the string the
+// shell built, so there was no instant at which they were missing.
+//
+// Measured 2026-08-26, and this is why these are waits rather than counts: with
+// the grid's mount delayed 300 ms — a fetch on a table of the size this design
+// targets — SEVEN tests in this file went red, and at 3 s an eighth did. They
+// had been passing because a fetch to localhost is fast, not because anything
+// made them wait.
+//
+// **And the table can go away again.** A grid is state in a JS atom keyed by the
+// seam element, so re-rendering the surface the seam sits in throws the mounted
+// grid away and mounts a new one, which fetches. Measured on the notebook cell
+// below, stamping the `.bd` element to see whether it was the same one: `enter(i)`
+// replaces the body the boot already drew, and for ONE 25 ms sample the cell holds
+// a mounted seam and no table at all — table, then nothing, then table. Under
+// `tableHTML` a re-render swapped one filled table for another in a single
+// innerHTML assignment and there was no gap to catch.
+//
+// So `drewRows` polls the two counts TOGETHER, in one `evaluate`, and rides over
+// a gap rather than sampling into it. `drewNoTable` is reclaimed.test.mjs's, and
+// counts the SEAM as well as the table, because "no table on screen" is no longer
+// the same claim as "no table is coming".
+//
+// A scope is a selector or an already-built locator — the notebook-cell test
+// reaches its cell by what it CONTAINS, which no selector string of ours names.
+const within = (page, scope) => (typeof scope === 'string' ? page.locator(scope) : scope);
+
+const drewRows = async (page, scope, why) => {
+  const root = within(page, scope);
+  // One round trip for both numbers: read separately, a re-render lands between
+  // them and reports a table with no rows, or rows with no table — a failure
+  // about the instrument rather than about the page.
+  const snap = () => root.evaluate(el => ({
+    tables: el.querySelectorAll('table.mold').length,
+    rows: el.querySelectorAll('table.mold tbody tr').length,
+    text: el.textContent.trim().slice(0, 200),
+  // A scope that is not on the page yet, or that matches more than one element,
+  // throws HERE rather than at the assertion — so it is carried into the message
+  // instead of arriving as a bare Playwright stack.
+  })).catch(e => ({ tables: 0, rows: 0, text: '(could not be read: ' + String(e.message).split('\n')[0] + ')' }));
+  const t0 = Date.now();
+  let m;
+  do {
+    m = await snap();
+    if (m.tables === 1 && m.rows > 0) return;
+    await new Promise(r => setTimeout(r, 50));
+  } while (Date.now() - t0 < 8000);
+  assert.fail(`${why} — after 8s it holds ${m.tables} table.mold and ${m.rows} rows, ` +
+              `and reads ${JSON.stringify(m.text)}`);
+};
+
+const drewNoTable = async (page, scope, why) => {
+  const root = within(page, scope);
+  assert.equal(await root.locator('table.mold').count(), 0, why);
+  assert.equal(await root.locator('[data-cljs-grid]').count(), 0,
+    `${why} — and the shell asked for a grid, which would have drawn one`);
+};
+
 // Every browser JVM extracts DuckDB's ~58 MB libduckdb_java*.so into java.io.tmpdir
 // and cannot delete it, because the harness kills the process group before
 // deleteOnExit runs. b64c532 pointed that tmpdir at the server's own directory, which
@@ -100,9 +165,8 @@ test('a healthy passthrough table says it reads live', async () => {
 
     // beside the rows, never instead of them: passthrough says how a table is
     // STORED, never whether it is well
+    await drewRows(page, '.molder-b', 'the badge replaced the table instead of sitting above it');
     const body = (await page.textContent('.molder-b')).trim();
-    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
-      'the badge replaced the table instead of sitting above it');
     assert.match(body, /EMEA/, 'and still shows its rows');
     assert.match(body, /APAC/);
   });
@@ -116,7 +180,7 @@ test('a source whose file is gone says so and offers a reconnect', async () => {
     assert.match(body, /unreachable/i,
       `the page does not say the source is unreachable — it drew: ${JSON.stringify(body)}`);
     assert.doesNotMatch(body, /^\s*empty\s*$/i, 'still drawing the italic word "empty"');
-    assert.equal(await page.locator('.molder-b table.mold').count(), 0,
+    await drewNoTable(page, '.molder-b',
       'a table with no rows in it is the answer this page exists not to give');
     assert.match(body, /gone\.csv/, `it does not say which file is missing: ${body}`);
     assert.match(body, /revenue/, 'it does not say what the table was connected as');
@@ -139,7 +203,8 @@ test('a drifted source names both column sets and offers a refresh', async () =>
     const body = (await page.textContent('.molder-b')).trim();
     assert.match(body, /columns changed/i,
       `the page does not say the columns changed — it drew: ${JSON.stringify(body)}`);
-    assert.equal(await page.locator('.molder-b table.mold').count(), 0);
+    await drewNoTable(page, '.molder-b',
+      'a drifted source drew rows, which is the thing its block replaces');
 
     // Both column sets, each scoped to its own element — asserting them over the
     // whole body would pass on `unusable`'s sentence alone, which names both and
@@ -194,6 +259,7 @@ test('a notebook cell draws the same faces, and its buttons are wired there too'
     const live = await cellFor('Live source');
     assert.equal(await live.locator('.livebadge').count(), 1,
       'a live source draws its badge in the molder but not in a cell');
+    await drewRows(page, live.locator('.bd'), 'the cell no longer shows its rows');
     assert.match((await live.locator('.bd').textContent()).trim(), /EMEA/,
       'and the cell still shows its rows');
 
@@ -377,8 +443,7 @@ test('the ＋ Data panel previews a file before connecting it', async () => {
 
     assert.match((await page.textContent('.molder-h .t')).trim(), /From the panel/,
       'something opened, but not the table the panel just made');
-    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
-      'the connected table drew no rows');
+    await drewRows(page, '.molder-b', 'the connected table drew no rows');
     assert.match(await page.textContent('.molder-b'), /EMEA/,
       'the table landed with none of the file’s rows in it');
     // And the same oracle the "describe commits nothing" check used, now moving
@@ -464,6 +529,7 @@ test('the ＋ Data panel connects a file live, and copies nothing into the lake'
       'the table just connected live draws no badge — a reader cannot tell it from a copy');
     assert.match((await page.textContent('.molder-b .livebadge')).trim(), /live\.csv/,
       'the badge does not say which file the table reads');
+    await drewRows(page, '.molder-b', 'the live table drew no rows at all');
     assert.match(await page.textContent('.molder-b'), /EMEA/,
       'the live table drew none of the file’s rows');
 
@@ -503,8 +569,7 @@ test('the ＋ Data panel still pastes', async () => {
 
     assert.match((await page.textContent('.molder-h .t')).trim(), /Pasted still works/,
       'something opened, but not the table the paste tab just made');
-    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
-      'the pasted table drew no rows');
+    await drewRows(page, '.molder-b', 'the pasted table drew no rows');
   });
 });
 
@@ -763,8 +828,7 @@ test('a file uploaded from the file tab previews, connects, and keeps its name',
       'the remembered name and the content-addressed name are the same string — the check above proves nothing');
 
     await connectPreview(page, at, 'Uploaded ' + tok);
-    assert.equal(await page.locator('.molder-b table.mold').count(), 1,
-      'the uploaded table drew no rows');
+    await drewRows(page, '.molder-b', 'the uploaded table drew no rows');
     assert.match(await page.textContent('.molder-b'), /EMEA/,
       'the table landed with none of the uploaded file’s rows in it');
 
@@ -846,6 +910,10 @@ test('a multi-byte character split across a chunk boundary arrives intact', asyn
     // And the human-visible half: DuckDB reads the file back, so the accent has
     // to survive all the way onto the screen.
     await connectPreview(page, at, 'Accents ' + tok);
+    // The wait is load-bearing for the THIRD assertion below and not only the
+    // first two: `doesNotMatch(/�/)` is satisfied by an empty panel, so
+    // read before the grid's rows land it is an assertion that cannot fail.
+    await drewRows(page, '.molder-b', 'the accented table drew no rows to inspect');
     const body = await page.textContent('.molder-b');
     assert.match(body, /café/, `the accented value did not survive the chunk boundary: ${JSON.stringify(body)}`);
     assert.match(body, /naïve/, `the accented value did not survive the chunk boundary: ${JSON.stringify(body)}`);
@@ -1321,7 +1389,7 @@ test('a URL typed into the ＋ Data panel becomes a table, and can only be copie
 
       assert.match((await page.textContent('.molder-h .t')).trim(), /From a URL/,
         'something opened, but not the table the URL just made');
-      assert.equal(await page.locator('.molder-b table.mold').count(), 1, 'the table drew no rows');
+      await drewRows(page, '.molder-b', 'the table from the URL drew no rows');
       assert.match(await page.textContent('.molder-b'), /EMEA/,
         'the table landed with none of the URL’s rows in it');
 

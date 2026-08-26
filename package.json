@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:browser": "TMPDIR=.tmp node --test --test-isolation=none 'test/browser/**/*.test.mjs'"
+    "test:browser": "TMPDIR=.tmp node --test --test-isolation=none 'test/browser/**/*.test.mjs'",
+    "//test:cljs": "The guard is load-bearing: a :node-test build whose :ns-regexp matches nothing compiles, prints `Ran 0 tests containing 0 assertions` and EXITS 0, while a real failure exits 1 — so `compile && node` alone cannot tell a suite that passed from a suite that was not there. Every ClojureScript test in the shell runs behind this command; do not simplify it back to the raw two-command form. POSIX `case` and not `grep`, because a pipeline's exit status is the LAST stage's and would discard node's.",
+    "test:cljs": "rm -f target/cljs-test.cjs target/cljs-test.out && clojure -M:cljs -m shadow.cljs.devtools.cli compile test && node target/cljs-test.cjs >target/cljs-test.out 2>&1; s=$?; [ -f target/cljs-test.out ] && cat target/cljs-test.out; [ $s -ne 0 ] && exit $s; case \"$(cat target/cljs-test.out)\" in *'Ran 0 tests'*) echo 'test:cljs FAILED: the runner ran ZERO tests. :ns-regexp in shadow-cljs.edn matched no namespace, so the suite was not there at all.' >&2; exit 1;; esac; exit 0"
   },
   "engines": {
     "node": ">=22"

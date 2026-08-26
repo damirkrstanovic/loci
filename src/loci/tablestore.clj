@@ -6,7 +6,8 @@
    table was before 2026-08-16 — and stays as the parity reference and as the
    store a test uses when it has nothing to say about DuckLake, the same role
    `substrate/PersistentStore` plays next to `dlv/DatalevinStore`."
-  (:require [clojure.string :as str]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]))
 
@@ -17,6 +18,35 @@
      for one table.")
   (rows [this handle opts]
     "A page of rows for `handle`. `opts` may carry :offset and :limit.")
+  (page [this handle window]
+    "One page of rows for `handle`, plus the cursor that starts the next page.
+
+     `window` may carry `:limit`, `:cursor` (opaque, nil for page 1), `:sort`
+     (`[col dir]`) and `:cols` (the columns to project, nil for all).
+
+     => `{:rows [...] :offset <n-or-nil> :next <cursor-or-nil>}`
+
+     **`:offset` is how many rows precede this page**, and it is a fact every
+     implementation has to be able to state — the elision's caption reads
+     `showing 101–200 of 250` off it, and the alternative is the client
+     multiplying its own page index by a page size it may have changed mid-walk.
+
+     Two of the three ways of producing it are handed the number: `InlineTable`
+     drops `:i` rows and the lake's offset mode OFFSETs by `:o`. The lake's
+     keyset mode has no such number and derives it from the first row's `rowid`
+     — so **that mode alone answers nil for a page with no rows in it**, having
+     no first row to read a position off. Nothing downstream sees the
+     difference, because an empty page also carries no `:next` and it is
+     `:next` that decides whether a hole gets described at all.
+
+     **Separate from `rows` rather than an option on it.** `rows` has twelve
+     callers — agent digests, `tools.clj`, `describe` — that want a *sample* for
+     a summary, not a page, and `mold-cap` is their default. Teaching `rows` to
+     page would push a paging concept into every one of them.
+
+     `:next` is produced by asking storage for `limit + 1` rows: if the extra one
+     comes back there is another page, and the cursor is built from the last row
+     actually returned. So the last page is known without a count.")
   (row-count [this handle] "How many rows `handle` names, without fetching them.")
   (reclaimed-at [this handle]
     "When this handle's rows were reclaimed, or nil if they were not.
@@ -299,6 +329,125 @@
                     {:column k :type (.getName (class v)) :value v})))
   (mapv (fn [r] (reduce-kv (fn [m k v] (assoc m (sub/col-kw k) v)) {} r)) rows))
 
+(def default-limit
+  "Rows per page when a window does not say. 100 rather than 60 — the old
+   client-side cap — because a page is now the whole of what the browser holds."
+  100)
+
+(def max-limit
+  "The ceiling a window may ask for. A design decision and not a measured one:
+   it is how many rows a person can look at, and 200 of a 36-column table is
+   already 7,200 cells."
+  200)
+
+(defn page-limit
+  "A window's `:limit`, clamped to 1..`max-limit` with `default-limit` for
+   absent. Takes a string too, because a window arrives in a query string."
+  [n]
+  (let [n (if (string? n) (parse-long n) n)]
+    (long (max 1 (min max-limit (or n default-limit))))))
+
+(defn encode-cursor
+  "A store's internal page key, as one opaque URL-safe string.
+
+   **Opaque is the contract; base64-of-EDN is only today's encoding.** The key's
+   shape differs per handle and per sort — a rowid here, an offset there — and
+   the shell has one pager because it never looks. `clojure.edn/read-string`
+   and not `read-string`: a cursor arrives from a query string, so it is hostile
+   input, and `edn` evaluates nothing."
+  [m]
+  (.encodeToString (java.util.Base64/getUrlEncoder)
+                   (.getBytes (pr-str m) "UTF-8")))
+
+(defn decode-cursor
+  "The map `encode-cursor` made, or **nil** for nil, non-string, blank, or
+   anything malformed.
+
+   nil means page 1, so a bookmarked cursor that no longer parses reopens the
+   table at the top rather than throwing. A 500 on a URL somebody saved is the
+   worse failure: the table looks broken when only the position was. The
+   whole body runs inside the `try` — `str/blank?` is type-hinted and throws
+   on a non-string, so checking it outside would defeat the point.
+
+   Validates only that the decoded value IS a map — not what its fields hold.
+   This function does not know a store's cursor shape, so a wrong-typed field
+   (`{:i \"nope\"}`) passes here; `cursor-int` below is where a store that
+   DOES know the shape catches it."
+  [s]
+  (try
+    (when-not (str/blank? s)
+      (let [m (edn/read-string (String. (.decode (java.util.Base64/getUrlDecoder) ^String s)
+                                        "UTF-8"))]
+        (when (map? m) m)))
+    (catch Exception _ nil)))
+
+(defn cursor-int
+  "The integer at `k` in a decoded cursor, or `default` for anything else —
+   missing, the wrong type, or below `default`. The 2-arity defaults to 0.
+
+   Split from `decode-cursor` on purpose: that function validates only that
+   the whole cursor is a map, because it does not know a store's cursor
+   shape. A per-field check belongs to the store that DOES.
+
+   **`default` is not always 0, and passing it explicitly is the point.**
+   `InlineTable`'s `:i` is an index — page 1 starts at row 0, so the 2-arity
+   is right for it, and a future `Lake`'s `:o` (an OFFSET, Task 2) is the same
+   shape. `Lake`'s `:k` is a different thing: a bound on a 0-based `rowid`,
+   read back as `WHERE rowid > k`, so ITS start-of-table is `-1`, not `0` —
+   `rowid > 0` skips row 0 of every table. Call `(cursor-int cursor :k -1)`
+   for it; the 2-arity would silently reintroduce that off-by-one, and it is
+   also the reason the floor below is `default` and not a hardcoded `0` — a
+   `:k` of `-1` is the valid, empty-page-so-far case, not a malformed one."
+  ([cursor k] (cursor-int cursor k 0))
+  ([cursor k default]
+   (let [v (get cursor k)]
+     (if (and (integer? v) (>= v default)) v default))))
+
+(defn project-cols
+  "The columns a window asks for, in the **handle's** order, or all of them.
+
+   Handle order and not the caller's, because `lake/q-as` names a result set
+   positionally: a reordered projection would label every value with its
+   neighbour's name. Unknown names are dropped, and dropping all of them means
+   all columns — a table with no columns is not something the shell can draw."
+  [h cols]
+  (if-let [want (some->> (seq cols) (map name) set)]
+    (let [kept (filterv #(contains? want (name %)) (:cols h))]
+      (if (seq kept) kept (:cols h)))
+    (:cols h)))
+
+(defn sort-spec
+  "A window's `:sort`, validated against the handle's own columns, or nil.
+
+   **Validation is not politeness.** `:sort` arrives in a query string and
+   reaches an `ORDER BY`. `lake/ident` quotes it, so a name cannot break out of
+   the identifier — but an unknown one reaches DuckDB as a binder error in the
+   middle of a render, and a table that throws because a stale bookmark named a
+   dropped column is worse than one that ignores the sort."
+  [h [col dir]]
+  (when (some? col)
+    (let [known (set (map name (:cols h)))]
+      (when (contains? known (name col))
+        [(name col) (if (= "desc" (str dir)) "desc" "asc")]))))
+
+(defn sort-rows
+  "`rows` ordered by a validated `sort-spec`, **nulls last in both directions**.
+
+   Nulls last matches the lake's `ORDER BY … NULLS LAST`. `InlineTable` is the
+   parity reference for `Lake`, so a difference here would be a difference every
+   paging test has to encode twice."
+  [[col dir] rows]
+  (let [k    (sub/col-kw col)
+        desc (= "desc" dir)]
+    (vec (sort-by #(get % k)
+                  (fn [a b]
+                    (cond (and (nil? a) (nil? b)) 0
+                          (nil? a)  1
+                          (nil? b) -1
+                          desc     (compare b a)
+                          :else    (compare a b)))
+                  rows))))
+
 (defrecord InlineTable []
   TableStore
   (put-rows! [_ _ rs]
@@ -309,6 +458,20 @@
       offset (drop offset)
       limit  (take limit)
       true   vec))
+  (page [_ h window]
+    (let [lim  (page-limit (:limit window))
+          i    (cursor-int (decode-cursor (:cursor window)) :i)
+          srt  (sort-spec h (:sort window))
+          proj (project-cols h (:cols window))
+          got  (->> (cond->> (:data h) srt (sort-rows srt))
+                    (drop i) (take (inc lim)) vec)
+          more (> (count got) lim)]
+      {:rows   (mapv #(select-keys % proj) (take lim got))
+       ;; The index this page was asked to start at. `InlineTable` is handed its
+       ;; ordinal outright — `:i` IS the count of rows dropped — so unlike the
+       ;; lake's keyset branch there is nothing to derive it from.
+       :offset i
+       :next   (when more (encode-cursor {:i (+ i lim)}))}))
   (row-count [_ h] (:rows h))
   (reclaimed-at [_ _] nil)
   (column-samples [_ h per-col max-cols]
@@ -601,3 +764,51 @@
                 (assoc gone :table/reclaimed at)
                 (throw e)))))))
     o))
+
+(defn hydrate-page
+  "`hydrate`, but for one page of a table rather than a `mold-cap` sample.
+
+   Returns the hydrated object with `:value` set to the page's rows,
+   `:table/total`, `:table/cols` set from the handle's FULL column list,
+   `:page/offset` set to how many rows precede this page, and `:page/next` set
+   to the cursor for the next page, or nil on the last one.
+
+   A `:source` handle additionally gets `:table/unbounded`, because its
+   `:table/total` is a count taken at connect over a file that can have been
+   rewritten since — see the assoc below.
+
+   **`:table/cols` is the handle's own list, not the page's.** A window may
+   narrow `:cols`, so the rows in `:value` can carry fewer keys than the table
+   has — and reading the column list back out of those rows would make hiding a
+   column one-way, since an unhidden one would have vanished from what a reader
+   could ever ask for again.
+
+   **Beside `hydrate` rather than a flag on it.** `hydrate` is reached from
+   thirteen places and twelve of them want the sample — its failure handling,
+   its `:table/unavailable` and `:table/source-drift` classification and its
+   `:table/passthrough` marker are all shared, so this delegates for a non-handle
+   value and for the failure paths and differs only in which read it issues."
+  [ts o window]
+  (if-not (and o (handle? (:value o)))
+    (hydrate ts o)
+    (let [ts (force ts)
+          h  (:value o)]
+      (try
+        (let [{:keys [rows next offset]} (page ts h window)]
+          (cond-> (assoc o :value rows :table/total (row-count ts h)
+                           :table/cols (:cols h)
+                           :page/offset offset :page/next next)
+            ;; A `:source` handle's row count was recorded at connect and the
+            ;; file it counted can have been rewritten since with no event
+            ;; anywhere — the same reason `:table/passthrough` exists. So the
+            ;; total is a claim, and the caption has to say so: `1,975+` rather
+            ;; than a confident wrong number. Clerk's `bounded-count` reaches
+            ;; the same label from the other direction, refusing to force a lazy
+            ;; sequence to find a total it can only bound.
+            (= :source (:store h)) (assoc :table/passthrough true
+                                          :table/unbounded true)))
+        (catch Exception _
+          ;; one classifier, not two: a page that throws is the same broken
+          ;; table a sample would have been, and `hydrate` already knows how to
+          ;; say which way it is broken.
+          (hydrate ts o))))))

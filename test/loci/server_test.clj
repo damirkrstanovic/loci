@@ -3,6 +3,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is use-fixtures]]
+            [cognitect.transit :as transit]
             [loci.agent :as agent]
             [loci.content :as c]
             [loci.embed :as embed]
@@ -72,6 +73,16 @@
    and `rerun-writes-a-handle-and-not-the-refreshed-rows`."
   [st id]
   (:value (tbl/hydrate lake/lake (sub/object st id))))
+
+(defn- transit-read
+  "Read a Transit response body back into Clojure data.
+
+   The point of reading rather than only grepping the string: `~:table/total` in
+   the body proves the writer emitted a namespaced keyword, and this proves a
+   reader turns it back into one. Those are two halves of the same claim and the
+   shell only benefits from both."
+  [^String s]
+  (transit/read (transit/reader (java.io.ByteArrayInputStream. (.getBytes s "UTF-8")) :json)))
 
 (deftest exit-closes-a-lake-that-was-opened
   (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-hook-" (System/nanoTime))
@@ -5483,3 +5494,339 @@
                                  :key-fn keyword)]
             (is (re-find #"X-Loci-Upload" (:error r))
                 "a request with no header is told what it is missing, not handed a stack trace")))))))
+
+;; ---------------------------------------------------------------------------
+;; /api/mold reads a window
+;;
+;; Tables land through `@lake/lake` — the suite's shared `:once` fixture lake —
+;; and not a separately opened `with-lake`, because `mold-payload` resolves
+;; `lake/lake` itself; rows put into a different lake instance would be
+;; unreachable through the route this exercises.
+;; ---------------------------------------------------------------------------
+
+(deftest a-mold-of-a-table-carries-one-page-and-a-cursor
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i :j (* i 2)}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [p1 (srv/mold-payload st no-memory "tbl:w" nil {:limit 100 :cols ["i"]})]
+      (is (= 100 (count (:rendered p1))))
+      (is (= 250 (:table/total p1)) "the true count is not the page's count")
+      ;; The cursor rides inside the elision now, not beside it — see
+      ;; `a-rows-mold-carries-an-elision-and-not-a-bare-cursor`.
+      (is (some? (get-in p1 [:elision :cursor])))
+      (is (= [:i :j] (:table/cols p1))
+          "the window projected only :i, but :table/cols still names every column on the
+           handle — hiding a column must stay reversible, not one-way")
+      (is (= [:i] (keys (first (:rendered p1))))
+          "and the rendered row really was narrowed to what the window asked for")
+      (let [p2 (srv/mold-payload st no-memory "tbl:w" nil
+                                 {:limit 100 :cursor (get-in p1 [:elision :cursor])})]
+        (is (= 100 (:i (first (:rendered p2)))))))))
+
+(deftest a-mold-with-no-window-is-what-it-always-was
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [m (srv/mold-payload st no-memory "tbl:w" nil)]
+      (is (= 250 (count (:rendered m)))
+          "every caller that does not ask for a page still gets mold-cap")
+      (is (nil? (:elision m))
+          "no window means no page, so there is no hole to describe"))))
+
+(deftest an-aggregate-view-has-no-elision
+  ;; Was `an-aggregate-view-is-not-paged`, asserting on the bare `:page/next`
+  ;; the elision replaced. Same fixture, same claim, read off the shape that
+  ;; now carries it.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i :grp (str "g" (mod i 5))}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [m (srv/mold-payload st no-memory "tbl:w" "table/summary" {:limit 10})]
+      (is (nil? (:elision m))
+          "a summary is not a window over rows — a pager under a chart computed
+           from something else would be a lie"))))
+
+(deftest a-hostile-sort-and-cols-still-page
+  ;; `window-params`' docstring claims neither field is trusted, because
+  ;; `sort-spec` and `project-cols` validate both against the handle downstream.
+  ;; Proven end to end, through the actual route: a sort naming a column the
+  ;; table does not have and a cols list of nothing but unknown names must both
+  ;; come back as an ordinary first page — not an error, and not an empty table.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        _  (sub/commit! st {:op :put :id "tbl:w"
+                            :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory no-memory]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))
+        ;; `:total` and `:cols`, not `:table/total`/`:table/cols` —
+        ;; `json/write-str` renders a namespaced keyword KEY by its bare name,
+        ;; so they cross this route unnamespaced. That is the JSON wire format,
+        ;; and `transit-keeps-a-namespaced-keyword-and-json-does-not` is where it
+        ;; is measured rather than assumed; the assertions below read what
+        ;; actually arrives. `:elision` is already unnamespaced and survives
+        ;; either way, its own keys included.
+        p (get! "id=tbl:w&limit=100&sort=nope,desc&cols=ghost,also-ghost")]
+    (is (= 100 (count (:rendered p))))
+    (is (= 250 (:total p)))
+    (is (some? (get-in p [:elision :cursor])))
+    (is (= ["i"] (:cols p))
+        "cols named nothing the table has, so project-cols fell back to every column")))
+
+(deftest the-mold-route-with-no-window-params-is-not-paged
+  ;; `window-params` must answer nil for an ordinary request — no limit, cursor,
+  ;; sort or cols anywhere in the query string — because `mold-payload` branches
+  ;; on nil vs. a map to choose `hydrate` over `hydrate-page`. A `window-params`
+  ;; that answered `{}` here would page every plain `/api/mold` read down to
+  ;; `default-limit` rows, and no OTHER test in this file would catch it: every
+  ;; other route-level mold test either supplies a window param of its own or
+  ;; reads a table under `default-limit` anyway. Proven by breaking the guard in
+  ;; `window-params` to always return a map: this is the one assertion, of the
+  ;; whole suite, that went red.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        _  (sub/commit! st {:op :put :id "tbl:w"
+                            :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+        get! (fn [qs] (with-redefs [c/store (delay st) mem/memory no-memory]
+                        (json/read-str (:body (srv/handler {:uri "/api/mold" :query-string qs}))
+                                       :key-fn keyword)))
+        p (get! "id=tbl:w")]
+    (is (= 250 (count (:rendered p)))
+        "the whole mold-cap sample, not a default-limit page")
+    (is (nil? (:elision p)) "and nothing describing a hole, because none was cut")))
+
+;; ---------------------------------------------------------------------------
+;; a notebook ships one page per cell
+;;
+;; `notebook-payload` merges a whole `mold-payload` into every `:ref` cell, so a
+;; notebook with five table cells carried five `mold-cap` samples in one
+;; response. Measured on the real substrate before this change: one 36-column ×
+;; 2,000-row cell was 5,428,753 bytes.
+;;
+;; The table lands in `@lake/lake` for the same reason the window tests above do:
+;; `mold-payload` resolves `lake/lake` itself.
+;; ---------------------------------------------------------------------------
+
+(deftest a-notebook-cell-carries-one-page-and-not-the-whole-sample
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :tx :events
+                     [{:op :put :id "tbl:n"
+                       :value (tbl/table-object @lake/lake "tbl:n" "T" rs {})}
+                      {:op :put :id "space:n"
+                       :value {:id "space:n" :kind :space :title "N"
+                               :value {:intent "one table cell"
+                                       :cells [{:ref "tbl:n"}]}}}]})
+    (with-redefs [mem/memory no-memory]
+      (let [cell (first (:cells (srv/notebook-payload st "space:n")))]
+        (is (= 100 (count (:rendered cell))) "a cell is a page, not a sample")
+        (is (= 250 (:table/total cell))      "and it still says how big the table is")
+        (is (some? (get-in cell [:elision :cursor]))
+            "and the rows it did not ship are reachable")))))
+
+;; ---------------------------------------------------------------------------
+;; the wire format: Transit beside JSON on /api/mold
+;;
+;; **The lake is `@lake/lake`, not a `with-lake` of this test's own**, for the
+;; same reason the window tests above say so: `mold-payload` resolves
+;; `lake/lake` itself, so rows landed in a separately opened lake would be
+;; unreachable through the route under test. **And `c/store` is redefined**,
+;; because `handler` reads the store through `(store)` — a test that skips that
+;; asks the user's real data directory for `tbl:w`.
+;; ---------------------------------------------------------------------------
+
+(defn- wire-body
+  "The raw body `/api/mold` answers `qs` with, against `st`."
+  [st qs]
+  (with-redefs [c/store (delay st) mem/memory no-memory]
+    (:body (srv/handler {:uri "/api/mold" :query-string qs}))))
+
+(deftest transit-keeps-a-namespaced-keyword-and-json-does-not
+  ;; The bug this exists to end: `clojure.data.json` renders a namespaced
+  ;; keyword KEY by its bare name, so `:table/total` reaches the shell as
+  ;; "total". Two tasks of the previous plan read `m['table/total']` and would
+  ;; have found undefined; `a-hostile-sort-and-cols-still-page` above reads
+  ;; `:total` and `:next` for exactly this reason.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 30)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "Windowed" rs {})})
+    (let [json    (wire-body st "id=tbl:w&limit=5")
+          transit (wire-body st "id=tbl:w&limit=5&wire=transit")]
+      (is (str/includes? json "\"total\"")
+          "JSON strips the namespace — this is the behaviour being routed around")
+      (is (not (str/includes? json "table/total")))
+      (is (str/includes? transit "~:table/total")
+          "Transit writes the keyword whole")
+      (is (= 30 (:table/total (transit-read transit)))
+          "and it reads back as the keyword, not as a string key"))))
+
+(deftest a-request-without-wire-transit-is-byte-identical-to-today
+  (let [st (sub/fresh-store)]
+    (sub/commit! st {:op :put :id "doc:d"
+                     :value {:id "doc:d" :kind :doc :title "D" :value "hello"}})
+    (with-redefs [c/store (delay st) mem/memory no-memory]
+      (let [r (srv/handler {:uri "/api/mold" :query-string "id=doc:d"})]
+        (is (= "application/json; charset=utf-8" (get-in r [:headers "Content-Type"])))
+        (is (= (json/write-str (srv/mold-payload st no-memory "doc:d" nil)) (:body r))
+            "no `wire` param means the JSON body every existing caller reads")))))
+
+(deftest transit-is-smaller-than-json-on-a-wide-page
+  ;; Transit caches repeated map keys, so a wide table writes each column name
+  ;; once rather than once per row. Asserting a RATIO and not a byte count — the
+  ;; count is one fixture's arithmetic, the ratio is the mechanism.
+  (let [st   (sub/fresh-store)
+        cols (mapv #(keyword (str "column_name_" %)) (range 36))
+        rs   (vec (for [i (range 200)]
+                    (into {} (map (fn [c] [c (str "value-" i)])) cols)))
+        size (fn [qs] (count (.getBytes ^String (wire-body st qs) "UTF-8")))]
+    (sub/commit! st {:op :put :id "tbl:wide"
+                     :value (tbl/table-object @lake/lake "tbl:wide" "Wide" rs {})})
+    (let [j (size "id=tbl:wide&limit=100")
+          t (size "id=tbl:wide&limit=100&wire=transit")]
+      (is (< t (* 0.8 j))
+          (str "transit " t " vs json " j " — key caching should pay on a wide table")))))
+
+;; ---------------------------------------------------------------------------
+;; the elision: a hole that knows it is a hole
+;;
+;; Design §3.1. The payload's bare `:page/next` becomes a labelled hole carrying
+;; everything the caption and the next request need. `@lake/lake` and not a
+;; `with-lake` of this test's own, for the reason the window tests above give.
+;; ---------------------------------------------------------------------------
+
+(deftest a-rows-mold-carries-an-elision-and-not-a-bare-cursor
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [{:keys [elision] :as m} (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})]
+      (is (nil? (:page/next m)) "the bare cursor is gone")
+      (is (= 100 (:n elision)))
+      (is (= 0   (:offset elision)))
+      (is (= 250 (:total elision)))
+      (is (false? (:unbounded? elision)))
+      (is (= [:rendered] (:path elision)))
+      (is (string? (:cursor elision)) "opaque, and present because there IS a next page"))))
+
+(deftest an-elision-on-page-two-says-where-page-two-starts
+  ;; `:offset` is the server's fact and the caption's arithmetic runs off it, so
+  ;; a page that is not page one has to carry its own ordinal — not zero, and not
+  ;; the client's page index times a limit the client may have changed.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [p1 (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})
+          p2 (srv/mold-payload st no-memory "tbl:w" nil
+                               {:limit 100 :cursor (get-in p1 [:elision :cursor])})]
+      (is (= 100 (:offset (:elision p2))))
+      (is (= 100 (:i (first (:rendered p2)))) "and the rows really are the ones it names"))))
+
+(deftest the-last-page-has-no-elision
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 30)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (is (nil? (:elision (srv/mold-payload st no-memory "tbl:w" nil {:limit 100})))
+        "nothing was omitted, so there is no hole to describe")))
+
+(deftest an-elision-survives-the-transit-wire-whole
+  ;; The two halves of this plan meet here: the elision is a map of UNnamespaced
+  ;; keys inside a payload whose own keys are namespaced, and the grid reads
+  ;; `:table/cols` and `:elision` out of the same map. JSON would hand it
+  ;; `"cols"`; Transit hands it both as written.
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (let [m (transit-read (wire-body st "id=tbl:w&limit=100&wire=transit"))]
+      (is (= [:i] (:table/cols m)))
+      (is (= {:n 100 :offset 0 :total 250 :unbounded? false :path [:rendered]}
+             (dissoc (:elision m) :cursor))
+          "every field of the hole crosses the wire as itself")
+      (is (string? (:cursor (:elision m)))))))
+
+;; ---------------------------------------------------------------------------
+;; `:unbounded?` is a claim about the total, and a notebook budgets its response
+;;
+;; The `lf/with-temp-lake` + `with-temp-data-dir` pair is the idiom the source
+;; tests above already use: `connect!` resolves `@lake/lake` and writes through
+;; `sub/data-dir`, so both have to be the test's own.
+;; ---------------------------------------------------------------------------
+
+(deftest a-live-sources-total-is-marked-unbounded
+  (lf/with-temp-lake
+    (fn []
+      (with-temp-data-dir
+        (fn []
+          (let [st  (sub/fresh-store)
+                dir (doto (io/file (sub/data-dir) "files") .mkdirs)
+                f   (io/file dir "live.csv")
+                _   (spit f (apply str "region,amount\n"
+                                   (for [i (range 250)] (str "r" (mod i 5) "," i "\n"))))
+                r   (src/connect! st {:uri (str "loci://files/" (.getName f)) :format :csv
+                                      :mode :passthrough :title "Live"})
+                e   (:elision (srv/mold-payload st no-memory (:id r) nil {:limit 100}))]
+            (is (= 250 (:total e)) "the count recorded at connect is still what it reports")
+            (is (true? (:unbounded? e))
+                "a passthrough total was recorded at connect and the file can have moved since")))))))
+
+(deftest a-materialised-tables-total-is-not-unbounded
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))]
+    (sub/commit! st {:op :put :id "tbl:w"
+                     :value (tbl/table-object @lake/lake "tbl:w" "W" rs {})})
+    (is (false? (:unbounded? (:elision (srv/mold-payload st no-memory "tbl:w" nil {:limit 100}))))
+        "loci wrote these rows and nothing else can have changed them")))
+
+;; The budget: eight cells, not five.
+;;
+;; **Five is the fixture that cannot fail.** `notebook-budget` is 500 and
+;; `tbl/default-limit` is 100, so with five `:ref` cells the share IS the
+;; default — the test would report 500 rows against a 500 budget with the budget
+;; removed entirely, certifying a mechanism that was not there. Eight cells makes
+;; the share 62 and the unbudgeted number 800, which is the only arrangement in
+;; which the assertion is about anything.
+(def ^:private budget-cells ["tbl:a" "tbl:b" "tbl:c" "tbl:d" "tbl:e" "tbl:f" "tbl:g" "tbl:h"])
+
+(defn- notebook-of-tables
+  "A store holding one space whose cells are `ids`, each a 250-row table."
+  [ids]
+  (let [st (sub/fresh-store)
+        rs (vec (for [i (range 250)] {:i i}))
+        mk (fn [id] {:op :put :id id :value (tbl/table-object @lake/lake id id rs {})})]
+    (sub/commit! st {:op :tx :events
+                     (conj (mapv mk ids)
+                           {:op :put :id "space:n"
+                            :value {:id "space:n" :kind :space :title "N"
+                                    :value {:intent "tables" :cells (mapv (fn [i] {:ref i}) ids)}}})})
+    st))
+
+(deftest a-notebooks-cells-share-one-budget
+  (let [st (notebook-of-tables budget-cells)]
+    (with-redefs [mem/memory no-memory]
+      (let [cells (:cells (srv/notebook-payload st "space:n"))
+            rows  (reduce + (map #(count (:rendered %)) cells))]
+        (is (= 8 (count cells)))
+        (is (<= rows srv/notebook-budget)
+            (str "eight cells shipped " rows " rows; the budget is the response, not the table"))
+        (is (every? #(pos? (count (:rendered %))) cells)
+            "and every cell still draws — a budget divides, it does not starve")))))
+
+(deftest a-notebook-with-more-cells-than-budget-still-draws-every-one
+  ;; The `(max 1 …)` floor. A budget smaller than the cell count would divide to
+  ;; zero, and a payload of eight empty grids is worse than a payload of eight
+  ;; single rows: it looks like eight empty tables. Redefining the budget rather
+  ;; than building a 501-cell notebook — the arithmetic is the same and the
+  ;; fixture costs eight tables instead of five hundred.
+  (let [st (notebook-of-tables budget-cells)]
+    (with-redefs [mem/memory no-memory srv/notebook-budget 3]
+      ;; Counts and not the cells themselves: `is` prints the whole failing
+      ;; value, and eight molded 100-row cells is a wall of output nobody reads.
+      (let [counts (mapv #(count (:rendered %)) (:cells (srv/notebook-payload st "space:n")))]
+        (is (= 8 (count counts)))
+        (is (= [1 1 1 1 1 1 1 1] counts)
+            "a share of zero is floored at one row, not at an empty grid")))))

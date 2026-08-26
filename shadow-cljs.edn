@@ -1,0 +1,42 @@
+;; Reads deps.edn rather than owning its own dependency set — the same
+;; arrangement Clerk uses (`{:deps {:aliases [:sci]}}` in its own file).
+{:deps    {:aliases [:cljs]}
+ :nrepl   false
+ :builds  {:grid {:target     :browser
+                  :output-dir "resources/public/js"
+                  :asset-path "/js"
+                  :modules    {:grid {:init-fn loci.grid/init}}}
+           ;; `:node-test` and not `:browser-test`: everything worth unit-testing
+           ;; here is a state transition or a hiccup structure, both of which are
+           ;; data. What needs a real DOM — sticky positions, scroll widths — is
+           ;; measured by the Playwright suite instead, because a headless DOM
+           ;; would answer those questions wrongly rather than not at all.
+           ;;
+           ;; **`:ns-regexp` matching nothing is a PASSING run of zero tests.**
+           ;; Measured 2026-08-25 by renaming the smoke test's ns out of the
+           ;; pattern: the build compiled 51 files instead of 79, the runner
+           ;; printed `Ran 0 tests containing 0 assertions` — and exited **0**.
+           ;; A real failure exits 1, so nothing downstream can tell the two
+           ;; apart. That asymmetry is why `loci.cljs-smoke-test` exists: it is the
+           ;; only assertion in the suite that reports the suite's own absence,
+           ;; and it is read by a human counting the number after "Ran".
+           ;;
+           ;; **`.cjs`, not `.js`.** `package.json` says `"type": "module"` for the
+           ;; Playwright suite, so Node reads a bare `.js` as ESM and shadow-cljs
+           ;; emits CommonJS — `ReferenceError: __dirname is not defined in ES
+           ;; module scope` before the first test runs. The extension is the whole
+           ;; fix; Node's own error message names it.
+           ;;
+           ;; **`source-map-support` is absent on purpose**, so every run prints
+           ;; `no "source-map-support" (run "npm install …")`. That line is a
+           ;; decision, not an oversight. `cljs.test` already names the failing
+           ;; test and prints the assertion form, which is what an assertion
+           ;; failure needs; the package only buys positions in original sources
+           ;; for an UNCAUGHT exception, where the trace would otherwise point
+           ;; into compiled JS. Against that: it would be the first npm
+           ;; dependency in a project whose shell has none. Revisit when someone
+           ;; hits an uncaught exception here and finds it undebuggable — a cost
+           ;; becomes a constraint when it is felt, not when it is noticed.
+           :test {:target    :node-test
+                  :output-to "target/cljs-test.cjs"
+                  :ns-regexp "-test$"}}}

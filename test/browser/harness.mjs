@@ -203,6 +203,42 @@ export const STORAGE_FIXTURE = `
            (fn [l] (mapv #(cond-> % (= "tbl:aged" (:id %)) (assoc :ts old)) l)))))
 `;
 
+// 36 columns, because that is the width at which the old renderer collapsed
+// every column to under one character. 250 rows, so at limit 100 there are three
+// pages and a short last one — the only way to see the elision go absent.
+//
+// `grp` has five values, 50 rows each, so a page boundary under a sort by `grp`
+// lands inside a run of equal values. `note` is one long value, for the tooltip
+// clip. `maybe` is null every third row, for NULLS LAST.
+//
+// Above DuckLake's ~10–20 row inlining threshold, so this is a real Parquet
+// table with a real rowid and the keyset branch is what is under test.
+//
+// **Column ORDER here is the hash order of a 36-key map, not the order written.**
+// `tbl/normalize-rows` rebuilds every row onto `{}`, which past eight keys is a
+// PersistentHashMap, and `cols-of` reads its keys — measured, `:c15` comes first
+// and `:id` twenty-sixth. It is stable, so a page renders the same twice; it is
+// not predictable, so a test that wants a named column must find it by its
+// header and never by index 0.
+export const GRID_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      row (fn [i] (into {:id (str "row-" i)
+                         :grp (str "g" (mod i 5))
+                         :note (apply str (repeat 900 "x"))
+                         :maybe (when (pos? (mod i 3)) i)}
+                        (for [c (range 32)] [(keyword (str "c" c)) (* i (inc c))])))
+      h   (tbl/put-rows! lk "tbl:grid" (mapv row (range 250)))]
+  (assert (= 36 (count (:cols h))) "the grid fixture stopped being 36 columns wide")
+  (sub/commit! st {:op :tx :events
+                   [{:op :put :id "tbl:grid"
+                     :value {:id "tbl:grid" :kind :table :title "Grid fixture" :value h}}
+                    {:op :put :id "space:grid"
+                     :value {:id "space:grid" :kind :space :title "Grid fixture"
+                             :value {:intent "a table 36 columns wide"
+                                     :cells [{:ref "tbl:grid"}]}}}]}))
+`;
+
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `
