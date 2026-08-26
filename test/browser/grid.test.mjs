@@ -397,3 +397,133 @@ test('nothing in src-cljs/ can read a cursor', () => {
   }
   console.log(`  MEASURED: ${files.length} files under src-cljs/, none of them peek`);
 });
+
+// ---- the sort control ----
+//
+// The server does the sorting: the window carries `[col dir]`, `sort-spec`
+// validates it against the handle and `ORDER BY … NULLS LAST, rowid ASC` builds
+// the order. So what these two measure is the CONTROL — that a click reaches the
+// request, and that the third click asks for no sort at all rather than for
+// ascending again.
+
+// Every cell of one column, top to bottom. A single cell is not enough to tell
+// a sorted page from an unsorted one here: natural order's first row and `grp`
+// ascending's first row are BOTH `g0`/`row-0`, because the ascending tiebreak is
+// `rowid ASC`. What separates them is the whole column — natural order cycles
+// g0…g4 down the page, ascending holds one value for fifty rows.
+const colValues = (page, name) => page.evaluate(([g, n]) => {
+  const heads = [...document.querySelectorAll(`${g} thead th`)];
+  const i = heads.findIndex(h => h.textContent.trim() === n);
+  return [...document.querySelectorAll(`${g} tbody tr`)].map(r => r.children[i].textContent.trim());
+}, [G, name]);
+
+const uniq = (xs) => [...new Set(xs)];
+
+// The header's own state, read the two ways it is published: `aria-sort`, which
+// is what a screen reader is told, and the `::after` the stylesheet draws off
+// it, which is what an eye sees. The second is not a stylesheet assertion — it
+// is the resolved value of the pseudo-element that is actually painted, so a
+// deleted rule reads `none` here.
+const sortState = (page, name) => page.evaluate(([g, n]) => {
+  const th = [...document.querySelectorAll(`${g} thead th`)].find(h => h.textContent.trim() === n);
+  return { aria: th.getAttribute('aria-sort'),
+           arrow: getComputedStyle(th, '::after').content,
+           // the header must keep saying which column it is: the arrow is a
+           // pseudo-element precisely so that it does not join this string.
+           text: th.textContent.trim() };
+}, [G, name]);
+
+// Click a header and wait for the whole round trip. **Not `step`**, which waits
+// on the caption: all three sorts of page one caption `showing 1–100 of 250`, so
+// the string is identical before and after and the wait would return instantly
+// on a page that had not been refetched. `aria-sort` changes on every one of the
+// three transitions, and it is written by the same render that writes the rows —
+// `refresh!` draws once, when the payload lands — so waiting on it waits on the
+// fetch as well.
+//
+// It waits for the state to CHANGE and then asserts what it changed to, rather
+// than waiting for the wanted value. The two agree on a correct implementation
+// and differ on a broken one: waiting for `null` on a third click that returned
+// to ascending reports `Timeout 10000ms exceeded`, which does not say what
+// happened; waiting for a change reports `expected null, actual 'ascending'`,
+// which does.
+const sortBy = async (page, name, want) => {
+  const i = await colIndex(page, name);
+  assert.ok(i >= 0, `the ${name} column is missing from the fixture`);
+  const was = (await sortState(page, name)).aria;
+  await page.click(`${G} thead th:nth-child(${i + 1})`);
+  await page.waitForFunction(([g, n, w]) => {
+    const th = [...document.querySelectorAll(`${g} thead th`)].find(h => h.textContent.trim() === n);
+    return th && th.getAttribute('aria-sort') !== w;
+  }, [G, name, was], { timeout: 10000 });
+  assert.equal((await sortState(page, name)).aria, want,
+    `clicking ${name} while it was ${JSON.stringify(was)} should leave it ${JSON.stringify(want)}`);
+};
+
+test('a header sorts ascending, then descending, then back to the table\'s own order', async () => {
+  await withPage(browser, 'cljs-grid-sort', async (page) => {
+    await openGrid(page);
+
+    // Natural order, before anything is clicked: `grp` cycles g0…g4 down the
+    // page, one value per row, because row i has `g(i mod 5)`.
+    assert.deepEqual((await colValues(page, 'grp')).slice(0, 5), ['g0', 'g1', 'g2', 'g3', 'g4']);
+    assert.equal(await cellText(page, 'id'), 'row-0');
+    assert.deepEqual(await sortState(page, 'grp'),
+      { aria: null, arrow: 'none', text: 'grp' }, 'nothing is sorted yet');
+
+    await sortBy(page, 'grp', 'ascending');
+    let v = await colValues(page, 'grp');
+    // 250 rows over five groups is 50 each, so an ascending page of 100 is
+    // exactly the g0 block then the g1 block — a shape natural order cannot
+    // produce and one cell could never have shown.
+    assert.deepEqual(uniq(v.slice(0, 50)), ['g0'], `first fifty were ${uniq(v.slice(0, 50))}`);
+    assert.deepEqual(uniq(v.slice(50)), ['g1'], `second fifty were ${uniq(v.slice(50))}`);
+    assert.equal(await cellText(page, 'id'), 'row-0', 'ties break by rowid, so g0 starts at row-0');
+    const asc = await sortState(page, 'grp');
+    assert.equal(asc.aria, 'ascending');
+    assert.ok(asc.arrow.includes('▲'), `the header's marker is ${asc.arrow}`);
+    assert.equal(asc.text, 'grp', 'the arrow is painted, not written into the header');
+
+    await sortBy(page, 'grp', 'descending');
+    v = await colValues(page, 'grp');
+    assert.deepEqual(uniq(v.slice(0, 50)), ['g4']);
+    assert.deepEqual(uniq(v.slice(50)), ['g3']);
+    assert.equal(await cellText(page, 'id'), 'row-4', 'g4 is rows 4, 9, 14 … and the tiebreak is ascending');
+    const desc = await sortState(page, 'grp');
+    assert.equal(desc.aria, 'descending');
+    assert.ok(desc.arrow.includes('▼'), `the header's marker is ${desc.arrow}`);
+
+    // **The third click, which is the whole point of this test.** Natural order
+    // is the only order a lake table pages by seeking rather than by counting,
+    // so a two-state toggle would make the cheapest ordering the one state a
+    // person can never get back to.
+    await sortBy(page, 'grp', null);
+    assert.deepEqual((await colValues(page, 'grp')).slice(0, 5), ['g0', 'g1', 'g2', 'g3', 'g4'],
+      'the third click asked for ascending again rather than for no sort at all');
+    assert.equal(await cellText(page, 'id'), 'row-0');
+    assert.deepEqual(await sortState(page, 'grp'), { aria: null, arrow: 'none', text: 'grp' });
+  });
+});
+
+test('sorting restarts the walk at page one', async () => {
+  await withPage(browser, 'cljs-grid-sort-restarts', async (page) => {
+    await openGrid(page);
+    await clickNext(page);
+    assert.equal(await caption(page), 'showing 101–200 of 250');
+
+    await sortBy(page, 'grp', 'ascending');
+    // **`dead(prev)` is the assertion that bites here and the caption is not.**
+    // Measured 2026-08-26 by making `toggle-sort` keep both the stack and the
+    // page: the server refuses a cursor minted under a different `:sort` — it
+    // compares the cursor's `:s` against the request's — so it answers with the
+    // first page of the new order anyway and this caption still reads
+    // `showing 1–100 of 250`. What the sabotage leaves visible is a Prev control
+    // that is alive on page one. The caption is kept because it fails to the
+    // OTHER defect: a shell that sent the stale cursor to a store that honoured
+    // it would land mid-table.
+    assert.equal(await caption(page), 'showing 1–100 of 250');
+    assert.equal(await dead(page, 'prev'), true, 'the walk restarted, so there is no back');
+    assert.equal(await cellText(page, 'id'), 'row-0');
+    assert.deepEqual(uniq((await colValues(page, 'grp')).slice(0, 50)), ['g0']);
+  });
+});

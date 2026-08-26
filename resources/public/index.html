@@ -202,7 +202,21 @@
      only while the header is on screen. `background` is not decoration — a
      sticky element is painted over scrolling content and shows through without
      one. */
-  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white)}
+  .grid thead th{position:sticky;top:0;z-index:2;background:var(--white);
+    cursor:pointer;user-select:none}
+  /* A header is a CONTROL, and it has three states rather than two: one click
+     sorts ascending, a second descending, a third restores the table's own
+     order. `user-select:none` because a control you click three times in a row
+     otherwise selects its own label on the second.
+     The arrow is a pseudo-element and NOT text in the cell: the browser suite
+     finds every column by its header's textContent, and a marker inside the
+     cell would rename whichever of the 36 is sorted, halfway through a test.
+     Keyed off `aria-sort`, which is also what a screen reader reads and what
+     the suite asserts on — one attribute rather than a second data-* copy of
+     the same fact. */
+  .grid thead th[aria-sort]::after{margin-left:4px;font-size:9px;color:var(--accent)}
+  .grid thead th[aria-sort=ascending]::after{content:"\25b2"}
+  .grid thead th[aria-sort=descending]::after{content:"\25bc"}
   /* The first column is the row's identity, and a table wider than its panel
      loses it on the first horizontal scroll. */
   .grid th:first-child,.grid td:first-child{

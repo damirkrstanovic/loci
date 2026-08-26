@@ -85,13 +85,22 @@
     (is (not (view/has-next? s3)) "there is no hole, so there is nowhere to go")))
 
 (defn- els
-  "Every hiccup element in `tree` whose tag begins with `tag`. The pager is
-   private, so the tests reach it the way a reader does — through what `grid`
-   returns, which is data."
+  "Every hiccup element in `tree` whose tag is `tag`, class shorthand and all —
+   `:button.btn.ghost.sm` is a button. The pager is private, so the tests reach
+   it the way a reader does: through what `grid` returns, which is data.
+
+   **The boundary is not decoration.** A bare `starts-with?` also matches
+   `:thead` when asked for `\"th\"`, and `:tbody` when asked for `\"tb\"` — so a
+   test reading the header cells' attributes silently got the `thead` wrapper's
+   as its first answer, and every assertion about the first column's header was
+   really about a wrapper that has no attributes at all. Found 2026-08-26, by
+   the assertion going red on a correct implementation."
   [tree tag]
-  (filter #(and (vector? %) (keyword? (first %))
-                (str/starts-with? (name (first %)) tag))
-          (tree-seq coll? seq tree)))
+  (let [tag? (fn [k] (let [n (name k)]
+                       (and (str/starts-with? n tag)
+                            (contains? #{nil \. \#} (get n (count tag))))))]
+    (filter #(and (vector? %) (keyword? (first %)) (tag? (first %)))
+            (tree-seq coll? seq tree))))
 
 (deftest prev-is-dead-on-page-one-and-next-is-dead-at-the-end
   (let [on-1  (grid/on-payload (grid/init-state "tbl:x") payload)
@@ -113,3 +122,62 @@
     (is (= [50] (keep #(when (:selected (second %))
                          (js/parseInt (:value (second %)) 10)) opts))
         "exactly one option is selected, and it is the size in force")))
+
+;; ---- Task 9: the sort control ----
+
+(deftest a-header-cycles-ascending-descending-and-back-to-the-tables-own-order
+  ;; **Three states and not two.** Natural order is the only order a lake table
+  ;; pages by SEEKING — `WHERE rowid > k` — rather than by counting rows it then
+  ;; throws away, so it has to be reachable rather than lost on the first click.
+  ;; A two-state toggle would make the cheapest ordering the one state a person
+  ;; can never get back to.
+  (let [s0 (grid/init-state "tbl:x")
+        s1 (grid/toggle-sort s0 :b)
+        s2 (grid/toggle-sort s1 :b)
+        s3 (grid/toggle-sort s2 :b)]
+    (is (= [:b "asc"] (:sort s1)) "the first click sorts ascending")
+    (is (= [:b "desc"] (:sort s2)) "the second reverses it")
+    (is (nil? (:sort s3)) "and the third asks for no sort at all, not for ascending again")))
+
+(deftest a-different-column-starts-its-own-cycle
+  ;; Otherwise the second column would inherit the first's phase — click `grp`
+  ;; twice, then `id` once, and get `id` descending, which nobody asked for.
+  (let [s (grid/toggle-sort (grid/toggle-sort (grid/init-state "tbl:x") :b) :b)]
+    (is (= [:b "desc"] (:sort s)))
+    (is (= [:a "asc"] (:sort (grid/toggle-sort s :a)))
+        "a new column starts at ascending whatever the old one had reached")))
+
+(deftest sorting-restarts-the-walk
+  ;; A cursor names a position in ONE ordering — the same reason `set-limit`
+  ;; throws the stack away. Under keyset the cursor is a rowid, which means
+  ;; nothing once the rows are ordered by a column; under offset the server
+  ;; already refuses a cursor minted under a different `:sort`. Either way page
+  ;; two of the old order is not page two of the new one.
+  (let [s1 (grid/next-page (assoc (grid/init-state "tbl:x") :payload payload))
+        s2 (grid/toggle-sort s1 :a)]
+    (is (= 1 (:page s1)) "the walk really had moved off page one")
+    (is (= [grid/page-one] (:stack s2)) "every cursor in the stack named the old order")
+    (is (= 0 (:page s2)))))
+
+(deftest the-sorted-header-says-which-way-and-the-others-say-nothing
+  ;; `aria-sort` and not a `data-*` attribute: it is what a screen reader reads,
+  ;; what the stylesheet draws the arrow off, and what the browser suite asserts
+  ;; on. Absent — not "none" — when a column is unsorted, so that `th[aria-sort]`
+  ;; selects exactly the one column that is.
+  (let [asc  (grid/toggle-sort (grid/on-payload (grid/init-state "tbl:x") payload) :b)
+        desc (grid/toggle-sort asc :b)
+        nat  (grid/toggle-sort desc :b)
+        aria (fn [s] (map #(:aria-sort (second %)) (els (view/grid nil s) "th")))]
+    (is (= [nil "ascending"] (aria asc)) "one header carries the state; the other carries nothing")
+    (is (= [nil "descending"] (aria desc)))
+    (is (= [nil nil] (aria nat)) "the table's own order is no column's sort")))
+
+(deftest a-header-click-names-the-grid-and-the-column
+  ;; The action carries `el` because `!grids` is keyed by the mounted element and
+  ;; a page can hold more than one grid; it carries the column because the header
+  ;; is the only thing that knows which one was pressed. Replicant hands handler
+  ;; data back verbatim, so what is written here is exactly what `set-dispatch!`
+  ;; receives — there is no placeholder interpolation to get wrong.
+  (let [ths (els (view/grid ::el (grid/on-payload (grid/init-state "tbl:x") payload)) "th")]
+    (is (= [[[:sort/toggle ::el :a]] [[:sort/toggle ::el :b]]]
+           (map #(get-in (second %) [:on :click]) ths)))))

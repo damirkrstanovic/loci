@@ -64,6 +64,25 @@
                         (and (seq vs) (every? number? vs)))))
         cols))
 
+(defn- aria-sort
+  "What `aria-sort` this column's header carries, or nil for no attribute.
+
+   **One attribute, not two.** `aria-sort` is the standard way a header
+   announces its state, the browser suite reads it, and the stylesheet draws the
+   arrow off it — a `data-grid-sort` beside it would be a second copy of one
+   fact, able to disagree with the first the day someone edits only one.
+
+   nil rather than `\"none\"` for an unsorted column: Replicant removes an
+   attribute whose value is falsy, so nil is what a *selector* can tell apart —
+   `th[aria-sort]` is the sorted one, and there is exactly one.
+
+   The arrow itself is a `::after` pseudo-element in the stylesheet and NOT text
+   in the cell. The browser suite finds every column by its header's
+   `textContent`; a marker inside the cell would rename whichever of the 36 is
+   sorted, halfway through a test."
+  [[c d] col]
+  (when (= c col) (if (= "desc" d) "descending" "ascending")))
+
 (def ^:private page-sizes
   "What a person can ask for, not what the server will honour: `page-limit`
    clamps, and the elision reports the size it actually used."
@@ -133,9 +152,20 @@
      [:div {:data-grid-scroll true
             :style {:overflow "auto" :max-height "420px"}}
       [:table.mold
+       ;; **A header is a control with three states, not two.** Ascending,
+       ;; descending, and back to the table's own order — which is the only
+       ;; order a lake table pages by SEEKING (`WHERE rowid > k`) rather than by
+       ;; counting, so it has to be reachable rather than lost on the first
+       ;; click. `loci.grid/toggle-sort` is the cycle; this is the control.
+       ;;
+       ;; The server does the sorting. This sends `[col dir]` on the window and
+       ;; `sort-spec` validates it against the handle, so a header naming a
+       ;; column the table has since lost is ignored rather than fatal.
        [:thead [:tr (for [c cols]
                       [:th {:replicant/key c :title (name c)
-                            :class (when (nums c) "num")}
+                            :aria-sort (aria-sort (:sort s) c)
+                            :class (when (nums c) "num")
+                            :on {:click [[:sort/toggle el c]]}}
                        (name c)])]]
        [:tbody
         (for [[i row] (map-indexed vector rendered)]
