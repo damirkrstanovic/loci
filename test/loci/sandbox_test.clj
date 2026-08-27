@@ -192,6 +192,36 @@
          (is (= 1 (:total (meta r)))
              ":total is the size of THIS query's answer — one aggregate row — not the source's 24"))))))
 
+;; ---- queries: q's per-call outcome, recorded where the model's own code
+;;      cannot reach it (server/capped-block's count-match check reads this)
+
+(deftest queries-records-total-count-and-capped-for-every-q-call
+  (fixture
+   (fn [st]
+     (let [ctx (sbx/context st "tbl:big" nil (counter-mint-id st))
+           q   (get (:bindings ctx) 'q)
+           tbl (get (:bindings ctx) 'table)]
+       (is (empty? (sbx/queries ctx)) "nothing queried yet")
+       (q {:select [:*] :from [[tbl :t]]} 100)
+       (q {:select [:*] :from [[tbl :t]] :where [:< :n 5]})
+       (is (= [{:total 2500 :count 100 :capped true}
+               {:total 5 :count 5 :capped false}]
+              (sbx/queries ctx))
+           "oldest first, and reshaping the RETURNED rows afterward cannot touch this — it is recorded inside q, before the model's code ever sees the result")))))
+
+;; ---- context's extra-ids: a report refresh has no `space` to enumerate
+;;      tables from, only `:reads` — extra-ids is how those get into scope
+
+(deftest context-extra-ids-pulls-in-tables-space-does-not-name
+  (lf/with-temp-lake
+   (fn []
+     (let [st (sub/fresh-store)]
+       (put-table! st "tbl:x" [{:a 1}])
+       (put-table! st "tbl:y" [{:b 2}])
+       ;; no notebook, no space — tbl:y is reachable only via extra-ids
+       (let [ctx (sbx/context st "tbl:x" nil (counter-mint-id st) ["tbl:y"])]
+         (is (= #{"tbl:x" "tbl:y"} (set (keys (get (:bindings ctx) 'tables))))))))))
+
 ;; ---- 11: two q calls in one run read the same snapshot --------------------
 
 (deftest two-q-calls-in-one-run-read-the-same-snapshot

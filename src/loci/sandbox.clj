@@ -165,20 +165,31 @@
                    1e6)})))
 
 (defn context
-  "The sandbox context for a run over `id`, scoped to `space`'s tables.
+  "The sandbox context for a run over `id`, scoped to `space`'s tables, plus
+   any `extra-ids` — ids to pull in even though `space` does not name them
+   (nil-able, and nothing when omitted).
+
+   `extra-ids` exists for exactly one caller: `server/rerun!` refreshing a
+   report outside any notebook, over the `:reads` its ORIGINAL run recorded.
+   `space` cannot stand in for that — a report's `:fn` object never stores
+   which space it ran in, only `:reads` — so without this a multi-table
+   report's refresh would only ever see `id`, the same gap `:reads` exists to
+   close.
+
    `mint-id` is `(fn [prefix] …)` — see the namespace docstring for why it is
    injected rather than owned here.
 
-   => `{:bindings {…} :events <atom> :reads <atom> :tables {id [ts h]}}`.
-   Pass `:bindings` to `sci/eval-string`; `events` and `reads` are read after
-   the run, by `(events ctx)` / `(reads ctx)` below.
+   => `{:bindings {…} :events <atom> :reads <atom> :queries <atom> :tables {id
+   [ts h]}}`. Pass `:bindings` to `sci/eval-string`; `events`, `reads` and
+   `queries` are read after the run, by `(events ctx)` / `(reads ctx)` /
+   `(queries ctx)` below.
 
    Every table this context can see is resolved to a handle EXACTLY ONCE,
    right here, before any binding runs — see \"Snapshot pinning\" in the
    namespace docstring. `table`/`tables` are the resulting HoneySQL relations,
    plain values; nothing downstream re-resolves them."
-  [st id space mint-id]
-  (let [ids       (table-ids st id space)
+  [st id space mint-id & [extra-ids]]
+  (let [ids       (vec (distinct (concat (table-ids st id space) extra-ids)))
         tables    (into {} (keep (fn [i] (when-let [o (sub/object st i)]
                                             (when-let [th (table-handle o)]
                                               [i th])))
@@ -187,6 +198,7 @@
         rel->id   (into {} (for [[i r] relations] [r i]))
         events    (atom [])
         reads     (atom #{})
+        queries   (atom [])
         ;; The `:reads` bookkeeping the plan first drafted matched with
         ;; `(str/includes? (pr-str hq) (pr-str relation))` — a relation
         ;; appearing inside a string literal in the query would have counted.
@@ -202,12 +214,15 @@
                                                      (fmt (hq/->count (dissoc hq :limit))))))))
         run-q     (fn [hq lim]
                     (note! hq)
-                    (let [total (count-of hq)
-                          rows  (vec (lake/q (force lake/lake) (fmt (assoc hq :limit lim))))]
-                      (with-meta rows {:total total :capped (> total (count rows))})))]
+                    (let [total  (count-of hq)
+                          rows   (vec (lake/q (force lake/lake) (fmt (assoc hq :limit lim))))
+                          capped (> total (count rows))]
+                      (swap! queries conj {:total total :count (count rows) :capped capped})
+                      (with-meta rows {:total total :capped capped})))]
     {:tables tables
      :events events
      :reads  reads
+     :queries queries
      :bindings
      {'table  (get relations id)
       'tables relations
@@ -255,8 +270,29 @@
 (defn reads
   "The set of table ids `q`, `q-reduce` and `q-all` actually resolved a
    relation for during this run — not every table `context` could see, only
-   the ones a query touched. Task 10 records this as the `:fn` object's
-   `:reads`, so `rerun!` can refresh a multi-table report when any of its
-   inputs change."
+   the ones a query touched. `server`'s `:fn` object stores this as `:reads`,
+   and both readers of it are load-bearing: `rerun!` treats a table in
+   another object's `:reads` as a dependency edge, exactly like `:from`, so a
+   multi-table report refreshes when ANY input changes — and a report
+   refresh re-derives `context` with these ids as `extra-ids`, so a table
+   read only via `tables` (never `:from`) is still in scope the second time."
   [ctx]
   @(:reads ctx))
+
+(defn queries
+  "The outcome of every `(q …)` call this run made, oldest first — `{:total
+   :count :capped}`, the same numbers `run-q` also stamps onto its rows as
+   metadata.
+
+   Exists because metadata does not survive what a model ordinarily does with
+   `q`'s result — `mapv`, `map`, `for`, a renamed key all drop it (confirmed
+   at the REPL: `(meta (mapv identity (with-meta [{:a 1}] {:capped
+   true})))` => nil) — so a report block built from a reshaped capped result
+   carries no mark a caller could read off the ROWS THEMSELVES. This is a
+   property of the RUN instead: `server/capped-block`'s count-match check
+   refuses an inline block whose row count equals a capped call's count,
+   which a reshape that preserves row count (every one of the examples
+   above) cannot defeat, because the model's code never sees this atom and
+   so cannot touch it."
+  [ctx]
+  @(:queries ctx))

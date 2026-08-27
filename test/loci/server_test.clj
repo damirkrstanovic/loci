@@ -6538,3 +6538,267 @@
             (is (= :table (:kind obj)))
             (is (= 10000 (:table/total hy))
                 "a capped q result outside a report still lands as a table, capped page and all")))))))
+
+;; ---------------------------------------------------------------------------
+;; review finding 1 — the capped-block guard is defeated by ordinary model
+;; code (mapv, map, for, a renamed key): metadata does not survive any of
+;; them, confirmed at the REPL before writing this
+;; (`(meta (mapv identity (with-meta [{:a 1}] {:capped true})))` => nil), so
+;; the tests above — which all embed q's LITERAL return value — never
+;; exercised the gap. These do. Three independent checks now stand behind
+;; `capped-block`: metadata (kept for the precise message), a structural cap
+;; at `tbl/mold-cap` regardless of provenance, and a count-match against
+;; `loci.sandbox/queries`, a per-run record the model's code never sees and
+;; so cannot strip.
+;; ---------------------------------------------------------------------------
+
+(deftest a-mapv-reshaped-capped-result-inline-is-refused
+  ;; THE regression test: must fail without the fix. `mapv identity` is the
+  ;; most ordinary thing a model writes to add nothing at all, and it strips
+  ;; q's metadata just as surely as a computed column would.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (mapv identity (q {:select [:*] :from [[table :t]]}))] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [before (count (sub/history st))
+                r      (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)) "mapv strips q's metadata; the guard must not rely on it alone")
+            (is (str/includes? (:error r) "capped")
+                (str "the refusal must name the rule: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refused report must not commit")))))))
+
+(deftest a-computed-column-is-refused-by-count-match-alone
+  ;; The realistic case — a computed column, via `for`/`assoc` — with an
+  ;; explicit limit UNDER mold-cap, so the structural check cannot also be
+  ;; the one catching it: only the count-match check (a page of 1,500 exactly
+  ;; matches a capped q call's own returned count) can refuse this.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (vec (for [row (q {:select [:*] :from [[table :t]]} 1500)] "
+                             "(assoc row :x 1)))] [{:block :table :title \"All\" :rows r}])"))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "capped q call")
+                (str "the message must name the count-match rule specifically: " (:error r)))))))))
+
+(deftest filtering-a-capped-result-down-small-is-allowed
+  ;; Both directions must be pinned. A genuinely small, deliberately filtered
+  ;; result — count 10, nowhere near the capped call's own count of 1,500 —
+  ;; must not be refused. Over-strictness is a real failure too.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]] :order-by [:n]} 1500)] "
+                             "[{:block :table :title \"Small\" :rows (vec (filter #(< (:n %) 10) r))}])"))]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)) (str "a genuinely small, filtered result must not be refused: " (:error r)))
+            (is (= 10 (count (:rows (first (:value obj))))))))))))
+
+(deftest forged-capped-metadata-below-every-threshold-is-refused-by-meta-alone
+  ;; Isolates the metadata check: no `q` call happens at all (so
+  ;; count-match's set is empty) and the block carries one row (so the
+  ;; structural cap cannot trip either). Only `(:capped (meta rows))` catches
+  ;; this — proving metadata still does real work, even though it is not
+  ;; load-bearing for the reshape cases above.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:small" (vec (for [n (range 5)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:small"
+                         :value {:id "tbl:small" :kind :table :title "Small" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "[{:block :table :title \"X\" "
+                             ":rows (with-meta [{:n 1}] {:total 99999 :capped true})}]"))]
+          (let [r (srv/compute-clj! st "tbl:small" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "99999")
+                (str "the meta-carried true total must reach the message: " (:error r)))))))))
+
+(deftest an-inline-block-over-mold-cap-built-without-q-is-refused-by-the-structural-cap
+  ;; Isolates the structural check: `q-all` never marks capped metadata and
+  ;; never records a "capped" outcome in `loci.sandbox/queries` (it has no
+  ;; concept of capped — it always returns every row), so neither of the
+  ;; other two checks can catch a block this large. Only the row-count cap
+  ;; does.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q-all {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "row cap")
+                (str "the message must name the structural rule specifically: " (:error r)))))))))
+
+;; ---------------------------------------------------------------------------
+;; review finding 2 — `rerun!` can now refresh a report, and `:reads` is what
+;; makes a multi-table report's refresh see every input it queried, not just
+;; `:from`.
+;;
+;; Before this fix, verified at the REPL: `rerun!` on a report id answered
+;; `{:error "not a table: report:1"}`, and `rerun!` on the report's SOURCE
+;; walked into the report as a child and skipped it — "this function answers
+;; with a report, not a table" — and skipped a `keep!`-made table with
+;; "unknown lineage via " (empty — it never got a `:via`).
+;; ---------------------------------------------------------------------------
+
+(deftest rerun-on-the-source-refreshes-a-report-it-made
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rsrc" [{:region "EMEA" :revenue 100}
+                                                      {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rsrc"
+                         :value {:id "tbl:rsrc" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [[[:sum :revenue] :total]] "
+                             ":from [[table :t]]})] [{:block :table :title \"Total\" :rows r}])"))]
+          (let [made   (srv/compute-clj! st "tbl:rsrc" "total revenue" nil)
+                rid    (:openId made)
+                before (:value (sub/object st rid))]
+            (is (nil? (:error made)))
+            (is (= [{:total 350}] (:rows (first before))))
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rsrc" [{:region "EMEA" :revenue 900}
+                                                            {:region "APAC" :revenue 250}])]
+              (sub/commit! st {:op :assoc :id "tbl:rsrc" :path [:value] :value h2}))
+            (let [r     (srv/rerun! st "tbl:rsrc")
+                  after (:value (sub/object st rid))]
+              (is (= [rid] (:refreshed r)))
+              (is (= [] (:skipped r)))
+              (is (= [{:total 1150}] (:rows (first after)))
+                  "the report's own numbers must follow the new source data"))))))))
+
+(deftest rerun-on-the-source-refreshes-a-report-and-truthfully-skips-its-stale-keep-table
+  ;; The keep!-table `:via` fix, isolated: the OLD keep!-made table is a
+  ;; SEPARATE child of the source (same `:from`), independently walked by
+  ;; `rerun!`'s BFS. It must be skipped, not refreshed on its own — and the
+  ;; reason must now be truthful, not the old empty "unknown lineage via ".
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rkeep" [{:region "EMEA" :revenue 100}
+                                                       {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rkeep"
+                         :value {:id "tbl:rkeep" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})] "
+                             "[{:block :ref :id id}])"))]
+          (let [made    (srv/compute-clj! st "tbl:rkeep" "keep everything" nil)
+                rid     (:openId made)
+                old-tid (:id (first (:value (sub/object st rid))))
+                fid     (:via (sub/object st rid))]
+            (is (= fid (:via (sub/object st old-tid)))
+                "the keep! table must carry the SAME :via as its report — the fix this test targets")
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rkeep" [{:region "EMEA" :revenue 5}
+                                                             {:region "APAC" :revenue 6}
+                                                             {:region "X" :revenue 7}])]
+              (sub/commit! st {:op :assoc :id "tbl:rkeep" :path [:value] :value h2}))
+            (let [r        (srv/rerun! st "tbl:rkeep")
+                  new-tid  (:id (first (:value (sub/object st rid))))]
+              (is (= [rid] (:refreshed r)))
+              (is (= 1 (count (:skipped r))))
+              (is (= old-tid (:id (first (:skipped r))))
+                  "the STALE keep! table is skipped, not the fresh one the refresh just made")
+              (is (not (str/includes? (:why (first (:skipped r))) "unknown lineage"))
+                  (str "the skip reason must be truthful, not the old empty message: "
+                       (:why (first (:skipped r)))))
+              (is (str/includes? (:why (first (:skipped r))) "report")
+                  (str "the skip reason must say why: " (:why (first (:skipped r)))))
+              (is (not= old-tid new-tid) "the refresh makes a FRESH keep! table under a new id")
+              (is (= 3 (:table/total (tbl/hydrate lake/lake (sub/object st new-tid))))
+                  "the new keep! table holds the new source's rows")
+              (is (some? (sub/object st old-tid))
+                  "the stale table is orphaned garbage, not deleted — loci.lakegc's job, not rerun!'s"))))))))
+
+(deftest rerun-refreshes-a-multi-table-report-via-reads-not-just-from
+  ;; The `:reads` case. The report's `:from` names tbl:a; its code also
+  ;; queries tbl:b through `tables`. Changing tbl:b — NOT tbl:a — must still
+  ;; refresh the report: `:reads`, not `:from` alone, is what `rerun!` walks.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            ha (tbl/put-rows! @lake/lake "tbl:ra" [{:k "a" :v 1} {:k "b" :v 2}])
+            hb (tbl/put-rows! @lake/lake "tbl:rb" [{:k "a" :v 100} {:k "b" :v 200}])]
+        (sub/commit! st {:op :put :id "tbl:ra" :value {:id "tbl:ra" :kind :table :title "A" :value ha}})
+        (sub/commit! st {:op :put :id "tbl:rb" :value {:id "tbl:rb" :kind :table :title "B" :value hb}})
+        (sub/commit! st {:op :put :id "space:rm"
+                         :value {:id "space:rm" :kind :space :title "Multi"
+                                 :value {:cells [{:ref "tbl:ra"} {:ref "tbl:rb"}]}}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [[[:sum :o.v] :total]] :from [[table :s]] "
+                             ":join [[(get tables \"tbl:rb\") :o] [:= :s.k :o.k]]})] "
+                             "[{:block :table :title \"Joined\" :rows r}])"))]
+          (let [made   (srv/compute-clj! st "tbl:ra" "join total" "space:rm")
+                rid    (:openId made)
+                fid    (:via (sub/object st rid))
+                before (:value (sub/object st rid))]
+            (is (nil? (:error made)))
+            (is (= #{"tbl:ra" "tbl:rb"} (set (get-in (sub/object st fid) [:value :reads])))
+                "both tables the query actually joined must be recorded")
+            (is (= [{:total 300}] (:rows (first before))))
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rb" [{:k "a" :v 900} {:k "b" :v 950}])]
+              (sub/commit! st {:op :assoc :id "tbl:rb" :path [:value] :value h2}))
+            (let [r     (srv/rerun! st "tbl:rb")   ; NOT tbl:ra, the report's :from
+                  after (:value (sub/object st rid))]
+              (is (= [rid] (:refreshed r)))
+              (is (= [{:total 1850}] (:rows (first after)))
+                  "changing the :reads-only table must still refresh the report"))))))))
+
+(deftest one-undo-after-a-report-refresh-reverses-the-whole-refresh
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rundo" [{:region "EMEA" :revenue 100}
+                                                       {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rundo"
+                         :value {:id "tbl:rundo" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})] "
+                             "[{:block :ref :id id}])"))]
+          (let [made    (srv/compute-clj! st "tbl:rundo" "keep everything" nil)
+                rid     (:openId made)
+                old-tid (:id (first (:value (sub/object st rid))))
+                before  (:value (sub/object st rid))]
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rundo" [{:region "EMEA" :revenue 5}
+                                                             {:region "APAC" :revenue 6}
+                                                             {:region "X" :revenue 7}])]
+              (sub/commit! st {:op :assoc :id "tbl:rundo" :path [:value] :value h2}))
+            (srv/rerun! st rid)
+            (let [new-tid (:id (first (:value (sub/object st rid))))]
+              (is (not= old-tid new-tid) "sanity: the refresh really did make a new table")
+              (sub/undo! st)
+              (is (= before (:value (sub/object st rid)))
+                  "one undo restores the report's OWN value")
+              (is (nil? (sub/object st new-tid))
+                  "one undo also removes the NEW keep! table the refresh made")
+              (is (some? (sub/object st old-tid))
+                  "and restores the OLD one the refresh had replaced"))))))))
