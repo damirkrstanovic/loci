@@ -144,18 +144,28 @@
         "and it hydrates to the empty table the shell already draws")))
 
 (deftest a-save_as-that-filtered-everything-out-is-an-empty-table
-  ;; the reachable half of the empty-rows change: `vs/interpret` with a filter
-  ;; that matched nothing returns [], and `Lake/put-rows!` refuses it. Left
-  ;; unguarded the throw escapes `dispatch` into the agent's tool loop, where
+  ;; Was: `vs/interpret` with a filter that matched nothing returned [], and
+  ;; `Lake/put-rows!` refuses an empty vector, so the writer special-cased the
+  ;; result to a literal `:value []` rather than a handle. Left unguarded the
+  ;; throw would have escaped `dispatch` into the agent's tool loop, where
   ;; `draft-brief!` turns the whole brief into "(agent unavailable: …)".
+  ;;
+  ;; Now: `save_as` goes through `create-from-spec` — `CREATE TABLE … AS SELECT`
+  ;; — which is DDL, not an insert, so it materialises a real, empty lake table
+  ;; rather than refusing. There is no longer a `[]` literal on this path at
+  ;; all: `(:rows r)` is the handle's row count (0), and the object's `:value`
+  ;; is a genuine handle a later `query_table` can read like any other table.
   (let [st (sub/fresh-store)
         h  (tbl/put-rows! @lake/lake "tbl:x" [{:a 1 :b "p"} {:a 2 :b "q"}])
         _  (sub/commit! st {:op :put :id "tbl:x"
                             :value {:id "tbl:x" :kind :table :title "X" :value h}})
         r  (tools/dispatch st "query_table" {:table_id "tbl:x" :save_as "nothing"
-                                             :filter {:col "b" :op "=" :val "zzz"}})]
-    (is (= [] (:rows r)))
-    (is (= [] (:value (sub/object st (:saved_as r)))))))
+                                             :filter {:col "b" :op "=" :val "zzz"}})
+        v  (:value (sub/object st (:saved_as r)))]
+    (is (= 0 (:rows r)))
+    (is (tbl/handle? v))
+    (is (= 0 (:rows v)))
+    (is (= :lake (:store v)))))
 
 (deftest a-column-collision-is-a-tool-error-not-a-throw
   ;; A model that emits both "Total Sales" and "total_sales" names two columns
@@ -239,3 +249,88 @@
   ;; bite. What changes is whether the column counts as a number at all.
   (let [rows (tools/md-table->rows "| region | share |\n|---|---|\n| EMEA | ~30% |\n| APAC | ~25% |\n")]
     (is (= [:share] (fnlib/numeric-cols rows)))))
+
+;; ---------------------------------------------------------------------------
+;; Task 5: query_table sums every row, not a mold-cap sample
+;; ---------------------------------------------------------------------------
+
+(deftest query-table-is-exact-above-mold-cap
+  (lf/with-temp-lake
+    (fn []
+      (let [st   (sub/fresh-store)
+            rows (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0}))
+            h    (tbl/put-rows! @lake/lake "tbl:big" rows)]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (tools/dispatch st "query_table"
+                                {:table_id "tbl:big" :group_by "region"
+                                 :measure "v" :agg "sum"})]
+          (is (= 2500.0 (double (reduce + (map :v (:rows r)))))
+              "2000.0 here means the mold-cap sample came back")
+          (is (= 5 (:total r)) "the model must be told the answer's true size"))))))
+
+(deftest query-table-says-when-it-capped
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (tools/dispatch st "query_table" {:table_id "tbl:big" :limit 10})]
+          (is (= 10 (count (:rows r))))
+          (is (= 2500 (:total r)))
+          (is (true? (:capped r))))))))
+
+(deftest query-table-is-not-capped-when-it-fits
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (tools/dispatch st "query_table"
+                                {:table_id "tbl:big" :group_by "n" :agg "count" :limit 5000})]
+          (is (= 2500 (:total r)))
+          (is (false? (:capped r))))))))
+
+(deftest query-table-save-as-keeps-every-row
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r   (tools/dispatch st "query_table"
+                                  {:table_id "tbl:big"
+                                   :filter {:col "n" :op ">" :val 499}
+                                   :save_as "Filtered"})
+              obj (sub/object st (:saved_as r))]
+          (is (= 2000 (:rows (:value obj)))
+              "a derived table built from a 2,000-row sample would hold 1,500")
+          (is (= :lake (:store (:value obj)))))))))
+
+(deftest query-table-refuses-a-reclaimed-table
+  ;; The existing behaviour must survive: hydrate degrades a reclaimed table to
+  ;; :value [] rather than throwing, so without a check the tool answers
+  ;; {:rows []} — "your filter matched nothing" — and the model reports a real
+  ;; zero. Worse on save_as, where it would commit an empty derived table.
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [r (tools/dispatch st "query_table" {:table_id "tbl:gone"})]
+        (is (:error r))
+        (is (clojure.string/includes? (:error r) "tbl:gone"))))))
+
+(deftest query-table-still-works-on-a-legacy-inline-table
+  ;; Tables written before 2026-08-16 hold their rows IN the event. InlineTable
+  ;; answers the same protocol, so the language must be identical either way.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            rows (vec (for [n (range 60)] {:region (str "r" (mod n 3)) :v 1.0}))]
+        (sub/commit! st {:op :put :id "tbl:inline"
+                         :value {:id "tbl:inline" :kind :table :title "Inline" :value rows}})
+        (let [r (tools/dispatch st "query_table"
+                                {:table_id "tbl:inline" :group_by "region"
+                                 :measure "v" :agg "sum"})]
+          (is (= 3 (:total r)))
+          (is (= 60.0 (double (reduce + (map :v (:rows r)))))))))))
