@@ -9,7 +9,8 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [loci.sourcespec :as ssp]
-            [loci.substrate :as sub]))
+            [loci.substrate :as sub]
+            [loci.viewspec :as vs]))
 
 (defprotocol TableStore
   (put-rows! [this id rows]
@@ -81,7 +82,53 @@
 
      This is what a table's chunk is built from. It exists so that describing a
      10M-row table costs nine values rather than a page of rows, and so that the
-     description covers the whole column rather than its first `mold-cap` rows."))
+     description covers the whole column rather than its first `mold-cap` rows.")
+  (column-profile [this handle]
+    "`{:cols [...] :numeric [...] :categorical [...] :rows n}` — everything the ƒ
+     palette needs to decide which verbs to offer, **fetching no rows**.
+
+     `:numeric` comes from the store's own types, not from whatever the first row
+     happened to hold. `:categorical` is a column with 2–12 distinct values, and
+     it is answered through `column-samples` asked for 13 per column rather than
+     by a second `count(DISTINCT)` mechanism: 2–12 samples come back for a
+     category, 13 for anything wider.
+
+     **`column-samples` drops nulls**, so a column with twelve distinct values one
+     of which is null reports eleven. That is accurate enough for a menu
+     affordance and is not worth a second query to correct.
+
+     Before 2026-08-27 the palette hydrated a 2,000-row sample to answer all of
+     this, so `lib:pivot` was offered or greyed on a guess about the rest of the
+     table, and every ƒ menu open paid a JDBC read for it.")
+  (query [this handle spec]
+    "Run `spec`'s question half — `group_by` / `measure` / `agg` / `filter` /
+     `sort` / `limit` — against `handle`.
+
+     => `{:rows [...] :total <n> :capped <bool>}`
+
+     **`:total` is the size of the ANSWER, before `:limit`**, and it is not
+     optional. It is what lets a caller say \"200 of 900,000\" rather than
+     implying 200 is all there is — the same rule the entity page follows with
+     `\"50 of 137\"`, for the same reason.
+
+     **`:capped` is true when the store returned fewer rows than `:total`.** A
+     capped result is NOT an error. A large answer is a table, and this design
+     has `create-from-spec` for exactly that.
+
+     **Rows carry KEYWORD keys from every implementation.** `loci.viewspec`
+     builds a grouped row with `(array-map (name gb) …)`, which is a String key,
+     while the lake's come back through `sub/col-kw` as keywords. One protocol
+     method must not answer in two shapes, so `InlineTable` normalizes.
+
+     Specified by the 2026-08-16 big-content spec and never built. Its absence is
+     why five callers read a `mold-cap` sample and treated it as the table.")
+  (create-from-spec [this handle spec id title]
+    "The same question, materialised as a new table under `id`. => a handle.
+
+     Named after `loci.lake/create-from-relation!`, which is what the lake
+     implementation calls. Measured 2026-08-27: `CREATE TABLE … AS <spec>` over a
+     927,830-row answer costs **81 ms and 0 MB of heap**, where pulling the same
+     rows through JDBC into Clojure maps costs about 25,000 ms and 214 MB."))
 
 (def sample-max-chars
   "How long one sample value may be, in **Unicode code points**.
@@ -478,7 +525,39 @@
     (let [rs (:data h)]
       (into {} (for [c (take max-cols (:cols h))]
                  [c (->> rs (keep #(get % c)) (map str) (map clip-sample)
-                         distinct sort (take per-col) vec)])))))
+                         distinct sort (take per-col) vec)]))))
+  (column-profile [_ h]
+    ;; A scan, not a push-down — its rows are already in the handle, so there is
+    ;; nothing to ask a query engine for. `:numeric` looks at every non-nil value
+    ;; in the column rather than the first row alone, which is what makes this
+    ;; the reference `Lake` (whose :numeric comes from DESCRIBE) has to agree
+    ;; with: a column typed consistently reads the same either way, and a
+    ;; column that is NOT typed consistently — real for a Clojure map, never
+    ;; possible for a DuckDB column — has to pick one, so "every value is a
+    ;; number" is the version that cannot be wrong for a genuinely numeric column.
+    (let [rs      (:data h)
+          cols    (:cols h)
+          vals-of (fn [c] (keep #(get % c) rs))
+          numeric (vec (for [c cols :let [vs (vals-of c)] :when (and (seq vs) (every? number? vs))] c))
+          numset  (set numeric)
+          categorical (vec (for [c cols
+                                  :when (not (numset c))
+                                  :let [n (count (distinct (map str (vals-of c))))]
+                                  :when (<= 2 n 12)]
+                              c))]
+      {:cols cols :numeric numeric :categorical categorical :rows (count rs)}))
+  (query [this handle spec]
+    ;; The inline store folds in Clojure, which is what it has always done and is
+    ;; correct here: its rows are IN the handle, so there is nothing to push down
+    ;; to. It is the parity reference — `Lake` must agree with it.
+    (let [all (vec (rows this handle {}))
+          out (mapv #(update-keys % (fn [k] (if (string? k) (keyword k) k)))
+                    (vs/question spec all))]
+      {:rows   (if-let [l (:limit spec)] (vec (take l out)) out)
+       :total  (count out)
+       :capped (boolean (and (:limit spec) (> (count out) (:limit spec))))}))
+  (create-from-spec [this handle spec id _title]
+    (put-rows! this id (:rows (query this handle (dissoc spec :limit))))))
 
 (defn inline-table [] (->InlineTable))
 
@@ -488,6 +567,18 @@
    problem from the substrate to the browser. The largest table in the substrate
    today is 1,000 rows, so this changes nothing about what currently renders."
   2000)
+
+(def max-query-rows
+  "How many rows a `query` returns when the spec sets no `:limit`.
+
+   **A latency budget, not a memory one.** Measured 2026-08-27: crossing JDBC into
+   Clojure maps costs about 5 µs a row plus 3.7 µs a cell, so 1,000,000 rows of
+   four columns is 27 s and 220 MB. The heap is fine on any modern box; 27 s is
+   not. 10,000 rows of that shape is 0.8 s.
+
+   A result above this is not an error. It comes back capped, with the true
+   `:total`, and `create-from-spec` is how a caller keeps all of it."
+  10000)
 
 (defn table-value
   "Rows, landed in `ts`, as a table object's `:value` — a handle, or `[]` for no
@@ -812,3 +903,25 @@
           ;; table a sample would have been, and `hydrate` already knows how to
           ;; say which way it is broken.
           (hydrate ts o))))))
+
+(defn store+handle
+  "The store and handle for a table object, whatever backs it — `[ts h]`, or nil
+   if the object is not a table.
+
+   A legacy inline table keeps its rows IN the event, so it is landed in an
+   `InlineTable` and one code path then serves both. That is what lets every
+   caller ask the protocol rather than branching on how a table happens to be
+   stored.
+
+   Takes `lake` **or a delay of one**, like `hydrate`, and forces it only when
+   the object is actually handle-backed. `tools.clj` and `server.clj` each had
+   a private copy of exactly this pair, `server.clj`'s added by the task before
+   this with a comment asking for the merge — this is that merge, not a third
+   copy."
+  [lake o]
+  (let [v (:value o)]
+    (cond
+      (handle? v) [(force lake) v]
+      (and (sequential? v) (seq v) (every? map? v))
+      (let [ts (inline-table)] [ts (put-rows! ts (:id o) v)])
+      :else nil)))

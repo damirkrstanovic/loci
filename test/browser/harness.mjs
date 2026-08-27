@@ -239,6 +239,32 @@ export const GRID_FIXTURE = `
                                      :cells [{:ref "tbl:grid"}]}}}]}))
 `;
 
+// A report whose `:ref` block points at a real table — Task 11. Before this
+// task, `renderReport`'s `default: return ''` made such a block vanish
+// silently; the whole point of `reportref.test.mjs` is to fail on rendered
+// pixels if that regresses, which the server-side test of the same claim
+// (server_test.clj) structurally cannot see — it can only prove the PAYLOAD
+// carries the resolved rows, never that the shell drew them.
+//
+// Its own server for RECLAIMED_FIXTURE's reason: it adds objects, and
+// tags.test.mjs counts the corpus.
+export const REPORT_REF_FIXTURE = `
+(let [st @c/store
+      lk @lake/lake
+      h  (tbl/put-rows! lk "tbl:refd" [{:region "EMEA" :revenue 100} {:region "APAC" :revenue 200}])]
+  (sub/commit! st {:op :tx :events
+                   [{:op :put :id "tbl:refd"
+                     :value {:id "tbl:refd" :kind :table :title "Referenced fixture" :value h}}
+                    {:op :put :id "report:ref"
+                     :value {:id "report:ref" :kind :report :title "Report with a ref"
+                             :value [{:block :heading :text "A referenced table"}
+                                     {:block :ref :id "tbl:refd"}]}}
+                    {:op :put :id "space:reportref"
+                     :value {:id "space:reportref" :kind :space :title "Report ref fixture"
+                             :value {:intent "a report pointing at a real table"
+                                     :cells [{:ref "report:ref"}]}}}]}))
+`;
+
 // Tags on the seeded corpus, so the strip has something to show. Two notebooks
 // share a tag and one carries two, which is what makes include/exclude testable.
 const TAG_FIXTURE = `

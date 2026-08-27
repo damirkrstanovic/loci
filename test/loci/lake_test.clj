@@ -1437,3 +1437,242 @@
           p (tbl/page lk h {:limit 5 :cursor (tbl/encode-cursor {:k 9999})})]
       (is (= [] (:rows p)))
       (is (nil? (:offset p)) "no first row, so nothing to report a position from"))))
+
+;; ---------------------------------------------------------------------------
+;; the lake answers a question in SQL (Task 3)
+;; ---------------------------------------------------------------------------
+
+(deftest lake-query-groups-over-every-row
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0}))
+          h    (tbl/put-rows! lk "tbl:big" rows)
+          r    (tbl/query lk h {:group_by "region" :measure "v" :agg "sum"})]
+      (is (= 5 (:total r)))
+      (is (= 2500.0 (double (reduce + (map :v (:rows r)))))
+          "the sum must cover 2,500 rows — 2,000 would mean the sample came back"))))
+
+(deftest lake-query-total-is-the-answer-not-the-page
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:big" (vec (for [n (range 2500)] {:n n})))
+          r (tbl/query lk h {:limit 10})]
+      (is (= 10 (count (:rows r))))
+      (is (= 2500 (:total r)))
+      (is (true? (:capped r))))))
+
+(deftest lake-query-pins-the-handles-snapshot
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:v" (vec (for [n (range 2500)] {:n n})))]
+      (lake/x! lk (str "DELETE FROM " (:table h) " WHERE n < 1000"))
+      (is (= 2500 (:total (tbl/query lk h {})))
+          "the handle names a snapshot; a later write must not change its answer"))))
+
+(deftest lake-query-returns-keyword-keys
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:big"
+                           (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+      (doseq [spec [{:group_by "region" :measure "v" :agg "sum"} {}]]
+        (is (every? keyword? (keys (first (:rows (tbl/query lk h spec)))))
+            (str "non-keyword keys for " (pr-str spec)))))))
+
+(deftest lake-and-inline-agree-on-rows-not-just-counts
+  ;; Comparing only :total is what let a key-type mismatch through in Task 2.
+  ;; This compares the ANSWERS: same key set, same values as a multiset, with
+  ;; numbers normalised to double because DuckDB may hand back DECIMAL where
+  ;; Clojure held a Double.
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)]
+                      {:region (str "r" (mod n 5)) :v (double (mod n 7))}))
+          hl   (tbl/put-rows! lk "tbl:p" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:p" rows)
+          norm (fn [rs] (set (map (fn [r]
+                                    (into {} (for [[k v] r]
+                                               [k (if (number? v) (double v) v)])))
+                                  rs)))]
+      (doseq [spec [{:group_by "region" :measure "v" :agg "sum"}
+                    {:group_by "region" :measure "v" :agg "count"}
+                    {:group_by "region" :measure "v" :agg "min"}
+                    {:group_by "region" :measure "v" :agg "max"}
+                    {:filter {:col "region" :op "=" :val "r0"} :limit 5}
+                    {:filter {:col "region" :op "≠" :val "r0"} :limit 5}]]
+        (let [a (tbl/query ii hi spec)
+              b (tbl/query lk hl spec)]
+          (is (= (:total a) (:total b)) (str "totals differ for " (pr-str spec)))
+          (is (= (norm (:rows a)) (norm (:rows b)))
+              (str "rows differ for " (pr-str spec)
+                   "\n  inline: " (pr-str (first (:rows a)))
+                   "\n  lake:   " (pr-str (first (:rows b))))))))))
+
+(deftest lake-and-inline-agree-on-sort-order
+  ;; The set-based parity test above cannot see ordering, which is how a broken
+  ;; grouped sort survived in viewspec while the lake sorted correctly in SQL.
+  (with-lake [lk]
+    (let [rows (vec (concat (for [_ (range 800)] {:region "r2" :v 1.0})
+                            (for [_ (range 800)] {:region "r0" :v 100.0})
+                            (for [_ (range 900)] {:region "r1" :v 50.0})))
+          hl   (tbl/put-rows! lk "tbl:s" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:s" rows)]
+      (doseq [s ["asc" "desc"]]
+        (let [spec {:group_by "region" :measure "v" :agg "sum" :sort s}
+              a (mapv :v (:rows (tbl/query ii hi spec)))
+              b (mapv :v (:rows (tbl/query lk hl spec)))]
+          (is (= (mapv double a) (mapv double b))
+              (str "stores disagree on " s " ORDER — inline " (pr-str a)
+                   " vs lake " (pr-str b))))))))
+
+(deftest lake-create-from-spec-keeps-every-matching-row
+  (with-lake [lk]
+    (let [h  (tbl/put-rows! lk "tbl:big" (vec (for [n (range 2500)] {:n n :v 1.0})))
+          h2 (tbl/create-from-spec lk h {:filter {:col "n" :op ">" :val 499}}
+                                   "tbl:derived-1" "Filtered")]
+      (is (tbl/handle? h2))
+      (is (= :lake (:store h2)))
+      (is (= 2000 (:rows h2)) "2,000 matching rows — 1,500 would mean a sample was filtered"))))
+
+(deftest lake-column-profile-reads-no-rows
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:p"
+                           (vec (for [n (range 2500)]
+                                  {:region (str "r" (mod n 3))
+                                   :v (double n)
+                                   :note (str "unique-" n)})))
+          p (tbl/column-profile lk h)]
+      (is (= [:region :v :note] (:cols p)))
+      (is (= [:v] (:numeric p)) "numeric comes from DuckDB's type, not from a first row")
+      (is (= [:region] (:categorical p)) ":note has 2,500 distinct values — not a category")
+      (is (= 2500 (:rows p))))))
+
+(deftest lake-and-inline-agree-on-the-column-profile
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)]
+                      {:region (str "r" (mod n 3)) :v (double n) :note (str "u" n)}))
+          hl   (tbl/put-rows! lk "tbl:p" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:p" rows)]
+      (is (= (tbl/column-profile ii hi) (tbl/column-profile lk hl))))))
+
+(deftest lake-create-from-spec-names-the-results-columns-not-the-sources
+  ;; An aggregate's columns are NOT the source's. A handle whose :cols name
+  ;; columns the table does not have fails every later read with a binder error.
+  (with-lake [lk]
+    (let [h  (tbl/put-rows! lk "tbl:big"
+                            (vec (for [n (range 2500)]
+                                   {:region (str "r" (mod n 5)) :v 1.0 :extra "x"})))
+          h2 (tbl/create-from-spec lk h {:group_by "region" :measure "v" :agg "sum"}
+                                   "tbl:derived-2" "By region")]
+      (is (= #{:region :v} (set (:cols h2)))
+          (str "handle :cols must come from the RESULT, got " (pr-str (:cols h2))))
+      (is (= 5 (count (tbl/rows lk h2 {})))
+          "and the table must actually be readable through those cols"))))
+
+(deftest lake-query-answers-a-source-handle
+  ;; relation-of first read (:table h) and (:snapshot h) directly, which a
+  ;; :source handle has neither of, so query_table on a passthrough table threw
+  ;; an NPE inside ident. Regression from 80da24a, found in Phase 2's review.
+  (with-lake [lk]
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-src-" (System/nanoTime))
+          f   (io/file dir "t.csv")]
+      (try
+        (.mkdirs (io/file dir))
+        (spit f "region,revenue\nEMEA,10\nAPAC,20\nEMEA,30\n")
+        (let [h {:store :source :uri (str "file://" (.getAbsolutePath f)) :format :csv
+                 :cols [:region :revenue] :raw ["region" "revenue"] :rows 3}]
+          (is (= 3 (:total (tbl/query lk h {}))))
+          (let [r (tbl/query lk h {:group_by "region" :measure "revenue" :agg "sum"})]
+            (is (= 2 (:total r)))
+            (is (= 60.0 (double (reduce + (map :revenue (:rows r))))))))
+        (finally (rm-rf dir))))))
+
+(deftest lake-query-renames-a-sources-columns
+  ;; from-of renames the FILE's header to loci's :cols inside the FROM. Without
+  ;; it a source whose header is not an identifier fails with
+  ;; `Binder Error: Referenced column "total_revenue" not found`.
+  (with-lake [lk]
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-src2-" (System/nanoTime))
+          f   (io/file dir "t.csv")]
+      (try
+        (.mkdirs (io/file dir))
+        (spit f "Total Revenue ($),Region\n10,EMEA\n20,APAC\n")
+        (let [h {:store :source :uri (str "file://" (.getAbsolutePath f)) :format :csv
+                 :cols [:total_revenue :region] :raw ["Total Revenue ($)" "Region"] :rows 2}
+              r (tbl/query lk h {:group_by "region" :measure "total_revenue" :agg "sum"})]
+          (is (= 2 (:total r)))
+          (is (= 30.0 (double (reduce + (map :total_revenue (:rows r)))))))
+        (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; reduce-rows — folding a whole query without materialising it
+;; ---------------------------------------------------------------------------
+
+(deftest reduce-rows-sees-every-row
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(5000) s(i)")
+    (is (= 5000 (lake/reduce-rows lk "SELECT * FROM r_a"
+                                  (fn [acc batch] (+ acc (count batch))) 0)))
+    (is (= 12497500 (lake/reduce-rows lk "SELECT * FROM r_a"
+                                      (fn [acc batch] (+ acc (reduce + (map :n batch)))) 0)))))
+
+(deftest reduce-rows-hands-over-batches-not-one-big-vector
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(5000) s(i)")
+    (let [sizes (lake/reduce-rows lk "SELECT * FROM r_a"
+                                  (fn [acc batch] (conj acc (count batch))) [])]
+      (is (> (count sizes) 1) "one batch means nothing was streamed")
+      (is (every? #(<= % lake/batch-rows) sizes)
+          "a batch must not exceed DuckDB's vector")
+      (is (= 5000 (reduce + sizes)) "and the batches must account for every row"))))
+
+(deftest reduce-rows-closes-its-statement
+  ;; A lazy seq escaping with-open is the classic bug. reduce-rows takes the
+  ;; reducing function so the scope is closed; this proves the connection is
+  ;; still usable afterwards.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(100) s(i)")
+    (lake/reduce-rows lk "SELECT * FROM r_a" (fn [acc _] acc) nil)
+    (is (= [{:n 100}] (lake/q lk "SELECT count(*) AS n FROM r_a")))))
+
+(deftest reduce-rows-handles-an-empty-result
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(10) s(i)")
+    (is (= 0 (lake/reduce-rows lk "SELECT * FROM r_a WHERE n > 999"
+                               (fn [acc batch] (+ acc (count batch))) 0))
+        "no rows must not mean the reducing fn is called with an empty batch")))
+
+(deftest reduce-rows-names-columns-like-q-does
+  ;; "Revenue Total" is load-bearing: a column whose JDBC label is already a
+  ;; legal keyword name (like `n` or `s`) survives a naming bug that skips
+  ;; `sub/col-kw` entirely and would pass either way. This one does not — `q`
+  ;; normalizes it to `:revenue_total`, and a reader that used the raw label
+  ;; would produce `:Revenue Total`, a keyword that does not read back.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_b AS SELECT 1 AS n, 'x' AS s, 2 AS \"Revenue Total\"")
+    (let [via-q (first (lake/q lk "SELECT * FROM r_b"))
+          via-r (first (lake/reduce-rows lk "SELECT * FROM r_b"
+                                         (fn [acc batch] (into acc batch)) []))]
+      (is (= (set (keys via-q)) (set (keys via-r)))
+          "one reader must not name columns differently from the other")
+      (is (= via-q via-r)))))
+
+(deftest reduce-rows-bounds-retention
+  ;; The claim in the docstring, made falsifiable. Folding to a counter must not
+  ;; retain rows; folding into a vector must. Compares RETAINED heap after a GC,
+  ;; not peak — allocation churn is not what this bounds.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_c AS SELECT i AS a, i*2 AS b, 'p' || i AS c FROM range(200000) s(i)")
+    (let [rt      (Runtime/getRuntime)
+          used    (fn [] (System/gc) (Thread/sleep 300)
+                    (/ (- (.totalMemory rt) (.freeMemory rt)) 1048576.0))
+          before  (used)
+          _       (lake/reduce-rows lk "SELECT * FROM r_c"
+                                    (fn [acc batch] (+ acc (count batch))) 0)
+          counted (- (used) before)
+          held    (lake/reduce-rows lk "SELECT * FROM r_c"
+                                    (fn [acc batch] (into acc batch)) [])
+          kept    (- (used) before)]
+      (is (= 200000 (count held)))
+      (is (< counted 20.0)
+          (str "folding to a counter retained " counted " MB — it should retain ~nothing"))
+      (is (> kept (* 3 (max counted 1.0)))
+          (str "folding into a vector retained " kept " MB, counter retained " counted
+               " MB — if these are close, the test is not measuring retention")))))

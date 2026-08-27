@@ -24,6 +24,7 @@
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
+            [loci.sandbox :as sbx]
             [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
@@ -473,6 +474,12 @@
      :mode  (let [m (:mode src)]
               (when (or (keyword? m) (string? m)) (name m)))}))
 
+;; `resolve-report-block` (defined below `mold-payload`, since it CALLS
+;; `mold-payload` to resolve a ref) is itself called FROM `mold-payload`'s
+;; `:else` branch — declared here so the two can refer to each other without
+;; either being defined out of order.
+(declare resolve-report-block)
+
 (defn mold-payload
   "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
    every `:ref` cell of a notebook payload is built out of.
@@ -580,10 +587,19 @@
       ;; needs the memory — which is exactly the assumption the entity branch
       ;; above just stopped being able to make for the function as a whole.
       :else
-      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
+      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))
+            ;; A report's blocks may carry `:ref`/`:chart :ref` — Task 11.
+            ;; Resolved HERE, once, rather than by the shell: `:report/full`
+            ;; and `:report/data` are the only two viewers `report?` matches
+            ;; whose `:kind` is `:report` (`:report/outline` renders strings,
+            ;; nothing to resolve), so this is the one seam every report
+            ;; payload passes through regardless of which of the two drew it.
+            rendered (if (= :report (:kind mv))
+                       (mapv (partial resolve-report-block st m) (:rendered mv))
+                       (:rendered mv))]
         (cond-> {:id id :title (:title o) :kind (name (:kind mv))
                  :view (when (:view mv) (kw->str (:view mv)))
-                 :label (:label mv) :rendered (:rendered mv)
+                 :label (:label mv) :rendered rendered
                  :alternatives (alternatives st o) :source (source-block o)}
           ;; `:table/total` and `:table/cols` only when `hydrate`/`hydrate-page`
           ;; actually put them on `o` — a doc, a report or a metric molds
@@ -628,6 +644,75 @@
                            :unbounded? (boolean (:table/unbounded o))
                            :path       [:rendered]
                            :cursor     (:page/next o)})))))))
+
+;; ---- report blocks that name another object (Task 11) ----
+;;
+;; A report block is `{:block :ref :id …}` or `{:block :chart :ref … :spec
+;; …}` — see `loci.agent`'s `clj-transform-sys` prompt for the exact two
+;; shapes a model is told to write. Neither carries rows; both name an id a
+;; `keep!` call minted in the same `:tx`. Nothing rendered them before this —
+;; `renderReport`'s `default: return ''` swallowed an unrecognised block kind
+;; silently, which is exactly why a `:ref` block used to vanish rather than
+;; error.
+
+(defn- ref-target
+  "The id a report block names, or nil for a block that names none.
+
+   `:ref` carries it as `:id` — the block's OWN id, there being nothing else
+   for a pointer-only block to have one of. `:chart` carries it as `:ref`,
+   because a chart block already owns `:spec`; giving it `:id` too would read
+   as the chart's own id rather than as what it draws from."
+  [block]
+  (case (:block block)
+    :ref   (:id block)
+    :chart (:ref block)
+    nil))
+
+(defn resolve-report-block
+  "One report block, with the object it names molded in — the exact call
+   `notebook-payload` makes for a `:ref` cell (`mold-payload st m (:ref c)
+   (:view c) …`, this same function, no view forced), so a report block and a
+   notebook cell resolve through one call and can never draw an object two
+   different ways.
+
+   A `:ref` block is MERGED with its resolved payload — `:kind`, `:rendered`,
+   `:alternatives`, `:source`, `:table/total`… land on the block exactly as
+   they land on a notebook cell, so the shell's existing per-kind renderer
+   (`renderMold`) draws it with no ref-specific case of its own. A `:chart`
+   block keeps its own `:spec` and gets only the referenced table's rows
+   folded into it (`[:spec :rows]`) — `chartSVG` already reads `spec.rows`
+   for an inline chart, and a ref-drawn chart is that same shape with the
+   rows fetched instead of authored.
+
+   **Recursion guard.** A block naming a `:report` is refused outright, before
+   `mold-payload` is ever called on it — not just when it would cycle back to
+   THIS report. `mold-payload` resolves a report's blocks by calling this
+   function again, so resolving into another report would recurse for as long
+   as the chain of reports does, and a report referencing itself (directly or
+   through others) would recurse forever. Nothing asks for report-in-report
+   nesting; refusing it unconditionally is simpler than detecting a cycle and
+   costs nothing a real report design needs.
+
+   A missing id degrades the same way a notebook's `:type \"missing\"` cell
+   does — a message, because a dangling ref is a fact about the data, not a
+   bug in this function."
+  [st m block]
+  (if-let [id (ref-target block)]
+    (let [target (sub/object st id)]
+      (cond
+        (nil? target)
+        (assoc block :error (str "no such object: " id))
+
+        (= :report (:kind target))
+        (assoc block :error
+               (str id " is a report — a report block cannot reference another report"))
+
+        (= :ref (:block block))
+        (merge block (mold-payload st m id nil))
+
+        :else ;; :chart with a :ref
+        (assoc-in block [:spec :rows] (:rendered (mold-payload st m id nil)))))
+    block))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
@@ -1324,7 +1409,9 @@
 ;; file goes through one of them. `import-csv!` was the last holdout, with its
 ;; `(rand-int 9999)` suffix; it mints nothing now — `loci.source/mint-id` names
 ;; the table, as it does for every other connected source.
-(declare next-id next-id-in)
+;; `run-minter` joins them for the same reason: `compute-clj!` needs it
+;; ~1200 lines before its definition, right beside `next-id-in`'s.
+(declare next-id next-id-in run-minter)
 
 (defn edit! [st id value]
   (if-not (and id (sub/object st id))
@@ -1388,7 +1475,16 @@
 (defn- run-clj-rows
   "Eval agent-written Clojure over rows in the SCI sandbox — accepts
    `(fn [rows] …)` or a bare expression over `rows`. Returns {:rows out}
-   or {:error …}; throws on eval errors, callers keep their own try."
+   or {:error …}; throws on eval errors, callers keep their own try.
+
+   Still used by `run-any-fn` (the ƒ palette re-applying a saved `:fn`) and
+   `recompute` (`rerun!`'s lineage refresh) — both hand a `:fn` object's code
+   ACTUAL rows already fetched into the JVM, which is a different contract
+   from `run-sandboxed` below and not one Task 10 touches. A `:fn` object
+   `compute-clj!` writes now holds sandbox code (`q`, `table`, `keep!`, no
+   `rows`), so re-running one of THOSE through this function will fail — see
+   this namespace's `compute-clj!` docstring for why that gap is named and not
+   closed here."
   [code rows]
   (let [res (sci/eval-string code (assoc sci-opts :bindings {'rows (vec rows)}))
         out (json-safe (vec (if (fn? res) (res (vec rows)) res)))]
@@ -1396,53 +1492,264 @@
       {:rows out}
       {:error "the function did not return rows"})))
 
-(defn compute-clj! [st id prompt space]
+(defn- run-sandboxed
+  "Eval model-written Clojure with `ctx`'s sandbox bindings — `table`,
+   `tables`, `q`, `q-reduce`, `q-all`, `keep!`. Returns whatever the code
+   produced: rows, report blocks or a string. Throws on eval errors; callers
+   keep their own try.
+
+   There is no `rows` bound — see `loci.sandbox`'s namespace docstring. If the
+   code evaluates to a function, it is called with NO arguments: there are no
+   rows left to hand it, so a function shape can only mean \"here is a thunk
+   of my own answer\", not \"here is what to do with rows\"."
+  [code ctx]
+  (let [res (sci/eval-string code (assoc sci-opts :bindings (:bindings ctx)))]
+    (if (fn? res) (res) res)))
+
+(defn- shape-of
+  "What model-written code returned: `:table` for a vector of maps, `:report`
+   for a vector of report blocks, `:doc` for a string, or nil — an honest
+   error, not a shape to coerce.
+
+   **Order matters.** A report block is ALSO a map, so a vector of blocks
+   would satisfy the `:table` test too. Checked in the same order
+   `loci.content/report?` and `table?` already use — report before table — so
+   a report is never read as one row of a table."
+  [v]
+  (cond
+    (string? v) :doc
+    (and (sequential? v) (seq v) (every? :block v)) :report
+    (and (sequential? v) (seq v) (every? map? v)) :table
+    :else nil))
+
+;; ---- Task 12: a report may not carry a capped page as though it were the
+;; whole answer ----
+;;
+;; `q` pages past `tbl/max-query-rows` and says so IN THE ROWS' OWN METADATA
+;; (`{:total n :capped true}` — `loci.sandbox`'s `run-q`), which survives
+;; `json-safe`'s `postwalk` (`clojure.walk` reconstructs collections but
+;; carries their meta along; confirmed at the REPL before writing this, both
+;; on a bare vector and on one nested inside a block map inside a report
+;; vector). If a report block embeds those rows verbatim, the shell shows
+;; 10,000 of 900,000 rows captioned as though that were the answer — the exact
+;; failure `query_table` and friends had before this plan started, reopened
+;; through a new door: a query surface that answers exactly, wired to a report
+;; block that can still lie about how much of the answer it is showing.
+;;
+;; `keep!` is the honest path, and it is not a favour asked of the model — see
+;; `compute-clj!` below, which refuses the block and re-asks rather than
+;; rendering it. `keep!` materialises the query as its own table, and once a
+;; report references it with `:ref` (or `:chart :ref`) instead of a copy, the
+;; grid's paging, cursor and "showing 101–200 of 900,000" caption come for
+;; free — the same table view Task 3/4 already built, not new work.
+
+(defn- block-rows
+  "The rows a report block `b` carries DIRECTLY — the value `staticTable` and
+   `chartSVG` render with no further resolution
+   (`resources/public/index.html`'s `renderReport`). `:heading` and `:text`
+   carry none; `:ref` and `:chart :ref` carry none either — `resolve-report-block`
+   fetches those from the object they name, well after this runs. `:table`'s
+   `:rows` and `:chart`'s `[:spec :rows]` are the only two shapes that do, so
+   those are the only two checked."
+  [b]
+  (case (:block b)
+    :table (:rows b)
+    :chart (get-in b [:spec :rows])
+    nil))
+
+;; Metadata alone is not enough: `(:capped (meta rows))` survives loci's own
+;; plumbing but not the model's — `mapv`, `map`, `for`, a renamed key all
+;; strip it (confirmed at the REPL: `(meta (mapv identity (with-meta [{:a 1}]
+;; {:capped true})))` => nil), so `(mapv identity (q {…}))` inlined from a
+;; 12,000-row table used to commit unrefused. Two more checks, neither of
+;; which a reshape can touch, because neither reads anything the model's code
+;; produced:
+;;
+;;  - **structural**: no inline block may carry more than `tbl/mold-cap` rows,
+;;    whatever its provenance — a report is prose plus small tables, not a
+;;    page.
+;;  - **count-match**: `loci.sandbox/queries` records every `q` call's own
+;;    outcome, in the RUN, where the model's code cannot reach it. A block
+;;    whose row count equals a capped call's returned count is refused —
+;;    catching `mapv`/`map`/`for`, which preserve row count, even though they
+;;    destroy the metadata that would otherwise say so.
+
+(defn- block-cap-reason
+  "Why block `b`'s rows are refused, or nil if they carry none or are fine.
+   `capped-counts` is the set of row-counts `q` returned for a CAPPED call
+   this run — see the namespace-level comment above for why three checks and
+   not one."
+  [b capped-counts]
+  (when-let [rows (block-rows b)]
+    (cond
+      (:capped (meta rows))                 :meta
+      (> (count rows) tbl/mold-cap)         :structural
+      (contains? capped-counts (count rows)) :count-match)))
+
+(defn- capped-block
+  "The first `[block reason]` in report `blocks` refused under
+   `block-cap-reason`, or nil."
+  [blocks capped-counts]
+  (first (keep (fn [b] (when-let [r (block-cap-reason b capped-counts)] [b r]))
+               blocks)))
+
+(defn- capped-block-message
+  "What the model reads back when `capped-block` finds one — names the block,
+   the reason and the fix, because `compute-clj!`'s retry loop feeds this to
+   the model as `err` exactly as it does an eval exception; a message only a
+   person could act on would waste the retry."
+  [[b reason]]
+  (let [rows (block-rows b)
+        m    (meta rows)]
+    (str "report block :" (name (:block b)) " carries " (count rows)
+         (case reason
+           :meta        (str " of " (:total m) " rows straight from a capped q result")
+           :structural  (str " rows, more than a report block may carry ("
+                              tbl/mold-cap " row cap) — treated the same as a "
+                              "capped q result: too many rows to be the "
+                              "honest whole answer inline")
+           :count-match " rows, the same count a capped q call returned earlier in this run")
+         " — call keep! to materialise the query as a table, then point the "
+         "report at it with {:block :ref :id …} (or :chart :ref) instead of "
+         "embedding the rows")))
+
+(defn- capped-counts
+  "The row-counts `q` returned for every CAPPED call `ctx` made this run —
+   what `block-cap-reason`'s count-match check compares an inline block
+   against. Only `q` has capped/uncapped outcomes at all; `q-all` and
+   `q-reduce` never mark one."
+  [ctx]
+  (->> (sbx/queries ctx) (filter :capped) (map :count) set))
+
+(defn- compute-run
+  "Run sandbox `code` in `ctx` and classify what it answered — `{:kind
+   :table/:report/:doc :value v}`, or `{:error msg}` for an unrecognised
+   shape or a report that fails Task 12's capped-block guard.
+
+   The ONE place that guard lives. Shared by `compute-clj!`'s fresh
+   generation and `rerun!`'s report refresh (`recompute`, below) — a refresh
+   that re-ran the same guard-less logic `compute-clj!` used to run could
+   answer with a capped page a fresh run would have refused, exactly the
+   defect this guard exists to close."
+  [code ctx]
+  (let [value (json-safe (run-sandboxed code ctx))
+        kind  (shape-of value)]
+    (cond
+      (not kind) {:error "the function returned neither rows, nor report blocks, nor text"}
+      (and (= :report kind) (capped-block value (capped-counts ctx)))
+      {:error (capped-block-message (capped-block value (capped-counts ctx)))}
+      :else {:kind kind :value value})))
+
+(defn- attach-via
+  "`evs` — `keep!`'s accumulated `:put` events — with `:via fid` stamped onto
+   every table it made. `fid` is minted only after the sandbox run returns
+   (see `compute-clj!`'s docstring for why one minter serves the whole run),
+   so `keep!` itself cannot write it; this is where it becomes known.
+
+   Without this a keep!-made table carried no `:via` at all, and `rerun!`'s
+   lineage walk skipped it with the empty, unreadable \"unknown lineage via
+   \" — now it reads \"this function answers with a report, not a table\",
+   the true reason: the table is a BYPRODUCT of its report's code, not an
+   independently re-runnable node, and `rerun!` correctly leaves it alone —
+   refreshing the report replaces it with a fresh one under a fresh id."
+  [evs fid]
+  (mapv (fn [e] (cond-> e (and (= :put (:op e)) (= :table (get-in e [:value :kind])))
+                  (assoc-in [:value :via] fid)))
+        evs))
+
+(defn compute-clj!
+  "A user's request over table `id`, in one query-shaped run: the model writes
+   Clojure against `loci.sandbox`'s five verbs (`table`/`tables`/`q`/`q-reduce`/
+   `q-all`/`keep!`), it runs sandboxed, and whatever shape comes back — rows, a
+   report, or a note — lands as ONE `:tx` with the `:fn` that made it.
+
+   Before 2026-08-27 this hydrated a `mold-cap` sample and asked for
+   `(fn [rows] …)`, so the model could only ever answer for the sample it was
+   shown — see `loci.sandbox`'s namespace docstring for the failure that was.
+
+   **The `:fn` this writes is stamped `:contract \"sandbox\"`.** Task 10 left
+   `run-any-fn` (the ƒ palette, reached from `fn-preview`/`fn-apply!`) and
+   `recompute` (`rerun!`'s lineage refresh) still handing every `:fn`'s code
+   raw `rows` through `run-clj-rows` — the OLD contract, which a sandbox-shaped
+   `:fn` cannot speak, so re-running one just written answered `Could not
+   resolve symbol: q`. `:contract` is how those two callers now tell which
+   contract a `:fn`'s code speaks: `\"sandbox\"` for what this function writes,
+   absent for everything written before this fix — see `run-any-fn` and
+   `recompute` for the dispatch, and `run-sandboxed-fn` for why a re-run's
+   own `keep!` events are dropped rather than committed."
+  [st id prompt space]
   (try
-    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
-      (if-not (and (sequential? rows) (seq rows) (every? map? rows))
-        {:error "compute works on tables"}
-        (let [cols    (mapv name (keys (first rows)))
-              sample  (take 3 rows)
+    (let [o      (sub/object st id)
+          [ts h] (tbl/store+handle lake/lake o)
+          ;; `store+handle` does not check reclamation, unlike the `hydrate`
+          ;; this replaced — a reclaimed table used to fail here with a clear
+          ;; answer and, without this check, fails a few lines down inside
+          ;; DuckDB with a raw driver message instead. `tools/why-unreadable`
+          ;; is the same check `query_table` already makes; reused rather than
+          ;; copied so a reclamation reads the same sentence on both agent
+          ;; surfaces. nil when `ts` is nil — `why-unreadable` needs a real
+          ;; handle, and the `not ts` branch below answers first anyway.
+          why    (when ts (tools/why-unreadable ts h o))]
+      (cond
+        (not ts) {:error "compute works on tables"}
+        why {:error (str "table " id " cannot be read: " why)}
+        :else
+        (let [profile (tbl/column-profile ts h)
+              samples (tbl/column-samples ts h 3 12)
+              ;; One minter for the WHOLE run — every `keep!` inside the
+              ;; sandbox AND the two ids compute mints itself below (`fid`,
+              ;; and `oid` when the result is a table, which shares `keep!`'s
+              ;; own `tbl:derived-` prefix). Splitting those across two minters
+              ;; reintroduces exactly the 2026-07-23 collision: nothing commits
+              ;; until this run's one `:tx`, so a second `next-id-in` over the
+              ;; same unmoved snapshot can hand out an id `keep!` already
+              ;; issued, and the second `:put` silently replaces the first.
+              mint-id (run-minter (sub/objects st))
+              ctx     (sbx/context st id space mint-id)
               attempt (fn [prev-code err]
-                        (let [code (agent/make-clj-transform cols sample prompt prev-code err)]
-                          (assoc (try (run-clj-rows code rows)
-                                      (catch Exception e {:error (.getMessage e)}))
-                                 :code code)))
+                        (let [code (agent/make-clj-transform profile samples prompt prev-code err)]
+                          (try
+                            (assoc (compute-run code ctx) :code code)
+                            (catch Exception e {:error (.getMessage e) :code code}))))
               ;; one bad generation shouldn't sink the request: retry once,
               ;; feeding the eval error back so the model can fix its code
-              r1   (attempt nil nil)
-              r    (if (:error r1) (attempt (:code r1) (:error r1)) r1)
-              code (:code r)
-              out  (:rows r)]
+              r1 (attempt nil nil)
+              r  (if (:error r1) (attempt (:code r1) (:error r1)) r1)]
           (if (:error r)
             {:error (str "compute failed: " (:error r))}
-            ;; max+1, not count+1. Counting is how three notebooks died on
-            ;; 2026-07-23: `space:dd-` was minted `(inc (count …))` over a store
-            ;; that had booted 49 of 80 events, so it re-minted 16/17/18 onto
-            ;; live notebooks and `:put` — `assoc-in`, no occupancy check —
-            ;; replaced them in silence. These two had neither the
-            ;; `(rand-int 9999)` suffix that saved `tbl:extract-14-677` nor an
-            ;; existence check, and `fn-apply!` below already minted
-            ;; `tbl:derived-` through `next-id`: one prefix, two rules. A count
-            ;; also falls with nothing wrong at all — remove a derived table and
-            ;; the next compute re-mints the id of one still sitting there.
-            ;; `next-id-in` over ONE `sub/objects` rather than `next-id` twice:
-            ;; each call re-folds the whole log on the EDN stores (2.334 ms vs
-            ;; 1.135 ms at 3003 events), and both ids come from one snapshot.
-            (let [objm (sub/objects st)
-                  p    (str/trim prompt)
-                  fid  (next-id-in objm (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
-                  nid  (next-id-in objm "tbl:derived-")
-                  ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
-                  fobj {:id fid :kind :fn :title (str "fn: " p)
-                        :value {:source id :prompt p :lang "clojure" :code code}}
-                  tobj (tbl/table-object @lake/lake nid ttl out {:from id :via fid})
-                  evs (cond-> [{:op :put :id fid :value fobj}
-                               {:op :put :id nid :value tobj}]
-                        (and space (space? st space))
-                        (conj (nb/append-cell-event st space {:ref nid})))]
-              (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid :object (mold-payload st mem/memory nid nil)})))))
+            (let [{:keys [value code kind]} r]
+              (if-not kind
+                {:error "compute failed: the function returned neither rows, nor report blocks, nor text"}
+                (let [p    (str/trim prompt)
+                      fid  (mint-id (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
+                      ttl  (if (> (count p) 48) (str (subs p 0 48) "…") p)
+                      fobj {:id fid :kind :fn :title (str "fn: " p)
+                            :value {:source id :reads (vec (sbx/reads ctx))
+                                    :prompt p :lang "clojure" :contract "sandbox" :code code}}
+                      oid  (mint-id (case kind
+                                      :table  "tbl:derived-"
+                                      :report "report:"
+                                      :doc    "doc:"))
+                      oobj (case kind
+                             :table  (tbl/table-object @lake/lake oid ttl value {:from id :via fid})
+                             :report {:id oid :kind :report :title ttl :value (vec value)
+                                      :from id :via fid}
+                             :doc    {:id oid :kind :doc :title ttl :value value
+                                      :from id :via fid})
+                      ;; ONE :tx: keep!'s accumulated events (tagged :via fid
+                      ;; — see attach-via — so rerun!'s lineage walk can tell
+                      ;; a keep!-made table apart from an "unknown lineage"
+                      ;; one), the :fn, the result, and the cell — so an
+                      ;; aborted run commits nothing and one undo removes a
+                      ;; report with every table it made.
+                      evs  (cond-> (into (attach-via (vec (sbx/events ctx)) fid)
+                                         [{:op :put :id fid :value fobj}
+                                          {:op :put :id oid :value oobj}])
+                             (and space (space? st space))
+                             (conj (nb/append-cell-event st space {:ref oid})))]
+                  (sub/commit! st {:op :tx :events evs})
+                  {:state (state-payload st) :openId oid
+                   :object (mold-payload st mem/memory oid nil)})))))))
     (catch Exception e {:error (str "compute failed: " (.getMessage e))})))
 
 ;; the functions living in the substrate, with their code — an inspector for the
@@ -1462,13 +1769,9 @@
 
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
-(defn- table-rows [st id]
-  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
-    (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
-
 (defn fns-payload [st id]
-  (if-let [rows (table-rows st id)]
-    {:fns (into (fnlib/catalog rows)
+  (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
+    {:fns (into (fnlib/catalog (tbl/column-profile ts h))
                 (->> (sub/objects st) vals
                      (filter #(and (= :fn (:kind %)) (= "clojure" (get-in % [:value :lang]))))
                      (sort-by :id)
@@ -1476,7 +1779,56 @@
                                     :doc (get-in o [:value :prompt]) :ok true :params []}))))}
     {:error "functions work on tables"}))
 
-(defn- run-any-fn [st fid rows params]
+(defn- run-sandboxed-fn
+  "A sandbox-shaped `:fn`'s `code`, re-run over `id`'s CURRENT committed state
+   through `loci.sandbox`, scoped to `space` (nil outside a notebook) —
+   exactly how `compute-clj!` itself runs it. `{:rows v}` for a table answer,
+   `{:error msg}` for anything else; never throws, so the caller's own `try`
+   around eval errors still applies.
+
+   Shared by `run-any-fn` (the ƒ palette, reached from `fn-preview` and
+   `fn-apply!`) and `recompute` (`rerun!`'s lineage refresh) — the two callers
+   Task 10 left running sandbox-shaped code through the OLD `rows` contract,
+   which it cannot speak: re-applying a function `compute-clj!` had just
+   written answered `Could not resolve symbol: q`, caught by each caller's
+   own `try`, so an :error and not a 500 — but a function that could not be
+   reused, which was the entire point of keeping it. One dispatch here rather
+   than two near-copies, one per caller.
+
+   **`keep!`'s events are dropped, not committed.** A re-run's sandbox code
+   can call `keep!` exactly as the original run could; committing those
+   events would mint a fresh interim table on every re-apply of the same
+   function, which nobody asked for and `undo!` cannot distinguish from the
+   function's own answer. The interim table `keep!` writes to the lake still
+   happens — that side effect is `loci.sandbox`'s, not this dispatch's — it is
+   just never referenced from an event, so `loci.lakegc` reclaims it: the
+   same already-documented leak `compute-clj!`'s own docstring names for an
+   aborted run, not a new kind.
+
+   **A re-run must answer a table.** `shape-of` classifies what the sandbox
+   code returned; a report or a note is refused with an error naming which,
+   not committed as though it were rows and not a stack trace."
+  [st id code space]
+  (let [ctx (sbx/context st id space (run-minter (sub/objects st)))
+        v   (json-safe (run-sandboxed code ctx))]
+    (case (shape-of v)
+      :table  {:rows v}
+      :report {:error "this function answers with a report, not a table — Apply only builds tables"}
+      :doc    {:error "this function answers with text, not a table — Apply only builds tables"}
+      {:error "the function did not return rows"})))
+
+(defn- run-any-fn
+  "Re-run a saved `:fn`, or a `lib:` builtin, over `rows` — the ƒ palette's
+   one dispatch, reached from `fn-preview` and `fn-apply!`.
+
+   **A `:fn`'s `:value :contract` says which contract its code speaks.**
+   `\"sandbox\"` — every `:fn` `compute-clj!` has written since 2026-08-27 —
+   runs through `run-sandboxed-fn`; absent (every `:fn` written before that)
+   still runs `rows` through `run-clj-rows`, unchanged. `id` and `space` are
+   only needed for the sandbox branch — `rows` (already fetched by both
+   callers) is what the old branch still runs on. See `run-sandboxed-fn` for
+   why the dispatch exists and what a re-run does with `keep!`."
+  [st id fid rows params space]
   (cond
     (nil? fid)
     {:error "which function?"}
@@ -1486,6 +1838,12 @@
       (cond
         (not= :fn (:kind o)) {:error (str "unknown function: " fid)}
         (not= "clojure" (get-in o [:value :lang])) {:error "not a runnable function"}
+
+        (= "sandbox" (get-in o [:value :contract]))
+        (try
+          (run-sandboxed-fn st id (get-in o [:value :code]) space)
+          (catch Exception e {:error (.getMessage e)}))
+
         :else (try
                 (run-clj-rows (get-in o [:value :code]) rows)
                 (catch Exception e {:error (.getMessage e)}))))
@@ -1496,40 +1854,88 @@
 
 (defn fn-preview [st id fid params]
   (try
-    (if-let [rows (table-rows st id)]
-      (let [r (run-any-fn st fid rows params)]
-        (if (:error r)
-          r
-          {:before (json-safe (vec (take 8 rows)))
-           :after (vec (take 8 (:rows r))) :count (count (:rows r))}))
+    (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
+      (if-let [spec (fnlib/spec-of fid params)]
+        ;; Pushed down: eight rows out of DuckDB, and the count of the whole
+        ;; answer — never a sample, because `query` computes `:total` before
+        ;; any `:limit` is applied.
+        (let [before (tbl/query ts h {:limit 8})
+              after  (tbl/query ts h (assoc spec :limit 8))]
+          {:before (json-safe (vec (:rows before)))
+           :after  (json-safe (vec (:rows after)))
+           :count  (:total after)})
+        ;; Not pushed down — pivot, delta, share, top, or an agent-written fn.
+        ;; Runs over a bounded page and SAYS SO, so a preview is never read as
+        ;; the answer. `fn-apply!`'s fallback runs over everything.
+        (let [total (tbl/row-count ts h)
+              rows  (tbl/rows ts h {:limit tbl/mold-cap})
+              ;; no notebook space at preview time — a sandbox-shaped :fn that
+              ;; reads more than its own table only sees `id`, same as a
+              ;; multi-table compute-clj! run made outside any space would.
+              r     (run-any-fn st id fid rows params nil)]
+          (if (:error r)
+            r
+            (cond-> {:before (json-safe (vec (take 8 rows)))
+                     :after  (vec (take 8 (:rows r)))
+                     :count  (count (:rows r))}
+              (< (count rows) total) (assoc :sampled {:over (count rows) :of total})))))
       {:error "functions work on tables"})
     (catch Exception e {:error (.getMessage e)})))
 
 (defn fn-apply! [st id fid params space]
   (try
-    (if-let [rows (table-rows st id)]
+    (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
       (if (and space (not (space? st space)))
         {:error (str "not a notebook: " space)}
-        (let [r (run-any-fn st fid rows params)]
-          (if (:error r)
-            r
-            (let [src (sub/object st id)
-                  lbl (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
-                          (:title (sub/object st fid)) fid)
-                  nid (next-id st "tbl:derived-")
-                  tobj (tbl/table-object @lake/lake nid (str (:title src) " · " lbl)
-                                         (:rows r) {:from id :via fid :params (or params {})})
-                  evs (cond-> [{:op :put :id nid :value tobj}]
-                        (and space (space? st space))
-                        (conj (nb/append-cell-event st space {:ref nid})))]
-              (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid}))))
+        (let [src   (sub/object st id)
+              lbl   (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
+                        (:title (sub/object st fid)) fid)
+              nid   (next-id st "tbl:derived-")
+              ttl   (str (:title src) " · " lbl)
+              extra {:from id :via fid :params (or params {})}
+              land! (fn [tobj]
+                      (let [evs (cond-> [{:op :put :id nid :value tobj}]
+                                  (and space (space? st space))
+                                  (conj (nb/append-cell-event st space {:ref nid})))]
+                        (sub/commit! st {:op :tx :events evs})
+                        {:state (state-payload st) :openId nid}))]
+          (if-let [spec (fnlib/spec-of fid params)]
+            ;; CREATE TABLE AS — 81 ms and 0 MB for 927,830 rows, measured
+            ;; 2026-08-27, against ~25,000 ms and 214 MB to pull them.
+            (land! (merge {:id nid :kind :table :title ttl
+                          :value (tbl/create-from-spec ts h spec nid ttl)}
+                         extra))
+            ;; Not pushed down: every row, via `rows` with no `:limit` — the
+            ;; existing method, no sentinel needed for "all of it" — then
+            ;; through Clojure.
+            (let [rows (tbl/rows ts h {})
+                  r    (run-any-fn st id fid rows params space)]
+              (if (:error r)
+                r
+                (land! (tbl/table-object @lake/lake nid ttl (:rows r) extra)))))))
       {:error "functions work on tables"})
     (catch Exception e {:error (.getMessage e)})))
 
+(defn- refresh-events
+  "The commit events one report refresh produces: any `keep!` tables its code
+   made THIS run, tagged `:via fid` exactly as a fresh `compute-clj!` run
+   tags them (see `attach-via`), plus one `:assoc` replacing the report's own
+   `:value` with the new blocks.
+
+   The PREVIOUS run's `keep!` tables are not touched — orphaned, the same
+   already-documented leak `keep!` always has for an aborted run;
+   `loci.lakegc` reclaims them. The report keeps its id, so every `:ref`
+   block pointing at IT from elsewhere stays valid; every `:ref` block
+   INSIDE it now points at the fresh tables instead."
+  [ctx fid oid blocks]
+  (into (attach-via (vec (sbx/events ctx)) fid)
+        [{:op :assoc :id oid :path [:value] :value (vec blocks)}]))
+
 ;; ---- live lineage: derived tables know :from/:via/:params, so the whole
 ;; downstream chain can be recomputed against fresh source rows — one :tx,
-;; one undo. Legacy tables without :params are skipped, never guessed. ----
+;; one undo. Legacy tables without :params are skipped, never guessed. A
+;; derived REPORT re-runs its stored code fresh instead — see recompute's
+;; :kind :report branch, below. ----
 (defn- recompute [st working obj]
   ;; working = {id -> newly-computed rows} for already-refreshed ancestors
   (let [src-id (:from obj)
@@ -1569,11 +1975,48 @@
       why {:why (str "source " src-id "'s rows are unusable: " why)}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
-      (if-let [code (get-in (sub/object st via) [:value :code])]
-        (try (let [r (run-clj-rows code rows)]        ; already {:rows}/{:error}
-               (if (:error r) {:why (:error r)} r))
-             (catch Exception e {:why (str "recompute failed: " (.getMessage e))}))
-        {:why (str "function " via " is gone")})
+      (let [fo (sub/object st via)]
+        (if-not (get-in fo [:value :code])
+          {:why (str "function " via " is gone")}
+          (try
+            (if (= :report (:kind obj))
+              ;; A report refresh re-runs the SAME stored code fresh, through
+              ;; a NEW `sbx/context` — `compute-run` is the ONE place Task
+              ;; 12's capped-block guard lives, shared with `compute-clj!`'s
+              ;; fresh generation, so a refresh cannot answer with a capped
+              ;; page a fresh run would have refused. `extra-ids` is the
+              ;; fn's own recorded `:reads`: a report has no `space` stored
+              ;; to re-derive `tables` from, so a table read only via
+              ;; `tables` (never `:from`) would otherwise drop out of scope
+              ;; the second time. `nil` `rows`/`known` above are unused
+              ;; here — a report's code queries the lake directly, not
+              ;; threaded rows.
+              (let [ctx (sbx/context st src-id nil (run-minter (sub/objects st))
+                                     (get-in fo [:value :reads]))
+                    r   (compute-run (get-in fo [:value :code]) ctx)]
+                (cond
+                  (:error r) {:why (:error r)}
+                  (not= :report (:kind r))
+                  {:why (str "refresh answered a " (name (:kind r))
+                             ", not a report — the code must answer the same "
+                             "shape it did originally")}
+                  :else {:events (refresh-events ctx via (:id obj) (:value r))}))
+              (let [r (if (= "sandbox" (get-in fo [:value :contract]))
+                        ;; sandbox-shaped: `run-sandboxed-fn` against src-id's
+                        ;; CURRENT committed state, no notebook space — not
+                        ;; through `rows`/`known` above, which only the
+                        ;; rows-shaped branch reads. A multi-level chain where
+                        ;; an ANCESTOR was refreshed earlier in this same rerun
+                        ;; (in `working`, not yet committed) is a known gap this
+                        ;; does not close: the sandbox queries the lake, which
+                        ;; still has the old version until this rerun's one :tx
+                        ;; lands. Named rather than engineered around —
+                        ;; `loci.sandbox/context` has no way to see uncommitted
+                        ;; rows, and giving it one is outside this fix's scope.
+                        (run-sandboxed-fn st src-id (get-in fo [:value :code]) nil)
+                        (run-clj-rows (get-in fo [:value :code]) rows))]  ; already {:rows}/{:error}
+                (if (:error r) {:why (:error r)} r)))
+            (catch Exception e {:why (str "recompute failed: " (.getMessage e))}))))
       (str/starts-with? (str via) "lib:")
       (if-let [ps (:params obj)]
         (let [r (fnlib/run-fn via rows ps)]
@@ -1583,8 +2026,13 @@
 
 (defn rerun!
   "Refresh id (if derived) and everything derived from it, transitively.
-   Children recompute against their parent's NEW rows. All updates land as
-   one :tx. Returns {:state :refreshed [ids] :skipped [{:id :why}]}.
+   Table children recompute against their parent's NEW rows; a report child
+   re-runs its stored code fresh against the current lake — see `recompute`'s
+   `:kind :report` branch. A dependency is either the original `:from` link
+   or a table named in a fn's own `:reads`, so a multi-table report refreshes
+   when ANY input it queried changes, not only the one `compute-clj!` was
+   called on. All updates land as one :tx. Returns {:state :refreshed [ids]
+   :skipped [{:id :why}]}.
 
    The `try` is the one every sibling has — `fn-apply!`, `compute-clj!`,
    `import-csv!`, `describe!`, `make-view!`, `do!` — and this was the only writer
@@ -1598,11 +2046,24 @@
   [st id]
   (try
     (let [o (sub/object st id)]
-      (if-not (and o (= :table (:kind o)))
+      (if-not (and o (#{:table :report} (:kind o)))
         {:error (str "not a table: " id)}
-        (let [objs     (vals (sub/objects st))
-              children (fn [pid] (->> objs (filter #(= pid (:from %))) (sort-by :id) (map :id)))
-              ;; breadth-first over the :from DAG, parents before children
+        (let [objs      (vals (sub/objects st))
+              ;; `:reads`-of `via`: the ids a sandbox-contract fn's ORIGINAL
+              ;; run actually queried — nil for anything else (a `lib:` via,
+              ;; a legacy `:fn` with no `:reads`, or no `:via` at all).
+              reads-of  (fn [via] (when (and via (str/starts-with? (str via) "fn:"))
+                                     (set (get-in (sub/object st via) [:value :reads]))))
+              ;; `pid` is a dependency of `c` either the ORIGINAL way (`c`
+              ;; was made `:from` pid) or the multi-table way (`c`'s fn
+              ;; QUERIED pid, recorded in `:reads`, even though `c`'s own
+              ;; `:from` names a different table) — the case a report made
+              ;; over `tables` needs: it refreshes when ANY input changes,
+              ;; not only the one `compute-clj!` happened to be called on.
+              depends?  (fn [pid c] (or (= pid (:from c))
+                                        (contains? (reads-of (:via c)) pid)))
+              children  (fn [pid] (->> objs (filter #(depends? pid %)) (sort-by :id) (map :id)))
+              ;; breadth-first over the dependency DAG, parents before children
               order    (loop [q (vec (if (:from o) [id] (children id))) seen #{} out []]
                          (if (empty? q)
                            out
@@ -1610,26 +2071,36 @@
                              (if (seen x)
                                (recur (vec xs) seen out)
                                (recur (vec (concat xs (children x))) (conj seen x) (conj out x))))))
-              {:keys [working refreshed skipped]}
-              (reduce (fn [{:keys [working refreshed skipped]} cid]
+              {:keys [working refreshed skipped events]}
+              (reduce (fn [{:keys [working refreshed skipped events]} cid]
                         (let [r (recompute st working (sub/object st cid))]
-                          (if (:rows r)
+                          (cond
+                            (:rows r)
                             {:working (assoc working cid (:rows r))
-                             :refreshed (conj refreshed cid) :skipped skipped}
+                             :refreshed (conj refreshed cid) :skipped skipped :events events}
+                            (:events r)
+                            {:working working :refreshed (conj refreshed cid)
+                             :skipped skipped :events (into events (:events r))}
+                            :else
                             {:working working :refreshed refreshed
-                             :skipped (conj skipped {:id cid :why (:why r)})})))
-                      {:working {} :refreshed [] :skipped []}
+                             :skipped (conj skipped {:id cid :why (:why r)}) :events events})))
+                      {:working {} :refreshed [] :skipped [] :events []}
                       order)]
-          ;; `working` holds ROWS, because that is what `recompute` threads from
-          ;; an ancestor to its descendants. What lands in the LOG is the handle
-          ;; those rows were written to — the seventh writer, and the one that
-          ;; builds no `:kind :table` literal for a grep to find.
+          ;; `working` holds ROWS for a refreshed TABLE, because that is what
+          ;; `recompute` threads from an ancestor to its descendants; a
+          ;; refreshed REPORT has no rows to thread (nothing derives further
+          ;; from a report) and contributes its own ready-made events to
+          ;; `events` instead — see `refresh-events`. What lands in the LOG
+          ;; for a table is the handle those rows were written to — the
+          ;; seventh writer, and the one that builds no `:kind :table`
+          ;; literal for a grep to find.
           (when (seq refreshed)
-            (sub/commit! st {:op :tx :events (mapv (fn [cid]
-                                                     {:op :assoc :id cid :path [:value]
-                                                      :value (tbl/table-value @lake/lake cid
-                                                                              (get working cid))})
-                                                   refreshed)}))
+            (sub/commit! st {:op :tx :events (into events
+                                                    (mapv (fn [cid]
+                                                            {:op :assoc :id cid :path [:value]
+                                                             :value (tbl/table-value @lake/lake cid
+                                                                                     (get working cid))})
+                                                          (keys working)))}))
           {:state (state-payload st) :refreshed refreshed :skipped skipped})))
     (catch Exception e {:error (.getMessage e)})))
 
@@ -2506,6 +2977,29 @@
    ids under it — the failure § 7 of the 2026-08-09 forensics is about."
   [st prefix]
   (next-id-in (sub/objects st) prefix))
+
+(defn- run-minter
+  "A `mint-id` for one sandbox run — `(fn [prefix] …)`, `loci.sandbox/context`'s
+   fourth argument, and the one `compute-clj!` also uses for its own `fid`/`oid`.
+   `next-id-in` over one snapshot of `objm`, never repeating a prefix within
+   the run: ids already issued are folded back in on every call.
+
+   Nothing commits until the run's single `:tx` at the end, so the log does
+   not change between two mints and a bare `next-id-in` would hand two calls
+   for the SAME prefix the same id — the second `:put` silently replacing the
+   first. That is the shape that destroyed three notebooks on 2026-07-23
+   (`next-id`'s docstring), which is why `next-id-in` exists at all, and it is
+   also why `compute-clj!` mints `fid`/`oid` through THIS rather than a second
+   bare `next-id-in objm ...` call: `oid`, when the result is a table, shares
+   `keep!`'s own `tbl:derived-` prefix, so a run that both `keep!`s and
+   returns rows must not let compute's own mint and the sandbox's disagree
+   about what has already been issued."
+  [objm]
+  (let [issued (atom {})]
+    (fn [prefix]
+      (let [id (next-id-in (merge objm @issued) prefix)]
+        (swap! issued assoc id true)
+        id))))
 
 (defn findings-prefix
   "The `find:` prefix a notebook's findings documents are minted under:

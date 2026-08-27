@@ -464,3 +464,88 @@
         p2 (tbl/page ts h {:limit 100 :cursor (:next p1)})]
     (is (= 0   (:offset p1)) "page one starts at row zero")
     (is (= 100 (:offset p2)) "and page two says so without the caller counting")))
+
+;; ---------------------------------------------------------------------------
+;; a table answers a question: query and create-from-spec
+;; ---------------------------------------------------------------------------
+
+(def qrows
+  (vec (for [n (range 30)]
+         {:region (str "r" (mod n 3)) :v (double n) :name (str "n" n)})))
+
+(deftest inline-query-groups-and-totals
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)
+        r  (tbl/query ts h {:group_by "region" :measure "v" :agg "sum"})]
+    (is (= 3 (:total r)) ":total is the answer's size, not the page's")
+    (is (= 3 (count (:rows r))))
+    (is (= 435.0 (reduce + (map :v (:rows r)))) "every row is summed, not a sample")))
+
+(deftest inline-query-returns-keyword-keys
+  ;; The two stores implement ONE protocol method and must agree on key type.
+  ;; viewspec builds a grouped row with (array-map (name gb) ...), which is a
+  ;; String key; Lake/query returns keywords via sub/col-kw. Without this,
+  ;; (:region row) reads nil on one store and works on the other, and nothing
+  ;; notices until far downstream.
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)]
+    (doseq [spec [{:group_by "region" :measure "v" :agg "sum"}
+                  {:group_by "region" :agg "count"}
+                  {}]]
+      (let [row (first (:rows (tbl/query ts h spec)))]
+        (is (every? keyword? (keys row))
+            (str "string keys leaked for " (pr-str spec) ": " (pr-str (keys row))))))
+    (is (= #{"r0" "r1" "r2"}
+           (set (map :region (:rows (tbl/query ts h {:group_by "region" :measure "v"}))))))))
+
+(deftest inline-query-total-survives-a-limit
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)
+        r  (tbl/query ts h {:limit 4})]
+    (is (= 4 (count (:rows r))))
+    (is (= 30 (:total r)) ":total must be the full answer, or a report lies about it")
+    (is (true? (:capped r)))))
+
+(deftest inline-query-is-not-capped-when-it-fits
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)]
+    (is (false? (:capped (tbl/query ts h {:limit 100}))))
+    (is (false? (:capped (tbl/query ts h {}))))))
+
+(deftest inline-query-filters
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)]
+    (is (= 20 (:total (tbl/query ts h {:filter {:col "v" :op ">" :val 9}}))))
+    (is (= 10 (:total (tbl/query ts h {:filter {:col "region" :op "=" :val "r0"}}))))
+    (is (= 20 (:total (tbl/query ts h {:filter {:col "region" :op "≠" :val "r0"}}))))
+    (is (= 11 (:total (tbl/query ts h {:filter {:col "name" :op "contains" :val "N1"}})))
+        "contains is case-insensitive: n1 plus n10..n19")))
+
+(deftest inline-query-min-and-max
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)]
+    (is (= 0.0  (:v (first (:rows (tbl/query ts h {:group_by "region" :measure "v" :agg "min"}))))))
+    (is (= 27.0 (:v (first (:rows (tbl/query ts h {:group_by "region" :measure "v" :agg "max"}))))))))
+
+(deftest inline-column-profile
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:p"
+                          (vec (for [n (range 40)]
+                                 {:region (str "r" (mod n 3))
+                                  :v (double n)
+                                  :note (str "unique-" n)})))
+        p  (tbl/column-profile ts h)]
+    (is (= [:region :v :note] (:cols p)))
+    (is (= [:v] (:numeric p)))
+    (is (= [:region] (:categorical p)) ":note has 40 distinct values — not a category")
+    (is (= 40 (:rows p)))))
+
+(deftest inline-create-from-spec-returns-a-handle
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:q" qrows)
+        h2 (tbl/create-from-spec ts h {:group_by "region" :measure "v" :agg "sum"}
+                                 "tbl:derived-1" "By region")]
+    (is (tbl/handle? h2))
+    (is (= 3 (:rows h2)))
+    (is (= 3 (count (tbl/rows ts h2 {}))))
+    (is (every? keyword? (keys (first (tbl/rows ts h2 {})))))))

@@ -9,7 +9,9 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [honey.sql :as sql]
             [loci.config :as config]
+            [loci.honeyq :as hq]
             [loci.sourcespec :as ssp]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]))
@@ -147,6 +149,52 @@
   (with-open [st (.createStatement (conn-of lk))
               rs (.executeQuery st sql)]
     (rs->maps rs ks unwrap)))
+
+(def batch-rows
+  "Rows handed to `reduce-rows`'s function at a time. **2048 because that is
+   DuckDB's vector**, and `setFetchSize` is accepted and silently ignored —
+   verified 2026-08-27. Not ours to tune."
+  2048)
+
+(defn reduce-rows
+  "Fold `f` over every row of `sql`, one batch at a time. `f` is
+   `(fn [acc batch] …)` where `batch` is a vector of row maps.
+
+   **Takes the reducing function so it owns the scope.** It does not hand back a
+   lazy seq: one escaping `with-open` is the classic Clojure bug, and `q` closes
+   its statement on the way out.
+
+   **What this bounds is RETENTION, and not time.** Measured 2026-08-27 over
+   1,000,000 rows of four columns: advancing the cursor costs 4,954 ms, reading
+   the four columns costs 22,297 ms, and building maps takes it to 27,335 ms —
+   so 82% of the cost is the driver and batching saves the other 18%. It does not
+   bound allocation pressure either: over 857,142 rows with batches dropped every
+   2,048, observed heap still rose to 506 MB between collections.
+
+   Retained heap for a whole 1,000,000-row result was 220 MB — 231 bytes a row —
+   so on any modern heap **time is the binding constraint, not memory**.
+
+   DuckDB's JDBC does stream: `executeQuery` over 1,000,000 rows returns in 18 ms
+   and the first row in 1 ms.
+
+   `f` is never called with an empty batch, so an empty result returns `init`."
+  [lk sql f init]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (let [md (.getMetaData rs)
+          n  (.getColumnCount md)
+          ks (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n))]
+      (loop [acc init]
+        (let [batch (loop [i 0, b (transient [])]
+                      (if (and (< i batch-rows) (.next rs))
+                        (recur (inc i)
+                               (conj! b (into {} (map-indexed
+                                                   (fn [idx k] [k (unwrap (.getObject rs (inc idx)))])
+                                                   ks))))
+                        (persistent! b)))]
+          (if (seq batch)
+            (recur (f acc batch))
+            acc))))))
 
 (defn- extension-dir
   "Where DuckDB should keep its extensions, or nil to leave DuckDB's own default
@@ -1278,6 +1326,71 @@
                                     " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
+(def ^:private numeric-type-re
+  "Matched, case-insensitively, against a `DESCRIBE`d column's `column_type` to
+   decide `column-profile`'s `:numeric`.
+
+   The task that specified this listed `integer/decimal/double/float/real/
+   hugeint/numeric`, and that set alone misses the type DuckDB actually gives a
+   JSON integer: measured 2026-08-27, `put-rows!` over `{:i 1}` — the path every
+   agent-authored table and CSV import takes — types the column `BIGINT`, which
+   contains none of those seven words. `bigint`/`smallint`/`tinyint` are added
+   for that reason, as substrings so the unsigned forms (`UBIGINT`, `USMALLINT`,
+   `UTINYINT`, `UINTEGER`) match too without being spelled out.
+
+   Not widened to a bare `int`, even though every name above already contains
+   it: DuckDB's `INTERVAL` type contains `int` as well (*int*erval) and is not a
+   number."
+  #"(?i)integer|decimal|double|float|real|hugeint|numeric|bigint|smallint|tinyint")
+
+(defn relation-of
+  "A handle as a HoneySQL FROM entry, through `from-of`.
+
+   **A subquery map, not a bare `[:raw …]`.** DuckDB refuses an alias directly on
+   a versioned relation — `FROM t AT (VERSION => 1) AS x` is
+   `Parser Error: syntax error at or near \"AS\"` — so it has to be wrapped to be
+   aliasable at all, which is also what lets one query join two tables. Verified
+   2026-08-27.
+
+   **`from-of` and not a table name, and that is the whole fix.** This function
+   first read `(:table h)` and `(:snapshot h)` directly, which a `:source`
+   handle does not have, so `query_table` on a passthrough table threw an NPE
+   inside `ident`. `from-of` answers for both stores AND renames a source's
+   columns to loci's inside the FROM — see its docstring for the binder error
+   that rename prevents."
+  [h]
+  {:select [:*] :from [[[:raw (from-of h)]]]})
+
+(defn create-from-sql!
+  "Materialise any SQL SELECT as a new lake table and return the handle.
+
+   `create-from-relation!`'s sibling for a QUERY rather than a file, and the
+   difference is `:cols`. `create-from-relation!` is given `describe`'s columns
+   because it is reading a file whose header it just read. A query's columns are
+   **not** the source's — `SELECT region, SUM(v) AS v` has two whatever the
+   source had — so they are read back off the result with `DESCRIBE`.
+
+   Getting this wrong writes a handle whose `:cols` name columns the table does
+   not have, and every later read of it fails with `Binder Error: Referenced
+   column not found` — the same failure `loci.source`'s docstring records for a
+   passthrough handle carrying half a recipe."
+  [lk id sql]
+  (let [table (table-name id (System/nanoTime))]
+    (x! lk (str "CREATE TABLE " table " AS " sql))
+    {:store :lake :table table :snapshot (current-snapshot lk)
+     :rows  (:n (first (q lk (str "SELECT count(*) AS n FROM " table))))
+     :cols  (mapv #(sub/col-kw (:column_name %))
+                  (q lk (str "DESCRIBE SELECT * FROM " table)))}))
+
+(defn- run-honey
+  "Format `hq` with values inlined and run it. One string, so `q` is unchanged.
+
+   Inlined rather than parameterised because loci is single-user and personal —
+   decided 2026-08-27. HoneySQL emits parameters separately if that ever changes,
+   so the work would be a JDBC path and not a rewrite."
+  [lk hq]
+  (q lk (first (sql/format hq {:inline true}))))
+
 (extend-type Lake
   tbl/TableStore
   (put-rows! [lk id rs]
@@ -1392,7 +1505,46 @@
 
   (column-samples [lk h per-col max-cols]
     (sample-cache lk (samples-version h) (from-of h)
-                  (vec (take max-cols (:cols h))) per-col)))
+                  (vec (take max-cols (:cols h))) per-col))
+
+  (column-profile [lk h]
+    ;; `from-of`, not `relation-of` — `relation-of` reads `(:table h)` and
+    ;; `(:snapshot h)` directly and only a `:lake` handle has either. `from-of`
+    ;; is the function `rows` and `column-samples` already use for exactly this
+    ;; reason: it is snapshot-pinned SQL text for a `:lake` handle and a renamed
+    ;; `read_csv`/passthrough relation for a `:source` one, so one query works
+    ;; for both handle shapes this store answers for.
+    (let [cols    (:cols h)
+          types   (into {}
+                        (map (fn [r] [(sub/col-kw (:column_name r)) (:column_type r)]))
+                        (q lk (str "DESCRIBE SELECT * FROM " (from-of h))))
+          numeric (vec (filter #(re-find numeric-type-re (str (types %))) cols))
+          numset  (set numeric)
+          samples (tbl/column-samples lk h 13 (count cols))
+          categorical (vec (for [c cols
+                                  :when (and (not (numset c))
+                                             (<= 2 (count (get samples c)) 12))]
+                              c))]
+      {:cols cols :numeric numeric :categorical categorical :rows (:rows h)}))
+
+  (query [this handle spec]
+    (let [rel   (relation-of handle)
+          base  (hq/->honey (dissoc spec :limit) rel)
+          ;; Count FIRST, always. Measured 2026-08-27 over 1,000,000 rows: the
+          ;; GROUP BY costs 20 ms and this costs 6 ms, because DuckDB answers a
+          ;; grouped count from the cardinality and never computes the sums.
+          ;; It is also the PARSE CHECK — HoneySQL emits wrong SQL rather than
+          ;; raising, and this is where DuckDB says so before any result is
+          ;; trusted.
+          total (long (:n (first (run-honey this (hq/->count base)))))
+          lim   (or (:limit spec) tbl/max-query-rows)
+          rows  (vec (run-honey this (assoc base :limit lim)))]
+      {:rows rows :total total :capped (> total (count rows))}))
+
+  (create-from-spec [this handle spec id _title]
+    (create-from-sql! this id
+                      (first (sql/format (hq/->honey (dissoc spec :limit) (relation-of handle))
+                                         {:inline true})))))
 
 (defn sweep!
   "Automatic table GC. Disabled, deliberately, and it reports that rather than

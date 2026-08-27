@@ -12,8 +12,7 @@
             [loci.lake :as lake]
             [loci.notebook :as nb]
             [loci.substrate :as sub]
-            [loci.tablestore :as tbl]
-            [loci.viewspec :as vs]))
+            [loci.tablestore :as tbl]))
 
 (defn- table-objs [st] (->> (sub/objects st) vals (filter #(= :table (:kind %)))))
 
@@ -86,15 +85,20 @@
                :parameters {:type "object" :properties {}}}}
    {:type "function"
     :function {:name "query_table"
-               :description "Filter / group / aggregate a table and return the resulting rows. Use this for any exact figure — never guess."
+               :description (str "Filter / group / aggregate a table and return the resulting "
+                                 "rows. Runs in DuckDB over every row — use this for any exact "
+                                 "figure, never guess. The reply carries `total`, the answer's "
+                                 "true size; when `capped` is true you were given a page of it, "
+                                 "so aggregate further, add a limit, or set save_as to keep all "
+                                 "of it as a new table.")
                :parameters {:type "object"
                             :properties {:table_id {:type "string"}
                                          :group_by {:type "string" :description "column to group by (optional)"}
                                          :measure  {:type "string" :description "numeric column to aggregate (optional)"}
-                                         :agg      {:type "string" :enum ["sum" "avg" "count"]}
+                                         :agg      {:type "string" :enum ["sum" "avg" "count" "min" "max"]}
                                          :filter   {:type "object"
                                                     :properties {:col {:type "string"}
-                                                                 :op {:type "string" :enum ["=" ">" "<"]}
+                                                                 :op {:type "string" :enum ["=" "≠" ">" "<" "contains"]}
                                                                  :val {}}}
                                          :sort     {:type "string" :enum ["asc" "desc"]}
                                          :limit    {:type "integer"}
@@ -144,25 +148,45 @@
                       at (assoc :reclaimed at))))
           os)))
 
+(defn why-unreadable
+  "Why this table's rows must not be acted on, or nil.
+
+   **`reclaimed-at` first, because it answers without fetching rows.** Asking
+   `unusable` means hydrating, and `hydrate` reads a `mold-cap` sample — about
+   0.28 s of JDBC for a wide table, on every `query_table` call, to answer a
+   question the catalog already knows. Measured 2026-08-17: one catalog round
+   trip costs 3.5 ms.
+
+   `hydrate` is still the fallback for a `:source` handle, because a passthrough
+   table's file can vanish or change its header with no event committed, and
+   `reclaimed-at` answers nil for such a handle by design — see its docstring.
+
+   Public since 2026-08-27: `server/compute-clj!` calls this too, rather than
+   growing a second copy of the rule — `tools.clj` and `server.clj` each had a
+   private `store+handle` before Task 7 of the query-pushdown plan merged
+   them, and that is the pattern this avoids repeating."
+  [ts h o]
+  (if (= :source (:store h))
+    (tbl/unusable (tbl/hydrate lake/lake o))
+    (when-let [at (tbl/reclaimed-at ts h)]
+      (str "its rows were reclaimed at " (tbl/reclaimed-str at)))))
+
 (defn- do-query [st {:keys [table_id save_as] :as args}]
-  (if-let [o (some->> (sub/object st table_id) (tbl/hydrate lake/lake))]
-    ;; `hydrate` degrades an unusable table to `:value []` rather than throwing,
-    ;; so without this the tool answers `{:rows []}` — "your filter matched
-    ;; nothing" — and the model reports a real zero. Worse on the `save_as` path,
-    ;; where it would commit an empty derived table over the answer. An `:error`
-    ;; naming the reason is something the model can act on and say out loud, and
-    ;; `tbl/unusable` is where every reader gets that sentence — a reclamation,
-    ;; a source file that is gone, a source whose columns moved.
-    (if-let [why (tbl/unusable o)]
-      {:error (str "table " table_id " cannot be read: " why)}
-      (let [spec (assoc (select-keys args [:group_by :measure :agg :filter :sort :limit]) :kind "table")
-            rendered (vec (take 200 (:rendered (vs/interpret spec (:value o)))))]
-        (if save_as
-          (let [nid (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
-                obj (tbl/table-object @lake/lake nid save_as rendered)]
-            (sub/commit! st {:op :put :id nid :value obj})
-            {:saved_as nid :rows rendered})
-          {:rows rendered})))
+  (if-let [o (sub/object st table_id)]
+    (if-let [[ts h] (tbl/store+handle lake/lake o)]
+      (if-let [why (why-unreadable ts h o)]
+        {:error (str "table " table_id " cannot be read: " why)}
+        (let [spec (select-keys args [:group_by :measure :agg :filter :sort :limit])]
+          (if save_as
+            (let [nid  (str "tbl:derived-" (count (table-objs st)) "-" (inc (rand-int 9999)))
+                  h2   (tbl/create-from-spec ts h spec nid save_as)
+                  tobj {:id nid :kind :table :title save_as :value h2
+                        :from table_id :via "query_table"}]
+              (sub/commit! st {:op :put :id nid :value tobj})
+              {:saved_as nid :rows (:rows h2)})
+            (let [r (tbl/query ts h spec)]
+              {:rows (:rows r) :total (:total r) :capped (:capped r)}))))
+      {:error (str "table " table_id " has no rows")})
     {:error (str "no table " table_id)}))
 
 ;; Through `loci.config`, like every other configured value: `TAVILY_API_KEY` is

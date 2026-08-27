@@ -477,11 +477,24 @@
     (is (:error (srv/fn-preview st "tbl:t" nil {})))
     (is (= before (count (sub/history st))))))            ; nothing committed
 
-(deftest fn-preview-surfaces-empty-result-as-error
+(deftest fn-preview-reports-a-pushed-down-empty-match-honestly
+  ;; Renamed from `fn-preview-surfaces-empty-result-as-error`, 2026-08-27:
+  ;; `lib:filter` now carries a `:spec`, so "revenue > 9999" matching nothing
+  ;; is a real, pushed-down DuckDB answer — the same shape `query_table
+  ;; :save_as` already treats as legitimate in
+  ;; `a-save_as-that-filtered-everything-out-is-an-empty-table`
+  ;; (tools_test.clj), not a possibly-broken transform. `fnlib/run-fn`'s
+  ;; "empty output is an honest error" guard exists to catch AGENT-WRITTEN
+  ;; Clojure that may have malfunctioned; a declarative SQL filter carries no
+  ;; such ambiguity — DuckDB either answers or the `try` around `fn-preview`
+  ;; catches a real exception — so `:error` is no longer the right shape here.
+  ;;
+  ;; Old: (is (:error r)) and (is (nil? (:after r))).
   (let [st (store-with-table)
         r (srv/fn-preview st "tbl:t" "lib:filter" {:col "revenue" :op ">" :value "9999"})]
-    (is (:error r))                                       ; honest "no rows came out"
-    (is (nil? (:after r)))))                              ; not an empty table
+    (is (nil? (:error r)))
+    (is (= [] (:after r)))
+    (is (= 0 (:count r)))))
 
 (deftest store-at-clamps-and-freezes
   (let [st (sub/fresh-store)]
@@ -585,9 +598,14 @@
   ;; stopped; the marker check is what replaces that.
   ;;
   ;; **The `via` here has to be an aggregate, and that is the whole test.**
-  ;; Measured 2026-08-17: all six `lib:` builtins answer "no rows came out —
+  ;; Measured 2026-08-17: every `lib:` builtin answered "no rows came out —
   ;; nothing to keep" for an empty input, so with a `lib:` via the marker
-  ;; changes only the message a skip reports. An agent-written fn that counts
+  ;; changed only the message a skip reports. Since 2026-08-27 that is no
+  ;; longer all six: `lib:filter` and `lib:group` are pushed down and answer
+  ;; an empty match honestly rather than erroring (see
+  ;; `fn-preview-reports-a-pushed-down-empty-match-honestly`); the other four
+  ;; still route through `fnlib/run-fn` and this reasoning still holds for
+  ;; them. An agent-written fn that counts
   ;; returns `[{:n 0}]` from no rows — non-empty, so nothing downstream refuses
   ;; it — and `rerun!` commits it over the good table and reports success.
   ;; Sabotaged, this test goes from `[{:n 100}]` to `[{:n 0}]` and `:refreshed`.
@@ -781,18 +799,25 @@
 (deftest compute-retries-once-with-error-feedback
   ;; live-fire finding: one bad LLM sample ("Could not resolve symbol")
   ;; coin-flipped the whole flow. One retry, error fed back, then honest.
+  ;;
+  ;; OLD (pre-2026-08-27): the retry's code was `(mapv #(assoc % :x 1) rows)`
+  ;; — an expression over the `rows` binding compute-clj! no longer provides.
+  ;; NEW: `q` against `table`, the sandbox's query surface.
   (let [calls (atom [])]
     (with-redefs [agent/make-clj-transform
-                  (fn [cols sample prompt & [prev-code err]]
+                  (fn [profile samples prompt prev-code err]
                     (swap! calls conj err)
-                    (if err "(mapv #(assoc % :x 1) rows)" "(bad"))]
+                    (if err "(q {:select [:* [1 :x]] :from [[table :t]]})" "(bad"))]
       (let [st (store-with-table)
-            r  (srv/compute-clj! st "tbl:t" "add x" nil)]
+            r  (srv/compute-clj! st "tbl:t" "add x" nil)
+            fo (sub/object st (:via (sub/object st (:openId r))))]
         (is (nil? (:error r)))
         (is (= 2 (count @calls)))
         (is (nil? (first @calls)))                        ; first attempt: no error context
         (is (string? (second @calls)))                    ; retry got the eval error
-        (is (= 1 (:x (first (rows-of st (:openId r))))))))))
+        (is (= 1 (:x (first (rows-of st (:openId r))))))
+        (is (= "(q {:select [:* [1 :x]] :from [[table :t]]})" (get-in fo [:value :code]))
+            "the SECOND attempt's code is what landed as the :fn, not the bad first one")))))
 
 (deftest compute-fails-honestly-after-two-bad-attempts
   (with-redefs [agent/make-clj-transform (fn [& _] "(bad")]
@@ -845,7 +870,7 @@
     st))
 
 (deftest compute-mints-past-the-highest-id-not-past-the-count
-  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+  (with-redefs [agent/make-clj-transform (fn [& _] "(q {:select [:* [1 :x]] :from [[table :t]]})")]
     (let [st     (store-with-a-gap-between-count-and-max)
           before (count (sub/history st))
           r      (srv/compute-clj! st "tbl:x" "add x" nil)
@@ -868,7 +893,7 @@
   ;; count numbered every source's functions off one running total, so the FIRST
   ;; function over a brand-new table came out `fn:y-2`. Two sources, because one
   ;; source cannot tell "counts the store" from "counts this source".
-  (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+  (with-redefs [agent/make-clj-transform (fn [& _] "(q {:select [:* [1 :x]] :from [[table :t]]})")]
     (let [st (store-with-a-gap-between-count-and-max)]
       (sub/commit! st {:op :put :id "tbl:y"
                        :value {:id "tbl:y" :kind :table :title "Y" :value trows}})
@@ -4332,7 +4357,7 @@
         (is (landed? (:openId (srv/fn-apply! st "tbl:t" "lib:top"
                                              {:by "revenue" :n "1" :order "desc"} nil)))
             "the ƒ apply")
-        (with-redefs [agent/make-clj-transform (fn [& _] "(mapv #(assoc % :x 1) rows)")]
+        (with-redefs [agent/make-clj-transform (fn [& _] "(q {:select [:* [1 :x]] :from [[table :t]]})")]
           (is (landed? (:openId (srv/compute-clj! st "tbl:t" "add x" nil)))
               "compute-clj!"))))))
 
@@ -4445,10 +4470,18 @@
   ;; the other half of the same measurement: this path refuses upstream, so the
   ;; empty branch of `tbl/table-object` is unreachable from here — do not "fix"
   ;; compute by removing a guard it does not use.
-  (with-redefs [agent/make-clj-transform (fn [& _] "(filterv (fn [_] false) rows)")]
+  ;;
+  ;; OLD (pre-2026-08-27): `"(filterv (fn [_] false) rows)"`, and the error was
+  ;; "the function did not return rows" — `run-clj-rows`'s own wording. NEW:
+  ;; a `q` that filters everything out returns `[]`, `shape-of` answers nil for
+  ;; an empty sequential (same as any other unrecognised shape), and
+  ;; `compute-clj!`'s message now names all three shapes it will accept.
+  (with-redefs [agent/make-clj-transform
+                (fn [& _] "(q {:select [:*] :from [[table :t]] :where [:= 1 0]})")]
     (let [st (store-with-table)
           r  (srv/compute-clj! st "tbl:t" "keep nothing" nil)]
-      (is (= "compute failed: the function did not return rows" (:error r))))))
+      (is (= "compute failed: the function returned neither rows, nor report blocks, nor text"
+             (:error r))))))
 
 (deftest rerun-writes-a-handle-and-not-the-refreshed-rows
   ;; The seventh writer, and the one no grep for `:kind :table` finds: `rerun!`
@@ -4624,7 +4657,13 @@
             "the scan walks PAST the reclaimed output to the live table behind it")
         ;; and the flow runs to the end. The model is stubbed — what is being
         ;; measured is which table the step was handed, not what it computed.
-        (with-redefs [agent/make-clj-transform (fn [& _] "(fn [rows] rows)")]
+        ;;
+        ;; OLD (pre-2026-08-27): `"(fn [rows] rows)"` — a one-arg function over
+        ;; the `rows` binding. NEW: a sandboxed function is called with NO
+        ;; arguments, so a one-arg `(fn [rows] rows)` would itself throw an
+        ;; arity error now; a plain `q` is the equivalent expression.
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
           (let [r (srv/run-flow! st "flow:f")]
             (is (= "done" (:status r))
                 "the flow completes rather than failing at a table it never needed")))))))
@@ -5830,3 +5869,936 @@
         (is (= 8 (count counts)))
         (is (= [1 1 1 1 1 1 1 1] counts)
             "a share of zero is floored at one row, not at an empty grid")))))
+
+;; ---------------------------------------------------------------------------
+;; Task 7 — the ƒ palette applies to every row, not `mold-cap`
+;;
+;; 2,500 rows everywhere: above `mold-cap` (2,000), so a regression here would
+;; pass with the sampling bug present. Params are keyword-keyed throughout —
+;; verified against `body-json`'s `:key-fn keyword`, which keywordizes every
+;; level of a JSON body including a nested `params` object, and against every
+;; existing `fn-preview`/`fn-apply!` test in this file, all of which already
+;; call with keyword keys. String keys, as an earlier draft of this test used,
+;; silently produce `{:col nil :op nil :val nil}` through `{:keys […]}`
+;; destructuring — confirmed at the REPL — so this is a correction to reality,
+;; not a stylistic choice.
+;; ---------------------------------------------------------------------------
+
+(deftest fn-apply-filters-every-row
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r   (srv/fn-apply! st "tbl:big" "lib:filter"
+                                 {:col "n" :op ">" :value "499"} nil)
+              obj (sub/object st (:openId r))]
+          (is (= 2000 (:rows (:value obj)))
+              "1,500 here means the derived table was built from a 2,000-row sample")
+          (is (= :lake (:store (:value obj)))
+              "and it must be handle-backed — CREATE TABLE AS, not rows through the JVM"))))))
+
+(deftest fn-apply-groups-every-row
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r   (srv/fn-apply! st "tbl:big" "lib:group"
+                                 {:by "region" :measure "v" :agg "sum"} nil)
+              rs  (tbl/rows @lake/lake (:value (sub/object st (:openId r))) {})]
+          (is (= 5 (count rs)))
+          (is (= 2500.0 (double (reduce + (map :v rs))))
+              "2000.0 would mean the group ran over the sample"))))))
+
+(deftest fn-preview-reports-the-true-count
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (srv/fn-preview st "tbl:big" "lib:filter"
+                                {:col "n" :op ">" :value "499"})]
+          (is (= 8 (count (:after r))) "a preview is still eight rows")
+          (is (= 2000 (:count r)) "but the count is the whole answer")
+          (is (nil? (:sampled r)) "a pushed-down verb is not sampled"))))))
+
+(deftest fn-preview-says-when-it-sampled
+  ;; lib:share has no :spec — it runs in Clojure. Preview must SAY it only saw
+  ;; part of the table, or a preview reads as the answer.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (srv/fn-preview st "tbl:big" "lib:share" {:col "v"})]
+          (is (some? (:sampled r)))
+          (is (= 2500 (:of (:sampled r)))))))))
+
+(deftest fn-apply-runs-a-clojure-verb-over-every-row
+  ;; lib:share is not pushed down, so apply must still see all 2,500 rows.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r  (srv/fn-apply! st "tbl:big" "lib:share" {:col "v"} nil)
+              rs (tbl/rows @lake/lake (:value (sub/object st (:openId r))) {})]
+          (is (= 2500 (count rs)) "2,000 would mean the sample was used")
+          (is (every? #(= 0.04 (Double/parseDouble (format "%.2f" (:share_pct %)))) (take 5 rs))
+              "each row's share of 2,500 equal values is 0.04%"))))))
+
+;; ---------------------------------------------------------------------------
+;; Task 10 — compute-clj! grows up: a query surface, three shapes, one :tx
+;;
+;; `agent/make-clj-transform` is stubbed with `with-redefs` throughout, so
+;; every test here is deterministic and makes no network call.
+;; ---------------------------------------------------------------------------
+
+(deftest compute-returns-a-table-for-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [[[:count :*] :n]] :from [[table :t]]})")]
+          (let [r (srv/compute-clj! st "tbl:big" "count them" nil)]
+            (is (nil? (:error r)))
+            (is (= :table (:kind (sub/object st (:openId r)))))
+            (is (= 2500 (long (:n (first (rows-of st (:openId r)))))))))))))
+
+(deftest compute-returns-a-report-for-blocks
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]] :limit 5})]"
+                             "  [{:block :heading :text \"Report\"}"
+                             "   {:block :ref :id id}])"))]
+          (let [r   (srv/compute-clj! st "tbl:big" "report" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)))
+            (is (= :report (:kind obj)))
+            (is (= 2 (count (:value obj))))
+            (is (= :ref (:block (second (:value obj)))))
+            (is (some? (sub/object st (:id (second (:value obj)))))
+                "the ref must point at a table the same :tx committed")))))))
+
+(deftest compute-returns-a-doc-for-a-string
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform (fn [& _] "\"There are 2500 rows.\"")]
+          (let [r   (srv/compute-clj! st "tbl:big" "summarize" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)))
+            (is (str/starts-with? (:openId r) "doc:"))
+            (is (= :doc (:kind obj)))
+            (is (= "There are 2500 rows." (:value obj)))))))))
+
+(deftest compute-two-keep-calls-mint-two-distinct-ids
+  ;; The 2026-07-23 bug, reached through a new door: nothing commits until this
+  ;; run's one :tx, so if the two keep! calls below were handed the same id,
+  ;; the second :put would silently replace the first and only ONE table would
+  ;; survive the commit — see `run-minter`'s docstring.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [a (keep! \"A\" {:select [:*] :from [[table :t]] :limit 5})"
+                             "      b (keep! \"B\" {:select [:*] :from [[table :t]] :limit 6})]"
+                             "  [{:block :ref :id a} {:block :ref :id b}])"))]
+          (let [r    (srv/compute-clj! st "tbl:big" "two tables" nil)
+                obj  (sub/object st (:openId r))
+                aid  (:id (first (:value obj)))
+                bid  (:id (second (:value obj)))]
+            (is (nil? (:error r)))
+            (is (some? aid)) (is (some? bid))
+            (is (not= aid bid)
+                "two keep! calls in one run must mint two DIFFERENT ids")
+            (is (= :table (:kind (sub/object st aid))))
+            (is (= :table (:kind (sub/object st bid))))
+            (is (= 5 (count (rows-of st aid))) "A kept :limit 5")
+            (is (= 6 (count (rows-of st bid))) "B kept :limit 6 — both must survive distinctly")))))))
+
+(deftest compute-commits-once-and-undo-takes-it-all
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [a (keep! \"A\" {:select [:*] :from [[table :t]] :limit 5})"
+                             "      b (keep! \"B\" {:select [:*] :from [[table :t]] :limit 6})]"
+                             "  [{:block :ref :id a} {:block :ref :id b}])"))]
+          (let [before (count (sub/objects st))
+                r      (srv/compute-clj! st "tbl:big" "two tables" nil)]
+            (is (nil? (:error r)))
+            (is (= (+ before 4) (count (sub/objects st))) "report + fn + two tables")
+            (sub/undo! st)
+            (is (= before (count (sub/objects st)))
+                "one :tx means one undo removes the report and both tables")))))))
+
+(deftest compute-records-what-it-read-across-two-tables
+  ;; A one-table version of this test would pass trivially — `:reads` holding
+  ;; just the run's own `id` proves nothing about whether it came from `q` or
+  ;; was hard-coded. Two tables, joined through `tables`, is the version that
+  ;; can actually fail.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            ha (tbl/put-rows! @lake/lake "tbl:a" (vec (for [n (range 30)] {:n n})))
+            hb (tbl/put-rows! @lake/lake "tbl:b" (vec (for [n (range 20)] {:m n})))]
+        (sub/commit! st {:op :put :id "tbl:a" :value {:id "tbl:a" :kind :table :title "A" :value ha}})
+        (sub/commit! st {:op :put :id "tbl:b" :value {:id "tbl:b" :kind :table :title "B" :value hb}})
+        (sub/commit! st {:op :put :id "space:s"
+                         :value {:id "space:s" :kind :space :title "S"
+                                 :value {:intent "i" :cells [{:ref "tbl:a"} {:ref "tbl:b"}]}}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        "(q {:select [:*] :from [[table :t] [(get tables \"tbl:b\") :b]] :limit 3})")]
+          (let [r  (srv/compute-clj! st "tbl:a" "join them" "space:s")
+                fo (first (filter #(= :fn (:kind %)) (vals (sub/objects st))))]
+            (is (nil? (:error r)))
+            (is (= #{"tbl:a" "tbl:b"} (set (:reads (:value fo))))
+                ":reads must come from what q actually resolved, never parsed out of the code")))))))
+
+(deftest compute-has-no-rows-binding
+  ;; The enforcement `loci.sandbox`'s namespace docstring describes: code
+  ;; referencing `rows` gets an honest eval error, not a silent empty answer.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 10)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform (fn [& _] "rows")]
+          (let [r (srv/compute-clj! st "tbl:big" "give me rows" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "rows")
+                "the failure is reported honestly, not swallowed into an empty result")))))))
+
+(deftest compute-group-by-covers-every-row-not-a-sample
+  ;; Exactness: 2,500 rows is above `tbl/mold-cap` (2,000). Summing 2,000.0
+  ;; would mean the model was handed a sample; q groups over the whole table.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        "(q {:select [:region [[:sum :v] :v]] :from [[table :t]] :group-by [:region]})")]
+          (let [r  (srv/compute-clj! st "tbl:big" "sum by region" nil)
+                rs (rows-of st (:openId r))]
+            (is (nil? (:error r)))
+            (is (= 5 (count rs)))
+            (is (= 2500.0 (double (reduce + (map :v rs))))
+                "2,000.0 would mean a mold-cap sample came back, not every row")))))))
+
+;; `compute-retries-once-with-error-feedback`, far above, already covers the
+;; retry contract — the stub is called twice and the SECOND attempt's code is
+;; what lands as the :fn — so it is not duplicated here.
+
+(deftest compute-keep-and-a-table-result-in-one-run-do-not-collide
+  ;; A second seam the same bug can reach through: when the result itself is a
+  ;; table, `oid` shares `keep!`'s own "tbl:derived-" prefix. A run that BOTH
+  ;; keep!s an interim table AND returns rows as its own answer must mint past
+  ;; whatever the sandbox already issued, not repeat it — `compute-clj!` mints
+  ;; `oid` through the SAME `mint-id` the sandbox context uses for exactly
+  ;; this reason. Not one of the plan's nine; added because reasoning through
+  ;; `run-minter`'s placement surfaced this as the same defect wearing a
+  ;; different call order.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 10)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [a (keep! \"Interim\" {:select [:*] :from [[table :t]] :limit 3})]"
+                             "  (q {:select [:*] :from [[table :t]] :limit 4}))"))]
+          (let [before (count (sub/objects st))
+                r      (srv/compute-clj! st "tbl:big" "keep and return" nil)]
+            (is (nil? (:error r)))
+            (is (= "tbl:derived-2" (:openId r))
+                "compute's own result id must mint PAST whatever keep! already issued in this run")
+            (is (some? (sub/object st "tbl:derived-1")) "the interim kept table must also survive")
+            (is (= (+ before 3) (count (sub/objects st))) "interim table + fn + result table")))))))
+
+;; ---------------------------------------------------------------------------
+;; the Phase 3 gap: a `:fn` compute-clj! writes now holds sandbox code (`q`,
+;; `table`, `keep!`, no `rows`), and `run-any-fn` (the ƒ palette, reached from
+;; `fn-preview`/`fn-apply!`) and `recompute` (`rerun!`'s lineage refresh) still
+;; ran every `:fn`'s code through `run-clj-rows`, which binds `rows` and
+;; nothing else. Confirmed live at the REPL before any fix: re-applying a
+;; function compute-clj! had just written answered
+;; `{:error "Could not resolve symbol: q"}` — caught by the existing `try`, so
+;; safe rather than a 500, and completely broken as a feature. `:contract` on
+;; `:value` is the discriminator: `"sandbox"` for code compute-clj! writes now,
+;; absent for every `:fn` written before this fix — which is what makes the
+;; back-compat tests below the load-bearing half of this change, not a nod.
+;; ---------------------------------------------------------------------------
+
+(deftest fn-apply-reruns-a-sandbox-shaped-fn
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c   (srv/compute-clj! st "tbl:t" "all rows" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-apply! st "tbl:t" fid {} nil)]
+            (is (nil? (:error c)))
+            (is (some? fid))
+            (is (nil? (:error r))
+                (str "re-applying a function compute-clj! just wrote must not fail resolving q: " (:error r)))
+            (is (= 2 (count (rows-of st (:openId r)))))
+            (is (= #{"EMEA" "APAC"} (set (map :region (rows-of st (:openId r))))))))))))
+
+(deftest fn-preview-reruns-a-sandbox-shaped-fn
+  ;; `fn-preview` is what the user sees before pressing Apply — same failure
+  ;; mode, same fix, different caller.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c   (srv/compute-clj! st "tbl:t" "all rows" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-preview st "tbl:t" fid {})]
+            (is (nil? (:error c)))
+            (is (nil? (:error r))
+                (str "preview must not fail resolving q: " (:error r)))
+            (is (= 2 (:count r)))))))))
+
+(deftest fn-apply-still-runs-an-old-rows-shaped-fn
+  ;; The back-compat guarantee: a `:fn` committed by hand, in the OLD shape —
+  ;; `:lang "clojure"`, no `:contract`, code written over `rows` — must keep
+  ;; working exactly as it did before this fix. Nothing already in a store
+  ;; needs migrating.
+  (let [st (store-with-table)]
+    (sub/commit! st {:op :put :id "fn:t-1"
+                     :value {:id "fn:t-1" :kind :fn :title "fn: double it"
+                             :value {:lang "clojure" :code "(fn [rows] (mapv #(update % :revenue * 2) rows))"}}})
+    (let [r (srv/fn-apply! st "tbl:t" "fn:t-1" {} nil)]
+      (is (nil? (:error r)))
+      (is (= #{200 500} (set (map :revenue (rows-of st (:openId r)))))))))
+
+(deftest rerun-refreshes-a-derived-table-through-a-sandbox-shaped-fn
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c (srv/compute-clj! st "tbl:t" "all rows" nil)
+                b (:openId c)]
+            (is (nil? (:error c)))
+            ;; change the source: EMEA revenue jumps past APAC
+            (sub/commit! st {:op :assoc :id "tbl:t" :path [:value]
+                             :value [{:region "EMEA" :revenue 900} {:region "APAC" :revenue 250}]})
+            (let [r (srv/rerun! st "tbl:t")]
+              (is (= [b] (:refreshed r)) (str "skipped: " (:skipped r)))
+              (is (= #{900 250} (set (map :revenue (rows-of st b))))))))))))
+
+(deftest fn-apply-refuses-a-sandbox-shaped-fn-that-answers-with-a-report
+  ;; `fn-apply!` builds a table; a report is not one. Refused honestly, with
+  ;; an error naming the reason — not a stack trace and not silently
+  ;; committing something the caller cannot use.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "[{:block :heading :text \"Report\"}]")]
+          (let [c      (srv/compute-clj! st "tbl:t" "report" nil)
+                fid    (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                before (count (sub/history st))
+                r      (srv/fn-apply! st "tbl:t" fid {} nil)]
+            (is (nil? (:error c)))
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "report")
+                (str "the refusal must name why: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refusal must not commit anything")))))))
+
+(deftest fn-apply-rerun-sums-every-row-not-a-sample
+  ;; Exactness: the whole point. A re-apply through the palette must not
+  ;; quietly become a sample again — 2,500 rows is above `tbl/mold-cap`
+  ;; (2,000); 2,000.0 here would mean a sample came back on re-apply.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big" :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        "(q {:select [:region [[:sum :v] :v]] :from [[table :t]] :group-by [:region]})")]
+          (let [c   (srv/compute-clj! st "tbl:big" "sum by region" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-apply! st "tbl:big" fid {} nil)
+                rs  (rows-of st (:openId r))]
+            (is (nil? (:error c)))
+            (is (nil? (:error r)))
+            (is (= 5 (count rs)))
+            (is (= 2500.0 (double (reduce + (map :v rs))))
+                "2,000.0 would mean a mold-cap sample came back on re-apply, not every row")))))))
+
+;; ---------------------------------------------------------------------------
+;; a small regression alongside the gap above: `compute-clj!`'s move from
+;; `hydrate` to `tbl/store+handle` (Task 10) dropped the reclamation check
+;; `hydrate` used to give for free — a reclaimed table now fails deep inside
+;; DuckDB with a raw driver message instead of answering clearly up front.
+;; Confirmed live at the REPL before any fix:
+;;   {:error "compute failed: IO Error: Cannot open file \"…/ducklake-….parquet\": No such file or directory"}
+;; ---------------------------------------------------------------------------
+
+(deftest compute-refuses-a-reclaimed-table-clearly
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [r (srv/compute-clj! st "tbl:gone" "count" nil)]
+        (is (some? (:error r)))
+        (is (str/includes? (:error r) "tbl:gone"))
+        (is (str/includes? (:error r) "reclaimed")
+            (str "must name reclamation clearly, not a raw duckdb error: " (:error r)))))))
+
+;; ---------------------------------------------------------------------------
+;; Task 11 — a report `:ref` block resolves through the same call a notebook
+;; cell does
+;;
+;; Task 10 already teaches the model to emit `{:block :ref :id <a keep! id>}`
+;; and `{:block :chart :ref <id> :spec {…}}` (`clj-transform-sys`); nothing
+;; resolved them until now — `renderReport`'s `default: return ''` made a
+;; `:ref` block vanish silently rather than error, which is why the browser
+;; test below asserts on rendered DOM and not merely on the server payload.
+;;
+;; `notebook-payload` hydrates a `:ref` cell with
+;; `(mold-payload st mem/memory (:ref c) (:view c) …)` and MERGES the result
+;; onto the cell — `resolve-report-block` makes the identical call
+;; (`mold-payload st m id nil`) and merges it onto a `:ref` block the same
+;; way, confirmed by reading `notebook-payload` (`src/loci/server.clj`,
+;; the `cells` binding) before writing this.
+;; ---------------------------------------------------------------------------
+
+(deftest report-ref-block-resolves-the-referenced-table
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:a" [{:n 1} {:n 2} {:n 3}])
+            _  (sub/commit! st {:op :put :id "tbl:a"
+                                :value {:id "tbl:a" :kind :table :title "A" :value h}})
+            _  (sub/commit! st {:op :put :id "report:r"
+                                :value {:id "report:r" :kind :report :title "R"
+                                        :value [{:block :heading :text "Hi"}
+                                                {:block :ref :id "tbl:a"}]}})
+            p  (srv/mold-payload st no-memory "report:r" nil)
+            b  (second (:rendered p))]
+        (is (= "report" (:kind p)))
+        (is (= :ref (:block b)))
+        (is (nil? (:error b)) "a real table must resolve, not refuse")
+        (is (= "table" (:kind b)) "the resolved payload's own kind, merged onto the block")
+        (is (= [{:n 1} {:n 2} {:n 3}] (:rendered b))
+            "the referenced table's rows, not a copy authored into the block")))))
+
+(deftest report-chart-ref-block-resolves-the-referenced-tables-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:a" [{:n 1} {:n 2} {:n 3}])
+            _  (sub/commit! st {:op :put :id "tbl:a"
+                                :value {:id "tbl:a" :kind :table :title "A" :value h}})
+            _  (sub/commit! st {:op :put :id "report:r"
+                                :value {:id "report:r" :kind :report :title "R"
+                                        :value [{:block :chart :ref "tbl:a"
+                                                 :spec {:chart "bar" :x "n" :y "n"}}]}})
+            p  (srv/mold-payload st no-memory "report:r" nil)
+            b  (first (:rendered p))]
+        (is (= :chart (:block b)))
+        (is (nil? (:error b)))
+        (is (= "bar" (get-in b [:spec :chart])) "the authored half of the spec survives untouched")
+        (is (= [{:n 1} {:n 2} {:n 3}] (get-in b [:spec :rows]))
+            "the referenced table's rows, folded into the spec chartSVG already reads")))))
+
+(deftest report-inline-table-block-still-works
+  ;; The shipped demo report (`content.clj`'s qbr/retention/planets/… reports)
+  ;; carries rows INLINE on `:block :table` — this must survive resolution
+  ;; untouched, because `report-ref-block-resolves-the-referenced-table`
+  ;; proves the NEW path works and says nothing about the old one.
+  (let [rows [{:region "EMEA" :revenue 100} {:region "APAC" :revenue 200}]
+        st   (sub/fresh-store)
+        _    (sub/commit! st {:op :put :id "report:r"
+                              :value {:id "report:r" :kind :report :title "R"
+                                      :value [{:block :table :title "T" :rows rows}]}})
+        p    (srv/mold-payload st no-memory "report:r" nil)
+        b    (first (:rendered p))]
+    (is (= :table (:block b)))
+    (is (= rows (:rows b)) "an inline table block's rows must be untouched by ref resolution")
+    (is (nil? (:error b)))))
+
+(deftest report-ref-to-a-report-is-refused-not-recursed
+  ;; Under a timeout: a missing guard's failure mode is unbounded recursion,
+  ;; and an assertion with no timeout would run right along with it. Measured
+  ;; by sabotaging the guard out (Task 11's mandatory step C): this particular
+  ;; recursion is NOT tail-recursive — `resolve-report-block` calls
+  ;; `mold-payload`, which calls `mapv` of `resolve-report-block` over a
+  ;; report's blocks — so removing the guard blows the JVM stack in well
+  ;; under a second rather than spinning for the full 3000ms. `(future …)`
+  ;; wraps `deref`'s own `ExecutionException` in `:threw` for that reason:
+  ;; the guard's JOB is "never let this recurse", and a fast crash is exactly
+  ;; as much a failure to do that job as a slow hang would be — this test
+  ;; means to catch whichever one an unguarded implementation produces.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            _  (sub/commit! st {:op :put :id "report:a"
+                                :value {:id "report:a" :kind :report :title "A"
+                                        :value [{:block :ref :id "report:b"}]}})
+            _  (sub/commit! st {:op :put :id "report:b"
+                                :value {:id "report:b" :kind :report :title "B"
+                                        :value [{:block :ref :id "report:a"}]}})
+            f  (future (try (srv/mold-payload st no-memory "report:a" nil)
+                            (catch Throwable t {:threw (.getName (class t))})))
+            p  (deref f 3000 :TIMED-OUT)]
+        (is (not= :TIMED-OUT p) "a report referencing a report must refuse, not hang")
+        (is (not (:threw p)) (str "must refuse cleanly, not blow the stack recursing: " p))
+        ;; Only a `p` that neither timed out nor threw is a real payload with
+        ;; blocks to inspect — checking further into a `:TIMED-OUT` or a
+        ;; `:threw` map would just be a second, confusing failure on top of
+        ;; the real one the two assertions above already reported.
+        (when (and (not= :TIMED-OUT p) (not (:threw p)))
+          (let [b (first (:rendered p))]
+            (is (some? (:error b)) "refused, with a message")
+            (is (str/includes? (:error b) "report")
+                (str "the message must name why: " (:error b)))))))))
+
+(deftest report-ref-to-a-missing-id-degrades-honestly
+  (let [st (sub/fresh-store)
+        _  (sub/commit! st {:op :put :id "report:r"
+                            :value {:id "report:r" :kind :report :title "R"
+                                    :value [{:block :ref :id "tbl:does-not-exist"}]}})
+        p  (srv/mold-payload st no-memory "report:r" nil)
+        b  (first (:rendered p))]
+    (is (some? (:error b)) "a dangling ref must say so, not crash and not render blank")
+    (is (str/includes? (:error b) "tbl:does-not-exist"))))
+
+;; ---------------------------------------------------------------------------
+;; Task 12 — a report block may not carry a capped page as though it were the
+;; whole answer
+;;
+;; `agent/make-clj-transform` is stubbed throughout, as every Task 10/11 test
+;; above does, so nothing here makes a network call. `tbl/max-query-rows` is
+;; 10,000 (confirmed at the REPL before writing these): 12,000 rows caps a
+;; bare `(q {:select [:*] …})`, 50 does not.
+;; ---------------------------------------------------------------------------
+
+(deftest a-capped-report-block-inline-is-refused
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [before (count (sub/history st))
+                r      (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "capped")
+                (str "the refusal must name the rule: " (:error r)))
+            (is (str/includes? (:error r) "keep!")
+                (str "the refusal must say what to do instead: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refused report must not commit — no report, no :fn")))))))
+
+(deftest an-uncapped-report-block-inline-is-allowed
+  ;; Both directions must be pinned — a guard that refuses everything is not a
+  ;; guard. Identical code to the test above, over a table small enough that
+  ;; q never caps.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:small" (vec (for [n (range 50)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:small"
+                         :value {:id "tbl:small" :kind :table :title "Small" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [r   (srv/compute-clj! st "tbl:small" "show me everything" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)))
+            (is (= :report (:kind obj)))
+            (is (= :table (:block (first (:value obj)))))
+            (is (= 50 (count (:rows (first (:value obj)))))
+                "the inline block's rows must survive untouched — this is the honest case")))))))
+
+(deftest keep-plus-a-ref-block-is-the-way-through-a-capped-result
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})]"
+                             "  [{:block :heading :text \"Report\"} {:block :ref :id id}])"))]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))
+                ref (second (:value obj))
+                hy  (tbl/hydrate lake/lake (sub/object st (:id ref)))]
+            (is (nil? (:error r)))
+            (is (= :report (:kind obj)))
+            (is (= :ref (:block ref)))
+            (is (= :table (:kind (sub/object st (:id ref))))
+                "keep! landed a real table the report block points at, not a copy")
+            (is (= 12000 (:table/total hy))
+                "the table keep! made holds every row, not the page q returned")))))))
+
+(deftest a-capped-refusal-reaches-the-retry-loop
+  ;; The existing contract (`compute-retries-once-with-error-feedback`, far
+  ;; above), exercised on this new failure: the stub is called twice, and the
+  ;; SECOND call receives the FIRST call's error as `err`.
+  (lf/with-temp-lake
+    (fn []
+      (let [st    (sub/fresh-store)
+            h     (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))
+            calls (atom [])]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [profile samples prompt prev-code err]
+                        (swap! calls conj err)
+                        (if err
+                          (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})]"
+                               "  [{:block :ref :id id}])")
+                          (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                               "[{:block :table :title \"All\" :rows r}])")))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (nil? (:error r)) "the retry's fixed code must land cleanly")
+            (is (= 2 (count @calls)))
+            (is (nil? (first @calls)) "first attempt: no error context")
+            (is (string? (second @calls)) "retry got the capped-block refusal")
+            (is (str/includes? (second @calls) "capped")
+                "the retry must receive the SAME rule the first refusal named")))))))
+
+(deftest a-capped-result-outside-a-report-still-commits-a-table
+  ;; The rule is about report blocks, not about q — a bare, capped q result
+  ;; (a plain vector of maps, no :block anywhere) is a :table answer, and this
+  ;; check never runs on it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))
+                hy  (tbl/hydrate lake/lake obj)]
+            (is (nil? (:error r)))
+            (is (= :table (:kind obj)))
+            (is (= 10000 (:table/total hy))
+                "a capped q result outside a report still lands as a table, capped page and all")))))))
+
+;; ---------------------------------------------------------------------------
+;; review finding 1 — the capped-block guard is defeated by ordinary model
+;; code (mapv, map, for, a renamed key): metadata does not survive any of
+;; them, confirmed at the REPL before writing this
+;; (`(meta (mapv identity (with-meta [{:a 1}] {:capped true})))` => nil), so
+;; the tests above — which all embed q's LITERAL return value — never
+;; exercised the gap. These do. Three independent checks now stand behind
+;; `capped-block`: metadata (kept for the precise message), a structural cap
+;; at `tbl/mold-cap` regardless of provenance, and a count-match against
+;; `loci.sandbox/queries`, a per-run record the model's code never sees and
+;; so cannot strip.
+;; ---------------------------------------------------------------------------
+
+(deftest a-mapv-reshaped-capped-result-inline-is-refused
+  ;; THE regression test: must fail without the fix. `mapv identity` is the
+  ;; most ordinary thing a model writes to add nothing at all, and it strips
+  ;; q's metadata just as surely as a computed column would.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (mapv identity (q {:select [:*] :from [[table :t]]}))] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [before (count (sub/history st))
+                r      (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)) "mapv strips q's metadata; the guard must not rely on it alone")
+            (is (str/includes? (:error r) "capped")
+                (str "the refusal must name the rule: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refused report must not commit")))))))
+
+(deftest a-computed-column-is-refused-by-count-match-alone
+  ;; The realistic case — a computed column, via `for`/`assoc` — with an
+  ;; explicit limit UNDER mold-cap, so the structural check cannot also be
+  ;; the one catching it: only the count-match check (a page of 1,500 exactly
+  ;; matches a capped q call's own returned count) can refuse this.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (vec (for [row (q {:select [:*] :from [[table :t]]} 1500)] "
+                             "(assoc row :x 1)))] [{:block :table :title \"All\" :rows r}])"))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "capped q call")
+                (str "the message must name the count-match rule specifically: " (:error r)))))))))
+
+(deftest filtering-a-capped-result-down-small-is-allowed
+  ;; Both directions must be pinned. A genuinely small, deliberately filtered
+  ;; result — count 10, nowhere near the capped call's own count of 1,500 —
+  ;; must not be refused. Over-strictness is a real failure too.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]] :order-by [:n]} 1500)] "
+                             "[{:block :table :title \"Small\" :rows (vec (filter #(< (:n %) 10) r))}])"))]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)) (str "a genuinely small, filtered result must not be refused: " (:error r)))
+            (is (= 10 (count (:rows (first (:value obj))))))))))))
+
+(deftest forged-capped-metadata-below-every-threshold-is-refused-by-meta-alone
+  ;; Isolates the metadata check: no `q` call happens at all (so
+  ;; count-match's set is empty) and the block carries one row (so the
+  ;; structural cap cannot trip either). Only `(:capped (meta rows))` catches
+  ;; this — proving metadata still does real work, even though it is not
+  ;; load-bearing for the reshape cases above.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:small" (vec (for [n (range 5)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:small"
+                         :value {:id "tbl:small" :kind :table :title "Small" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "[{:block :table :title \"X\" "
+                             ":rows (with-meta [{:n 1}] {:total 99999 :capped true})}]"))]
+          (let [r (srv/compute-clj! st "tbl:small" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "99999")
+                (str "the meta-carried true total must reach the message: " (:error r)))))))))
+
+(deftest an-inline-block-over-mold-cap-built-without-q-is-refused-by-the-structural-cap
+  ;; Isolates the structural check: `q-all` never marks capped metadata and
+  ;; never records a "capped" outcome in `loci.sandbox/queries` (it has no
+  ;; concept of capped — it always returns every row), so neither of the
+  ;; other two checks can catch a block this large. Only the row-count cap
+  ;; does.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q-all {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "row cap")
+                (str "the message must name the structural rule specifically: " (:error r)))))))))
+
+;; ---------------------------------------------------------------------------
+;; review finding 2 — `rerun!` can now refresh a report, and `:reads` is what
+;; makes a multi-table report's refresh see every input it queried, not just
+;; `:from`.
+;;
+;; Before this fix, verified at the REPL: `rerun!` on a report id answered
+;; `{:error "not a table: report:1"}`, and `rerun!` on the report's SOURCE
+;; walked into the report as a child and skipped it — "this function answers
+;; with a report, not a table" — and skipped a `keep!`-made table with
+;; "unknown lineage via " (empty — it never got a `:via`).
+;; ---------------------------------------------------------------------------
+
+(deftest rerun-on-the-source-refreshes-a-report-it-made
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rsrc" [{:region "EMEA" :revenue 100}
+                                                      {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rsrc"
+                         :value {:id "tbl:rsrc" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [[[:sum :revenue] :total]] "
+                             ":from [[table :t]]})] [{:block :table :title \"Total\" :rows r}])"))]
+          (let [made   (srv/compute-clj! st "tbl:rsrc" "total revenue" nil)
+                rid    (:openId made)
+                before (:value (sub/object st rid))]
+            (is (nil? (:error made)))
+            (is (= [{:total 350}] (:rows (first before))))
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rsrc" [{:region "EMEA" :revenue 900}
+                                                            {:region "APAC" :revenue 250}])]
+              (sub/commit! st {:op :assoc :id "tbl:rsrc" :path [:value] :value h2}))
+            (let [r     (srv/rerun! st "tbl:rsrc")
+                  after (:value (sub/object st rid))]
+              (is (= [rid] (:refreshed r)))
+              (is (= [] (:skipped r)))
+              (is (= [{:total 1150}] (:rows (first after)))
+                  "the report's own numbers must follow the new source data"))))))))
+
+(deftest rerun-on-the-source-refreshes-a-report-and-truthfully-skips-its-stale-keep-table
+  ;; The keep!-table `:via` fix, isolated: the OLD keep!-made table is a
+  ;; SEPARATE child of the source (same `:from`), independently walked by
+  ;; `rerun!`'s BFS. It must be skipped, not refreshed on its own — and the
+  ;; reason must now be truthful, not the old empty "unknown lineage via ".
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rkeep" [{:region "EMEA" :revenue 100}
+                                                       {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rkeep"
+                         :value {:id "tbl:rkeep" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})] "
+                             "[{:block :ref :id id}])"))]
+          (let [made    (srv/compute-clj! st "tbl:rkeep" "keep everything" nil)
+                rid     (:openId made)
+                old-tid (:id (first (:value (sub/object st rid))))
+                fid     (:via (sub/object st rid))]
+            (is (= fid (:via (sub/object st old-tid)))
+                "the keep! table must carry the SAME :via as its report — the fix this test targets")
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rkeep" [{:region "EMEA" :revenue 5}
+                                                             {:region "APAC" :revenue 6}
+                                                             {:region "X" :revenue 7}])]
+              (sub/commit! st {:op :assoc :id "tbl:rkeep" :path [:value] :value h2}))
+            (let [r        (srv/rerun! st "tbl:rkeep")
+                  new-tid  (:id (first (:value (sub/object st rid))))]
+              (is (= [rid] (:refreshed r)))
+              (is (= 1 (count (:skipped r))))
+              (is (= old-tid (:id (first (:skipped r))))
+                  "the STALE keep! table is skipped, not the fresh one the refresh just made")
+              (is (not (str/includes? (:why (first (:skipped r))) "unknown lineage"))
+                  (str "the skip reason must be truthful, not the old empty message: "
+                       (:why (first (:skipped r)))))
+              (is (str/includes? (:why (first (:skipped r))) "report")
+                  (str "the skip reason must say why: " (:why (first (:skipped r)))))
+              (is (not= old-tid new-tid) "the refresh makes a FRESH keep! table under a new id")
+              (is (= 3 (:table/total (tbl/hydrate lake/lake (sub/object st new-tid))))
+                  "the new keep! table holds the new source's rows")
+              (is (some? (sub/object st old-tid))
+                  "the stale table is orphaned garbage, not deleted — loci.lakegc's job, not rerun!'s"))))))))
+
+(deftest rerun-refreshes-a-multi-table-report-via-reads-not-just-from
+  ;; The `:reads` case. The report's `:from` names tbl:a; its code also
+  ;; queries tbl:b through `tables`. Changing tbl:b — NOT tbl:a — must still
+  ;; refresh the report: `:reads`, not `:from` alone, is what `rerun!` walks.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            ha (tbl/put-rows! @lake/lake "tbl:ra" [{:k "a" :v 1} {:k "b" :v 2}])
+            hb (tbl/put-rows! @lake/lake "tbl:rb" [{:k "a" :v 100} {:k "b" :v 200}])]
+        (sub/commit! st {:op :put :id "tbl:ra" :value {:id "tbl:ra" :kind :table :title "A" :value ha}})
+        (sub/commit! st {:op :put :id "tbl:rb" :value {:id "tbl:rb" :kind :table :title "B" :value hb}})
+        (sub/commit! st {:op :put :id "space:rm"
+                         :value {:id "space:rm" :kind :space :title "Multi"
+                                 :value {:cells [{:ref "tbl:ra"} {:ref "tbl:rb"}]}}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [[[:sum :o.v] :total]] :from [[table :s]] "
+                             ":join [[(get tables \"tbl:rb\") :o] [:= :s.k :o.k]]})] "
+                             "[{:block :table :title \"Joined\" :rows r}])"))]
+          (let [made   (srv/compute-clj! st "tbl:ra" "join total" "space:rm")
+                rid    (:openId made)
+                fid    (:via (sub/object st rid))
+                before (:value (sub/object st rid))]
+            (is (nil? (:error made)))
+            (is (= #{"tbl:ra" "tbl:rb"} (set (get-in (sub/object st fid) [:value :reads])))
+                "both tables the query actually joined must be recorded")
+            (is (= [{:total 300}] (:rows (first before))))
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rb" [{:k "a" :v 900} {:k "b" :v 950}])]
+              (sub/commit! st {:op :assoc :id "tbl:rb" :path [:value] :value h2}))
+            (let [r     (srv/rerun! st "tbl:rb")   ; NOT tbl:ra, the report's :from
+                  after (:value (sub/object st rid))]
+              (is (= [rid] (:refreshed r)))
+              (is (= [{:total 1850}] (:rows (first after)))
+                  "changing the :reads-only table must still refresh the report"))))))))
+
+(deftest one-undo-after-a-report-refresh-reverses-the-whole-refresh
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h1 (tbl/put-rows! @lake/lake "tbl:rundo" [{:region "EMEA" :revenue 100}
+                                                       {:region "APAC" :revenue 250}])]
+        (sub/commit! st {:op :put :id "tbl:rundo"
+                         :value {:id "tbl:rundo" :kind :table :title "Src" :value h1}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})] "
+                             "[{:block :ref :id id}])"))]
+          (let [made    (srv/compute-clj! st "tbl:rundo" "keep everything" nil)
+                rid     (:openId made)
+                old-tid (:id (first (:value (sub/object st rid))))
+                before  (:value (sub/object st rid))]
+            (let [h2 (tbl/put-rows! @lake/lake "tbl:rundo" [{:region "EMEA" :revenue 5}
+                                                             {:region "APAC" :revenue 6}
+                                                             {:region "X" :revenue 7}])]
+              (sub/commit! st {:op :assoc :id "tbl:rundo" :path [:value] :value h2}))
+            (srv/rerun! st rid)
+            (let [new-tid (:id (first (:value (sub/object st rid))))]
+              (is (not= old-tid new-tid) "sanity: the refresh really did make a new table")
+              (sub/undo! st)
+              (is (= before (:value (sub/object st rid)))
+                  "one undo restores the report's OWN value")
+              (is (nil? (sub/object st new-tid))
+                  "one undo also removes the NEW keep! table the refresh made")
+              (is (some? (sub/object st old-tid))
+                  "and restores the OLD one the refresh had replaced"))))))))
