@@ -903,3 +903,25 @@
           ;; table a sample would have been, and `hydrate` already knows how to
           ;; say which way it is broken.
           (hydrate ts o))))))
+
+(defn store+handle
+  "The store and handle for a table object, whatever backs it — `[ts h]`, or nil
+   if the object is not a table.
+
+   A legacy inline table keeps its rows IN the event, so it is landed in an
+   `InlineTable` and one code path then serves both. That is what lets every
+   caller ask the protocol rather than branching on how a table happens to be
+   stored.
+
+   Takes `lake` **or a delay of one**, like `hydrate`, and forces it only when
+   the object is actually handle-backed. `tools.clj` and `server.clj` each had
+   a private copy of exactly this pair, `server.clj`'s added by the task before
+   this with a comment asking for the merge — this is that merge, not a third
+   copy."
+  [lake o]
+  (let [v (:value o)]
+    (cond
+      (handle? v) [(force lake) v]
+      (and (sequential? v) (seq v) (every? map? v))
+      (let [ts (inline-table)] [ts (put-rows! ts (:id o) v)])
+      :else nil)))

@@ -1397,6 +1397,10 @@
       {:error "the function did not return rows"})))
 
 (defn compute-clj! [st id prompt space]
+  ;; Still `hydrate` — a `mold-cap` sample, unchanged, deliberately: this is
+  ;; compute-clj!'s OWN local equivalent of the `table-rows` this task deletes,
+  ;; not that helper by another name. Task 10 replaces this with the sandbox,
+  ;; which hands the model a query surface instead of rows in the JVM at all.
   (try
     (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
       (if-not (and (sequential? rows) (seq rows) (every? map? rows))
@@ -1462,31 +1466,8 @@
 
 ;; ---- the function palette: built-in single-table verbs (loci.fnlib) plus
 ;; agent-written :fn objects, previewed live, applied as ONE reversible :tx ----
-(defn- table-rows [st id]
-  (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
-    (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
-
-(defn- store+handle
-  "The store and handle for object `id`'s table, whatever backs it — a
-   handle-backed table reads from the lake and a legacy inline table (rows in
-   the event, no handle at all) is landed in an `InlineTable` so both answer
-   `column-profile` the same way. nil when `id` names no table.
-
-   `loci.tools` keeps the same pair under the same name, built for
-   `query_table`'s `do-list`; Task 7 is where the two get one home. This is the
-   version `fns-payload` needs now, so it can ask `column-profile` instead of
-   hydrating a `mold-cap` sample to answer three questions that are not about
-   rows at all."
-  [st id]
-  (let [v (:value (sub/object st id))]
-    (cond
-      (tbl/handle? v) [(force lake/lake) v]
-      (and (sequential? v) (seq v) (every? map? v))
-      (let [ts (tbl/inline-table)] [ts (tbl/put-rows! ts id v)])
-      :else nil)))
-
 (defn fns-payload [st id]
-  (if-let [[ts h] (store+handle st id)]
+  (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
     {:fns (into (fnlib/catalog (tbl/column-profile ts h))
                 (->> (sub/objects st) vals
                      (filter #(and (= :fn (:kind %)) (= "clojure" (get-in % [:value :lang]))))
@@ -1515,34 +1496,62 @@
 
 (defn fn-preview [st id fid params]
   (try
-    (if-let [rows (table-rows st id)]
-      (let [r (run-any-fn st fid rows params)]
-        (if (:error r)
-          r
-          {:before (json-safe (vec (take 8 rows)))
-           :after (vec (take 8 (:rows r))) :count (count (:rows r))}))
+    (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
+      (if-let [spec (fnlib/spec-of fid params)]
+        ;; Pushed down: eight rows out of DuckDB, and the count of the whole
+        ;; answer — never a sample, because `query` computes `:total` before
+        ;; any `:limit` is applied.
+        (let [before (tbl/query ts h {:limit 8})
+              after  (tbl/query ts h (assoc spec :limit 8))]
+          {:before (json-safe (vec (:rows before)))
+           :after  (json-safe (vec (:rows after)))
+           :count  (:total after)})
+        ;; Not pushed down — pivot, delta, share, top, or an agent-written fn.
+        ;; Runs over a bounded page and SAYS SO, so a preview is never read as
+        ;; the answer. `fn-apply!`'s fallback runs over everything.
+        (let [total (tbl/row-count ts h)
+              rows  (tbl/rows ts h {:limit tbl/mold-cap})
+              r     (run-any-fn st fid rows params)]
+          (if (:error r)
+            r
+            (cond-> {:before (json-safe (vec (take 8 rows)))
+                     :after  (vec (take 8 (:rows r)))
+                     :count  (count (:rows r))}
+              (< (count rows) total) (assoc :sampled {:over (count rows) :of total})))))
       {:error "functions work on tables"})
     (catch Exception e {:error (.getMessage e)})))
 
 (defn fn-apply! [st id fid params space]
   (try
-    (if-let [rows (table-rows st id)]
+    (if-let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
       (if (and space (not (space? st space)))
         {:error (str "not a notebook: " space)}
-        (let [r (run-any-fn st fid rows params)]
-          (if (:error r)
-            r
-            (let [src (sub/object st id)
-                  lbl (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
-                          (:title (sub/object st fid)) fid)
-                  nid (next-id st "tbl:derived-")
-                  tobj (tbl/table-object @lake/lake nid (str (:title src) " · " lbl)
-                                         (:rows r) {:from id :via fid :params (or params {})})
-                  evs (cond-> [{:op :put :id nid :value tobj}]
-                        (and space (space? st space))
-                        (conj (nb/append-cell-event st space {:ref nid})))]
-              (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid}))))
+        (let [src   (sub/object st id)
+              lbl   (or (:label (first (filter #(= fid (:id %)) fnlib/builtins)))
+                        (:title (sub/object st fid)) fid)
+              nid   (next-id st "tbl:derived-")
+              ttl   (str (:title src) " · " lbl)
+              extra {:from id :via fid :params (or params {})}
+              land! (fn [tobj]
+                      (let [evs (cond-> [{:op :put :id nid :value tobj}]
+                                  (and space (space? st space))
+                                  (conj (nb/append-cell-event st space {:ref nid})))]
+                        (sub/commit! st {:op :tx :events evs})
+                        {:state (state-payload st) :openId nid}))]
+          (if-let [spec (fnlib/spec-of fid params)]
+            ;; CREATE TABLE AS — 81 ms and 0 MB for 927,830 rows, measured
+            ;; 2026-08-27, against ~25,000 ms and 214 MB to pull them.
+            (land! (merge {:id nid :kind :table :title ttl
+                          :value (tbl/create-from-spec ts h spec nid ttl)}
+                         extra))
+            ;; Not pushed down: every row, via `rows` with no `:limit` — the
+            ;; existing method, no sentinel needed for "all of it" — then
+            ;; through Clojure.
+            (let [rows (tbl/rows ts h {})
+                  r    (run-any-fn st fid rows params)]
+              (if (:error r)
+                r
+                (land! (tbl/table-object @lake/lake nid ttl (:rows r) extra)))))))
       {:error "functions work on tables"})
     (catch Exception e {:error (.getMessage e)})))
 

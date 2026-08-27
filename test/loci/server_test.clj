@@ -477,11 +477,24 @@
     (is (:error (srv/fn-preview st "tbl:t" nil {})))
     (is (= before (count (sub/history st))))))            ; nothing committed
 
-(deftest fn-preview-surfaces-empty-result-as-error
+(deftest fn-preview-reports-a-pushed-down-empty-match-honestly
+  ;; Renamed from `fn-preview-surfaces-empty-result-as-error`, 2026-08-27:
+  ;; `lib:filter` now carries a `:spec`, so "revenue > 9999" matching nothing
+  ;; is a real, pushed-down DuckDB answer — the same shape `query_table
+  ;; :save_as` already treats as legitimate in
+  ;; `a-save_as-that-filtered-everything-out-is-an-empty-table`
+  ;; (tools_test.clj), not a possibly-broken transform. `fnlib/run-fn`'s
+  ;; "empty output is an honest error" guard exists to catch AGENT-WRITTEN
+  ;; Clojure that may have malfunctioned; a declarative SQL filter carries no
+  ;; such ambiguity — DuckDB either answers or the `try` around `fn-preview`
+  ;; catches a real exception — so `:error` is no longer the right shape here.
+  ;;
+  ;; Old: (is (:error r)) and (is (nil? (:after r))).
   (let [st (store-with-table)
         r (srv/fn-preview st "tbl:t" "lib:filter" {:col "revenue" :op ">" :value "9999"})]
-    (is (:error r))                                       ; honest "no rows came out"
-    (is (nil? (:after r)))))                              ; not an empty table
+    (is (nil? (:error r)))
+    (is (= [] (:after r)))
+    (is (= 0 (:count r)))))
 
 (deftest store-at-clamps-and-freezes
   (let [st (sub/fresh-store)]
@@ -585,9 +598,14 @@
   ;; stopped; the marker check is what replaces that.
   ;;
   ;; **The `via` here has to be an aggregate, and that is the whole test.**
-  ;; Measured 2026-08-17: all six `lib:` builtins answer "no rows came out —
+  ;; Measured 2026-08-17: every `lib:` builtin answered "no rows came out —
   ;; nothing to keep" for an empty input, so with a `lib:` via the marker
-  ;; changes only the message a skip reports. An agent-written fn that counts
+  ;; changed only the message a skip reports. Since 2026-08-27 that is no
+  ;; longer all six: `lib:filter` and `lib:group` are pushed down and answer
+  ;; an empty match honestly rather than erroring (see
+  ;; `fn-preview-reports-a-pushed-down-empty-match-honestly`); the other four
+  ;; still route through `fnlib/run-fn` and this reasoning still holds for
+  ;; them. An agent-written fn that counts
   ;; returns `[{:n 0}]` from no rows — non-empty, so nothing downstream refuses
   ;; it — and `rerun!` commits it over the good table and reports success.
   ;; Sabotaged, this test goes from `[{:n 100}]` to `[{:n 0}]` and `:refreshed`.
@@ -5830,3 +5848,90 @@
         (is (= 8 (count counts)))
         (is (= [1 1 1 1 1 1 1 1] counts)
             "a share of zero is floored at one row, not at an empty grid")))))
+
+;; ---------------------------------------------------------------------------
+;; Task 7 — the ƒ palette applies to every row, not `mold-cap`
+;;
+;; 2,500 rows everywhere: above `mold-cap` (2,000), so a regression here would
+;; pass with the sampling bug present. Params are keyword-keyed throughout —
+;; verified against `body-json`'s `:key-fn keyword`, which keywordizes every
+;; level of a JSON body including a nested `params` object, and against every
+;; existing `fn-preview`/`fn-apply!` test in this file, all of which already
+;; call with keyword keys. String keys, as an earlier draft of this test used,
+;; silently produce `{:col nil :op nil :val nil}` through `{:keys […]}`
+;; destructuring — confirmed at the REPL — so this is a correction to reality,
+;; not a stylistic choice.
+;; ---------------------------------------------------------------------------
+
+(deftest fn-apply-filters-every-row
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r   (srv/fn-apply! st "tbl:big" "lib:filter"
+                                 {:col "n" :op ">" :value "499"} nil)
+              obj (sub/object st (:openId r))]
+          (is (= 2000 (:rows (:value obj)))
+              "1,500 here means the derived table was built from a 2,000-row sample")
+          (is (= :lake (:store (:value obj)))
+              "and it must be handle-backed — CREATE TABLE AS, not rows through the JVM"))))))
+
+(deftest fn-apply-groups-every-row
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r   (srv/fn-apply! st "tbl:big" "lib:group"
+                                 {:by "region" :measure "v" :agg "sum"} nil)
+              rs  (tbl/rows @lake/lake (:value (sub/object st (:openId r))) {})]
+          (is (= 5 (count rs)))
+          (is (= 2500.0 (double (reduce + (map :v rs))))
+              "2000.0 would mean the group ran over the sample"))))))
+
+(deftest fn-preview-reports-the-true-count
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 2500)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (srv/fn-preview st "tbl:big" "lib:filter"
+                                {:col "n" :op ">" :value "499"})]
+          (is (= 8 (count (:after r))) "a preview is still eight rows")
+          (is (= 2000 (:count r)) "but the count is the whole answer")
+          (is (nil? (:sampled r)) "a pushed-down verb is not sampled"))))))
+
+(deftest fn-preview-says-when-it-sampled
+  ;; lib:share has no :spec — it runs in Clojure. Preview must SAY it only saw
+  ;; part of the table, or a preview reads as the answer.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r (srv/fn-preview st "tbl:big" "lib:share" {:col "v"})]
+          (is (some? (:sampled r)))
+          (is (= 2500 (:of (:sampled r)))))))))
+
+(deftest fn-apply-runs-a-clojure-verb-over-every-row
+  ;; lib:share is not pushed down, so apply must still see all 2,500 rows.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:n n :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (let [r  (srv/fn-apply! st "tbl:big" "lib:share" {:col "v"} nil)
+              rs (tbl/rows @lake/lake (:value (sub/object st (:openId r))) {})]
+          (is (= 2500 (count rs)) "2,000 would mean the sample was used")
+          (is (every? #(= 0.04 (Double/parseDouble (format "%.2f" (:share_pct %)))) (take 5 rs))
+              "each row's share of 2,500 equal values is 0.04%"))))))

@@ -98,11 +98,25 @@
     :params [{:name "col" :type "col"}
              {:name "op" :type "choice" :options ["=" "≠" ">" "<" "contains"]}
              {:name "value" :type "text"}]
-    :run filter-run}
+    :run filter-run
+    :spec (fn [{:keys [col op value]}] {:filter {:col col :op op :val value}})}
    {:id "lib:group" :label "Group & aggregate" :doc "one row per group — sum/avg/min/max/count a column"
     :params [{:name "by" :type "col"} {:name "measure" :type "numcol"}
              {:name "agg" :type "choice" :options ["sum" "avg" "min" "max" "count"]}]
-    :pred needs-numeric :run group-run}
+    :pred needs-numeric :run group-run
+    :spec (fn [{:keys [by measure agg]}] {:group_by by :measure measure :agg (or agg "sum")})}
+   ;; lib:top gets NO :spec, deliberately, despite carrying exactly the
+   ;; :sort/:measure/:limit shape `query` already understands. Verified
+   ;; 2026-08-27: `create-from-spec` always `(dissoc spec :limit)` — the
+   ;; correct contract for `query_table :save_as`, where a display limit must
+   ;; never truncate what gets saved — so pushing "Top 5" through it lands
+   ;; every sorted row, not 5. `fn-preview`'s own `(assoc spec :limit 8)`
+   ;; collides with the same field for the same reason: it would report
+   ;; "top 1" as two rows out of two, not one. Both confirmed at the REPL
+   ;; against a 2-row table with `:limit 1`. Until something teaches
+   ;; `create-from-spec` to tell "N is the answer" apart from "N is a display
+   ;; cap", lib:top stays on `:run`, over every row via `store+handle` same as
+   ;; before — correct, just not pushed down.
    {:id "lib:top" :label "Top N" :doc "sort by a numeric column and keep the first N"
     :params [{:name "by" :type "numcol"} {:name "n" :type "num"}
              {:name "order" :type "choice" :options ["desc" "asc"]}]
@@ -143,6 +157,21 @@
               {:id id :label label :doc doc :ok (nil? why) :why why
                :params (mapv #(if-let [o (opts (:type %))] (assoc % :options o) %) params)}))
           builtins)))
+
+(defn spec-of
+  "The view-spec a builtin's params imply, or nil when the verb cannot be
+   pushed down. Nil is the signal to fall back to `:run` over rows.
+
+   Only `lib:filter` and `lib:group` carry a `:spec`. `lib:pivot`, `lib:delta`
+   and `lib:share` do not: DuckDB can express all three — `PIVOT`, `lag()`,
+   `sum() OVER ()` — but each needs new grammar in the view-spec language, and
+   the language grows when something hurts, not ahead of it. `lib:top` does
+   not either, despite fitting the `:sort`/`:measure`/`:limit` shape exactly —
+   see the comment on its builtin entry for why `:limit` there is not safe to
+   push through `create-from-spec` yet."
+  [fid params]
+  (when-let [f (:spec (first (filter #(= fid (:id %)) builtins)))]
+    (f params)))
 
 (defn run-fn
   "Run builtin `fid` over rows with string-valued params. Returns

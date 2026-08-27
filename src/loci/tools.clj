@@ -148,18 +148,6 @@
                       at (assoc :reclaimed at))))
           os)))
 
-(defn- store+handle
-  "The store and handle for a table object, whatever backs it. A legacy inline
-   table — rows in the event — is landed in an `InlineTable` so one code path
-   serves both, and the query language is then identical either way."
-  [o]
-  (let [v (:value o)]
-    (cond
-      (tbl/handle? v) [(force lake/lake) v]
-      (and (sequential? v) (seq v) (every? map? v))
-      (let [ts (tbl/inline-table)] [ts (tbl/put-rows! ts (:id o) v)])
-      :else nil)))
-
 (defn- why-unreadable
   "Why this table's rows must not be acted on, or nil.
 
@@ -180,7 +168,7 @@
 
 (defn- do-query [st {:keys [table_id save_as] :as args}]
   (if-let [o (sub/object st table_id)]
-    (if-let [[ts h] (store+handle o)]
+    (if-let [[ts h] (tbl/store+handle lake/lake o)]
       (if-let [why (why-unreadable ts h o)]
         {:error (str "table " table_id " cannot be read: " why)}
         (let [spec (select-keys args [:group_by :measure :agg :filter :sort :limit])]
