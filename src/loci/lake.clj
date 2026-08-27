@@ -1280,6 +1280,23 @@
                                     " WHERE " (ident c) " IS NOT NULL)"
                                     " ORDER BY v LIMIT " (long per-col))))])))))
 
+(def ^:private numeric-type-re
+  "Matched, case-insensitively, against a `DESCRIBE`d column's `column_type` to
+   decide `column-profile`'s `:numeric`.
+
+   The task that specified this listed `integer/decimal/double/float/real/
+   hugeint/numeric`, and that set alone misses the type DuckDB actually gives a
+   JSON integer: measured 2026-08-27, `put-rows!` over `{:i 1}` — the path every
+   agent-authored table and CSV import takes — types the column `BIGINT`, which
+   contains none of those seven words. `bigint`/`smallint`/`tinyint` are added
+   for that reason, as substrings so the unsigned forms (`UBIGINT`, `USMALLINT`,
+   `UTINYINT`, `UINTEGER`) match too without being spelled out.
+
+   Not widened to a bare `int`, even though every name above already contains
+   it: DuckDB's `INTERVAL` type contains `int` as well (*int*erval) and is not a
+   number."
+  #"(?i)integer|decimal|double|float|real|hugeint|numeric|bigint|smallint|tinyint")
+
 (defn relation-of
   "A handle as a HoneySQL FROM entry that pins its snapshot.
 
@@ -1443,6 +1460,26 @@
   (column-samples [lk h per-col max-cols]
     (sample-cache lk (samples-version h) (from-of h)
                   (vec (take max-cols (:cols h))) per-col))
+
+  (column-profile [lk h]
+    ;; `from-of`, not `relation-of` — `relation-of` reads `(:table h)` and
+    ;; `(:snapshot h)` directly and only a `:lake` handle has either. `from-of`
+    ;; is the function `rows` and `column-samples` already use for exactly this
+    ;; reason: it is snapshot-pinned SQL text for a `:lake` handle and a renamed
+    ;; `read_csv`/passthrough relation for a `:source` one, so one query works
+    ;; for both handle shapes this store answers for.
+    (let [cols    (:cols h)
+          types   (into {}
+                        (map (fn [r] [(sub/col-kw (:column_name r)) (:column_type r)]))
+                        (q lk (str "DESCRIBE SELECT * FROM " (from-of h))))
+          numeric (vec (filter #(re-find numeric-type-re (str (types %))) cols))
+          numset  (set numeric)
+          samples (tbl/column-samples lk h 13 (count cols))
+          categorical (vec (for [c cols
+                                  :when (and (not (numset c))
+                                             (<= 2 (count (get samples c)) 12))]
+                              c))]
+      {:cols cols :numeric numeric :categorical categorical :rows (:rows h)}))
 
   (query [this handle spec]
     (let [rel   (relation-of handle)

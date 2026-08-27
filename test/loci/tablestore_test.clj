@@ -527,6 +527,19 @@
     (is (= 0.0  (:v (first (:rows (tbl/query ts h {:group_by "region" :measure "v" :agg "min"}))))))
     (is (= 27.0 (:v (first (:rows (tbl/query ts h {:group_by "region" :measure "v" :agg "max"}))))))))
 
+(deftest inline-column-profile
+  (let [ts (tbl/inline-table)
+        h  (tbl/put-rows! ts "tbl:p"
+                          (vec (for [n (range 40)]
+                                 {:region (str "r" (mod n 3))
+                                  :v (double n)
+                                  :note (str "unique-" n)})))
+        p  (tbl/column-profile ts h)]
+    (is (= [:region :v :note] (:cols p)))
+    (is (= [:v] (:numeric p)))
+    (is (= [:region] (:categorical p)) ":note has 40 distinct values — not a category")
+    (is (= 40 (:rows p)))))
+
 (deftest inline-create-from-spec-returns-a-handle
   (let [ts (tbl/inline-table)
         h  (tbl/put-rows! ts "tbl:q" qrows)

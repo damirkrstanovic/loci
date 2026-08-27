@@ -1530,6 +1530,28 @@
       (is (= :lake (:store h2)))
       (is (= 2000 (:rows h2)) "2,000 matching rows — 1,500 would mean a sample was filtered"))))
 
+(deftest lake-column-profile-reads-no-rows
+  (with-lake [lk]
+    (let [h (tbl/put-rows! lk "tbl:p"
+                           (vec (for [n (range 2500)]
+                                  {:region (str "r" (mod n 3))
+                                   :v (double n)
+                                   :note (str "unique-" n)})))
+          p (tbl/column-profile lk h)]
+      (is (= [:region :v :note] (:cols p)))
+      (is (= [:v] (:numeric p)) "numeric comes from DuckDB's type, not from a first row")
+      (is (= [:region] (:categorical p)) ":note has 2,500 distinct values — not a category")
+      (is (= 2500 (:rows p))))))
+
+(deftest lake-and-inline-agree-on-the-column-profile
+  (with-lake [lk]
+    (let [rows (vec (for [n (range 2500)]
+                      {:region (str "r" (mod n 3)) :v (double n) :note (str "u" n)}))
+          hl   (tbl/put-rows! lk "tbl:p" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:p" rows)]
+      (is (= (tbl/column-profile ii hi) (tbl/column-profile lk hl))))))
+
 (deftest lake-create-from-spec-names-the-results-columns-not-the-sources
   ;; An aggregate's columns are NOT the source's. A handle whose :cols name
   ;; columns the table does not have fails every later read with a binder error.

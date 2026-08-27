@@ -90,14 +90,54 @@
     (is (= 75.0 (:share_pct (second out))))))
 
 (deftest catalog-greys-with-reasons-and-fills-options
-  (let [cat (fnl/catalog rows)                       ; has numeric + cat cols
+  (let [profile {:cols [:region :revenue :units] :numeric [:revenue :units]
+                 :categorical [:region] :rows 3}      ; has numeric + ONE cat col
+        cat (fnl/catalog profile)
         by-id (into {} (map (juxt :id identity)) cat)]
     (is (:ok (by-id "lib:filter")))
-    (is (not (:ok (by-id "lib:pivot"))))             ; rows has ONE cat col
+    (is (not (:ok (by-id "lib:pivot"))))             ; profile has ONE cat col
     (is (= "needs two category columns" (:why (by-id "lib:pivot"))))
-    ;; col params carry the live column options for the UI selects
+    ;; col params carry the profile's column options for the UI selects
     (let [p (first (filter #(= "by" (:name %)) (:params (by-id "lib:top"))))]
       (is (= ["revenue" "units"] (:options p)))))
-  (let [prose [{:note "a"} {:note "b"}]
+  (let [prose {:cols [:note] :numeric [] :categorical [] :rows 2}
         by-id (into {} (map (juxt :id identity)) (fnl/catalog prose))]
     (is (= "needs a numeric column" (:why (by-id "lib:top"))))))
+
+;; ---------------------------------------------------------------------------
+;; catalog takes a profile — {:cols :numeric :categorical :rows} — never rows.
+;; See loci.tablestore/column-profile, which answers it without fetching one.
+;; ---------------------------------------------------------------------------
+
+(def profile
+  "What `catalog` needs, and all it needs: column names, which are numeric,
+   which are categorical, and how many rows there are. No row is a member."
+  {:cols [:region :revenue :name] :numeric [:revenue] :categorical [:region] :rows 2500})
+
+(deftest catalog-takes-a-profile-not-rows
+  (let [c (fnl/catalog profile)
+        by-id (into {} (map (juxt :id identity)) c)]
+    (is (= 6 (count c)))
+    (is (= ["region" "revenue" "name"]
+           (:options (first (filter #(= "col" (:type %))
+                                    (:params (by-id "lib:filter")))))))
+    (is (= ["revenue"]
+           (:options (first (filter #(= "numcol" (:type %))
+                                    (:params (by-id "lib:group")))))))))
+
+(deftest a-verb-is-greyed-from-the-profile
+  (let [by-id (into {} (map (juxt :id identity)) (fnl/catalog (assoc profile :numeric [])))]
+    (is (false? (:ok (by-id "lib:group"))))
+    (is (= "needs a numeric column" (:why (by-id "lib:group"))))))
+
+(deftest pivot-needs-two-category-columns-and-asks-the-profile
+  (let [one (into {} (map (juxt :id identity)) (fnl/catalog profile))
+        two (into {} (map (juxt :id identity))
+                  (fnl/catalog (assoc profile :categorical [:region :name])))]
+    (is (false? (:ok (one "lib:pivot"))) "one category column is not two")
+    (is (true?  (:ok (two "lib:pivot"))))))
+
+(deftest delta-asks-the-row-count-not-a-sample
+  (let [by-id #(into {} (map (juxt :id identity)) (fnl/catalog %))]
+    (is (false? (:ok ((by-id (assoc profile :rows 1)) "lib:delta"))))
+    (is (true?  (:ok ((by-id profile) "lib:delta"))))))

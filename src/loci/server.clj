@@ -1466,9 +1466,28 @@
   (let [rows (:value (tbl/hydrate lake/lake (sub/object st id)))]
     (when (and (sequential? rows) (seq rows) (every? map? rows)) rows)))
 
+(defn- store+handle
+  "The store and handle for object `id`'s table, whatever backs it — a
+   handle-backed table reads from the lake and a legacy inline table (rows in
+   the event, no handle at all) is landed in an `InlineTable` so both answer
+   `column-profile` the same way. nil when `id` names no table.
+
+   `loci.tools` keeps the same pair under the same name, built for
+   `query_table`'s `do-list`; Task 7 is where the two get one home. This is the
+   version `fns-payload` needs now, so it can ask `column-profile` instead of
+   hydrating a `mold-cap` sample to answer three questions that are not about
+   rows at all."
+  [st id]
+  (let [v (:value (sub/object st id))]
+    (cond
+      (tbl/handle? v) [(force lake/lake) v]
+      (and (sequential? v) (seq v) (every? map? v))
+      (let [ts (tbl/inline-table)] [ts (tbl/put-rows! ts id v)])
+      :else nil)))
+
 (defn fns-payload [st id]
-  (if-let [rows (table-rows st id)]
-    {:fns (into (fnlib/catalog rows)
+  (if-let [[ts h] (store+handle st id)]
+    {:fns (into (fnlib/catalog (tbl/column-profile ts h))
                 (->> (sub/objects st) vals
                      (filter #(and (= :fn (:kind %)) (= "clojure" (get-in % [:value :lang]))))
                      (sort-by :id)

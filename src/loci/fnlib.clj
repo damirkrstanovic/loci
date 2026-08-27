@@ -6,13 +6,25 @@
 
 (defn numeric-cols
   "Columns whose value is a number — judged from the first row only,
-   a cheap guess rather than a full scan."
+   a cheap guess rather than a full scan.
+
+   `catalog` stopped calling this on 2026-08-27 — it now takes a profile that
+   already answers the numeric question without a row in sight, see
+   `loci.tablestore/column-profile`. Kept, and still exported, because
+   `loci.tools/md-cell-val`'s pinned test (`a-salvaged-number-column-is-
+   numeric-to-the-palette` in `tools_test.clj`) asserts against it directly:
+   the thing it is checking is whether a salvaged markdown cell reads back as a
+   number at all, over rows that were never landed in a store."
   [rows]
   (vec (for [[k v] (first rows) :when (number? v)] k)))
 
 (defn cat-cols
   "Category columns: all-string columns with 2–12 distinct values —
-   few enough to group by, more than one so grouping means something."
+   few enough to group by, more than one so grouping means something.
+
+   `catalog` stopped calling this on 2026-08-27, for the same reason as
+   `numeric-cols` above. Kept for its own test in `fnlib-test`; nothing else in
+   `src/` calls it, checked 2026-08-27."
   [rows]
   (vec (for [k (keys (first rows))
              :let [vs (map k rows)]
@@ -53,7 +65,7 @@
         s (sort-by #(let [v (get % k)] (if (number? v) v 0)) rows)]
     (vec (take n (if (= order "asc") s (reverse s))))))
 
-(defn- needs-numeric [rows] (when (empty? (numeric-cols rows)) "needs a numeric column"))
+(defn- needs-numeric [{:keys [numeric]}] (when (empty? numeric) "needs a numeric column"))
 
 (defn- pivot-run [rows {:keys [rows_col cols_col measure agg]}]
   (let [rk (keyword rows_col) ck (keyword cols_col) mk (keyword measure) agg (or agg "sum")]
@@ -98,12 +110,14 @@
    {:id "lib:pivot" :label "Pivot" :doc "rows × columns grid — aggregate a measure by two categories"
     :params [{:name "rows_col" :type "catcol"} {:name "cols_col" :type "catcol"}
              {:name "measure" :type "numcol"} {:name "agg" :type "choice" :options ["sum" "avg" "count"]}]
-    :pred (fn [rows] (or (needs-numeric rows)
-                         (when (< (count (cat-cols rows)) 2) "needs two category columns")))
+    :pred (fn [{:keys [categorical] :as p}]
+            (or (needs-numeric p)
+               (when (< (count categorical) 2) "needs two category columns")))
     :run pivot-run}
    {:id "lib:delta" :label "Change vs previous row" :doc "adds delta and %-change columns, row over row"
     :params [{:name "col" :type "numcol"}]
-    :pred (fn [rows] (or (needs-numeric rows) (when (< (count rows) 2) "needs at least two rows")))
+    :pred (fn [{:keys [rows] :as p}]
+            (or (needs-numeric p) (when (< rows 2) "needs at least two rows")))
     :run delta-run}
    {:id "lib:share" :label "Share of total" :doc "adds each row's % of the column total"
     :params [{:name "col" :type "numcol"}]
@@ -112,13 +126,20 @@
 (defn catalog
   "The palette for one table: every builtin with :ok/:why (greyed functions
    stay visible — the reason teaches the vocabulary) and col params filled
-   with the table's live column options."
-  [rows]
-  (let [opts {"col"    (mapv name (keys (first rows)))
-              "numcol" (mapv name (numeric-cols rows))
-              "catcol" (mapv name (cat-cols rows))}]
+   with the table's column options — taken from a PROFILE, never rows.
+
+   `profile` is `{:cols :numeric :categorical :rows}`, exactly what
+   `loci.tablestore/column-profile` answers without fetching a row. Before
+   2026-08-27 this took `rows` — a 2,000-row sample on any table larger than
+   that — and judged :numeric from the first row alone and :categorical by
+   scanning the sample it was handed, so a verb was offered or greyed on a
+   guess about a million-row table's other 998,000 rows."
+  [{:keys [cols numeric categorical] :as profile}]
+  (let [opts {"col"    (mapv name cols)
+              "numcol" (mapv name numeric)
+              "catcol" (mapv name categorical)}]
     (mapv (fn [{:keys [id label doc params pred]}]
-            (let [why (when pred (pred rows))]
+            (let [why (when pred (pred profile))]
               {:id id :label label :doc doc :ok (nil? why) :why why
                :params (mapv #(if-let [o (opts (:type %))] (assoc % :options o) %) params)}))
           builtins)))

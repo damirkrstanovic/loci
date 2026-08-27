@@ -83,6 +83,23 @@
      This is what a table's chunk is built from. It exists so that describing a
      10M-row table costs nine values rather than a page of rows, and so that the
      description covers the whole column rather than its first `mold-cap` rows.")
+  (column-profile [this handle]
+    "`{:cols [...] :numeric [...] :categorical [...] :rows n}` — everything the ƒ
+     palette needs to decide which verbs to offer, **fetching no rows**.
+
+     `:numeric` comes from the store's own types, not from whatever the first row
+     happened to hold. `:categorical` is a column with 2–12 distinct values, and
+     it is answered through `column-samples` asked for 13 per column rather than
+     by a second `count(DISTINCT)` mechanism: 2–12 samples come back for a
+     category, 13 for anything wider.
+
+     **`column-samples` drops nulls**, so a column with twelve distinct values one
+     of which is null reports eleven. That is accurate enough for a menu
+     affordance and is not worth a second query to correct.
+
+     Before 2026-08-27 the palette hydrated a 2,000-row sample to answer all of
+     this, so `lib:pivot` was offered or greyed on a guess about the rest of the
+     table, and every ƒ menu open paid a JDBC read for it.")
   (query [this handle spec]
     "Run `spec`'s question half — `group_by` / `measure` / `agg` / `filter` /
      `sort` / `limit` — against `handle`.
@@ -509,6 +526,26 @@
       (into {} (for [c (take max-cols (:cols h))]
                  [c (->> rs (keep #(get % c)) (map str) (map clip-sample)
                          distinct sort (take per-col) vec)]))))
+  (column-profile [_ h]
+    ;; A scan, not a push-down — its rows are already in the handle, so there is
+    ;; nothing to ask a query engine for. `:numeric` looks at every non-nil value
+    ;; in the column rather than the first row alone, which is what makes this
+    ;; the reference `Lake` (whose :numeric comes from DESCRIBE) has to agree
+    ;; with: a column typed consistently reads the same either way, and a
+    ;; column that is NOT typed consistently — real for a Clojure map, never
+    ;; possible for a DuckDB column — has to pick one, so "every value is a
+    ;; number" is the version that cannot be wrong for a genuinely numeric column.
+    (let [rs      (:data h)
+          cols    (:cols h)
+          vals-of (fn [c] (keep #(get % c) rs))
+          numeric (vec (for [c cols :let [vs (vals-of c)] :when (and (seq vs) (every? number? vs))] c))
+          numset  (set numeric)
+          categorical (vec (for [c cols
+                                  :when (not (numset c))
+                                  :let [n (count (distinct (map str (vals-of c))))]
+                                  :when (<= 2 n 12)]
+                              c))]
+      {:cols cols :numeric numeric :categorical categorical :rows (count rs)}))
   (query [this handle spec]
     ;; The inline store folds in Clojure, which is what it has always done and is
     ;; correct here: its rows are IN the handle, so there is nothing to push down
