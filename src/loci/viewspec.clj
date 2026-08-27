@@ -60,8 +60,17 @@
     (if-let [s (:sort spec)]
       (let [key     (if gb ycol (or (some-> measure name)
                                     (name (first (keys (first agged))))))
-            ordered (sort-by #(or (num (get % (keyword key))) (str (get % (keyword key))))
-                             agged)]
+            ;; **Both key types, and that is the bug this fixes.** A grouped row
+            ;; is built by `(array-map (name gb) …)` and carries STRING keys,
+            ;; while an ungrouped row passes through with its original keywords.
+            ;; Looking up only `(keyword key)` made every grouped sort key nil,
+            ;; so every row compared equal: "asc" returned `group-by`'s arbitrary
+            ;; order and "desc" returned it reversed. Found 2026-08-27, when
+            ;; `Lake/query` began sorting the same spec correctly in SQL and the
+            ;; two stores disagreed.
+            at      (fn [r] (let [v (get r key ::none)]
+                              (if (= ::none v) (get r (keyword key)) v)))
+            ordered (sort-by #(or (num (at %)) (str (at %))) agged)]
         (vec (if (= s "desc") (reverse ordered) ordered)))
       agged)))
 

@@ -52,3 +52,28 @@
     (is (= 27.0 (get (group-row maxs "r0") "v")))
     (is (= 1.0 (get (group-row mins "r1") "v")))
     (is (= 29.0 (get (group-row maxs "r2") "v")))))
+
+(def unordered
+  "A fixture whose `group-by` order is NOT its value order. The 30-row `rows`
+   fixture hides a broken sort, because r0/r1/r2 happen to come out already
+   ascending by sum."
+  (vec (concat (for [_ (range 3)] {:region "r2" :v 1.0})
+               (for [_ (range 3)] {:region "r0" :v 100.0})
+               (for [_ (range 3)] {:region "r1" :v 50.0}))))
+
+(deftest grouped-sort-actually-sorts
+  (let [vals (fn [s] (mapv #(get % "v")
+                           (vs/question {:group_by "region" :measure "v"
+                                         :agg "sum" :sort s}
+                                        unordered)))]
+    (is (= [3.0 150.0 300.0] (vals "asc"))
+        "asc must order by the aggregated value, not by group-by's natural order")
+    (is (= [300.0 150.0 3.0] (vals "desc"))
+        "desc must order by the aggregated value, not reverse natural order")))
+
+(deftest ungrouped-sort-still-sorts
+  ;; This path already worked — pin it so the fix does not break it.
+  (is (= [100.0 100.0 100.0 50.0 50.0 50.0 1.0 1.0 1.0]
+         (mapv :v (vs/question {:measure "v" :sort "desc"} unordered))))
+  (is (= [1.0 1.0 1.0 50.0 50.0 50.0 100.0 100.0 100.0]
+         (mapv :v (vs/question {:measure "v" :sort "asc"} unordered)))))

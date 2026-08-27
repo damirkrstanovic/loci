@@ -1503,6 +1503,24 @@
                    "\n  inline: " (pr-str (first (:rows a)))
                    "\n  lake:   " (pr-str (first (:rows b))))))))))
 
+(deftest lake-and-inline-agree-on-sort-order
+  ;; The set-based parity test above cannot see ordering, which is how a broken
+  ;; grouped sort survived in viewspec while the lake sorted correctly in SQL.
+  (with-lake [lk]
+    (let [rows (vec (concat (for [_ (range 800)] {:region "r2" :v 1.0})
+                            (for [_ (range 800)] {:region "r0" :v 100.0})
+                            (for [_ (range 900)] {:region "r1" :v 50.0})))
+          hl   (tbl/put-rows! lk "tbl:s" rows)
+          ii   (tbl/inline-table)
+          hi   (tbl/put-rows! ii "tbl:s" rows)]
+      (doseq [s ["asc" "desc"]]
+        (let [spec {:group_by "region" :measure "v" :agg "sum" :sort s}
+              a (mapv :v (:rows (tbl/query ii hi spec)))
+              b (mapv :v (:rows (tbl/query lk hl spec)))]
+          (is (= (mapv double a) (mapv double b))
+              (str "stores disagree on " s " ORDER — inline " (pr-str a)
+                   " vs lake " (pr-str b))))))))
+
 (deftest lake-create-from-spec-keeps-every-matching-row
   (with-lake [lk]
     (let [h  (tbl/put-rows! lk "tbl:big" (vec (for [n (range 2500)] {:n n :v 1.0})))
