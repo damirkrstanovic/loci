@@ -2409,11 +2409,36 @@ function staticTable(rows){
 }
 function renderReport(blocks){
   return blocks.map(b=>{
+    // A `:ref`/`:chart :ref` block the server could not or would not resolve —
+    // a dangling id, or a ref that would have pointed at another report (the
+    // recursion guard). Surfaced BEFORE the switch, so it catches a refused
+    // `:chart` block too: without this, `chartSVG(b.spec)` sees a `spec` with
+    // no `rows` on it (resolution failed before it could fold any in) and
+    // answers its own "no chart" — an honest guard for an author who forgot
+    // rows, but here it would swallow the actual reason and read as an empty
+    // chart rather than a broken reference.
+    if(b.error) return '<div style="color:var(--attn);font-size:12.5px;margin:6px 0">'+esc(b.error)+'</div>';
     switch(b.block){
       case 'heading': return '<h3 style="font-family:\'IBM Plex Serif\',serif;font-weight:400;font-size:18px;margin:18px 0 6px">'+esc(b.text)+'</h3>';
       case 'text':    return mdToHtml(b.text);
       case 'table':   return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+staticTable(b.rows);
+      // `:chart` needs no ref-specific case: whether `b.spec` was authored
+      // inline or resolved server-side from a `:ref` table's rows
+      // (`resolve-report-block`, src/loci/server.clj), it lands here as the
+      // same `{chart,x,y,rows}` shape and chartSVG cannot tell the difference.
       case 'chart':   return '<div style="margin:6px 0 14px">'+chartSVG(b.spec)+'</div>';
+      // A `:ref` block points at a real object instead of carrying a copy of
+      // its rows. The server resolved it (`resolve-report-block`) through the
+      // SAME call `notebook-payload` makes to hydrate a `:ref` cell
+      // (`mold-payload st m id nil`) and merged the result onto `b` — so `b`
+      // now carries `kind`/`rendered`/`alternatives`/`source`/… exactly as a
+      // notebook cell does. `renderMold` is the one function that already
+      // knows how to draw every kind a mold can answer with; calling it here
+      // instead of adding a second table/list/chart/… switch is what makes a
+      // report block and a notebook cell structurally unable to disagree
+      // about how the same object is drawn — a table ref, for instance, draws
+      // the live ClojureScript grid (`data-cljs-grid`), not a static copy.
+      case 'ref':     return (b.title?'<div class="sec-h">'+esc(b.title)+'</div>':'')+renderMold(b);
       default:        return '';
     }
   }).join('');

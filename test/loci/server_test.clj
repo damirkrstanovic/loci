@@ -6296,3 +6296,122 @@
         (is (str/includes? (:error r) "tbl:gone"))
         (is (str/includes? (:error r) "reclaimed")
             (str "must name reclamation clearly, not a raw duckdb error: " (:error r)))))))
+
+;; ---------------------------------------------------------------------------
+;; Task 11 — a report `:ref` block resolves through the same call a notebook
+;; cell does
+;;
+;; Task 10 already teaches the model to emit `{:block :ref :id <a keep! id>}`
+;; and `{:block :chart :ref <id> :spec {…}}` (`clj-transform-sys`); nothing
+;; resolved them until now — `renderReport`'s `default: return ''` made a
+;; `:ref` block vanish silently rather than error, which is why the browser
+;; test below asserts on rendered DOM and not merely on the server payload.
+;;
+;; `notebook-payload` hydrates a `:ref` cell with
+;; `(mold-payload st mem/memory (:ref c) (:view c) …)` and MERGES the result
+;; onto the cell — `resolve-report-block` makes the identical call
+;; (`mold-payload st m id nil`) and merges it onto a `:ref` block the same
+;; way, confirmed by reading `notebook-payload` (`src/loci/server.clj`,
+;; the `cells` binding) before writing this.
+;; ---------------------------------------------------------------------------
+
+(deftest report-ref-block-resolves-the-referenced-table
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:a" [{:n 1} {:n 2} {:n 3}])
+            _  (sub/commit! st {:op :put :id "tbl:a"
+                                :value {:id "tbl:a" :kind :table :title "A" :value h}})
+            _  (sub/commit! st {:op :put :id "report:r"
+                                :value {:id "report:r" :kind :report :title "R"
+                                        :value [{:block :heading :text "Hi"}
+                                                {:block :ref :id "tbl:a"}]}})
+            p  (srv/mold-payload st no-memory "report:r" nil)
+            b  (second (:rendered p))]
+        (is (= "report" (:kind p)))
+        (is (= :ref (:block b)))
+        (is (nil? (:error b)) "a real table must resolve, not refuse")
+        (is (= "table" (:kind b)) "the resolved payload's own kind, merged onto the block")
+        (is (= [{:n 1} {:n 2} {:n 3}] (:rendered b))
+            "the referenced table's rows, not a copy authored into the block")))))
+
+(deftest report-chart-ref-block-resolves-the-referenced-tables-rows
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:a" [{:n 1} {:n 2} {:n 3}])
+            _  (sub/commit! st {:op :put :id "tbl:a"
+                                :value {:id "tbl:a" :kind :table :title "A" :value h}})
+            _  (sub/commit! st {:op :put :id "report:r"
+                                :value {:id "report:r" :kind :report :title "R"
+                                        :value [{:block :chart :ref "tbl:a"
+                                                 :spec {:chart "bar" :x "n" :y "n"}}]}})
+            p  (srv/mold-payload st no-memory "report:r" nil)
+            b  (first (:rendered p))]
+        (is (= :chart (:block b)))
+        (is (nil? (:error b)))
+        (is (= "bar" (get-in b [:spec :chart])) "the authored half of the spec survives untouched")
+        (is (= [{:n 1} {:n 2} {:n 3}] (get-in b [:spec :rows]))
+            "the referenced table's rows, folded into the spec chartSVG already reads")))))
+
+(deftest report-inline-table-block-still-works
+  ;; The shipped demo report (`content.clj`'s qbr/retention/planets/… reports)
+  ;; carries rows INLINE on `:block :table` — this must survive resolution
+  ;; untouched, because `report-ref-block-resolves-the-referenced-table`
+  ;; proves the NEW path works and says nothing about the old one.
+  (let [rows [{:region "EMEA" :revenue 100} {:region "APAC" :revenue 200}]
+        st   (sub/fresh-store)
+        _    (sub/commit! st {:op :put :id "report:r"
+                              :value {:id "report:r" :kind :report :title "R"
+                                      :value [{:block :table :title "T" :rows rows}]}})
+        p    (srv/mold-payload st no-memory "report:r" nil)
+        b    (first (:rendered p))]
+    (is (= :table (:block b)))
+    (is (= rows (:rows b)) "an inline table block's rows must be untouched by ref resolution")
+    (is (nil? (:error b)))))
+
+(deftest report-ref-to-a-report-is-refused-not-recursed
+  ;; Under a timeout: a missing guard's failure mode is unbounded recursion,
+  ;; and an assertion with no timeout would run right along with it. Measured
+  ;; by sabotaging the guard out (Task 11's mandatory step C): this particular
+  ;; recursion is NOT tail-recursive — `resolve-report-block` calls
+  ;; `mold-payload`, which calls `mapv` of `resolve-report-block` over a
+  ;; report's blocks — so removing the guard blows the JVM stack in well
+  ;; under a second rather than spinning for the full 3000ms. `(future …)`
+  ;; wraps `deref`'s own `ExecutionException` in `:threw` for that reason:
+  ;; the guard's JOB is "never let this recurse", and a fast crash is exactly
+  ;; as much a failure to do that job as a slow hang would be — this test
+  ;; means to catch whichever one an unguarded implementation produces.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            _  (sub/commit! st {:op :put :id "report:a"
+                                :value {:id "report:a" :kind :report :title "A"
+                                        :value [{:block :ref :id "report:b"}]}})
+            _  (sub/commit! st {:op :put :id "report:b"
+                                :value {:id "report:b" :kind :report :title "B"
+                                        :value [{:block :ref :id "report:a"}]}})
+            f  (future (try (srv/mold-payload st no-memory "report:a" nil)
+                            (catch Throwable t {:threw (.getName (class t))})))
+            p  (deref f 3000 :TIMED-OUT)]
+        (is (not= :TIMED-OUT p) "a report referencing a report must refuse, not hang")
+        (is (not (:threw p)) (str "must refuse cleanly, not blow the stack recursing: " p))
+        ;; Only a `p` that neither timed out nor threw is a real payload with
+        ;; blocks to inspect — checking further into a `:TIMED-OUT` or a
+        ;; `:threw` map would just be a second, confusing failure on top of
+        ;; the real one the two assertions above already reported.
+        (when (and (not= :TIMED-OUT p) (not (:threw p)))
+          (let [b (first (:rendered p))]
+            (is (some? (:error b)) "refused, with a message")
+            (is (str/includes? (:error b) "report")
+                (str "the message must name why: " (:error b)))))))))
+
+(deftest report-ref-to-a-missing-id-degrades-honestly
+  (let [st (sub/fresh-store)
+        _  (sub/commit! st {:op :put :id "report:r"
+                            :value {:id "report:r" :kind :report :title "R"
+                                    :value [{:block :ref :id "tbl:does-not-exist"}]}})
+        p  (srv/mold-payload st no-memory "report:r" nil)
+        b  (first (:rendered p))]
+    (is (some? (:error b)) "a dangling ref must say so, not crash and not render blank")
+    (is (str/includes? (:error b) "tbl:does-not-exist"))))

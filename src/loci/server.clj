@@ -474,6 +474,12 @@
      :mode  (let [m (:mode src)]
               (when (or (keyword? m) (string? m)) (name m)))}))
 
+;; `resolve-report-block` (defined below `mold-payload`, since it CALLS
+;; `mold-payload` to resolve a ref) is itself called FROM `mold-payload`'s
+;; `:else` branch — declared here so the two can refer to each other without
+;; either being defined out of order.
+(declare resolve-report-block)
+
 (defn mold-payload
   "One object, rendered: what `/api/mold` and `/api/object/…` answer, and what
    every `:ref` cell of a notebook payload is built out of.
@@ -581,10 +587,19 @@
       ;; needs the memory — which is exactly the assumption the entity branch
       ;; above just stopped being able to make for the function as a whole.
       :else
-      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))]
+      (let [mv (mold/mold (:value o) (when (seq view) (str->kw view)))
+            ;; A report's blocks may carry `:ref`/`:chart :ref` — Task 11.
+            ;; Resolved HERE, once, rather than by the shell: `:report/full`
+            ;; and `:report/data` are the only two viewers `report?` matches
+            ;; whose `:kind` is `:report` (`:report/outline` renders strings,
+            ;; nothing to resolve), so this is the one seam every report
+            ;; payload passes through regardless of which of the two drew it.
+            rendered (if (= :report (:kind mv))
+                       (mapv (partial resolve-report-block st m) (:rendered mv))
+                       (:rendered mv))]
         (cond-> {:id id :title (:title o) :kind (name (:kind mv))
                  :view (when (:view mv) (kw->str (:view mv)))
-                 :label (:label mv) :rendered (:rendered mv)
+                 :label (:label mv) :rendered rendered
                  :alternatives (alternatives st o) :source (source-block o)}
           ;; `:table/total` and `:table/cols` only when `hydrate`/`hydrate-page`
           ;; actually put them on `o` — a doc, a report or a metric molds
@@ -629,6 +644,75 @@
                            :unbounded? (boolean (:table/unbounded o))
                            :path       [:rendered]
                            :cursor     (:page/next o)})))))))
+
+;; ---- report blocks that name another object (Task 11) ----
+;;
+;; A report block is `{:block :ref :id …}` or `{:block :chart :ref … :spec
+;; …}` — see `loci.agent`'s `clj-transform-sys` prompt for the exact two
+;; shapes a model is told to write. Neither carries rows; both name an id a
+;; `keep!` call minted in the same `:tx`. Nothing rendered them before this —
+;; `renderReport`'s `default: return ''` swallowed an unrecognised block kind
+;; silently, which is exactly why a `:ref` block used to vanish rather than
+;; error.
+
+(defn- ref-target
+  "The id a report block names, or nil for a block that names none.
+
+   `:ref` carries it as `:id` — the block's OWN id, there being nothing else
+   for a pointer-only block to have one of. `:chart` carries it as `:ref`,
+   because a chart block already owns `:spec`; giving it `:id` too would read
+   as the chart's own id rather than as what it draws from."
+  [block]
+  (case (:block block)
+    :ref   (:id block)
+    :chart (:ref block)
+    nil))
+
+(defn resolve-report-block
+  "One report block, with the object it names molded in — the exact call
+   `notebook-payload` makes for a `:ref` cell (`mold-payload st m (:ref c)
+   (:view c) …`, this same function, no view forced), so a report block and a
+   notebook cell resolve through one call and can never draw an object two
+   different ways.
+
+   A `:ref` block is MERGED with its resolved payload — `:kind`, `:rendered`,
+   `:alternatives`, `:source`, `:table/total`… land on the block exactly as
+   they land on a notebook cell, so the shell's existing per-kind renderer
+   (`renderMold`) draws it with no ref-specific case of its own. A `:chart`
+   block keeps its own `:spec` and gets only the referenced table's rows
+   folded into it (`[:spec :rows]`) — `chartSVG` already reads `spec.rows`
+   for an inline chart, and a ref-drawn chart is that same shape with the
+   rows fetched instead of authored.
+
+   **Recursion guard.** A block naming a `:report` is refused outright, before
+   `mold-payload` is ever called on it — not just when it would cycle back to
+   THIS report. `mold-payload` resolves a report's blocks by calling this
+   function again, so resolving into another report would recurse for as long
+   as the chain of reports does, and a report referencing itself (directly or
+   through others) would recurse forever. Nothing asks for report-in-report
+   nesting; refusing it unconditionally is simpler than detecting a cycle and
+   costs nothing a real report design needs.
+
+   A missing id degrades the same way a notebook's `:type \"missing\"` cell
+   does — a message, because a dangling ref is a fact about the data, not a
+   bug in this function."
+  [st m block]
+  (if-let [id (ref-target block)]
+    (let [target (sub/object st id)]
+      (cond
+        (nil? target)
+        (assoc block :error (str "no such object: " id))
+
+        (= :report (:kind target))
+        (assoc block :error
+               (str id " is a report — a report block cannot reference another report"))
+
+        (= :ref (:block block))
+        (merge block (mold-payload st m id nil))
+
+        :else ;; :chart with a :ref
+        (assoc-in block [:spec :rows] (:rendered (mold-payload st m id nil)))))
+    block))
 
 ;; ---- LEAP by meaning: the deep query, and only ever the deep query ----
 ;;
