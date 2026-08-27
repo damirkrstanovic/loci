@@ -1565,3 +1565,38 @@
           (str "handle :cols must come from the RESULT, got " (pr-str (:cols h2))))
       (is (= 5 (count (tbl/rows lk h2 {})))
           "and the table must actually be readable through those cols"))))
+
+(deftest lake-query-answers-a-source-handle
+  ;; relation-of first read (:table h) and (:snapshot h) directly, which a
+  ;; :source handle has neither of, so query_table on a passthrough table threw
+  ;; an NPE inside ident. Regression from 80da24a, found in Phase 2's review.
+  (with-lake [lk]
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-src-" (System/nanoTime))
+          f   (io/file dir "t.csv")]
+      (try
+        (.mkdirs (io/file dir))
+        (spit f "region,revenue\nEMEA,10\nAPAC,20\nEMEA,30\n")
+        (let [h {:store :source :uri (str "file://" (.getAbsolutePath f)) :format :csv
+                 :cols [:region :revenue] :raw ["region" "revenue"] :rows 3}]
+          (is (= 3 (:total (tbl/query lk h {}))))
+          (let [r (tbl/query lk h {:group_by "region" :measure "revenue" :agg "sum"})]
+            (is (= 2 (:total r)))
+            (is (= 60.0 (double (reduce + (map :revenue (:rows r))))))))
+        (finally (rm-rf dir))))))
+
+(deftest lake-query-renames-a-sources-columns
+  ;; from-of renames the FILE's header to loci's :cols inside the FROM. Without
+  ;; it a source whose header is not an identifier fails with
+  ;; `Binder Error: Referenced column "total_revenue" not found`.
+  (with-lake [lk]
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/loci-src2-" (System/nanoTime))
+          f   (io/file dir "t.csv")]
+      (try
+        (.mkdirs (io/file dir))
+        (spit f "Total Revenue ($),Region\n10,EMEA\n20,APAC\n")
+        (let [h {:store :source :uri (str "file://" (.getAbsolutePath f)) :format :csv
+                 :cols [:total_revenue :region] :raw ["Total Revenue ($)" "Region"] :rows 2}
+              r (tbl/query lk h {:group_by "region" :measure "total_revenue" :agg "sum"})]
+          (is (= 2 (:total r)))
+          (is (= 30.0 (double (reduce + (map :total_revenue (:rows r)))))))
+        (finally (rm-rf dir))))))

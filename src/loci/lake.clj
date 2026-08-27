@@ -1298,22 +1298,22 @@
   #"(?i)integer|decimal|double|float|real|hugeint|numeric|bigint|smallint|tinyint")
 
 (defn relation-of
-  "A handle as a HoneySQL FROM entry that pins its snapshot.
+  "A handle as a HoneySQL FROM entry, through `from-of`.
 
-   **A subquery map, not a bare `[:raw …]`, and the reason is measured.** DuckDB
-   refuses an alias directly on a versioned relation —
-   `FROM t AT (VERSION => 1) AS x` is `Parser Error: syntax error at or near
-   \"AS\"` — so the relation has to be wrapped to be aliasable at all, which is
-   also what lets one query join two tables. Verified 2026-08-27: the quoted,
-   the bare and the subquery-wrapped forms all read; only the aliased bare form
-   does not.
+   **A subquery map, not a bare `[:raw …]`.** DuckDB refuses an alias directly on
+   a versioned relation — `FROM t AT (VERSION => 1) AS x` is
+   `Parser Error: syntax error at or near \"AS\"` — so it has to be wrapped to be
+   aliasable at all, which is also what lets one query join two tables. Verified
+   2026-08-27.
 
-   `ident` quotes the table name. Names are minted by `table-name`, so this is
-   belt and braces rather than a fix."
+   **`from-of` and not a table name, and that is the whole fix.** This function
+   first read `(:table h)` and `(:snapshot h)` directly, which a `:source`
+   handle does not have, so `query_table` on a passthrough table threw an NPE
+   inside `ident`. `from-of` answers for both stores AND renames a source's
+   columns to loci's inside the FROM — see its docstring for the binder error
+   that rename prevents."
   [h]
-  {:select [:*]
-   :from   [[[:raw (str (ident (:table h))
-                        " AT (VERSION => " (long (:snapshot h)) ")")]]]})
+  {:select [:*] :from [[[:raw (from-of h)]]]})
 
 (defn create-from-sql!
   "Materialise any SQL SELECT as a new lake table and return the handle.
