@@ -1522,6 +1522,64 @@
     (and (sequential? v) (seq v) (every? map? v)) :table
     :else nil))
 
+;; ---- Task 12: a report may not carry a capped page as though it were the
+;; whole answer ----
+;;
+;; `q` pages past `tbl/max-query-rows` and says so IN THE ROWS' OWN METADATA
+;; (`{:total n :capped true}` — `loci.sandbox`'s `run-q`), which survives
+;; `json-safe`'s `postwalk` (`clojure.walk` reconstructs collections but
+;; carries their meta along; confirmed at the REPL before writing this, both
+;; on a bare vector and on one nested inside a block map inside a report
+;; vector). If a report block embeds those rows verbatim, the shell shows
+;; 10,000 of 900,000 rows captioned as though that were the answer — the exact
+;; failure `query_table` and friends had before this plan started, reopened
+;; through a new door: a query surface that answers exactly, wired to a report
+;; block that can still lie about how much of the answer it is showing.
+;;
+;; `keep!` is the honest path, and it is not a favour asked of the model — see
+;; `compute-clj!` below, which refuses the block and re-asks rather than
+;; rendering it. `keep!` materialises the query as its own table, and once a
+;; report references it with `:ref` (or `:chart :ref`) instead of a copy, the
+;; grid's paging, cursor and "showing 101–200 of 900,000" caption come for
+;; free — the same table view Task 3/4 already built, not new work.
+
+(defn- block-rows
+  "The rows a report block `b` carries DIRECTLY — the value `staticTable` and
+   `chartSVG` render with no further resolution
+   (`resources/public/index.html`'s `renderReport`). `:heading` and `:text`
+   carry none; `:ref` and `:chart :ref` carry none either — `resolve-report-block`
+   fetches those from the object they name, well after this runs. `:table`'s
+   `:rows` and `:chart`'s `[:spec :rows]` are the only two shapes that do, so
+   those are the only two checked."
+  [b]
+  (case (:block b)
+    :table (:rows b)
+    :chart (get-in b [:spec :rows])
+    nil))
+
+(defn- capped-block
+  "The first block in report `blocks` whose rows carry `:capped true` in their
+   own metadata, or nil. `(:capped (meta rows))` is false — not absent — for
+   an uncapped `q` result and nil for rows that never came from `q` at all
+   (hand-authored, as `content.clj`'s demo reports and the shipped
+   `report-inline-table-block-still-works` regression both are), so both read
+   as not-offending here; only a page `q` itself marked truncated does."
+  [blocks]
+  (first (filter #(:capped (meta (block-rows %))) blocks)))
+
+(defn- capped-block-message
+  "What the model reads back when `capped-block` finds one — names the block
+   and the fix, because `compute-clj!`'s retry loop feeds this to the model as
+   `err` exactly as it does an eval exception; a message only a person could
+   act on would waste the retry."
+  [b]
+  (let [rows (block-rows b)
+        m    (meta rows)]
+    (str "report block :" (name (:block b)) " carries " (count rows) " of "
+         (:total m) " rows straight from a capped q result — call keep! to "
+         "materialise the query as a table, then point the report at it with "
+         "{:block :ref :id …} (or :chart :ref) instead of embedding the rows")))
+
 (defn compute-clj!
   "A user's request over table `id`, in one query-shaped run: the model writes
    Clojure against `loci.sandbox`'s five verbs (`table`/`tables`/`q`/`q-reduce`/
@@ -1573,8 +1631,13 @@
               ctx     (sbx/context st id space mint-id)
               attempt (fn [prev-code err]
                         (let [code (agent/make-clj-transform profile samples prompt prev-code err)]
-                          (try {:value (json-safe (run-sandboxed code ctx)) :code code}
-                               (catch Exception e {:error (.getMessage e) :code code}))))
+                          (try
+                            (let [value (json-safe (run-sandboxed code ctx))
+                                  bad   (when (= :report (shape-of value)) (capped-block value))]
+                              (if bad
+                                {:error (capped-block-message bad) :code code}
+                                {:value value :code code}))
+                            (catch Exception e {:error (.getMessage e) :code code}))))
               ;; one bad generation shouldn't sink the request: retry once,
               ;; feeding the eval error back so the model can fix its code
               r1 (attempt nil nil)

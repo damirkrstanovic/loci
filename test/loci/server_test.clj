@@ -6415,3 +6415,126 @@
         b  (first (:rendered p))]
     (is (some? (:error b)) "a dangling ref must say so, not crash and not render blank")
     (is (str/includes? (:error b) "tbl:does-not-exist"))))
+
+;; ---------------------------------------------------------------------------
+;; Task 12 — a report block may not carry a capped page as though it were the
+;; whole answer
+;;
+;; `agent/make-clj-transform` is stubbed throughout, as every Task 10/11 test
+;; above does, so nothing here makes a network call. `tbl/max-query-rows` is
+;; 10,000 (confirmed at the REPL before writing these): 12,000 rows caps a
+;; bare `(q {:select [:*] …})`, 50 does not.
+;; ---------------------------------------------------------------------------
+
+(deftest a-capped-report-block-inline-is-refused
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [before (count (sub/history st))
+                r      (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "capped")
+                (str "the refusal must name the rule: " (:error r)))
+            (is (str/includes? (:error r) "keep!")
+                (str "the refusal must say what to do instead: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refused report must not commit — no report, no :fn")))))))
+
+(deftest an-uncapped-report-block-inline-is-allowed
+  ;; Both directions must be pinned — a guard that refuses everything is not a
+  ;; guard. Identical code to the test above, over a table small enough that
+  ;; q never caps.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:small" (vec (for [n (range 50)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:small"
+                         :value {:id "tbl:small" :kind :table :title "Small" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                             "[{:block :table :title \"All\" :rows r}])"))]
+          (let [r   (srv/compute-clj! st "tbl:small" "show me everything" nil)
+                obj (sub/object st (:openId r))]
+            (is (nil? (:error r)))
+            (is (= :report (:kind obj)))
+            (is (= :table (:block (first (:value obj)))))
+            (is (= 50 (count (:rows (first (:value obj)))))
+                "the inline block's rows must survive untouched — this is the honest case")))))))
+
+(deftest keep-plus-a-ref-block-is-the-way-through-a-capped-result
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})]"
+                             "  [{:block :heading :text \"Report\"} {:block :ref :id id}])"))]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))
+                ref (second (:value obj))
+                hy  (tbl/hydrate lake/lake (sub/object st (:id ref)))]
+            (is (nil? (:error r)))
+            (is (= :report (:kind obj)))
+            (is (= :ref (:block ref)))
+            (is (= :table (:kind (sub/object st (:id ref))))
+                "keep! landed a real table the report block points at, not a copy")
+            (is (= 12000 (:table/total hy))
+                "the table keep! made holds every row, not the page q returned")))))))
+
+(deftest a-capped-refusal-reaches-the-retry-loop
+  ;; The existing contract (`compute-retries-once-with-error-feedback`, far
+  ;; above), exercised on this new failure: the stub is called twice, and the
+  ;; SECOND call receives the FIRST call's error as `err`.
+  (lf/with-temp-lake
+    (fn []
+      (let [st    (sub/fresh-store)
+            h     (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))
+            calls (atom [])]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [profile samples prompt prev-code err]
+                        (swap! calls conj err)
+                        (if err
+                          (str "(let [id (keep! \"All\" {:select [:*] :from [[table :t]]})]"
+                               "  [{:block :ref :id id}])")
+                          (str "(let [r (q {:select [:*] :from [[table :t]]})] "
+                               "[{:block :table :title \"All\" :rows r}])")))]
+          (let [r (srv/compute-clj! st "tbl:big" "show me everything" nil)]
+            (is (nil? (:error r)) "the retry's fixed code must land cleanly")
+            (is (= 2 (count @calls)))
+            (is (nil? (first @calls)) "first attempt: no error context")
+            (is (string? (second @calls)) "retry got the capped-block refusal")
+            (is (str/includes? (second @calls) "capped")
+                "the retry must receive the SAME rule the first refusal named")))))))
+
+(deftest a-capped-result-outside-a-report-still-commits-a-table
+  ;; The rule is about report blocks, not about q — a bare, capped q result
+  ;; (a plain vector of maps, no :block anywhere) is a :table answer, and this
+  ;; check never runs on it.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big" (vec (for [n (range 12000)] {:n n})))]
+        (sub/commit! st {:op :put :id "tbl:big"
+                         :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [r   (srv/compute-clj! st "tbl:big" "show me everything" nil)
+                obj (sub/object st (:openId r))
+                hy  (tbl/hydrate lake/lake obj)]
+            (is (nil? (:error r)))
+            (is (= :table (:kind obj)))
+            (is (= 10000 (:table/total hy))
+                "a capped q result outside a report still lands as a table, capped page and all")))))))
