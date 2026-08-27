@@ -6152,3 +6152,147 @@
                 "compute's own result id must mint PAST whatever keep! already issued in this run")
             (is (some? (sub/object st "tbl:derived-1")) "the interim kept table must also survive")
             (is (= (+ before 3) (count (sub/objects st))) "interim table + fn + result table")))))))
+
+;; ---------------------------------------------------------------------------
+;; the Phase 3 gap: a `:fn` compute-clj! writes now holds sandbox code (`q`,
+;; `table`, `keep!`, no `rows`), and `run-any-fn` (the ƒ palette, reached from
+;; `fn-preview`/`fn-apply!`) and `recompute` (`rerun!`'s lineage refresh) still
+;; ran every `:fn`'s code through `run-clj-rows`, which binds `rows` and
+;; nothing else. Confirmed live at the REPL before any fix: re-applying a
+;; function compute-clj! had just written answered
+;; `{:error "Could not resolve symbol: q"}` — caught by the existing `try`, so
+;; safe rather than a 500, and completely broken as a feature. `:contract` on
+;; `:value` is the discriminator: `"sandbox"` for code compute-clj! writes now,
+;; absent for every `:fn` written before this fix — which is what makes the
+;; back-compat tests below the load-bearing half of this change, not a nod.
+;; ---------------------------------------------------------------------------
+
+(deftest fn-apply-reruns-a-sandbox-shaped-fn
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c   (srv/compute-clj! st "tbl:t" "all rows" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-apply! st "tbl:t" fid {} nil)]
+            (is (nil? (:error c)))
+            (is (some? fid))
+            (is (nil? (:error r))
+                (str "re-applying a function compute-clj! just wrote must not fail resolving q: " (:error r)))
+            (is (= 2 (count (rows-of st (:openId r)))))
+            (is (= #{"EMEA" "APAC"} (set (map :region (rows-of st (:openId r))))))))))))
+
+(deftest fn-preview-reruns-a-sandbox-shaped-fn
+  ;; `fn-preview` is what the user sees before pressing Apply — same failure
+  ;; mode, same fix, different caller.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c   (srv/compute-clj! st "tbl:t" "all rows" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-preview st "tbl:t" fid {})]
+            (is (nil? (:error c)))
+            (is (nil? (:error r))
+                (str "preview must not fail resolving q: " (:error r)))
+            (is (= 2 (:count r)))))))))
+
+(deftest fn-apply-still-runs-an-old-rows-shaped-fn
+  ;; The back-compat guarantee: a `:fn` committed by hand, in the OLD shape —
+  ;; `:lang "clojure"`, no `:contract`, code written over `rows` — must keep
+  ;; working exactly as it did before this fix. Nothing already in a store
+  ;; needs migrating.
+  (let [st (store-with-table)]
+    (sub/commit! st {:op :put :id "fn:t-1"
+                     :value {:id "fn:t-1" :kind :fn :title "fn: double it"
+                             :value {:lang "clojure" :code "(fn [rows] (mapv #(update % :revenue * 2) rows))"}}})
+    (let [r (srv/fn-apply! st "tbl:t" "fn:t-1" {} nil)]
+      (is (nil? (:error r)))
+      (is (= #{200 500} (set (map :revenue (rows-of st (:openId r)))))))))
+
+(deftest rerun-refreshes-a-derived-table-through-a-sandbox-shaped-fn
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "(q {:select [:*] :from [[table :t]]})")]
+          (let [c (srv/compute-clj! st "tbl:t" "all rows" nil)
+                b (:openId c)]
+            (is (nil? (:error c)))
+            ;; change the source: EMEA revenue jumps past APAC
+            (sub/commit! st {:op :assoc :id "tbl:t" :path [:value]
+                             :value [{:region "EMEA" :revenue 900} {:region "APAC" :revenue 250}]})
+            (let [r (srv/rerun! st "tbl:t")]
+              (is (= [b] (:refreshed r)) (str "skipped: " (:skipped r)))
+              (is (= #{900 250} (set (map :revenue (rows-of st b))))))))))))
+
+(deftest fn-apply-refuses-a-sandbox-shaped-fn-that-answers-with-a-report
+  ;; `fn-apply!` builds a table; a report is not one. Refused honestly, with
+  ;; an error naming the reason — not a stack trace and not silently
+  ;; committing something the caller cannot use.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:t" trows)]
+        (sub/commit! st {:op :put :id "tbl:t" :value {:id "tbl:t" :kind :table :title "T" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _] "[{:block :heading :text \"Report\"}]")]
+          (let [c      (srv/compute-clj! st "tbl:t" "report" nil)
+                fid    (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                before (count (sub/history st))
+                r      (srv/fn-apply! st "tbl:t" fid {} nil)]
+            (is (nil? (:error c)))
+            (is (some? (:error r)))
+            (is (str/includes? (:error r) "report")
+                (str "the refusal must name why: " (:error r)))
+            (is (= before (count (sub/history st)))
+                "a refusal must not commit anything")))))))
+
+(deftest fn-apply-rerun-sums-every-row-not-a-sample
+  ;; Exactness: the whole point. A re-apply through the palette must not
+  ;; quietly become a sample again — 2,500 rows is above `tbl/mold-cap`
+  ;; (2,000); 2,000.0 here would mean a sample came back on re-apply.
+  (lf/with-temp-lake
+    (fn []
+      (let [st (sub/fresh-store)
+            h  (tbl/put-rows! @lake/lake "tbl:big"
+                              (vec (for [n (range 2500)] {:region (str "r" (mod n 5)) :v 1.0})))]
+        (sub/commit! st {:op :put :id "tbl:big" :value {:id "tbl:big" :kind :table :title "Big" :value h}})
+        (with-redefs [agent/make-clj-transform
+                      (fn [& _]
+                        "(q {:select [:region [[:sum :v] :v]] :from [[table :t]] :group-by [:region]})")]
+          (let [c   (srv/compute-clj! st "tbl:big" "sum by region" nil)
+                fid (:id (first (filter #(= :fn (:kind %)) (vals (sub/objects st)))))
+                r   (srv/fn-apply! st "tbl:big" fid {} nil)
+                rs  (rows-of st (:openId r))]
+            (is (nil? (:error c)))
+            (is (nil? (:error r)))
+            (is (= 5 (count rs)))
+            (is (= 2500.0 (double (reduce + (map :v rs))))
+                "2,000.0 would mean a mold-cap sample came back on re-apply, not every row")))))))
+
+;; ---------------------------------------------------------------------------
+;; a small regression alongside the gap above: `compute-clj!`'s move from
+;; `hydrate` to `tbl/store+handle` (Task 10) dropped the reclamation check
+;; `hydrate` used to give for free — a reclaimed table now fails deep inside
+;; DuckDB with a raw driver message instead of answering clearly up front.
+;; Confirmed live at the REPL before any fix:
+;;   {:error "compute failed: IO Error: Cannot open file \"…/ducklake-….parquet\": No such file or directory"}
+;; ---------------------------------------------------------------------------
+
+(deftest compute-refuses-a-reclaimed-table-clearly
+  (lf/with-reclaimed-table
+    (fn [st]
+      (let [r (srv/compute-clj! st "tbl:gone" "count" nil)]
+        (is (some? (:error r)))
+        (is (str/includes? (:error r) "tbl:gone"))
+        (is (str/includes? (:error r) "reclaimed")
+            (str "must name reclamation clearly, not a raw duckdb error: " (:error r)))))))

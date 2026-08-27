@@ -148,7 +148,7 @@
                       at (assoc :reclaimed at))))
           os)))
 
-(defn- why-unreadable
+(defn why-unreadable
   "Why this table's rows must not be acted on, or nil.
 
    **`reclaimed-at` first, because it answers without fetching rows.** Asking
@@ -159,7 +159,12 @@
 
    `hydrate` is still the fallback for a `:source` handle, because a passthrough
    table's file can vanish or change its header with no event committed, and
-   `reclaimed-at` answers nil for such a handle by design — see its docstring."
+   `reclaimed-at` answers nil for such a handle by design — see its docstring.
+
+   Public since 2026-08-27: `server/compute-clj!` calls this too, rather than
+   growing a second copy of the rule — `tools.clj` and `server.clj` each had a
+   private `store+handle` before Task 7 of the query-pushdown plan merged
+   them, and that is the pattern this avoids repeating."
   [ts h o]
   (if (= :source (:store h))
     (tbl/unusable (tbl/hydrate lake/lake o))

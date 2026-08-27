@@ -1448,18 +1448,33 @@
    `(fn [rows] …)`, so the model could only ever answer for the sample it was
    shown — see `loci.sandbox`'s namespace docstring for the failure that was.
 
-   **`run-any-fn`/`recompute` still hand a saved `:fn`'s code raw `rows`
-   through `run-clj-rows`**, unchanged by this task — that is the ƒ palette
-   re-applying a function and `rerun!` refreshing a lineage, both call sites
-   this task was scoped to leave alone. A `:fn` object THIS function writes now
-   holds sandbox code, so those two paths cannot re-run one of its outputs;
-   named in the final report as a gap Task 10 does not close, not silently
-   patched over and not silently hit."
+   **The `:fn` this writes is stamped `:contract \"sandbox\"`.** Task 10 left
+   `run-any-fn` (the ƒ palette, reached from `fn-preview`/`fn-apply!`) and
+   `recompute` (`rerun!`'s lineage refresh) still handing every `:fn`'s code
+   raw `rows` through `run-clj-rows` — the OLD contract, which a sandbox-shaped
+   `:fn` cannot speak, so re-running one just written answered `Could not
+   resolve symbol: q`. `:contract` is how those two callers now tell which
+   contract a `:fn`'s code speaks: `\"sandbox\"` for what this function writes,
+   absent for everything written before this fix — see `run-any-fn` and
+   `recompute` for the dispatch, and `run-sandboxed-fn` for why a re-run's
+   own `keep!` events are dropped rather than committed."
   [st id prompt space]
   (try
-    (let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
-      (if-not ts
-        {:error "compute works on tables"}
+    (let [o      (sub/object st id)
+          [ts h] (tbl/store+handle lake/lake o)
+          ;; `store+handle` does not check reclamation, unlike the `hydrate`
+          ;; this replaced — a reclaimed table used to fail here with a clear
+          ;; answer and, without this check, fails a few lines down inside
+          ;; DuckDB with a raw driver message instead. `tools/why-unreadable`
+          ;; is the same check `query_table` already makes; reused rather than
+          ;; copied so a reclamation reads the same sentence on both agent
+          ;; surfaces. nil when `ts` is nil — `why-unreadable` needs a real
+          ;; handle, and the `not ts` branch below answers first anyway.
+          why    (when ts (tools/why-unreadable ts h o))]
+      (cond
+        (not ts) {:error "compute works on tables"}
+        why {:error (str "table " id " cannot be read: " why)}
+        :else
         (let [profile (tbl/column-profile ts h)
               samples (tbl/column-samples ts h 3 12)
               ;; One minter for the WHOLE run — every `keep!` inside the
@@ -1491,7 +1506,7 @@
                       ttl  (if (> (count p) 48) (str (subs p 0 48) "…") p)
                       fobj {:id fid :kind :fn :title (str "fn: " p)
                             :value {:source id :reads (vec (sbx/reads ctx))
-                                    :prompt p :lang "clojure" :code code}}
+                                    :prompt p :lang "clojure" :contract "sandbox" :code code}}
                       oid  (mint-id (case kind
                                       :table  "tbl:derived-"
                                       :report "report:"
@@ -1543,7 +1558,56 @@
                                     :doc (get-in o [:value :prompt]) :ok true :params []}))))}
     {:error "functions work on tables"}))
 
-(defn- run-any-fn [st fid rows params]
+(defn- run-sandboxed-fn
+  "A sandbox-shaped `:fn`'s `code`, re-run over `id`'s CURRENT committed state
+   through `loci.sandbox`, scoped to `space` (nil outside a notebook) —
+   exactly how `compute-clj!` itself runs it. `{:rows v}` for a table answer,
+   `{:error msg}` for anything else; never throws, so the caller's own `try`
+   around eval errors still applies.
+
+   Shared by `run-any-fn` (the ƒ palette, reached from `fn-preview` and
+   `fn-apply!`) and `recompute` (`rerun!`'s lineage refresh) — the two callers
+   Task 10 left running sandbox-shaped code through the OLD `rows` contract,
+   which it cannot speak: re-applying a function `compute-clj!` had just
+   written answered `Could not resolve symbol: q`, caught by each caller's
+   own `try`, so an :error and not a 500 — but a function that could not be
+   reused, which was the entire point of keeping it. One dispatch here rather
+   than two near-copies, one per caller.
+
+   **`keep!`'s events are dropped, not committed.** A re-run's sandbox code
+   can call `keep!` exactly as the original run could; committing those
+   events would mint a fresh interim table on every re-apply of the same
+   function, which nobody asked for and `undo!` cannot distinguish from the
+   function's own answer. The interim table `keep!` writes to the lake still
+   happens — that side effect is `loci.sandbox`'s, not this dispatch's — it is
+   just never referenced from an event, so `loci.lakegc` reclaims it: the
+   same already-documented leak `compute-clj!`'s own docstring names for an
+   aborted run, not a new kind.
+
+   **A re-run must answer a table.** `shape-of` classifies what the sandbox
+   code returned; a report or a note is refused with an error naming which,
+   not committed as though it were rows and not a stack trace."
+  [st id code space]
+  (let [ctx (sbx/context st id space (run-minter (sub/objects st)))
+        v   (json-safe (run-sandboxed code ctx))]
+    (case (shape-of v)
+      :table  {:rows v}
+      :report {:error "this function answers with a report, not a table — Apply only builds tables"}
+      :doc    {:error "this function answers with text, not a table — Apply only builds tables"}
+      {:error "the function did not return rows"})))
+
+(defn- run-any-fn
+  "Re-run a saved `:fn`, or a `lib:` builtin, over `rows` — the ƒ palette's
+   one dispatch, reached from `fn-preview` and `fn-apply!`.
+
+   **A `:fn`'s `:value :contract` says which contract its code speaks.**
+   `\"sandbox\"` — every `:fn` `compute-clj!` has written since 2026-08-27 —
+   runs through `run-sandboxed-fn`; absent (every `:fn` written before that)
+   still runs `rows` through `run-clj-rows`, unchanged. `id` and `space` are
+   only needed for the sandbox branch — `rows` (already fetched by both
+   callers) is what the old branch still runs on. See `run-sandboxed-fn` for
+   why the dispatch exists and what a re-run does with `keep!`."
+  [st id fid rows params space]
   (cond
     (nil? fid)
     {:error "which function?"}
@@ -1553,6 +1617,12 @@
       (cond
         (not= :fn (:kind o)) {:error (str "unknown function: " fid)}
         (not= "clojure" (get-in o [:value :lang])) {:error "not a runnable function"}
+
+        (= "sandbox" (get-in o [:value :contract]))
+        (try
+          (run-sandboxed-fn st id (get-in o [:value :code]) space)
+          (catch Exception e {:error (.getMessage e)}))
+
         :else (try
                 (run-clj-rows (get-in o [:value :code]) rows)
                 (catch Exception e {:error (.getMessage e)}))))
@@ -1578,7 +1648,10 @@
         ;; the answer. `fn-apply!`'s fallback runs over everything.
         (let [total (tbl/row-count ts h)
               rows  (tbl/rows ts h {:limit tbl/mold-cap})
-              r     (run-any-fn st fid rows params)]
+              ;; no notebook space at preview time — a sandbox-shaped :fn that
+              ;; reads more than its own table only sees `id`, same as a
+              ;; multi-table compute-clj! run made outside any space would.
+              r     (run-any-fn st id fid rows params nil)]
           (if (:error r)
             r
             (cond-> {:before (json-safe (vec (take 8 rows)))
@@ -1615,7 +1688,7 @@
             ;; existing method, no sentinel needed for "all of it" — then
             ;; through Clojure.
             (let [rows (tbl/rows ts h {})
-                  r    (run-any-fn st fid rows params)]
+                  r    (run-any-fn st id fid rows params space)]
               (if (:error r)
                 r
                 (land! (tbl/table-object @lake/lake nid ttl (:rows r) extra)))))))
@@ -1664,11 +1737,26 @@
       why {:why (str "source " src-id "'s rows are unusable: " why)}
       (nil? rows) {:why (str "source " src-id " is gone")}
       (str/starts-with? (str via) "fn:")
-      (if-let [code (get-in (sub/object st via) [:value :code])]
-        (try (let [r (run-clj-rows code rows)]        ; already {:rows}/{:error}
-               (if (:error r) {:why (:error r)} r))
-             (catch Exception e {:why (str "recompute failed: " (.getMessage e))}))
-        {:why (str "function " via " is gone")})
+      (let [fo (sub/object st via)]
+        (if-not (get-in fo [:value :code])
+          {:why (str "function " via " is gone")}
+          (try
+            (let [r (if (= "sandbox" (get-in fo [:value :contract]))
+                      ;; sandbox-shaped: `run-sandboxed-fn` against src-id's
+                      ;; CURRENT committed state, no notebook space — not
+                      ;; through `rows`/`known` above, which only the
+                      ;; rows-shaped branch reads. A multi-level chain where
+                      ;; an ANCESTOR was refreshed earlier in this same rerun
+                      ;; (in `working`, not yet committed) is a known gap this
+                      ;; does not close: the sandbox queries the lake, which
+                      ;; still has the old version until this rerun's one :tx
+                      ;; lands. Named rather than engineered around —
+                      ;; `loci.sandbox/context` has no way to see uncommitted
+                      ;; rows, and giving it one is outside this fix's scope.
+                      (run-sandboxed-fn st src-id (get-in fo [:value :code]) nil)
+                      (run-clj-rows (get-in fo [:value :code]) rows))]  ; already {:rows}/{:error}
+              (if (:error r) {:why (:error r)} r))
+            (catch Exception e {:why (str "recompute failed: " (.getMessage e))}))))
       (str/starts-with? (str via) "lib:")
       (if-let [ps (:params obj)]
         (let [r (fnlib/run-fn via rows ps)]
