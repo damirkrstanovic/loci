@@ -24,6 +24,7 @@
             [loci.memory :as mem]
             [loci.mold :as mold]
             [loci.notebook :as nb]
+            [loci.sandbox :as sbx]
             [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
@@ -1324,7 +1325,9 @@
 ;; file goes through one of them. `import-csv!` was the last holdout, with its
 ;; `(rand-int 9999)` suffix; it mints nothing now — `loci.source/mint-id` names
 ;; the table, as it does for every other connected source.
-(declare next-id next-id-in)
+;; `run-minter` joins them for the same reason: `compute-clj!` needs it
+;; ~1200 lines before its definition, right beside `next-id-in`'s.
+(declare next-id next-id-in run-minter)
 
 (defn edit! [st id value]
   (if-not (and id (sub/object st id))
@@ -1388,7 +1391,16 @@
 (defn- run-clj-rows
   "Eval agent-written Clojure over rows in the SCI sandbox — accepts
    `(fn [rows] …)` or a bare expression over `rows`. Returns {:rows out}
-   or {:error …}; throws on eval errors, callers keep their own try."
+   or {:error …}; throws on eval errors, callers keep their own try.
+
+   Still used by `run-any-fn` (the ƒ palette re-applying a saved `:fn`) and
+   `recompute` (`rerun!`'s lineage refresh) — both hand a `:fn` object's code
+   ACTUAL rows already fetched into the JVM, which is a different contract
+   from `run-sandboxed` below and not one Task 10 touches. A `:fn` object
+   `compute-clj!` writes now holds sandbox code (`q`, `table`, `keep!`, no
+   `rows`), so re-running one of THOSE through this function will fail — see
+   this namespace's `compute-clj!` docstring for why that gap is named and not
+   closed here."
   [code rows]
   (let [res (sci/eval-string code (assoc sci-opts :bindings {'rows (vec rows)}))
         out (json-safe (vec (if (fn? res) (res (vec rows)) res)))]
@@ -1396,57 +1408,112 @@
       {:rows out}
       {:error "the function did not return rows"})))
 
-(defn compute-clj! [st id prompt space]
-  ;; Still `hydrate` — a `mold-cap` sample, unchanged, deliberately: this is
-  ;; compute-clj!'s OWN local equivalent of the `table-rows` this task deletes,
-  ;; not that helper by another name. Task 10 replaces this with the sandbox,
-  ;; which hands the model a query surface instead of rows in the JVM at all.
+(defn- run-sandboxed
+  "Eval model-written Clojure with `ctx`'s sandbox bindings — `table`,
+   `tables`, `q`, `q-reduce`, `q-all`, `keep!`. Returns whatever the code
+   produced: rows, report blocks or a string. Throws on eval errors; callers
+   keep their own try.
+
+   There is no `rows` bound — see `loci.sandbox`'s namespace docstring. If the
+   code evaluates to a function, it is called with NO arguments: there are no
+   rows left to hand it, so a function shape can only mean \"here is a thunk
+   of my own answer\", not \"here is what to do with rows\"."
+  [code ctx]
+  (let [res (sci/eval-string code (assoc sci-opts :bindings (:bindings ctx)))]
+    (if (fn? res) (res) res)))
+
+(defn- shape-of
+  "What model-written code returned: `:table` for a vector of maps, `:report`
+   for a vector of report blocks, `:doc` for a string, or nil — an honest
+   error, not a shape to coerce.
+
+   **Order matters.** A report block is ALSO a map, so a vector of blocks
+   would satisfy the `:table` test too. Checked in the same order
+   `loci.content/report?` and `table?` already use — report before table — so
+   a report is never read as one row of a table."
+  [v]
+  (cond
+    (string? v) :doc
+    (and (sequential? v) (seq v) (every? :block v)) :report
+    (and (sequential? v) (seq v) (every? map? v)) :table
+    :else nil))
+
+(defn compute-clj!
+  "A user's request over table `id`, in one query-shaped run: the model writes
+   Clojure against `loci.sandbox`'s five verbs (`table`/`tables`/`q`/`q-reduce`/
+   `q-all`/`keep!`), it runs sandboxed, and whatever shape comes back — rows, a
+   report, or a note — lands as ONE `:tx` with the `:fn` that made it.
+
+   Before 2026-08-27 this hydrated a `mold-cap` sample and asked for
+   `(fn [rows] …)`, so the model could only ever answer for the sample it was
+   shown — see `loci.sandbox`'s namespace docstring for the failure that was.
+
+   **`run-any-fn`/`recompute` still hand a saved `:fn`'s code raw `rows`
+   through `run-clj-rows`**, unchanged by this task — that is the ƒ palette
+   re-applying a function and `rerun!` refreshing a lineage, both call sites
+   this task was scoped to leave alone. A `:fn` object THIS function writes now
+   holds sandbox code, so those two paths cannot re-run one of its outputs;
+   named in the final report as a gap Task 10 does not close, not silently
+   patched over and not silently hit."
+  [st id prompt space]
   (try
-    (let [o (tbl/hydrate lake/lake (sub/object st id)) rows (:value o)]
-      (if-not (and (sequential? rows) (seq rows) (every? map? rows))
+    (let [[ts h] (tbl/store+handle lake/lake (sub/object st id))]
+      (if-not ts
         {:error "compute works on tables"}
-        (let [cols    (mapv name (keys (first rows)))
-              sample  (take 3 rows)
+        (let [profile (tbl/column-profile ts h)
+              samples (tbl/column-samples ts h 3 12)
+              ;; One minter for the WHOLE run — every `keep!` inside the
+              ;; sandbox AND the two ids compute mints itself below (`fid`,
+              ;; and `oid` when the result is a table, which shares `keep!`'s
+              ;; own `tbl:derived-` prefix). Splitting those across two minters
+              ;; reintroduces exactly the 2026-07-23 collision: nothing commits
+              ;; until this run's one `:tx`, so a second `next-id-in` over the
+              ;; same unmoved snapshot can hand out an id `keep!` already
+              ;; issued, and the second `:put` silently replaces the first.
+              mint-id (run-minter (sub/objects st))
+              ctx     (sbx/context st id space mint-id)
               attempt (fn [prev-code err]
-                        (let [code (agent/make-clj-transform cols sample prompt prev-code err)]
-                          (assoc (try (run-clj-rows code rows)
-                                      (catch Exception e {:error (.getMessage e)}))
-                                 :code code)))
+                        (let [code (agent/make-clj-transform profile samples prompt prev-code err)]
+                          (try {:value (json-safe (run-sandboxed code ctx)) :code code}
+                               (catch Exception e {:error (.getMessage e) :code code}))))
               ;; one bad generation shouldn't sink the request: retry once,
               ;; feeding the eval error back so the model can fix its code
-              r1   (attempt nil nil)
-              r    (if (:error r1) (attempt (:code r1) (:error r1)) r1)
-              code (:code r)
-              out  (:rows r)]
+              r1 (attempt nil nil)
+              r  (if (:error r1) (attempt (:code r1) (:error r1)) r1)]
           (if (:error r)
             {:error (str "compute failed: " (:error r))}
-            ;; max+1, not count+1. Counting is how three notebooks died on
-            ;; 2026-07-23: `space:dd-` was minted `(inc (count …))` over a store
-            ;; that had booted 49 of 80 events, so it re-minted 16/17/18 onto
-            ;; live notebooks and `:put` — `assoc-in`, no occupancy check —
-            ;; replaced them in silence. These two had neither the
-            ;; `(rand-int 9999)` suffix that saved `tbl:extract-14-677` nor an
-            ;; existence check, and `fn-apply!` below already minted
-            ;; `tbl:derived-` through `next-id`: one prefix, two rules. A count
-            ;; also falls with nothing wrong at all — remove a derived table and
-            ;; the next compute re-mints the id of one still sitting there.
-            ;; `next-id-in` over ONE `sub/objects` rather than `next-id` twice:
-            ;; each call re-folds the whole log on the EDN stores (2.334 ms vs
-            ;; 1.135 ms at 3003 events), and both ids come from one snapshot.
-            (let [objm (sub/objects st)
-                  p    (str/trim prompt)
-                  fid  (next-id-in objm (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
-                  nid  (next-id-in objm "tbl:derived-")
-                  ttl (if (> (count p) 48) (str (subs p 0 48) "…") p)
-                  fobj {:id fid :kind :fn :title (str "fn: " p)
-                        :value {:source id :prompt p :lang "clojure" :code code}}
-                  tobj (tbl/table-object @lake/lake nid ttl out {:from id :via fid})
-                  evs (cond-> [{:op :put :id fid :value fobj}
-                               {:op :put :id nid :value tobj}]
-                        (and space (space? st space))
-                        (conj (nb/append-cell-event st space {:ref nid})))]
-              (sub/commit! st {:op :tx :events evs})
-              {:state (state-payload st) :openId nid :object (mold-payload st mem/memory nid nil)})))))
+            (let [{:keys [value code]} r
+                  kind (shape-of value)]
+              (if-not kind
+                {:error "compute failed: the function returned neither rows, nor report blocks, nor text"}
+                (let [p    (str/trim prompt)
+                      fid  (mint-id (str "fn:" (subs id (inc (str/index-of id ":"))) "-"))
+                      ttl  (if (> (count p) 48) (str (subs p 0 48) "…") p)
+                      fobj {:id fid :kind :fn :title (str "fn: " p)
+                            :value {:source id :reads (vec (sbx/reads ctx))
+                                    :prompt p :lang "clojure" :code code}}
+                      oid  (mint-id (case kind
+                                      :table  "tbl:derived-"
+                                      :report "report:"
+                                      :doc    "doc:"))
+                      oobj (case kind
+                             :table  (tbl/table-object @lake/lake oid ttl value {:from id :via fid})
+                             :report {:id oid :kind :report :title ttl :value (vec value)
+                                      :from id :via fid}
+                             :doc    {:id oid :kind :doc :title ttl :value value
+                                      :from id :via fid})
+                      ;; ONE :tx: keep!'s accumulated events, the :fn, the
+                      ;; result, and the cell — so an aborted run commits
+                      ;; nothing and one undo removes a report with every
+                      ;; table it made.
+                      evs  (cond-> (into (vec (sbx/events ctx))
+                                         [{:op :put :id fid :value fobj}
+                                          {:op :put :id oid :value oobj}])
+                             (and space (space? st space))
+                             (conj (nb/append-cell-event st space {:ref oid})))]
+                  (sub/commit! st {:op :tx :events evs})
+                  {:state (state-payload st) :openId oid
+                   :object (mold-payload st mem/memory oid nil)})))))))
     (catch Exception e {:error (str "compute failed: " (.getMessage e))})))
 
 ;; the functions living in the substrate, with their code — an inspector for the
@@ -2534,6 +2601,29 @@
    ids under it — the failure § 7 of the 2026-08-09 forensics is about."
   [st prefix]
   (next-id-in (sub/objects st) prefix))
+
+(defn- run-minter
+  "A `mint-id` for one sandbox run — `(fn [prefix] …)`, `loci.sandbox/context`'s
+   fourth argument, and the one `compute-clj!` also uses for its own `fid`/`oid`.
+   `next-id-in` over one snapshot of `objm`, never repeating a prefix within
+   the run: ids already issued are folded back in on every call.
+
+   Nothing commits until the run's single `:tx` at the end, so the log does
+   not change between two mints and a bare `next-id-in` would hand two calls
+   for the SAME prefix the same id — the second `:put` silently replacing the
+   first. That is the shape that destroyed three notebooks on 2026-07-23
+   (`next-id`'s docstring), which is why `next-id-in` exists at all, and it is
+   also why `compute-clj!` mints `fid`/`oid` through THIS rather than a second
+   bare `next-id-in objm ...` call: `oid`, when the result is a table, shares
+   `keep!`'s own `tbl:derived-` prefix, so a run that both `keep!`s and
+   returns rows must not let compute's own mint and the sandbox's disagree
+   about what has already been issued."
+  [objm]
+  (let [issued (atom {})]
+    (fn [prefix]
+      (let [id (next-id-in (merge objm @issued) prefix)]
+        (swap! issued assoc id true)
+        id))))
 
 (defn findings-prefix
   "The `find:` prefix a notebook's findings documents are minted under:

@@ -191,28 +191,77 @@
               (json/read-str :key-fn keyword) :technique)]
     (if (#{"view" "applet" "transform"} t) t "view")))
 
+(def ^:private clj-transform-sys
+  "System prompt for `make-clj-transform`. Five verbs, the same five rows as
+   the protocol table in `loci.sandbox`'s namespace docstring — `table`/
+   `tables`, `q`, `q-reduce`, `q-all`, `keep!` — and the one instruction that
+   matters most: do the arithmetic in `q`. There is no `rows` in scope; a
+   model that writes one gets an honest eval error, not a silent sample."
+  (str
+   "You write ONE Clojure expression that answers a question about a data table. "
+   "You do NOT have the rows in hand — you have a database. These are in scope:\n\n"
+   "  table                          this table, as a HoneySQL relation\n"
+   "  tables                         {id relation} for every table in the notebook\n"
+   "  (q honeysql)                   => rows, a vector of maps. Runs in DuckDB.\n"
+   "                                  (meta result) carries :total (the answer's\n"
+   "                                  true size) and :capped (true when you got a\n"
+   "                                  page and not the whole answer)\n"
+   "  (q-reduce honeysql f init)     fold over EVERY row, one bounded batch at a\n"
+   "                                  time — f is (fn [acc batch] …), batch a vector\n"
+   "  (q-all honeysql)               every row of the answer, in memory. EXPENSIVE —\n"
+   "                                  about 5 µs/row plus 3.7 µs/cell. Use only when\n"
+   "                                  nothing else will do.\n"
+   "  (keep! \"Title\" honeysql)       materialise a query as its own table — no row\n"
+   "                                  ever enters memory. Returns the new table's id.\n"
+   "  (keep! \"Title\" rows)           same, for rows you already hold in Clojure.\n\n"
+   "DO THE ARITHMETIC IN q — group, sum, filter, sort, join, all in HoneySQL. Use "
+   "Clojure only for what SQL cannot say.\n\n"
+   "A HoneySQL query looks like:\n"
+   "  {:select [:region [[:sum :revenue] :revenue]]\n"
+   "   :from [[table :t]] :group-by [:region] :order-by [[:revenue :desc]]}\n\n"
+   "Return exactly ONE of three shapes:\n"
+   "  · a vector of maps           → becomes a data table\n"
+   "  · a vector of report blocks  → becomes a report\n"
+   "  · a string                   → becomes a note\n\n"
+   "A report block is one of:\n"
+   "  {:block :heading :text \"…\"}\n"
+   "  {:block :text :text \"…\"}\n"
+   "  {:block :ref :id <a keep! id>}\n"
+   "  {:block :chart :ref <a keep! id> :spec {…}}\n\n"
+   "If (meta r) says :capped for a result you want to show in full, call keep! and "
+   "reference the table it makes — a report block must never carry rows straight "
+   "from a capped q result.\n\n"
+   "Use ONLY clojure.core and Math/* (e.g. Math/round, Math/pow, Math/sqrt). NO "
+   "other Java interop, NO I/O, NO atoms. Numeric results must be doubles or "
+   "rounded longs, NEVER ratios — wrap division as (double (/ a b)) or round it.\n\n"
+   "Respond with ONLY the Clojure expression. No prose, no markdown fence."))
+
 (defn make-clj-transform
-  "Natural-language request → a Clojure expression that evaluates to a pure
-   (fn [rows] …) returning new rows. Run SCI-sandboxed on the JVM — computation
-   stays in the substrate's own language; the browser only renders the result.
-   With prev-code + err, asks the model to correct its failed attempt."
-  [columns sample prompt & [prev-code err]]
-  (let [kws (str/join " " (map #(str ":" %) columns))
-        sys (str "You write ONE Clojure expression over `rows` — a vector of maps with KEYWORD keys " kws " "
-                 "(sample: " (json/write-str sample) "). `rows` is already bound; write a bare expression that "
-                 "uses it (e.g. `(->> rows (map …))`) OR `(fn [rows] …)`. It MUST return a new vector of maps — you may add "
-                 "keys, derive values, filter, sort, group/aggregate. Keep existing keys unless asked "
-                 "otherwise; new keys are keywords with short snake_case names. Use ONLY clojure.core and "
-                 "Math/* (e.g. Math/round, Math/pow, Math/sqrt). NO other Java interop, NO I/O, NO atoms. "
-                 "IMPORTANT: numeric results must be doubles or rounded longs, NEVER ratios — wrap division "
-                 "as (double (/ a b)) or round it. Respond with ONLY the Clojure expression — no markdown "
-                 "fences, no prose, no comments.")
-        msgs (cond-> [{:role "system" :content sys} {:role "user" :content prompt}]
-               ;; a failed attempt comes back with its error so the model can fix it
-               err (conj {:role "assistant" :content (str prev-code)}
-                         {:role "user" :content (str "That expression failed with: " err
-                                                     "\nReturn a corrected expression — same rules, ONLY the expression.")}))]
-    (strip-code-fence (chat msgs))))
+  "The Clojure the model writes for one sandboxed run over a table. `profile`
+   is `TableStore/column-profile`'s output and `samples` is `column-samples`'
+   — both bounded, and NEITHER is a row of the table. With `prev-code` + `err`,
+   asks the model to correct its failed attempt — the retry contract this
+   function always had.
+
+   Before 2026-08-27 this took three sample rows and asked for a function over
+   `rows`, which is exactly what let the model fold a sample and hand the
+   result back as the whole table's answer. There is no `rows` any more — see
+   `loci.sandbox`'s namespace docstring for why that is the enforcement and
+   not merely a convention."
+  [profile samples prompt prev-code err]
+  (let [ctx (str "columns: " (str/join ", " (map name (:cols profile))) "\n"
+                 "numeric: " (str/join ", " (map name (:numeric profile))) "\n"
+                 "categorical: " (str/join ", " (map name (:categorical profile))) "\n"
+                 "rows: " (:rows profile) "\n"
+                 "sample values:\n"
+                 (str/join "\n" (for [[c vs] samples]
+                                  (str "  " (name c) ": " (str/join " | " vs)))))
+        usr (cond-> (str ctx "\n\nTask: " prompt)
+              ;; a failed attempt comes back with its error so the model can fix it
+              prev-code (str "\n\nYour previous attempt:\n" prev-code
+                             "\n\nIt failed with:\n" err "\n\nFix it."))]
+    (strip-code-fence (chat [{:role "system" :content clj-transform-sys}
+                             {:role "user" :content usr}]))))
 
 (defn describe-view
   "Natural-language request → a JSON view-spec over the given columns."
