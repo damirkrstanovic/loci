@@ -150,6 +150,52 @@
               rs (.executeQuery st sql)]
     (rs->maps rs ks unwrap)))
 
+(def batch-rows
+  "Rows handed to `reduce-rows`'s function at a time. **2048 because that is
+   DuckDB's vector**, and `setFetchSize` is accepted and silently ignored —
+   verified 2026-08-27. Not ours to tune."
+  2048)
+
+(defn reduce-rows
+  "Fold `f` over every row of `sql`, one batch at a time. `f` is
+   `(fn [acc batch] …)` where `batch` is a vector of row maps.
+
+   **Takes the reducing function so it owns the scope.** It does not hand back a
+   lazy seq: one escaping `with-open` is the classic Clojure bug, and `q` closes
+   its statement on the way out.
+
+   **What this bounds is RETENTION, and not time.** Measured 2026-08-27 over
+   1,000,000 rows of four columns: advancing the cursor costs 4,954 ms, reading
+   the four columns costs 22,297 ms, and building maps takes it to 27,335 ms —
+   so 82% of the cost is the driver and batching saves the other 18%. It does not
+   bound allocation pressure either: over 857,142 rows with batches dropped every
+   2,048, observed heap still rose to 506 MB between collections.
+
+   Retained heap for a whole 1,000,000-row result was 220 MB — 231 bytes a row —
+   so on any modern heap **time is the binding constraint, not memory**.
+
+   DuckDB's JDBC does stream: `executeQuery` over 1,000,000 rows returns in 18 ms
+   and the first row in 1 ms.
+
+   `f` is never called with an empty batch, so an empty result returns `init`."
+  [lk sql f init]
+  (with-open [st (.createStatement (conn-of lk))
+              rs (.executeQuery st sql)]
+    (let [md (.getMetaData rs)
+          n  (.getColumnCount md)
+          ks (mapv #(sub/col-kw (.getColumnLabel md (inc %))) (range n))]
+      (loop [acc init]
+        (let [batch (loop [i 0, b (transient [])]
+                      (if (and (< i batch-rows) (.next rs))
+                        (recur (inc i)
+                               (conj! b (into {} (map-indexed
+                                                   (fn [idx k] [k (unwrap (.getObject rs (inc idx)))])
+                                                   ks))))
+                        (persistent! b)))]
+          (if (seq batch)
+            (recur (f acc batch))
+            acc))))))
+
 (defn- extension-dir
   "Where DuckDB should keep its extensions, or nil to leave DuckDB's own default
    alone — see `open-lake!` for why loci has to be able to say this at all.

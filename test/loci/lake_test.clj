@@ -1600,3 +1600,79 @@
           (is (= 2 (:total r)))
           (is (= 30.0 (double (reduce + (map :total_revenue (:rows r)))))))
         (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; reduce-rows — folding a whole query without materialising it
+;; ---------------------------------------------------------------------------
+
+(deftest reduce-rows-sees-every-row
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(5000) s(i)")
+    (is (= 5000 (lake/reduce-rows lk "SELECT * FROM r_a"
+                                  (fn [acc batch] (+ acc (count batch))) 0)))
+    (is (= 12497500 (lake/reduce-rows lk "SELECT * FROM r_a"
+                                      (fn [acc batch] (+ acc (reduce + (map :n batch)))) 0)))))
+
+(deftest reduce-rows-hands-over-batches-not-one-big-vector
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(5000) s(i)")
+    (let [sizes (lake/reduce-rows lk "SELECT * FROM r_a"
+                                  (fn [acc batch] (conj acc (count batch))) [])]
+      (is (> (count sizes) 1) "one batch means nothing was streamed")
+      (is (every? #(<= % lake/batch-rows) sizes)
+          "a batch must not exceed DuckDB's vector")
+      (is (= 5000 (reduce + sizes)) "and the batches must account for every row"))))
+
+(deftest reduce-rows-closes-its-statement
+  ;; A lazy seq escaping with-open is the classic bug. reduce-rows takes the
+  ;; reducing function so the scope is closed; this proves the connection is
+  ;; still usable afterwards.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(100) s(i)")
+    (lake/reduce-rows lk "SELECT * FROM r_a" (fn [acc _] acc) nil)
+    (is (= [{:n 100}] (lake/q lk "SELECT count(*) AS n FROM r_a")))))
+
+(deftest reduce-rows-handles-an-empty-result
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_a AS SELECT i AS n FROM range(10) s(i)")
+    (is (= 0 (lake/reduce-rows lk "SELECT * FROM r_a WHERE n > 999"
+                               (fn [acc batch] (+ acc (count batch))) 0))
+        "no rows must not mean the reducing fn is called with an empty batch")))
+
+(deftest reduce-rows-names-columns-like-q-does
+  ;; "Revenue Total" is load-bearing: a column whose JDBC label is already a
+  ;; legal keyword name (like `n` or `s`) survives a naming bug that skips
+  ;; `sub/col-kw` entirely and would pass either way. This one does not — `q`
+  ;; normalizes it to `:revenue_total`, and a reader that used the raw label
+  ;; would produce `:Revenue Total`, a keyword that does not read back.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_b AS SELECT 1 AS n, 'x' AS s, 2 AS \"Revenue Total\"")
+    (let [via-q (first (lake/q lk "SELECT * FROM r_b"))
+          via-r (first (lake/reduce-rows lk "SELECT * FROM r_b"
+                                         (fn [acc batch] (into acc batch)) []))]
+      (is (= (set (keys via-q)) (set (keys via-r)))
+          "one reader must not name columns differently from the other")
+      (is (= via-q via-r)))))
+
+(deftest reduce-rows-bounds-retention
+  ;; The claim in the docstring, made falsifiable. Folding to a counter must not
+  ;; retain rows; folding into a vector must. Compares RETAINED heap after a GC,
+  ;; not peak — allocation churn is not what this bounds.
+  (with-lake [lk]
+    (lake/x! lk "CREATE TABLE r_c AS SELECT i AS a, i*2 AS b, 'p' || i AS c FROM range(200000) s(i)")
+    (let [rt      (Runtime/getRuntime)
+          used    (fn [] (System/gc) (Thread/sleep 300)
+                    (/ (- (.totalMemory rt) (.freeMemory rt)) 1048576.0))
+          before  (used)
+          _       (lake/reduce-rows lk "SELECT * FROM r_c"
+                                    (fn [acc batch] (+ acc (count batch))) 0)
+          counted (- (used) before)
+          held    (lake/reduce-rows lk "SELECT * FROM r_c"
+                                    (fn [acc batch] (into acc batch)) [])
+          kept    (- (used) before)]
+      (is (= 200000 (count held)))
+      (is (< counted 20.0)
+          (str "folding to a counter retained " counted " MB — it should retain ~nothing"))
+      (is (> kept (* 3 (max counted 1.0)))
+          (str "folding into a vector retained " kept " MB, counter retained " counted
+               " MB — if these are close, the test is not measuring retention")))))
