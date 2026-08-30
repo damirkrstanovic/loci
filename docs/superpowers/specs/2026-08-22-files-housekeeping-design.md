@@ -1,9 +1,8 @@
 # The files directory learns housekeeping
 
 Date: 2026-08-22
-Status: **design settled, nothing built.** Three carry-overs from phase 2, found by its own
-Definition-of-done walk and by the review of Task 4. Everything below is design except where it says
-measured.
+Status: **built and merged in `98c3757` on 2026-08-22.** The body below records the design,
+the three phase 2 carry-overs, and the stated measurements.
 
 Phase 2 shipped and merged at `a2e5d93`: the shell can connect a file, upload one, and show a source
 that broke. It left three things behind. None of them blocks phase 3, and all three get *harder*

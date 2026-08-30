@@ -1,7 +1,8 @@
 # loci phase 3a — recall that finds by meaning
 
 Date: 2026-08-07
-Status: proposed
+Status: **shipped.** Semantic recall and model-specific merge shipped in commits
+`6c82ec0`, `dc8ccf4`, `bbd5737`, and `cea8472`. Unmerge shipped later in `ebda1b0`.
 Parent: `2026-08-05-datalevin-substrate-design.md` §3, §4, §5, §5.1, §9
 
 ## Goal

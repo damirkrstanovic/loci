@@ -1,8 +1,9 @@
 # External sources, phase 3: a location can be remote
 
 Date: 2026-08-23
-Status: **built and measured, 2026-08-23.** Everything below was design; what the building changed
-is struck through or corrected in place, and the numbers are under *Measured 2026-08-23*.
+Status: **built and measured.** Remote materialise mode merged in `079fcf2` on 2026-08-24.
+The URL field in the ＋ Data panel shipped in `c3bf0f6`. Everything below was design;
+what the work changed is struck through or corrected in place.
 
 Phase 1 shipped the framework and the file connector; phase 2 gave the shell a way in; the
 housekeeping branch merged at `98c3757` cleaned up after both. This phase adds `http://`, `https://`
@@ -190,9 +191,8 @@ way every other DuckDB failure already is.
   the panel can produce is `loci://files/<hash>`. There is no text input in it at all.
 
   I asserted this without checking and it propagated into `describe`'s docstring. Left struck rather
-  than deleted, because the phase was planned on it: **as built, phase 3 is reachable only by `curl`
-  or a REPL** — which is the state phase 2 opened by naming as unfinished. **The door is a task of
-  its own**, added to the plan on 2026-08-23.
+  than deleted, because the phase was planned on it. At this intermediate point, phase 3 was
+  reachable only by `curl` or a REPL. The URL field later shipped in `c3bf0f6`.
 - **The `:source` block, the live badge, drift, unavailable, `refresh!`, `:connectedAs`.** A remote
   materialised table is an ordinary materialised table.
 - **`sourcespec/relation`, the `readers` map, the handle shapes.** Untouched.

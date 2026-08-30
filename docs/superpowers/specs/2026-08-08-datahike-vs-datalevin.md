@@ -6,26 +6,30 @@ Status: **analysis only — no decision, no work implied.** Written because the
 but never evaluated Datahike, which had been parked as "XTDB/Datahike swap, out of scope"
 in the 2026-07-22 design. This closes that gap for later consideration.
 
+Current state, 2026-08-30: loci still uses Datalevin through KV, not Datalog. The
+environment has five KV DBIs plus the `touched` list DBI. Facts, chunks, and their vectors
+now live there.
+
 Evidence base: the Datahike source at `~/src/datahike` (main @ `cbdbd242`, 2026-08-04) and
 the Datalevin 1.0.0 jar in `~/.m2`, read directly. Where a claim comes from a project's own
 documentation rather than from its code or a measurement, it says so.
 
 ---
 
-## 0. The fact that frames everything
+## 0. The fact that framed the 2026-08-08 analysis
 
-**loci does not use Datalevin as a database.** `src/loci/dlv.clj` — 326 lines, the entire
-binding — uses it as an ordered KV store: `open-kv`, three dbis plus one list-dbi, one
+At that time, loci did not use Datalevin as a Datalog database. `src/loci/dlv.clj` was
+326 lines and used it as an ordered KV store: `open-kv`, three DBIs plus one list DBI, one
 `transact-kv` per commit, `get-range` for the boot replay, `list-range` bounded
 `[:at-most n]` for `object-at`. There is no `d/q` anywhere in `src/`, no schema, no
 full-text index, no vector index.
 
-The datalog / FTS / vector phases of the 2026-08-05 design are **planned, not built**, and
-semantic recall shipped *outside* the store entirely — `memory.clj` and `embed.clj` never
-touch Datalevin.
+The Datalog, full-text, and vector phases of the 2026-08-05 design were planned but unbuilt.
+Semantic recall then lived outside the store. `memory.clj` and `embed.clj` did not touch
+Datalevin.
 
-So this is not a comparison of two datalog engines. It is a comparison of what sits under
-a 326-line adapter, plus a bet about phases that have not happened.
+Thus, this was not a comparison of two Datalog engines. It compared what sat under the
+326-line adapter and the planned phases.
 
 ## 1. They are not the same category of thing
 

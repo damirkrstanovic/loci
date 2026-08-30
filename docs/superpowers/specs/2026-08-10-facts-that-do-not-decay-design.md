@@ -1,7 +1,8 @@
 # Facts that do not decay: design
 
 Date: 2026-08-10
-Status: **designed, approved in brainstorming 2026-08-10.** No implementation plan yet.
+Status: **shipped and measured** in commits `055577f`…`bc11a02`. Facts carry `:durable?`
+and `:durable-by`. The distiller judges durability, and the memory pane permits an override.
 
 ## The complaint
 

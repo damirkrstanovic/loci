@@ -2,8 +2,9 @@
 
 Date: 2026-08-15
 Status: **shipped, both phases.** Facts and chunks live in the substrate's environment;
-`memory.edn` and `chunks.edn` remain on disk as rollbacks and are no longer read at runtime.
-Measured on the real store: 256 facts, 300 chunks, `data/substrate/data.mdb` 988K → 12M.
+the old `memory.edn` and `chunks.edn` sidecars were removed later on 2026-08-15 in
+`bceb4ae`. Backup files can remain. Measured on the real store: 256 facts, 300 chunks,
+`data/substrate/data.mdb` 988K → 12M.
 
 ## The complaint
 

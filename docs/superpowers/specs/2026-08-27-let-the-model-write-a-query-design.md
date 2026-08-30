@@ -1,11 +1,9 @@
 # Let the model write a query, not a scan
 
 Date: 2026-08-27
-Status: **design settled with the user, nothing built, the measurement gate is RUN.** Every
-decision below was taken in conversation on 2026-08-27. The gate ran the same day against a
-throwaway lake of 1,000,000 rows and **found five errors in this spec, two of which would have
-shipped as wrong SQL**. All are corrected inline and marked *Corrected, measured 2026-08-27*.
-See "What the gate found" at the end. Numbers quoted from other specs are marked.
+Status: **built and merged in `29b137a` on 2026-08-27.** The measurement gate ran before the
+work and found five errors in this spec. Two errors would have produced wrong SQL.
+The body keeps the corrected design and marks the measured corrections in place.
 
 ## The want
 

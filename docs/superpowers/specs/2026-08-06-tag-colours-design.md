@@ -1,7 +1,7 @@
 # loci — tag colours: suggested on creation, chosen by you
 
 Date: 2026-08-06
-Status: proposed
+Status: **shipped** in commits `7e31112`…`8b2f57b`.
 
 ## Goal
 

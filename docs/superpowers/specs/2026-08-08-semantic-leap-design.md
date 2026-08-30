@@ -1,7 +1,7 @@
 # loci phase 3b — LEAP finds by meaning
 
 Date: 2026-08-08
-Status: proposed
+Status: **shipped** in commits `de2157b`, `a49dc91`, and `27036ac`.
 Parent: `2026-08-05-datalevin-substrate-design.md` §3; builds on `2026-08-07-semantic-recall-design.md`
 
 ## Goal

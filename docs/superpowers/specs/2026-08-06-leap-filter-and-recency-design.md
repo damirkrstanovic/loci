@@ -1,7 +1,7 @@
 # loci — LEAP as a filter, and recency as a ranking signal: design
 
 Date: 2026-08-06
-Status: accepted in brainstorming
+Status: **shipped** in commits `eb9618d`…`aa6bcb3`.
 
 ## Goal
 

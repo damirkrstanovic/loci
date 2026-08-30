@@ -1,10 +1,10 @@
 # loci — Datalevin substrate + hybrid recall: design
 
 Date: 2026-08-05
-Status: **phase 1 planned, built and merge-ready** (plan:
-`docs/superpowers/plans/2026-08-05-datalevin-store-phase1.md`; code: `src/loci/dlv.clj`,
-`src/loci/migrate.clj`). Phases 2 and 3 remain as designed below. Sections corrected
-against what was actually built are marked "as built".
+Status: **phase 1 shipped.** Phase 2's Datalog projection and full-text index remain
+unbuilt. Phase 3's user-visible semantic recall, semantic LEAP, and merge shipped through
+exact Clojure scans. The planned Datalevin Datalog and vector indexes remain unbuilt.
+Sections corrected against what was actually built are marked "as built".
 
 ## Goal
 
@@ -107,9 +107,15 @@ transaction — the record/recall separation is a rule about writes, not just ab
 | — | vector index | 1024-dim, cosine, keyed by chunk id |
 | — | FTS | over titles, prose cells, doc bodies, fact text |
 
-**Truth vs derived.** Only `events` is truth. `touched`, the projection, FTS and vectors
-are all rebuildable from it — a corrupted or stale index is a rebuild, never a data loss.
-Memory facts are a *parallel* truth with their own log; undo never touches them.
+**Current-state correction, 2026-08-30.** The table above records the original design.
+The environment now has five KV DBIs: `events`, `counts`, `meta`, `facts`, and `chunks`.
+It also has the `touched` list DBI. Facts and chunks, including vectors, use KV storage.
+There is no Datalog object projection, full-text index, or Datalevin vector index.
+
+**Current truth vs derived.** `events` is record truth. Facts are parallel recall truth;
+undo never touches them. `touched` and chunk vectors derive from events. Fact vectors derive
+from facts. The planned Datalog projection, full-text index, and Datalevin vector index do
+not exist.
 
 **Boot: fold the log, no snapshot.** Measured fold rate is ~0.75 µs/event, so boot costs
 ~2 ms at today's 80 events, 227 ms at 10k, and 3.75 s at 1M. A head snapshot buys nothing

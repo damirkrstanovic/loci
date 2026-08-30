@@ -1,8 +1,8 @@
 # External sources, phase 2: the shell learns sources
 
 Date: 2026-08-20
-Status: **design settled, nothing built.** Two facts below are measured on 2026-08-20 — what http-kit
-does with a request body, and what phase 1 left the shell unable to draw. Everything else is design.
+Status: **built and merged in `a2e5d93` on 2026-08-22.** The carry-over file cleanup work
+shipped in `98c3757`. The body below records the phase 2 design and its measurements.
 
 Phase 1 shipped and merged at `8757b79`: a file at a `loci://` or `file://` location becomes a loci
 table, materialised into DuckLake or read through on every query. This phase makes the shell able to

@@ -1,7 +1,9 @@
 # loci — the memory pane tells you what it knows about itself
 
 Date: 2026-08-08
-Status: proposed
+Status: **shipped** in commits `7696c3d` and `8966417`. The pane shows embed state,
+degradation, retrieval provenance, and merge history. Later work added unmerge and durable
+fact controls.
 
 ## Goal
 

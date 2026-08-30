@@ -1,7 +1,8 @@
 # A corpus worth browsing: design
 
 Date: 2026-08-10
-Status: **designed, approved in brainstorming 2026-08-10.** No implementation plan yet.
+Status: **shipped and imported after a rehearsal** in commits `760bbb1`, `a41cde0`,
+`d5841a3`, and `249e467`.
 
 ## What this is for, and what it is not
 

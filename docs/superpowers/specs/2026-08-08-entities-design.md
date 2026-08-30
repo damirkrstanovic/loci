@@ -1,8 +1,10 @@
 # Entities — a world for the facts to hang on: design
 
 Date: 2026-08-08
-Status: **designed, not planned.** Approved in brainstorming 2026-08-08; no implementation
-plan written yet.
+Status: **shipped with a measured correction** in commits `88d2c72`…`892871c` and
+`f8ab192`. The entity index, pages, materialization, subject chips, and LEAP support ship.
+The first broad recall union degraded 7 of 12 prompts. Current recall widens only for
+subjects named in the prompt.
 
 ## The complaint
 

@@ -1,7 +1,9 @@
 # loci — record/recall notebooks: design
 
 Date: 2026-07-22
-Status: approved in brainstorming; this document is the build spec.
+Status: **the original build shipped** in commits `e4c5bbd`…`d455b74`. Later work moved
+record and recall from the EDN stores described below into Datalevin. The body remains the
+original build spec.
 
 ## Goal
 

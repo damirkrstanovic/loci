@@ -1,8 +1,9 @@
 # loci — notebook tags + a structural overview: design
 
 Date: 2026-08-06
-Status: **§1 built and merged** (commits f813f73…5583209); §2 (tags) is what remains.
-Amended 2026-08-06 for tri-state include/exclude filtering.
+Status: **both sections shipped.** The overview shipped in commits `f813f73`…`5583209`.
+Tags shipped in commits `9e8e0ac`…`0a19f06`. The design was amended 2026-08-06 for
+tri-state include/exclude filtering.
 
 ## Goal
 

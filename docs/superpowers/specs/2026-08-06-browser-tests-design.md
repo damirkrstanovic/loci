@@ -1,7 +1,7 @@
 # loci — headless browser tests for the shell: design
 
 Date: 2026-08-06
-Status: accepted in brainstorming
+Status: **shipped 2026-08-06** in merge `d74531c`.
 
 ## Goal
 

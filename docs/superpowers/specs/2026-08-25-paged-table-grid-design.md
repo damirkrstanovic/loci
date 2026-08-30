@@ -1,9 +1,9 @@
 # The Rows view becomes a table you can actually read
 
 Date: 2026-08-25
-Status: **designed, nothing built.** Every number below marked *measured* was taken on
-2026-08-25 against the running container or in the nREPL; every one marked *unmeasured* is
-named as such and nothing in the design rests on it.
+Status: **paging and the ClojureScript grid are built.** They merged in `120b36b` on
+2026-08-26. The ClojureScript design supersedes the renderer sections below.
+Database-backed built-in aggregate viewers remain pending. Measurements retain their original date.
 
 A 36-column CSV imported cleanly and then rendered as this:
 

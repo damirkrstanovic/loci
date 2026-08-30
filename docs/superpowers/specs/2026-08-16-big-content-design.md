@@ -1,12 +1,9 @@
 # Big content: tables, blobs and media, without giving up undo
 
 Date: 2026-08-16
-Status: **design settled and measured, nothing built.** Every open question is answered and
-the measurement gate has been run — see "What to measure before building", all five items
-done. It found one design error (undo must restore, not re-point — the spec said the wrong
-thing and is corrected inline) and killed one optimisation before it was written. What remains
-is the implementation plan. No code written. Numbers below are measured on 2026-08-16 unless
-marked otherwise.
+Status: **partly built.** Table storage and manual per-table lake reclaim shipped in merge
+`bc07f18` on 2026-08-18. Images, video, blobs, and the content store remain unbuilt.
+The body below records the design state on 2026-08-16. Its measurements keep their original date.
 
 ## The want
 

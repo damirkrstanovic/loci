@@ -1,10 +1,9 @@
 # External sources: a location, a format, a mode — and CSV first
 
 Date: 2026-08-19
-Status: **design settled, nothing built.** Two facts below are measured on 2026-08-19 (DuckDB's
-CSV type inference, and what those types do to `json/write-str`); everything else is design.
-Scope is deliberately one connector: files. Object storage, SQL databases and REST APIs are
-named here only where they constrain the framework, and each gets its own spec.
+Status: **built in phases.** The file source framework shipped in `8757b79`. The shell shipped
+in `a2e5d93`. File cleanup shipped in `98c3757`. Remote materialise mode shipped in `079fcf2`.
+SQL database sources remain unbuilt. The body below records the phase 1 design from 2026-08-19.
 
 ## The want
 

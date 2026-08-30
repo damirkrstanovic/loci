@@ -1,7 +1,8 @@
 # Per-table lake GC — design
 
-**Status:** design settled 2026-08-17, nothing built. Measurement campaign complete; every
-number below was measured, not estimated.
+**Status:** built and merged in `bc07f18` on 2026-08-18. Manual per-table reports and
+reclaim work. Automatic catalog snapshot expiry remains off because it can break live handles.
+The body below records the settled design and its measurements from 2026-08-17.
 
 **Goal:** a user can see how much space each table's historical versions occupy, and reclaim
 them one table at a time, without losing anything they have not been told they are losing.

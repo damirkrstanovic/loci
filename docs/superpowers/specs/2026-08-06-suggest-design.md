@@ -1,7 +1,7 @@
 # loci — ✧ Suggest: the agent proposes, you decide
 
 Date: 2026-08-06
-Status: accepted in brainstorming
+Status: **shipped** in commits `747bd29`, `37de253`, and `ab46965`.
 
 ## Goal
 

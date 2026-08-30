@@ -10,7 +10,7 @@ This repo is the Clojure build. (The earlier single-file interaction prototype i
 | Layer | Role | record / recall |
 |---|---|---|
 | 1. Event log | deterministic, reversible — durable on Datalevin (embedded LMDB) behind the `Store` seam | **record** |
-| 2. Content store | tables, documents, blobs — stored canonically, `datafy`/`nav`-able | **record** |
+| 2. Content | table rows in DuckLake; documents remain in the event record; no blob store exists | **record** |
 | 3. Recall / AI-memory | `loci.memory` — Clojure-native engine (keyword+entity+recency+strength), persisted, agent-written | **recall** |
 | 4. Mold layer | views molded per object, by user *or* agent (Clerk viewer registry) | both |
 | 5. Shell | spaces + LEAP | — |
@@ -20,9 +20,8 @@ data (`{:id :label :pred :render}`), the registry is data, and a view's `:render
 plain Clojure data that any target (Clerk, Portal, a terminal) can draw.
 
 The **recall layer** is a Clojure-native engine (`loci.memory`) behind the
-`loci.mold/Recall` protocol — facts distilled by the agent after every flow,
-with provenance, reinforcement and decay. Undo never touches it: undo reverts
-the record, not the recall. (A Khora sidecar can still replace it — same seam.)
+`loci.mold/Recall` protocol. Datalevin stores facts with provenance,
+reinforcement and decay. Undo never touches recall: undo reverts the record.
 
 **Recall is scoped to the notebook you are standing in.** ✦ Ask, ✎ Draft, 🔍 Research
 and ✧ Suggest are each given only what was learned in that notebook's *lineage* — the
@@ -54,6 +53,9 @@ clojure -X:start        # starts Clerk + opens notebooks/loci.clj
 
 # the unit tests — Clojure: substrate, notebook, memory, tools, server
 clojure -M:test
+
+# the ClojureScript grid tests — compiled and run under Node
+npm run test:cljs
 
 # the browser tests — Node: the shell itself, driven headless
 npm install            # once; pulls playwright-core, downloads no browser
@@ -292,11 +294,9 @@ would turn "no key needed" into a 401 that reads like a wrong key. For the same 
 off rather than aiming loci at an empty URL. The two endpoints are optional independently of
 each other: with embed but no rerank, fusion runs and rerank is skipped.
 
-Semantic recall is landing in phases. With an embed endpoint configured, facts are embedded
-by a background worker and `recall` fuses cosine with the lexical signals; **semantic merge —
-collapsing two facts whose vectors are close enough to be the same fact — is the next phase
-and is not implemented yet.** The threshold it will merge above is already measured, and the
-warning below is about that number rather than about code you can run today.
+With an embed endpoint configured, a background worker embeds facts and `recall` fuses cosine
+with the lexical signals. Semantic merge collapses facts whose vectors pass the configured
+model's threshold. `loci.memory/unmerge!` can restore a fact from a merge.
 
 **Change `LOCI_EMBED_MODEL` and the merge threshold has to be re-measured.** This is the one
 setting that does not take care of itself, so it is worth reading before you change it.
@@ -330,22 +330,19 @@ included — it **refuses to merge and says so**: no fallback to the nearest num
 nothing merged. An unmerged memory is merely redundant; a wrongly merged one has lost
 something.
 
-To re-measure, against your own memory file and with the new model configured:
+To re-measure, use an explicit legacy EDN memory file with the new model configured:
 
 ```bash
-LOCI_EMBED_MODEL=your-new-model clojure -M:calibrate data/memory.edn
+LOCI_EMBED_MODEL=your-new-model clojure -M:calibrate path/to/memory.edn
 ```
 
-The path is required and has no default, so a calibration run cannot be aimed at your real
-memory by accident. It reads and never writes. What comes back is the percentile table over
-every pair and the highest-scoring pairs **with their texts** — because the step that decides
-the threshold is you reading those pairs and saying, for each, whether the two are the same
-fact. Scores alone cannot tell you; the whole failure above is two sentences about Kepler's
-Third Law that a cosine cannot separate. Pass your verdicts back from a REPL and it puts the
-number above every pair you called distinct:
+The path is required and has no default. Calibration does not read live facts from Datalevin.
+It reads the named legacy EDN file and never writes it. The result includes a percentile table
+and the highest-scoring pairs with their texts. Read each pair and decide if the facts match.
+Then pass your decisions from a REPL:
 
 ```clojure
-(loci.calibrate/calibrate! "data/memory.edn"
+(loci.calibrate/calibrate! "path/to/memory.edn"
   {:labels {#{"mem-12" "mem-40"} :duplicate
             #{"mem-3"  "mem-71"} :distinct}})
 ```
@@ -377,12 +374,14 @@ that looks healthy and answers nothing, and `LOCI_DATA=/data` is the container's
 the image already sets and which a `clojure -M:serve` on your own machine would take
 literally and refuse to start over.
 
-`clojure -M:serve` persists its state under `data/`, in **two stores**:
+`clojure -M:serve` persists its state under `data/`:
 
 ```
 data/
   substrate/   LMDB — the log. Truth: metadata, structure, and handles.
   lake/        DuckLake catalog + Parquet — every table's rows.
+  files/       files that loci owns for connected sources.
+  files.edn    the primary manifest for names and retired files.
 ```
 
 `data/substrate` is one Datalevin (LMDB) environment in six dbis: `events` (the
@@ -398,20 +397,17 @@ in one transaction — a `:put` lands in LMDB and the Parquet lands in the lake 
 so a copy taken between the two holds a handle pointing at a table the copy does
 not contain. Stopping the app first costs nothing and is route (3) below.
 
-**Table GC is off.** `data/lake` only grows: every write creates a new table and
-nothing is ever expired, because a handle reads `AT (VERSION => n)` and expiring
-a snapshot would invalidate every handle in the log that names it. See
-`loci.lake/sweep!`, which reports `:mode :disabled` and the reason rather than a
-zero that reads like a completed sweep. A growing `lake/` is the design, not a
-leak.
+**Automatic snapshot expiry is off.** A handle reads `AT (VERSION => n)`, so catalog-wide
+expiry can break a live handle. Manual per-table cleanup works. `GET /api/storage` reports
+each table's versions and bytes. `POST /api/storage/reclaim` removes one object's versions
+outside the undo window. `loci.lake/sweep!` remains disabled.
 
-Until 2026-08-15 the memory and the vectors were flat files beside it —
-`data/memory.edn` and `data/chunks.edn`, together twenty-five times the size of
-the database they sat next to. Both are still on disk, untouched, as rollbacks;
-neither is read at runtime. `loci.factmigrate/migrate-facts!` and
-`loci.chunks/migrate-from-file!` are what moved them. A pre-2026-08 EDN log at
+Until 2026-08-15, memory and vectors used `data/memory.edn` and `data/chunks.edn`.
+The live sidecar files were removed after migration. Backup files can remain, but runtime
+does not read them. `loci.factmigrate/migrate-facts!` and
+`loci.chunks/migrate-from-file!` moved their data. A pre-2026-08 EDN log at
 `data/substrate.edn` is migrated with `clojure -M:migrate`, which imports it
-verbatim and verifies the two logs materialize to the same state.
+verbatim and verifies that both logs materialize to the same state.
 
 **One writer.** loci is single-writer by design: one process owns the store, and
 there is no supported configuration in which two hold it open. Three ways in, and
@@ -441,12 +437,11 @@ the new store means losing everything committed in that week. That is the
 accepted trade: the check existed to stop an unreadable line truncating a text
 file, and a KV store has no lines to truncate.
 
-The two suites are deliberately separate: `clojure -M:test` stays fast and needs no
-browser, while the browser suite boots its own server against a throwaway substrate — it
-never opens `data/`. A failing browser test leaves a screenshot and a console log in
-`test/browser/failures/` (cleared at the start of every run), because the defect that
-motivated the suite (notebook titles rendering at ~3px when zoomed out) was invisible to
-every DOM assertion and only caught by looking.
+The three suites are separate. `clojure -M:test` runs Clojure tests.
+`npm run test:cljs` compiles and runs the ClojureScript grid tests under Node.
+The browser suite boots its own server against a throwaway substrate. It never opens
+`data/`. A browser failure leaves a screenshot and a console log in
+`test/browser/failures/`.
 
 Zoomed out, the overview groups each notebook with the ones it spawned — the
 structure the substrate already computes from `spawned-by` and `merged-from`, rather than
@@ -503,7 +498,7 @@ frontend only lays out the result.
 | `GET /` | the shell |
 | `GET /api/state` | spaces + objects |
 | `GET /api/object/:id` | an object's default mold + the "view this as…" menu |
-| `GET /api/mold?id=&view=` | the object re-molded by a chosen viewer |
+| `GET /api/mold?id=&view=&limit=&cursor=&sort=&cols=` | the object re-molded by a chosen viewer; table options page, sort, and select columns |
 | `GET /api/leap?q=` | incremental find across content + view-verbs |
 | `GET /api/undo` | revert the last substrate event |
 | `GET/POST /api/notebook` | a notebook's hydrated cells / one cell operation |
@@ -525,6 +520,14 @@ frontend only lays out the result.
 | `POST /api/tags` | replace a notebook's tags — one reversible event |
 | `POST /api/tag-suggest` | the agent proposes tags (background job); writes nothing |
 | `POST /api/tag-color` | choose a tag's colour — one reversible event |
+| `POST /api/source/describe` | inspect a source without connecting it |
+| `POST /api/source/connect` | connect a local or remote table source |
+| `POST /api/source/refresh` | refresh a materialised source |
+| `GET /api/source/files` | list files owned by loci |
+| `POST /api/source/upload` | upload one file chunk |
+| `GET /api/storage` | report lake and owned-file storage |
+| `POST /api/storage/reclaim` | reclaim one table object's old versions |
+| `POST /api/storage/reclaim-files` | reclaim files outside the retention window |
 
 ## Layout
 
@@ -532,12 +535,23 @@ frontend only lays out the result.
 src/loci/substrate.clj   layer 1: append-only event log behind a Store protocol
 src/loci/dlv.clj         layer 1, durable: the event log on Datalevin (LMDB) + touch index
 src/loci/migrate.clj     one-shot import of the old EDN log, verified by state equality
-src/loci/content.clj     layer 2: populated content + viewers; datafy/nav
+src/loci/tablestore.clj  table handles, hydration, paging and queries
+src/loci/lake.clj        DuckDB, DuckLake, Parquet and source relations
+src/loci/source.clj      source facade: describe, connect and refresh
+src/loci/sourcespec.clj  pure source URI, format and relation rules
+src/loci/files.clj       owned files, the manifest and file cleanup
+src/loci/content.clj     populated content + viewers; datafy/nav
 src/loci/mold.clj        layer 4: viewer registry, mold, Recall protocol (UI-free)
 src/loci/fnlib.clj       built-in single-table transforms — the ƒ function palette (UI-free)
 src/loci/memory.clj      layer 3: AI-memory engine (Recall protocol, persisted)
 src/loci/notebook.clj    notebook = space: cells, cell ops, computed links
+src/loci/sandbox.clj     model-written Clojure query surface
+src/loci/honeyq.clj      HoneySQL data validation and normalization
+src/loci/viewspec.clj    reusable table query and view specifications
 src/loci/server.clj      layer 5 backend: substrate + mold served as JSON
+src-cljs/loci/grid.cljs  table grid state, paging and network requests
+src-cljs/loci/grid/      Replicant table grid view
+test-cljs/               ClojureScript grid tests
 resources/public/index.html   layer 5 frontend: spaces + LEAP shell
 src/loci/demo.clj        headless walkthrough  (clojure -M:demo)
 notebooks/loci.clj       Clerk render target (alternative to the shell)
