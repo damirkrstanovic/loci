@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penpot.app/schemas/penpot-ai-kit/deck-quality-report.schema.json",
+  "title": "Deck-quality critique report (penpot-build-deck, references/07-critique-framework.md)",
+  "type": "object",
+  "required": ["runId", "scope", "deckStyle", "tonalArc", "outline", "axes", "monotony", "structuralGate", "belowThreshold", "findings"],
+  "properties": {
+    "runId": { "type": "string" },
+    "scope": { "type": "string", "description": "The deck page name + id, the slide boards scored, and the exports the scores cite." },
+    "deckStyle": { "type": "string", "description": "The committed profile from references/02-deck-styles.md, e.g. 'Tech-dark-gradient'." },
+    "tonalArc": { "type": "string", "description": "The committed arc, e.g. 'dark cover/sections/closing, light body'." },
+    "motif": { "type": "string", "description": "The one repeated device, e.g. 'oversized numerals'." },
+    "outline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["n", "archetype", "name"],
+        "properties": {
+          "n": { "type": "integer", "minimum": 1 },
+          "archetype": { "type": "string" },
+          "name": { "type": "string", "description": "Board name, NN-archetype-slug." },
+          "shapeId": { "type": "string" }
+        }
+      }
+    },
+    "axes": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "required": ["axis", "score", "evidence"],
+        "properties": {
+          "axis": { "enum": ["hierarchy", "composition", "typography", "color", "spacing", "content", "distinctiveness"] },
+          "score": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "evidence": { "type": "string", "description": "What in the slide exports justifies the score, naming slides. A score without visible evidence is invalid." },
+          "fix": { "type": "string", "description": "Required when score < 3: the concrete revision (which slides, what changes)." }
+        }
+      },
+      "description": "Exactly one entry per axis, scored against the per-slide exports (references/07-critique-framework.md)."
+    },
+    "monotony": {
+      "type": "object",
+      "required": ["slideCount", "consecutiveRepeats", "distinctArchetypes", "maxArchetypeShare"],
+      "properties": {
+        "slideCount": { "type": "integer", "minimum": 1 },
+        "consecutiveRepeats": { "type": "integer", "minimum": 0, "description": "Pairs of consecutive slides with the same archetype. Target 0." },
+        "distinctArchetypes": { "type": "integer", "minimum": 1 },
+        "maxArchetypeShare": { "type": "number", "minimum": 0, "maximum": 1, "description": "Share of the deck taken by the most used archetype. Target ≤ 0.4." },
+        "anchorAlternation": { "type": "number", "minimum": 0, "maximum": 1, "description": "Share of consecutive slide pairs whose anchor point differs." }
+      }
+    },
+    "structuralGate": {
+      "type": "object",
+      "required": ["pass"],
+      "properties": {
+        "pass": { "type": "boolean", "description": "auditDeckQuality.js verdict — the field brief-to-deck's branch condition reads together with belowThreshold." },
+        "wrongDims": { "type": "array", "items": { "type": "string" } },
+        "noVisual": { "type": "array", "items": { "type": "string" } },
+        "belowTypeFloor": { "type": "array", "items": { "type": "string" } },
+        "offSafeArea": { "type": "array", "items": { "type": "string" } },
+        "placeholders": { "type": "array", "items": { "type": "string" } },
+        "rawFills": { "type": "array", "items": { "type": "string" } },
+        "unlinkedSlides": { "type": "array", "items": { "type": "string" } },
+        "flowPresent": { "type": "boolean" },
+        "flipCleared": { "type": "integer" }
+      }
+    },
+    "belowThreshold": { "type": "integer", "description": "Count of axes with score < 3 — read by brief-to-deck's branch condition." },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "axis", "issue", "fix"],
+        "properties": {
+          "id": { "type": "string", "description": "Stable within the run, e.g. dk-composition-01. Reused across iterations when the same issue recurs." },
+          "severity": { "enum": ["High", "Medium", "Low"] },
+          "axis": { "enum": ["hierarchy", "composition", "typography", "color", "spacing", "content", "distinctiveness", "monotony"] },
+          "tell": { "type": "string", "description": "A named tell from shared/design-quality.md §7 or references/02-deck-styles.md 'what to refuse', reported verbatim." },
+          "slide": { "type": "string", "description": "Board name of the slide (NN-archetype-slug). Empty for deck-level findings." },
+          "shapeId": { "type": "string" },
+          "issue": { "type": "string" },
+          "measured": { "type": "string" },
+          "target": { "type": "string" },
+          "fix": { "type": "string" },
+          "safeSet": { "type": "boolean", "description": "true only if the fix is in the auto-apply safe set (policies/modes.json). Renaming a slide board is; everything else is not." }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "description": "Literal values the API cannot bind to tokens (gradients, glass fills, shadows) and failed image uploads, mirrored from the run ledger.",
+      "items": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" }, "shape": { "type": "string" }, "detail": { "type": "string" } } }
+    },
+    "revisionPasses": { "type": "integer", "minimum": 0, "maximum": 2 },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "truncation": { "type": "string", "description": "Non-empty when scope was capped/sampled — no silent truncation (AGENTS.md §12)." }
+  }
+}

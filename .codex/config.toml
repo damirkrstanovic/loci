@@ -1,0 +1,56 @@
+[mcp_servers.clojure-mcp]
+command = "clojure"
+args = [
+    "-Sdeps",
+    "{:deps {clojure-mcp/clojure-mcp {:local/root \"/home/damirk/src/clojure-mcp\"}} :aliases {:mcp {:exec-fn clojure-mcp.main/start}}}",
+    "-X:mcp",
+    ":config-profile",
+    ":cli-assist",
+    ":port",
+    "7888",
+    ":fallback-nrepl",
+    "true",
+]
+cwd = "/home/damirk/src/loci"
+startup_timeout_sec = 120
+tool_timeout_sec = 120
+enabled = true
+enabled_tools = [
+    "clojure_eval",
+    "clojure_edit",
+    "clojure_edit_replace_sexp",
+    "deps_grep",
+    "deps_list",
+    "deps_read",
+    "list_nrepl_ports",
+    "paren_repair",
+]
+default_tools_approval_mode = "auto"
+
+[mcp_servers.clojure-mcp.env]
+JAVA_TOOL_OPTIONS = "-XX:ActiveProcessorCount=2"
+CLJ_CACHE = "/home/damirk/src/loci/.tmp/clojure-mcp-cache"
+
+[mcp_servers.clojure-mcp.tools.clojure_edit]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.clojure_edit_replace_sexp]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.clojure_eval]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.deps_grep]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.deps_list]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.deps_read]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.list_nrepl_ports]
+approval_mode = "approve"
+
+[mcp_servers.clojure-mcp.tools.paren_repair]
+approval_mode = "approve"

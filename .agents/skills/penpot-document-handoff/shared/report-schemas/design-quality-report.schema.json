@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penpot.app/schemas/penpot-ai-kit/design-quality-report.schema.json",
+  "title": "Design-quality critique report (penpot-build-screen, shared/design-quality.md §8)",
+  "type": "object",
+  "required": ["runId", "scope", "styleProfile", "skeleton", "axes", "belowThreshold", "findings"],
+  "properties": {
+    "runId": { "type": "string" },
+    "scope": { "type": "string", "description": "What was scored: screen/board name(s) + ids, and the export the scores cite." },
+    "styleProfile": { "type": "string", "description": "The committed profile from shared/design-quality.md §1, e.g. 'Modern SaaS'." },
+    "skeleton": { "type": "string", "description": "The named shell + content pattern from shared/design-quality.md §5, e.g. 'Sidebar shell / Dashboard'." },
+    "axes": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "required": ["axis", "score", "evidence"],
+        "properties": {
+          "axis": { "enum": ["hierarchy", "composition", "typography", "color", "spacing", "content", "distinctiveness"] },
+          "score": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "evidence": { "type": "string", "description": "What in the export/shape tree justifies the score. A score without visible evidence is invalid." },
+          "fix": { "type": "string", "description": "Required when score < 3: the concrete revision that would raise it." }
+        }
+      },
+      "description": "Exactly one entry per axis, scored against the export image per shared/design-quality.md §8."
+    },
+    "belowThreshold": { "type": "integer", "description": "Count of axes with score < 3 — the field brief-to-screen's branch condition reads." },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "axis", "issue", "fix"],
+        "properties": {
+          "id": { "type": "string", "description": "Stable within the run, e.g. dq-color-01. Reused across iterations when the same issue recurs, so reports diff cleanly." },
+          "severity": { "enum": ["High", "Medium", "Low"] },
+          "axis": { "enum": ["hierarchy", "composition", "typography", "color", "spacing", "content", "distinctiveness"] },
+          "tell": { "type": "string", "description": "When the issue matches a named tell from shared/design-quality.md §7, its name — reported verbatim." },
+          "shapeId": { "type": "string" },
+          "shapeName": { "type": "string" },
+          "issue": { "type": "string" },
+          "measured": { "type": "string", "description": "The measured value when numeric, e.g. 'accent share ~22%' or 'body measure 118ch'." },
+          "target": { "type": "string", "description": "The doctrine target, e.g. '≤ 10%' or '45–75ch'." },
+          "fix": { "type": "string", "description": "Concrete proposed fix, naming the token/pattern to move to when applicable." },
+          "safeSet": { "type": "boolean", "description": "true only if the fix is in the auto-apply safe set (policies/modes.json). Aesthetic fixes almost never are." }
+        }
+      }
+    },
+    "revisionPasses": { "type": "integer", "minimum": 0, "maximum": 2, "description": "Self-revision passes already spent (max 2 per shared/design-quality.md §8)." },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "truncation": { "type": "string", "description": "Non-empty when scope was capped/sampled — no silent truncation (AGENTS.md §12)." }
+  }
+}

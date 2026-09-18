@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10.2" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Provenance patterns in notebook, science, and agent tools</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: 1.5em;}
+    div.column{flex: auto;}
+    @media screen {
+    div.columns{gap: min(4vw, 1.5em);}
+    div.column{overflow-x: auto;}
+    }
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+    :root {
+      --paper: #eceeea;
+      --card: #f9faf6;
+      --ink: #17201c;
+      --muted: #58625d;
+      --line: #cbd2cb;
+      --green: #2f6f5b;
+      --green-pale: #e1eee7;
+      --violet: #69547d;
+      --violet-pale: #eee9f3;
+      --warning: #8b4c25;
+      --warning-pale: #fff1e5;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.62;
+      scroll-behavior: smooth;
+    }
+    body {
+      box-sizing: border-box;
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px clamp(18px, 4vw, 56px) 64px;
+      color: var(--ink);
+      background: var(--paper);
+      font-size: 16px;
+      hyphens: none;
+    }
+    *, *::before, *::after { box-sizing: inherit; }
+    header#title-block-header { display: none; }
+    main {
+      max-width: 860px;
+      margin-left: min(292px, 27vw);
+      padding: clamp(22px, 4vw, 46px);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--card);
+      box-shadow: 0 10px 26px rgba(32, 48, 40, .06);
+    }
+    h1, h2, h3 {
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.14;
+    }
+    h1 { margin: 0 0 .3em; font-size: clamp(2.15rem, 5vw, 3.45rem); letter-spacing: -.025em; }
+    h2 { margin: 2.65em 0 .75em; padding-top: .25em; font-size: clamp(1.55rem, 3vw, 2.15rem); }
+    h3 { margin: 2em 0 .6em; font-size: 1.3rem; color: var(--green); }
+    p { margin: .9em 0; }
+    main > p:nth-of-type(1) {
+      margin: 0 0 1.25em;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .85rem;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .status-note {
+      margin: 1.5em 0 2.25em;
+      padding: 1rem 1.1rem;
+      border: 1px solid #d89c74;
+      border-left: 5px solid var(--warning);
+      border-radius: 7px;
+      background: var(--warning-pale);
+      color: #572c17;
+      font-size: 1.03rem;
+    }
+    a { color: var(--green); text-decoration-color: #8aafa0; text-underline-offset: .15em; }
+    a:visited { color: var(--violet); text-decoration-color: #b7a9c3; }
+    a[href^="http"]::after { content: " ↗"; font-size: .78em; white-space: nowrap; }
+    a:focus-visible {
+      outline: 3px solid #8b70a4;
+      outline-offset: 3px;
+      border-radius: 2px;
+    }
+    strong { color: #243b31; }
+    code {
+      padding: .1em .32em;
+      border-radius: 3px;
+      background: var(--violet-pale);
+      color: #4e3c60;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .88em;
+    }
+    ul, ol { padding-left: 1.45em; }
+    li + li { margin-top: .34em; }
+    figure {
+      margin: 1.65em 0;
+      padding: .7rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+    figure img { display: block; width: 100%; height: auto; border: 1px solid #dde2dc; border-radius: 5px; }
+    figcaption { margin: .75rem .25rem .15rem; color: var(--muted); font-size: .92rem; }
+    .table-scroll { margin: 1.35em 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
+    .table-scroll table { min-width: 680px; width: 100%; margin: 0; }
+    table { border-collapse: collapse; font-size: .92rem; }
+    th, td { padding: .7rem .75rem; border: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { background: var(--green-pale); color: #1f4e40; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .78rem; letter-spacing: .035em; text-transform: uppercase; }
+    tbody tr:nth-child(even) { background: #fbfcf9; }
+    #TOC {
+      position: fixed;
+      top: 28px;
+      width: min(250px, 23vw);
+      max-height: calc(100vh - 56px);
+      overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(249, 250, 246, .94);
+      box-shadow: 0 8px 20px rgba(32, 48, 40, .05);
+      font-size: .82rem;
+      line-height: 1.4;
+    }
+    #TOC::before { content: "On this page"; display: block; margin-bottom: .65rem; color: var(--green); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    #TOC ul { margin: 0; padding-left: 1.1em; }
+    #TOC > ul { padding-left: 0; list-style: none; }
+    #TOC li { margin: .35em 0; }
+    #TOC a { display: inline-block; color: var(--ink); text-decoration: none; }
+    #TOC a:hover { color: var(--green); text-decoration: underline; }
+    .product-profile { margin: 1.2rem 0 1.35rem; padding: 1rem 1.1rem; border: 1px solid #cfddd3; border-left: 4px solid var(--green); border-radius: 8px; background: var(--green-pale); }
+    .product-profile p { margin: .45rem 0; }
+    @media (max-width: 860px) {
+      body { padding: 16px; }
+      #TOC { position: static; width: 100%; max-height: 19rem; margin-bottom: 18px; }
+      main { margin: 0; padding: clamp(20px, 5vw, 34px); }
+    }
+    @media (max-width: 540px) {
+      body { font-size: 15px; }
+      main { border-radius: 9px; }
+      h2 { margin-top: 2.1em; }
+      th, td { padding: .58rem .62rem; }
+    }
+    @media print {
+      @page { margin: 15mm; }
+      html, body { background: #fff; }
+      body { max-width: none; padding: 0; font-size: 10.5pt; }
+      #TOC { position: static; width: auto; max-height: none; margin: 0 0 1.2em; box-shadow: none; }
+      main { max-width: none; margin: 0; padding: 0; border: 0; box-shadow: none; }
+      figure, .table-scroll { break-inside: avoid; }
+      .product-profile { break-inside: avoid; border-color: #9a9a9a; background: #fff; }
+      figure img { max-height: 225mm; width: auto; max-width: 100%; margin-inline: auto; }
+      h2, h3 { break-after: avoid; }
+      a { color: #000; text-decoration: underline; }
+      a[href^="http"]::after { content: " (" attr(href) ")"; font-size: .72em; overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#provenance-patterns-in-notebook-science-and-agent-tools"
+id="toc-provenance-patterns-in-notebook-science-and-agent-tools">Provenance
+patterns in notebook, science, and agent tools</a>
+<ul>
+<li><a href="#scope-and-reading-guide"
+id="toc-scope-and-reading-guide">Scope and reading guide</a></li>
+<li><a href="#screens-captured-during-the-review"
+id="toc-screens-captured-during-the-review">Screens captured during the
+review</a></li>
+<li><a href="#comparison-at-a-glance"
+id="toc-comparison-at-a-glance">Comparison at a glance</a></li>
+<li><a href="#product-findings" id="toc-product-findings">Product
+findings</a>
+<ul>
+<li><a href="#hex" id="toc-hex">Hex</a></li>
+<li><a href="#observable" id="toc-observable">Observable</a></li>
+<li><a href="#deepnote" id="toc-deepnote">Deepnote</a></li>
+<li><a href="#databricks-unity-catalog"
+id="toc-databricks-unity-catalog">Databricks Unity Catalog</a></li>
+<li><a href="#galaxy" id="toc-galaxy">Galaxy</a></li>
+<li><a href="#seqera" id="toc-seqera">Seqera</a></li>
+<li><a href="#datalad" id="toc-datalad">DataLad</a></li>
+<li><a href="#langsmith" id="toc-langsmith">LangSmith</a></li>
+<li><a href="#openai-agents-sdk-tracing"
+id="toc-openai-agents-sdk-tracing">OpenAI Agents SDK tracing</a></li>
+<li><a href="#arize-phoenix" id="toc-arize-phoenix">Arize
+Phoenix</a></li>
+</ul></li>
+<li><a href="#cross-product-patterns"
+id="toc-cross-product-patterns">Cross-product patterns</a>
+<ul>
+<li><a href="#1-start-from-the-thing-the-user-already-sees"
+id="toc-1-start-from-the-thing-the-user-already-sees">1. Start from the
+thing the user already sees</a></li>
+<li><a href="#2-use-a-compact-overview-and-a-detail-inspector"
+id="toc-2-use-a-compact-overview-and-a-detail-inspector">2. Use a
+compact overview and a detail inspector</a></li>
+<li><a href="#3-keep-status-visible" id="toc-3-keep-status-visible">3.
+Keep status visible</a></li>
+<li><a href="#4-make-direction-explicit"
+id="toc-4-make-direction-explicit">4. Make direction explicit</a></li>
+<li><a href="#5-separate-a-durable-object-from-one-execution"
+id="toc-5-separate-a-durable-object-from-one-execution">5. Separate a
+durable object from one execution</a></li>
+<li><a href="#6-preserve-the-failed-path"
+id="toc-6-preserve-the-failed-path">6. Preserve the failed path</a></li>
+<li><a href="#7-allow-a-safe-return-but-say-what-returns"
+id="toc-7-allow-a-safe-return-but-say-what-returns">7. Allow a safe
+return, but say what returns</a></li>
+</ul></li>
+<li><a href="#proposed-user-flows-for-loci"
+id="toc-proposed-user-flows-for-loci">Proposed user flows for loci</a>
+<ul>
+<li><a href="#flow-a-result-to-source"
+id="toc-flow-a-result-to-source">Flow A: result to source</a></li>
+<li><a href="#flow-b-failed-attempt-while-testing-a-hypothesis"
+id="toc-flow-b-failed-attempt-while-testing-a-hypothesis">Flow B: failed
+attempt while testing a hypothesis</a></li>
+<li><a href="#flow-c-retry-or-branch"
+id="toc-flow-c-retry-or-branch">Flow C: retry or branch</a></li>
+<li><a href="#flow-d-compare-runs" id="toc-flow-d-compare-runs">Flow D:
+compare runs</a></li>
+<li><a href="#flow-e-time-travel-with-current-recall"
+id="toc-flow-e-time-travel-with-current-recall">Flow E: time travel with
+current Recall</a></li>
+</ul></li>
+<li><a href="#a-small-ui-vocabulary-for-later-mockups"
+id="toc-a-small-ui-vocabulary-for-later-mockups">A small UI vocabulary
+for later mockups</a></li>
+<li><a href="#design-limits-and-open-questions"
+id="toc-design-limits-and-open-questions">Design limits and open
+questions</a></li>
+<li><a href="#source-index" id="toc-source-index">Source index</a></li>
+</ul></li>
+</ul>
+</nav>
+<main>
+<h1
+id="provenance-patterns-in-notebook-science-and-agent-tools">Provenance
+patterns in notebook, science, and agent tools</h1>
+<p>Date: 2026-08-31</p>
+<p class="status-note" role="note">Status: <strong>a research note, not a spec.</strong> It does not
+approve a data model, a screen, or an implementation. It records product
+patterns that can inform later loci design work.</p>
+<h2 id="scope-and-reading-guide">Scope and reading guide</h2>
+<p>This note asks a practical question: when a person sees a result, how
+can they find what made it, what else used it, and what happened when an
+attempt failed?</p>
+<p><strong>Observed</strong> means the point comes from the linked
+product documentation or a captured product screen. <strong>Inference
+for loci</strong> means it is a design conclusion. It is not a claim
+about the product.</p>
+<p>“Provenance” has two useful meanings:</p>
+<ul>
+<li><strong>Data provenance:</strong> inputs, transformations, and
+outputs.</li>
+<li><strong>Run provenance:</strong> work in one execution, including
+tools, parameters, duration, errors, and retries.</li>
+</ul>
+<p>loci needs both. A table or document needs a stable origin story. An
+agent flow also needs the story of the particular attempt that made,
+changed, or failed to make it.</p>
+<h2 id="screens-captured-during-the-review">Screens captured during the
+review</h2>
+<figure>
+<img src="assets/provenance-research/hex-graph-view-docs.png"
+alt="Hex Graph view. A notebook cell graph sits beside the linear notebook." />
+<figcaption>Figure 1. Hex documents Graph view as a mirror of notebook logic.
+Selecting a cell shows its upstream and downstream cells and scrolls the
+notebook to it. Source: <a
+href="https://learn.hex.tech/docs/explore-data/projects/project-execution/graph-view">Hex
+Graph view</a>.</figcaption>
+</figure>
+<figure>
+<img src="assets/provenance-research/galaxy-history-panel.png"
+alt="Galaxy History panel. Items appear as an ordered stack with state colours." />
+<figcaption>Figure 2. Galaxy makes a history the main work surface. Its
+ordered dataset list also exposes job state. Source: <a
+href="https://training.galaxyproject.org/training-material/topics/galaxy-interface/tutorials/history/tutorial.html">Galaxy
+histories</a>.</figcaption>
+</figure>
+<figure>
+<img src="assets/provenance-research/seqera-task-status.png"
+alt="Seqera task status row. Status counts appear before the task table." />
+<figcaption>Figure 3. Seqera shows status counts before the task-table
+detail. It does not show a task row with duration and resources. Source:
+<a
+href="https://docs.seqera.io/platform-cloud/monitoring/run-details">Seqera
+run details</a>.</figcaption>
+</figure>
+<figure>
+<img src="assets/provenance-research/seqera-task-detail.png"
+alt="Seqera task detail view. The screenshot shows task name, command, and status." />
+<figcaption>Figure 4. The screenshot shows a task name, command, and status.
+Other tabs make inputs, outputs, and logs available. Source: <a
+href="https://docs.seqera.io/platform-cloud/monitoring/run-details">Seqera
+run details</a>.</figcaption>
+</figure>
+<figure>
+<img src="assets/provenance-research/langsmith-trace.png"
+alt="LangSmith trace tree. Nested run steps show a selected run and its inputs, outputs, and timing." />
+<figcaption>Figure 5. LangSmith shows one agent run as a nested trace. The
+selected span opens in a detail pane. Source: <a
+href="https://docs.langchain.com/langsmith/view-traces">LangSmith trace
+view</a>.</figcaption>
+</figure>
+<h2 id="comparison-at-a-glance">Comparison at a glance</h2>
+<div class="table-scroll" role="region" aria-label="Product comparison" tabindex="0">
+<table>
+<thead>
+<tr>
+<th>Product</th>
+<th>Main provenance unit</th>
+<th>Main view</th>
+<th>A useful interaction</th>
+<th>Limit for loci</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hex</td>
+<td>notebook cell dependency</td>
+<td>directed cell graph beside notebook</td>
+<td>select a cell to highlight ancestors and descendants</td>
+<td>It explains code flow, not the full life of a result.</td>
+</tr>
+<tr>
+<td>Observable</td>
+<td>reactive cell dependency and notebook revision</td>
+<td>minimap and history pane</td>
+<td>select a cell to see direct dependencies</td>
+<td>It does not make failed runs a first-class history.</td>
+</tr>
+<tr>
+<td>Deepnote</td>
+<td>block dependency and project/run snapshot</td>
+<td>dependency graph and versions sidebar</td>
+<td>run a block with dependent blocks</td>
+<td>A restore changes a project snapshot.</td>
+</tr>
+<tr>
+<td>Databricks</td>
+<td>governed data object and query lineage</td>
+<td>catalog lineage graph</td>
+<td>switch upstream or downstream from a table</td>
+<td>It focuses on catalog objects and governed compute.</td>
+</tr>
+<tr>
+<td>Galaxy</td>
+<td>ordered analysis history and job-created dataset</td>
+<td>history panel and dataset provenance</td>
+<td>open a dataset to inspect the producing job</td>
+<td>Large histories become long and linear.</td>
+</tr>
+<tr>
+<td>Seqera</td>
+<td>workflow run, task, and file</td>
+<td>task list plus task detail</td>
+<td>open a failed task for command, inputs, outputs, and logs</td>
+<td>It is not an exploratory notebook.</td>
+</tr>
+<tr>
+<td>DataLad</td>
+<td>recorded command in a dataset revision</td>
+<td>Git history and command record</td>
+<td>rerun a past command</td>
+<td>Its main interface is the command line.</td>
+</tr>
+<tr>
+<td>LangSmith</td>
+<td>request trace and nested run</td>
+<td>trace tree plus span detail</td>
+<td>select a tool or model run in the tree</td>
+<td>It does not own durable workspace objects.</td>
+</tr>
+<tr>
+<td>OpenAI Agents SDK</td>
+<td>trace and parent/child spans</td>
+<td>trace viewer in the dashboard</td>
+<td>inspect a generation, tool call, handoff, or guardrail</td>
+<td>It needs an application model for data objects.</td>
+</tr>
+<tr>
+<td>Arize Phoenix</td>
+<td>OpenTelemetry trace and spans</td>
+<td>trace list, tree, and span queries</td>
+<td>filter traces, then inspect spans and evaluations</td>
+<td>It is observability infrastructure, not a user workspace.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="product-findings">Product findings</h2>
+<p>Each target persona below is a design reading of documented product scope, not a quoted vendor segment.</p>
+<h3 id="hex">Hex</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Hex is a collaborative notebook for data analysis, apps, and reports.</p>
+<p><strong>Target persona.</strong> Data analysts and data teams who build and share interactive analyses.</p>
+<p><strong>Why provenance matters.</strong> They need to trace a result through its upstream cells before they trust or change it.</p>
+</div>
+<p><strong>Observed model.</strong> Hex infers links between cells from
+variable references. Its Graph view is a visual mirror of notebook
+logic. Selecting a cell highlights its upstream ancestors and downstream
+descendants. Hex also scrolls the notebook to the selected cell. The
+user can hide imports and unlinked cells, combine or separate edges,
+drag nodes, and zoom. <a
+href="https://learn.hex.tech/docs/explore-data/projects/project-execution/graph-view">Official
+documentation</a></p>
+<p><strong>Observed user flow.</strong> A user sees a chart with an
+unexpected value. They select the chart cell in Graph view. Hex
+highlights the query and calculation cells that feed it. The notebook
+scrolls to the chart cell. The user follows the highlighted path
+upstream, edits a filter cell, and sees the graph update with the
+notebook.</p>
+<p><strong>Strength.</strong> The graph stays connected to the familiar
+linear notebook. Selection answers the immediate question: “what feeds
+this?”</p>
+<p><strong>Limit.</strong> A variable edge says that code depends on
+code. It does not say why a person chose a source, which agent made a
+claim, or whether a prior attempt failed.</p>
+<p><strong>Inference for loci.</strong> Keep the current object or
+notebook as the main surface. Offer a compact dependency map as a second
+surface. Selecting an object must also select and reveal it in the main
+content. Do not use a full graph as the only way to read provenance.</p>
+<h3 id="observable">Observable</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Observable is a reactive notebook platform for data analysis, visualization, and publication.</p>
+<p><strong>Target persona.</strong> Data journalists, analysts, and developers who explore and explain data.</p>
+<p><strong>Why provenance matters.</strong> They need to see how a cell depends on its inputs and recover or fork a useful notebook state.</p>
+</div>
+<p><strong>Observed model.</strong> Observable notebooks are made of
+cells. Its runtime uses cell dependencies to decide the order of data
+flow and execution. The Minimap lists cells and their dependencies. When
+a user focuses a cell, it shows direct links and shifts transitive
+dependencies. The History pane records changes and can restore earlier
+notebook versions. A user can fork a notebook to make an independent
+copy. <a
+href="https://observablehq.com/documentation/debugging/minimap">Minimap</a>
+and <a href="https://observablehq.com/documentation/notebooks/">notebook
+history</a> document these behaviors.</p>
+<p><strong>Observed user flow.</strong> A user edits a filter cell. The
+reactive notebook recalculates cells that depend on it. If the result is
+not useful, the user opens History and restores an earlier version. If
+they want an independent line of work, they fork the notebook to keep a
+separate branch.</p>
+<p><strong>Strength.</strong> Dependency navigation is small and local.
+Version history and forking make experimentation feel safe.</p>
+<p><strong>Limit.</strong> The dependency view focuses on named cell
+values. It does not show a durable chain through documents, imported
+files, agent prompts, or a separate recall store.</p>
+<p><strong>Inference for loci.</strong> Show direct parents and direct
+children by default. Let the user expand the path when needed. Preserve
+branch identity when a notebook is copied or spawned. Explain the
+relation in plain words, such as “uses table” or “spawned from”, not
+just an arrow.</p>
+<h3 id="deepnote">Deepnote</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Deepnote is a collaborative notebook for data analysis and data science projects.</p>
+<p><strong>Target persona.</strong> Data scientists and analysts who work together in shared projects.</p>
+<p><strong>Why provenance matters.</strong> They need to run dependents safely and inspect the exact project state that produced a result.</p>
+</div>
+<p><strong>Observed model.</strong> Deepnote parses notebook blocks to
+build a directed acyclic graph of variable dependencies. A user can run
+one block or that block with dependent blocks. The product also records
+project versions and keeps an immutable, read-only run snapshot after
+each run. Restoring an older project version first makes a snapshot of
+the current project. <a
+href="https://deepnote.com/docs/execution-modes">Execution modes</a> and
+<a href="https://deepnote.com/docs/history">version history</a> describe
+these behaviors.</p>
+<p><strong>Observed user flow.</strong> A user changes a SQL block. They
+choose “run dependent blocks”. Deepnote runs the selected block and the
+downstream blocks that need its values. The user later opens a run
+snapshot to see the notebook as it was when that execution occurred.
+They can preview a project version and restore it without losing the
+current state.</p>
+<p><strong>Strength.</strong> It separates two useful actions: recompute
+from a point, and inspect what a past run saw. The safe restore action
+makes the risk clear.</p>
+<p><strong>Limit.</strong> A project-wide restore fits a collaborative
+project. It does not directly solve the loci rule that Record moves in
+time while Recall stays current.</p>
+<p><strong>Inference for loci.</strong> A provenance panel should
+distinguish “this object now” from “this object at event 184”. The time
+travel screen must state that Recall is current and is not rolled back.
+A past execution should remain inspectable even when the current
+notebook has changed.</p>
+<h3 id="databricks-unity-catalog">Databricks Unity Catalog</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Unity Catalog is a governance layer for data, AI, and analytics assets in Databricks.</p>
+<p><strong>Target persona.</strong> Data engineers, data stewards, and analysts who manage shared data platforms.</p>
+<p><strong>Why provenance matters.</strong> They need to identify data sources, assess downstream impact, and meet governance needs.</p>
+</div>
+<p><strong>Observed model.</strong> Unity Catalog captures lineage for
+supported queries. Its graph can show which queries and files populate a
+table, which jobs and notebooks transform it, and which dashboards
+consume it. It can capture lineage down to columns. Catalog Explorer
+provides upstream and downstream views. Permission rules can mask nodes
+that the viewer cannot inspect. <a
+href="https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-lineage">Official
+documentation</a></p>
+<p><strong>Observed user flow.</strong> A dashboard shows a bad number.
+The user opens the table in Catalog Explorer and chooses upstream
+lineage. They find the notebook or job that wrote the table. They then
+choose downstream lineage before changing the source, to see which other
+tables, jobs, and dashboards will be affected.</p>
+<p><strong>Strength.</strong> It supports both diagnosis and impact
+analysis. The graph includes source, transformation, and consumer
+objects. Column lineage gives a precise answer when table-level links
+are too broad.</p>
+<p><strong>Limit.</strong> A governed catalog can assume stable asset
+names, workspace permissions, and a known compute system. loci is local
+and has notebooks, documents, tables, and agent actions together.</p>
+<p><strong>Inference for loci.</strong> Treat the source object, the
+action, and the result object as separate things. A result-to-source
+view needs an upstream mode. A before-change view needs a downstream
+mode. Start at object level. Add column detail only where stored facts
+can support it.</p>
+<h3 id="galaxy">Galaxy</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Galaxy is a web platform for accessible, reproducible scientific data analysis.</p>
+<p><strong>Target persona.</strong> Life-science researchers who run analyses without deep command-line skill.</p>
+<p><strong>Why provenance matters.</strong> They need to inspect inputs, tools, parameters, and failures behind each dataset.</p>
+</div>
+<p><strong>Observed model.</strong> Galaxy places datasets in a History.
+Each output dataset records the job that made it. Users can inspect
+dataset provenance, job parameters, input datasets, tool versions, and
+job state. Galaxy can extract a workflow from the jobs behind a history.
+A history is ordered and is also the practical record of an analysis. <a
+href="https://docs.galaxyproject.org/en/latest/lib/galaxy.webapps.galaxy.api.html#galaxy.webapps.galaxy.api.provenance">Dataset
+provenance API evidence</a> and <a
+href="https://training.galaxyproject.org/training-material/topics/galaxy-interface/tutorials/history/tutorial.html">history
+tutorial</a> show this model.</p>
+<p><strong>Observed user flow.</strong> A researcher sees that an output
+file is red or failed in the History panel. They open it. Galaxy shows
+the tool job and its error. They fix a parameter, run the tool again,
+and a new output appears later in the same ordered history. They can
+inspect the successful output to find the tool, inputs, and parameters
+that made it.</p>
+<p><strong>Strength.</strong> State is visible without opening detail.
+The history order gives a clear story of what a person tried. The
+producing job makes output provenance concrete.</p>
+<p><strong>Limit.</strong> The linear stack hides relationships when a
+history has many branches, reused inputs, or non-linear analysis.</p>
+<p><strong>Inference for loci.</strong> Keep an ordered event story
+available. Use a clear status mark for failed, running, and completed
+actions. Do not hide failed attempts. Connect each output object to its
+producing event, inputs, parameters, and error when present.</p>
+<h3 id="seqera">Seqera</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Seqera monitors and manages Nextflow data workflows.</p>
+<p><strong>Target persona.</strong> Bioinformatics and data-platform teams that run repeatable pipelines.</p>
+<p><strong>Why provenance matters.</strong> They need to debug failed tasks and trace files across complex workflow runs.</p>
+</div>
+<p><strong>Observed model.</strong> Seqera monitors Nextflow workflow
+runs. A run contains tasks. Task views show state, duration, resources,
+command, inputs, outputs, logs, and error data. Its newer data lineage
+feature records provenance at workflow and task levels and can trace
+files through the run. <a
+href="https://docs.seqera.io/platform-cloud/monitoring/run-details">Run
+details</a> and <a
+href="https://docs.seqera.io/platform-cloud/data/data-lineage">data
+lineage</a> describe these views.</p>
+<p><strong>Observed user flow.</strong> A pipeline run ends with
+failures. The user filters tasks by failed state. They open one task.
+They read the command, input and output paths, exit status, work
+directory, resource use, and logs. They correct the pipeline
+configuration and launch another run. The previous failed run remains
+available for comparison.</p>
+<p><strong>Strength.</strong> The list gives a fast answer to “what is
+wrong?” The task inspector holds the evidence needed to reproduce or
+debug it. Status stays visible before detail.</p>
+<p><strong>Limit.</strong> It is optimised for scheduled, repeated
+pipeline tasks. It does not model informal thought, documents, or an
+evolving hypothesis.</p>
+<p><strong>Inference for loci.</strong> Use the same two-level pattern
+for agent work: a compact flow list, then a focused inspector. Each
+attempted action should show input objects, tool or model, parameters,
+start and finish time, output objects, and an error or stop reason. Do
+not put all this detail on the canvas.</p>
+<h3 id="datalad">DataLad</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> DataLad manages data and reproducible data workflows from the command line.</p>
+<p><strong>Target persona.</strong> Researchers and data engineers who use version control for datasets and code.</p>
+<p><strong>Why provenance matters.</strong> They need a record of commands, inputs, and outputs to repeat or audit derived data.</p>
+</div>
+<p><strong>Observed model.</strong> DataLad records process provenance
+as structured data with a command, dataset ID, exit status, declared
+inputs, declared outputs, and working directory. The record lives with
+the dataset revision. <code>datalad rerun</code> can report or
+re-execute recorded commands. <a
+href="https://docs.datalad.org/en/latest/design/provenance_capture.html">Provenance
+capture</a> and <a
+href="https://docs.datalad.org/en/latest/generated/man/datalad-rerun.html"><code>rerun</code></a>
+document the record and rerun behavior.</p>
+<p><strong>Observed user flow.</strong> A researcher runs a command that
+creates derived files. DataLad stores the command and its declared input
+and output paths with the resulting revision. Months later, the
+researcher requests a rerun report to see which recorded commands would
+run. They rerun one revision, or export the commands as a script
+instead.</p>
+<p><strong>Strength.</strong> The record is precise enough to repeat
+work. Inputs and outputs are explicit. The old record remains tied to
+the revision that produced it.</p>
+<p><strong>Limit.</strong> Exact commands alone do not explain an
+analyst's intent or whether an output supports a claim. It also expects
+command-line and version-control skill.</p>
+<p><strong>Inference for loci.</strong> An action record should keep
+reproducible facts where possible: inputs, parameters, selected model or
+tool version, output handles, and error state. Show a plain language
+summary first. Offer the exact structured record as a secondary
+detail.</p>
+<h3 id="langsmith">LangSmith</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> LangSmith helps teams develop, test, and monitor LLM applications.</p>
+<p><strong>Target persona.</strong> LLM application developers and AI engineers.</p>
+<p><strong>Why provenance matters.</strong> They need to find which retrieval, model, or tool step caused an answer.</p>
+</div>
+<p><strong>Observed model.</strong> LangSmith records an LLM application
+request as a trace with nested runs. The trace view offers a tree, a
+timeline, inputs and outputs, metadata, timing, token use, errors, and
+links between parent and child runs. A run can represent a model call,
+tool call, chain, or agent step. <a
+href="https://docs.langchain.com/langsmith/view-traces">Trace view
+documentation</a> and <a
+href="https://docs.langchain.com/langsmith/run-data-format">trace data
+model</a> cover the main concepts.</p>
+<p><strong>Observed user flow.</strong> A user receives an unsupported
+answer. They open the trace for that request. The tree shows the agent's
+retrieval and tool calls. They select a retriever run and read the
+documents returned. They then select the model run and compare its
+prompt and answer. The user can identify whether retrieval, the model,
+or a tool caused the result.</p>
+<p><strong>Strength.</strong> A nested tree matches nested execution.
+The selected-span inspector avoids a dense graph. It makes a long agent
+run inspectable one step at a time.</p>
+<p><strong>Limit.</strong> The trace is a diagnostic record. It does not
+by itself say which durable notebook, table, or document a span
+changed.</p>
+<p><strong>Inference for loci.</strong> Use a trace tree for the inside
+of one agent action. Link trace outputs to the objects they created or
+changed. Keep object provenance and execution provenance connected, but
+do not merge them into one graph.</p>
+<h3 id="openai-agents-sdk-tracing">OpenAI Agents SDK tracing</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> The OpenAI Agents SDK helps developers build agent workflows with models and tools.</p>
+<p><strong>Target persona.</strong> Developers who build multi-step AI agents.</p>
+<p><strong>Why provenance matters.</strong> They need to inspect agent steps, handoffs, and tool calls when a workflow fails or behaves unexpectedly.</p>
+</div>
+<p><strong>Observed model.</strong> The Agents SDK records an end-to-end
+workflow as a trace. The trace contains parent and child spans. Built-in
+spans can record agent runs, generations, tool calls, handoffs,
+guardrails, and custom events. A trace has a workflow name, ID, optional
+group ID, and metadata. Spans have a parent link and start and end time.
+The trace viewer can inspect the run. The SDK warns that generation and
+function spans can contain sensitive input and output data. <a
+href="https://openai.github.io/openai-agents-python/tracing/">Tracing</a>
+and <a
+href="https://openai.github.io/openai-agents-python/ref/tracing/create/">trace
+and span creation</a> describe this model.</p>
+<p><strong>Observed user flow.</strong> A developer runs an agent that
+searches, calls a tool, hands work to a second agent, and returns an
+answer. They open the trace viewer. They select the failing tool span,
+read its parameters and error, then select the parent agent span to see
+the broader run. They use the group ID to find related traces from the
+same conversation.</p>
+<p><strong>Strength.</strong> It defines a small, general execution
+structure. Parent links give a reliable way to show nested work.
+Grouping connects related attempts without falsely making them one
+run.</p>
+<p><strong>Limit.</strong> It is an SDK-level trace model. It leaves
+object identity, durable event history, and the user interface of a
+workspace to the host application.</p>
+<p><strong>Inference for loci.</strong> A loci flow may use a
+trace-shaped internal record. The user should see only useful levels at
+first. Group related retries under a hypothesis or flow, but preserve a
+separate event for every record change.</p>
+<h3 id="arize-phoenix">Arize Phoenix</h3>
+<div class="product-profile">
+<p><strong>What it does.</strong> Arize Phoenix is an observability tool for LLM applications.</p>
+<p><strong>Target persona.</strong> ML and AI engineers who evaluate and debug production LLM systems.</p>
+<p><strong>Why provenance matters.</strong> They need to compare traces across runs and connect poor outputs to the spans that caused them.</p>
+</div>
+<p><strong>Observed model.</strong> Phoenix collects OpenTelemetry
+traces. A trace contains nested spans. Spans have timing and attributes.
+Phoenix identifies common LLM work as chain, retriever, reranker, LLM,
+embedding, agent, and tool spans. It can filter and query spans, join a
+span to its parent, and use span data for evaluations. <a
+href="https://arize.com/docs/phoenix/tracing/concepts-tracing/what-are-traces">Trace
+concepts</a> and <a
+href="https://arize.com/docs/phoenix/tracing/how-to-tracing/importing-and-exporting-traces/extract-data-from-spans">span
+queries</a> describe this use.</p>
+<p><strong>Observed user flow.</strong> A team sees an increase in bad
+answers. They filter traces by time and an evaluation result. They open
+a trace, select a retriever span, and compare its retrieved documents
+with the answer. They query span attributes to find other runs with the
+same model, tool, or failure pattern.</p>
+<p><strong>Strength.</strong> It supports both a single-run inspection
+and a search across many runs. The common span kinds give consistent
+labels.</p>
+<p><strong>Limit.</strong> It is built for development and operations. A
+person using loci needs a view grounded in their objects and questions,
+not an observability console.</p>
+<p><strong>Inference for loci.</strong> Add search and filters after the
+direct object path works. Useful filters include status, model or tool,
+source object, notebook, time, and hypothesis. The user should be able
+to find all failed runs that used a particular source without first
+understanding tracing.</p>
+<h2 id="cross-product-patterns">Cross-product patterns</h2>
+<h3 id="1-start-from-the-thing-the-user-already-sees">1. Start from the
+thing the user already sees</h3>
+<p>Hex starts from a notebook cell. Databricks starts from a table.
+Galaxy starts from a history item. LangSmith starts from a request
+trace. The user does not first choose a graph type.</p>
+<p><strong>Inference for loci.</strong> Every result, source, notebook
+cell, and agent output needs a visible “show provenance” action. It
+should open with that item selected.</p>
+<h3 id="2-use-a-compact-overview-and-a-detail-inspector">2. Use a
+compact overview and a detail inspector</h3>
+<p>Hex pairs a graph with a notebook. Seqera pairs a task list with task
+detail. LangSmith pairs a tree with a span inspector. These products do
+not ask one screen to show every fact.</p>
+<p><strong>Inference for loci.</strong> Put relation cues near objects.
+Put full evidence in a right-side inspector. Selecting any node, event,
+relation, or run should update that inspector. The inspector needs links
+to parent and child objects, not a dead end.</p>
+<h3 id="3-keep-status-visible">3. Keep status visible</h3>
+<p>Galaxy and Seqera show failed, running, and completed state in their
+primary lists. This lets a user decide where to look before reading
+logs.</p>
+<p><strong>Inference for loci.</strong> A failed flow must have a clear
+status label and an error summary. It must remain present after a
+successful retry. Do not replace a failed attempt with the later
+success.</p>
+<h3 id="4-make-direction-explicit">4. Make direction explicit</h3>
+<p>Databricks supports both upstream diagnosis and downstream impact.
+Hex labels ancestors and descendants through selection. Direction
+answers two different questions.</p>
+<div class="table-scroll" role="region" aria-label="Provenance directions" tabindex="0">
+<table>
+<thead>
+<tr>
+<th>User question</th>
+<th>Direction</th>
+<th>Useful words in loci</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>“Where did this result come from?”</td>
+<td>upstream</td>
+<td>uses, derived from, produced by</td>
+</tr>
+<tr>
+<td>“What will this change affect?”</td>
+<td>downstream</td>
+<td>used by, supports, feeds</td>
+</tr>
+<tr>
+<td>“What happened inside this run?”</td>
+<td>nested</td>
+<td>step of, called, handed off to</td>
+</tr>
+<tr>
+<td>“What else did I try?”</td>
+<td>related</td>
+<td>retry or branch (interface wording; design question)</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3 id="5-separate-a-durable-object-from-one-execution">5. Separate a
+durable object from one execution</h3>
+<p>Databricks links catalog objects and jobs. Galaxy links output
+datasets and the job that made them. LangSmith and the Agents SDK show
+the nested events inside one run. The products use different records
+because the questions differ.</p>
+<p><strong>Inference for loci.</strong> One table version is an object.
+One table write is an event. A current flow is an object, and its
+transitions are Record events. A notebook may link to the object and to
+the flow that made it. The UI must make those distinctions visible.</p>
+<h3 id="6-preserve-the-failed-path">6. Preserve the failed path</h3>
+<p>Seqera keeps failed tasks. Galaxy keeps failed history items. Trace
+systems retain errors inside a trace. DataLad records a non-zero exit
+value.</p>
+<p><strong>Inference for loci.</strong> A failure needs inputs,
+attempted action, error, stop time, and an optional human or agent note.
+A retry must point back to it. A later successful result must not make
+the older failure disappear.</p>
+<h3 id="7-allow-a-safe-return-but-say-what-returns">7. Allow a safe
+return, but say what returns</h3>
+<p>Observable and Deepnote show versions and safe restore paths. DataLad
+reruns recorded work. These actions have different meanings.</p>
+<p><strong>Inference for loci.</strong> Time travel restores the Record
+view only. Recall remains current. The screen needs an explicit notice:
+“You are viewing Record at event 184. Recall is current.” This prevents
+a user from treating current agent memory as evidence from the past.</p>
+<h2 id="proposed-user-flows-for-loci">Proposed user flows for loci</h2>
+<p>These flows use loci names from the current architecture. They are
+design examples, not API or screen requirements.</p>
+<h3 id="flow-a-result-to-source">Flow A: result to source</h3>
+<p><strong>Goal:</strong> explain a chart or conclusion without making
+the user read a whole notebook.</p>
+<ol type="1">
+<li>The user opens a result object, such as a chart, table, or
+conclusion cell.</li>
+<li>The user selects <strong>Provenance</strong>.</li>
+<li>loci opens a right inspector with the result as the selected
+item.</li>
+<li>The inspector says: “Produced by the <code>scenario-summary</code>
+table write.”</li>
+<li>It lists direct inputs: a source table, a filter event, and the
+notebook cell that requested it.</li>
+<li>The user selects the source table.</li>
+<li>The map or breadcrumb shifts upstream. The inspector shows its
+source location, import event, schema, and table version handle.</li>
+<li>The user expands one more relation at a time until they reach the
+imported file or connected source.</li>
+</ol>
+<p><strong>Why this fits the research.</strong> It uses the Hex and
+Databricks direction pattern. It uses the Seqera and LangSmith inspector
+pattern. It does not force a large graph on a simple question.</p>
+<h3 id="flow-b-failed-attempt-while-testing-a-hypothesis">Flow B: failed
+attempt while testing a hypothesis</h3>
+<p><strong>Goal:</strong> retain useful negative work and make the next
+action informed.</p>
+<ol type="1">
+<li>A user asks the agent to test a hypothesis in a notebook.</li>
+<li>loci creates a flow object with the hypothesis, selected inputs, and
+start time.</li>
+<li>The agent query fails, times out, or returns evidence against the
+hypothesis.</li>
+<li>loci records a transition as a Record event. <strong>Failed</strong>
+is execution state. “Did not support the hypothesis” is a conclusion
+from a completed flow, not a flow state.</li>
+<li>The notebook shows a compact attempt card with status, one-line
+reason, and time.</li>
+<li>The user opens the card. The inspector shows inputs, prompt or
+query, tool or model, trace steps, error or evidence, and produced
+objects if any.</li>
+<li>The user selects <strong>Try again from this attempt</strong> or
+<strong>Start a different approach</strong>.</li>
+<li>The new flow remains linked through the current Record relations or
+interface wording. The old attempt remains visible.</li>
+</ol>
+<p><strong>Why this fits the research.</strong> It applies Galaxy and
+Seqera status visibility. It applies LangSmith-style nested detail only
+when the user requests it. It prevents a success from erasing the
+history of a failed test.</p>
+<h3 id="flow-c-retry-or-branch">Flow C: retry or branch</h3>
+<p><strong>Goal:</strong> distinguish a correction from a different line
+of inquiry.</p>
+<ol type="1">
+<li>The user opens a failed flow or a result they want to
+challenge.</li>
+<li>loci presents two actions: <strong>Retry with changes</strong> and
+<strong>Branch from here</strong>.</li>
+<li>Retry copies the selected inputs and declares the prior flow as its
+predecessor.</li>
+<li>Branch starts from the selected Record event or notebook cell and
+asks for a new purpose.</li>
+<li>The provenance map shows a short fork marker rather than duplicating
+all shared parents.</li>
+<li>The inspector states the relation in interface wording: “This flow
+retries <code>flow-31</code> with a new threshold” or “This notebook was
+spawned from <code>Taiwan scenario analysis</code> at event 184.”</li>
+<li>Shared inputs appear once. Each branch shows its own outputs and
+execution status. Each notebook opens current Recall through the current
+lineage rules.</li>
+</ol>
+<p><strong>Why this fits the research.</strong> It combines Observable
+forks with the trace group idea from the Agents SDK. It avoids the false
+claim that two flows are the same execution.</p>
+<h3 id="flow-d-compare-runs">Flow D: compare runs</h3>
+<p><strong>Goal:</strong> answer why two attempts produced different
+results.</p>
+<ol type="1">
+<li>The user selects two flow cards, two table versions, or two notebook
+results.</li>
+<li>loci opens <strong>Compare</strong> in the inspector.</li>
+<li>The top line states the shared parent, if there is one.</li>
+<li>A compact difference list shows changed inputs, prompt or query,
+model or tool, parameters, source versions, duration, status, and output
+handles.</li>
+<li>The user selects a row, such as “source table version”.</li>
+<li>loci shows the two source records and their upstream
+difference.</li>
+<li>If outputs are tables, loci offers the existing table view for a
+data comparison. It does not pretend a sampled preview is the full table
+answer.</li>
+<li>The user can save a short notebook note that explains the comparison
+conclusion.</li>
+</ol>
+<p><strong>Why this fits the research.</strong> Seqera supports
+task-level evidence. DataLad shows that a repeat needs declared inputs
+and outputs. Phoenix shows that span attributes become useful for
+comparison only after they are recorded consistently.</p>
+<h3 id="flow-e-time-travel-with-current-recall">Flow E: time travel with
+current Recall</h3>
+<p><strong>Goal:</strong> inspect a past record without making Recall
+look historical.</p>
+<ol type="1">
+<li>The user opens a notebook or object and selects <strong>View at
+event</strong>.</li>
+<li>loci shows an event slider or ordered event list.</li>
+<li>The user chooses event 184.</li>
+<li>loci folds Record through event 184 and molds the historical
+notebook or object view.</li>
+<li>A persistent banner says: “Record at event 184. Recall is
+current.”</li>
+<li>The inspector separates <strong>Record evidence at event
+184</strong> and <strong>Current Recall</strong>.</li>
+<li>A fact written after event 184 carries its current timestamp. It
+does not appear as an old record change.</li>
+<li>The user selects <strong>Return to present</strong>. No Recall data
+changes.</li>
+</ol>
+<p><strong>Why this fits the research.</strong> Deepnote and Observable
+show the value of past views and safe returns. loci differs because
+Record and Recall have separate rules. The UI has to teach this at the
+moment it matters.</p>
+<h2 id="a-small-ui-vocabulary-for-later-mockups">A small UI vocabulary
+for later mockups</h2>
+<p>This is a proposed vocabulary. It is not a new storage model. Labels
+below are ordinary interface descriptions or design examples, not
+current fields unless the current relation name is shown.</p>
+<div class="table-scroll" role="region" aria-label="Proposed UI vocabulary" tabindex="0">
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>What it represents</th>
+<th>First detail to show</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Object</td>
+<td>notebook, cell, table version, document, or result</td>
+<td>title, type, current state</td>
+</tr>
+<tr>
+<td>Event</td>
+<td>one Record change or <code>:tx</code></td>
+<td>action, time, actor, affected objects</td>
+</tr>
+<tr>
+<td>Flow</td>
+<td>one agent or user execution</td>
+<td>status, purpose, start/end time, outputs</td>
+</tr>
+<tr>
+<td>Step</td>
+<td>part of a flow</td>
+<td>tool/model, input summary, output summary, error</td>
+</tr>
+<tr>
+<td>Relation</td>
+<td>a typed link between two items</td>
+<td>plain language label and direction</td>
+</tr>
+<tr>
+<td>Recall fact</td>
+<td>agent-written memory</td>
+<td>fact text, subject, confidence/rank, current time</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The first mockup should use only a few relation labels. Current
+relation names include <code>:spawned-by</code>,
+<code>:merged-from</code>, and <code>:from</code>; the UI may show
+ordinary descriptions such as “spawned from”.</p>
+<ul>
+<li><code>uses</code></li>
+<li><code>produced by</code></li>
+<li><code>derived from</code></li>
+<li><code>spawned from</code></li>
+<li><code>retry of</code> (design example; not a current field)</li>
+<li><code>branch from</code> (design example; not a current field)</li>
+<li><code>tests hypothesis</code> (design example; not a current
+field)</li>
+<li><code>supports</code> (design example; not a current field)</li>
+</ul>
+<p>Avoid a generic “related to” edge when a known relation exists. It
+hides the reason for the link.</p>
+<h2 id="design-limits-and-open-questions">Design limits and open
+questions</h2>
+<ul>
+<li>Which relations are already available from notebook references,
+<code>:spawned-by</code>, <code>:merged-from</code>, and
+<code>:from</code>?</li>
+<li>Which flow facts already exist in <code>loci.server</code>,
+<code>loci.agent</code>, and the event log?</li>
+<li>How should the flow object and its Record events appear
+together?</li>
+<li>Which errors and prompts can the app keep locally without exposing
+secret values?</li>
+<li>How should a relation appear when its parent object no longer has a
+present-day view?</li>
+<li>Does a user need a named hypothesis object, or is a notebook cell
+enough for the first version?</li>
+<li>Which comparison is meaningful for documents, tables, and agent
+answers respectively?</li>
+</ul>
+<p>No answer is assumed here. Read the existing specs and source before
+making a design decision.</p>
+<h2 id="source-index">Source index</h2>
+<p>All links below are official product documentation, except the Galaxy
+training material, which is from the Galaxy Training Network.</p>
+<ul>
+<li><a
+href="https://learn.hex.tech/docs/explore-data/projects/project-execution/graph-view">Hex
+Graph view</a></li>
+<li><a
+href="https://observablehq.com/documentation/notebooks/">Observable
+notebooks and history</a></li>
+<li><a
+href="https://observablehq.com/documentation/debugging/minimap">Observable
+Minimap</a></li>
+<li><a href="https://deepnote.com/docs/execution-modes">Deepnote
+execution modes</a></li>
+<li><a href="https://deepnote.com/docs/history">Deepnote version
+history</a></li>
+<li><a
+href="https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-lineage">Databricks
+Unity Catalog lineage</a></li>
+<li><a
+href="https://training.galaxyproject.org/training-material/topics/galaxy-interface/tutorials/history/tutorial.html">Galaxy
+history tutorial</a></li>
+<li><a
+href="https://docs.galaxyproject.org/en/latest/lib/galaxy.webapps.galaxy.api.html#galaxy.webapps.galaxy.api.provenance">Galaxy
+provenance API</a></li>
+<li><a
+href="https://docs.seqera.io/platform-cloud/monitoring/run-details">Seqera
+run details</a></li>
+<li><a
+href="https://docs.seqera.io/platform-cloud/data/data-lineage">Seqera
+data lineage</a></li>
+<li><a
+href="https://docs.datalad.org/en/latest/design/provenance_capture.html">DataLad
+provenance capture</a></li>
+<li><a
+href="https://docs.datalad.org/en/latest/generated/man/datalad-rerun.html">DataLad
+rerun</a></li>
+<li><a href="https://docs.langchain.com/langsmith/view-traces">LangSmith
+trace view</a></li>
+<li><a
+href="https://docs.langchain.com/langsmith/run-data-format">LangSmith
+trace data</a></li>
+<li><a
+href="https://openai.github.io/openai-agents-python/tracing/">OpenAI
+Agents SDK tracing</a></li>
+<li><a
+href="https://openai.github.io/openai-agents-python/ref/tracing/create/">OpenAI
+Agents SDK trace and span creation</a></li>
+<li><a
+href="https://arize.com/docs/phoenix/tracing/concepts-tracing/what-are-traces">Arize
+Phoenix trace concepts</a></li>
+<li><a
+href="https://arize.com/docs/phoenix/tracing/how-to-tracing/importing-and-exporting-traces/extract-data-from-spans">Arize
+Phoenix span queries</a></li>
+</ul>
+</main>
+</body>
+</html>
