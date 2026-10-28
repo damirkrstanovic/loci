@@ -2848,6 +2848,9 @@ let leapQ=null;         // the query `leapEntries` is the answer to
 let leapEntries=[];     // the lexical rows, as /api/leap returned them
 let leapDeep=null;      // {q, rows} — the `by meaning` rows and their query
 let deepTimer=null;
+let leapGeneration=0;
+let deepInFlight=null;
+const deepStatus=label=>({id:"__deep__",label,group:DEEP_GROUP,note:true});
 
 // `by meaning` sits after the lexical content and before the view verbs, which
 // is where a ?deep=1 response itself puts it: it is content, and the verbs stay
@@ -2869,11 +2872,11 @@ function withDeep(entries){
 const rowKey=r=>r?r.group+' '+r.id+' '+(r.label||''):null;
 
 async function renderLeap(){
-  const qv=q.value.trim();
+  const qv=q.value.trim(), generation=leapGeneration;
   const entries=await API.leap(qv);
-  if(q.value.trim()!==qv) return;   // a later keystroke has already asked; this answer is behind the box
+  if(generation!==leapGeneration || q.value.trim()!==qv) return;   // a later keystroke has already asked; this answer is behind the box
   leapQ=qv; leapEntries=entries;
-  composeLeap(false);
+  composeLeap(true);
 }
 
 // Fired on the pause and on Enter, never on a keystroke.
@@ -2883,18 +2886,34 @@ function scheduleDeep(){
 }
 async function deepen(qv){
   clearTimeout(deepTimer);
-  // "" has no meaning to search by, and the past is not what a present-tense
-  // vector answers about — the server refuses the first, and this refuses both.
   if(!qv||TIME) return;
-  let entries; try{ entries=await API.leapDeep(qv); }catch(err){ return; }  // an extra: a failure leaves the list alone
-  if(!Array.isArray(entries)) return;                                       // nor does an error body become a row
-  // Two checks, and neither is spare. This one drops an answer the box has
-  // already moved past, so a slow one cannot displace the fresh one in hand;
-  // the stash below is keyed by its query, so rows are only ever drawn beside
-  // the lexical list they belong to. A test covers each.
-  if(q.value.trim()!==qv) return;
-  leapDeep={q:qv, rows:entries.filter(e=>e.group===DEEP_GROUP)};
+  const generation=leapGeneration;
+  if(deepInFlight===generation) return;
+  deepInFlight=generation;
+  leapDeep={q:qv,rows:[deepStatus('Searching by meaning…')]};
   if(leapQ===qv) composeLeap(true);
+  let rows;
+  try {
+    const entries=await API.leapDeep(qv);
+    if(!Array.isArray(entries)) throw new Error('invalid response');
+    rows=entries.filter(e=>e.group===DEEP_GROUP);
+  } catch(err) {
+    rows=[deepStatus('Search by meaning is unavailable. Try again.')];
+  }
+  if(generation!==leapGeneration || q.value.trim()!==qv || TIME) return;
+  deepInFlight=null;
+  leapDeep={q:qv,rows};
+  if(leapQ===qv) composeLeap(true);
+}
+
+function beginLeapQuery(){
+  leapGeneration++;
+  deepInFlight=null;
+  const qv=q.value.trim();
+  leapQ=qv;
+  leapEntries=[];
+  leapDeep=qv&&!TIME?{q:qv,rows:[deepStatus('Searching by meaning…')]}:null;
+  composeLeap(false);
 }
 
 // keepSel: hold the cursor on the row it was on. A merge happens while you are
@@ -3923,10 +3942,10 @@ function openLeap(){ cmd.classList.add('live'); renderLeap(); }
 // a closed palette is owed nothing: cancel the pending deep query and forget
 // the rows it fetched, so re-opening starts from the lexical list again
 function closeLeap(){ cmd.classList.remove('live'); q.value=''; q.blur();
-  clearTimeout(deepTimer); leapDeep=null; }
+  clearTimeout(deepTimer); leapGeneration++; deepInFlight=null; leapDeep=null; }
 q.addEventListener('focus',()=>{ if(TIME){ q.blur(); showToast('time mode — ↩ now to search'); return; } openLeap(); });
 // the lexical request goes out on the key; the deep one only if the keys stop
-q.addEventListener('input',()=>{sel=0;renderLeap();scheduleDeep();});
+q.addEventListener('input',()=>{sel=0;beginLeapQuery();renderLeap();scheduleDeep();});
 q.addEventListener('keydown',e=>{
   if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,filtered.length-1);paintSel();}
   else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paintSel();}
@@ -3949,7 +3968,7 @@ q.addEventListener('keydown',e=>{
   else if(e.key==='Enter'){e.preventDefault();
     const r=filtered[sel];
     if(r&&r.note) deepen(q.value.trim()); else act();}
-  else if(e.key==='Escape'){ if(q.value){q.value='';renderLeap();} else {closeLeap(); if(mode==='focus') overview();} }
+  else if(e.key==='Escape'){ if(q.value){q.value='';clearTimeout(deepTimer);beginLeapQuery();renderLeap();} else {closeLeap(); if(mode==='focus') overview();} }
 });
 addEventListener('keydown',e=>{
   if(modal.classList.contains('on')){ if(e.key==='Escape') closeModal(); return; }

@@ -11,15 +11,20 @@ let server, browser;
 before(async () => { server = await startServer(); browser = await launchBrowser(); });
 after(async () => { await browser?.close(); await server?.stop(); });
 
-// Every keystroke fires its own renderLeap, and each awaits the network — the
-// list one keystroke behind is a real state to read. The Ask entry carries the
-// query verbatim in either mode, so it is the marker for "what is on screen
-// belongs to the last keystroke".
+// The Ask row appears immediately. Wait for the lexical response and its render
+// before checking the filter count or the height of the results list.
 const leapTo = async (page, text) => {
   await page.click('#q');
+  const lexical = page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === '/api/leap' && url.searchParams.get('q') === text &&
+      !url.searchParams.has('deep') && response.request().method() === 'GET';
+  });
   await page.locator('#q').pressSequentially(text, { delay: 25 });
-  await page.waitForFunction(t => [...document.querySelectorAll('#results .res .title')]
-    .some(el => el.textContent.includes('Ask the agent: “' + t + '”')), text);
+  const entries = await (await lexical).json();
+  assert.ok(entries.length > 0, `the fixture returned no lexical entries for “${text}”`);
+  await page.waitForFunction(({text, entries}) => leapQ === text &&
+    JSON.stringify(leapEntries) === JSON.stringify(entries), {text, entries});
 };
 
 const filterRow = (page) => page.locator('#results .res').filter({ hasText: 'Filter the overview' });

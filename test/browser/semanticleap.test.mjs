@@ -131,8 +131,8 @@ test('the lexical list is on screen while the deep request is still out, and one
       const l = await listing(page);
       assert.ok(l.some(x => x.row === 'LEX-A planets'),
         `the lexical rows are not drawn while the deep request is out: ${JSON.stringify(l)}`);
-      assert.equal(await hasByMeaning(page), false,
-        'a By meaning group appeared before any deep response arrived');
+      assert.ok(l.some(x => x.row === 'Searching by meaning…'),
+        'the pending search is not visible');
 
       // the deep request must have been fired ONCE, after the keys stopped —
       // not once per keystroke, which is exactly what the 250 ms pause is for
@@ -156,7 +156,7 @@ test('the by-meaning group merges in after the pause and the earlier results are
     await leapTo(page, 'planets');
     await until(() => seen.deep.length > 0, 'the deep request to be fired');
 
-    const before = await listing(page);
+    const before = (await listing(page)).filter(x => x.group !== 'By meaning' && x.row !== 'Searching by meaning…');
     assert.ok(!before.some(x => x.row && x.row.startsWith('DEEP-')), 'the gate did not hold');
 
     // record every state the list passes through: a "merge" that empties the
@@ -169,8 +169,8 @@ test('the by-meaning group merges in after the pause and the earlier results are
     });
 
     g.open();
-    await page.waitForFunction(() => [...document.querySelectorAll('#results .group')]
-      .some(x => x.textContent === 'By meaning'));
+    await page.waitForFunction(() => [...document.querySelectorAll('#results .res .title')]
+      .some(x => x.textContent === 'DEEP-SPACE planets'));
 
     const after = await listing(page);
     // the deep rows arrived...
@@ -269,9 +269,8 @@ test('a stale deep answer does not displace the fresh one already in hand', asyn
       });
 
       const rows = await rowTexts(page);
-      assert.ok(rows.includes('DEEP-SPACE alphabet'),
-        'the semantic hits for the current query are gone — a stale answer overwrote the ' +
-        `fresh one the shell had already fetched: ${JSON.stringify(rows)}`);
+      assert.ok(rows.includes('Searching by meaning…'),
+        `the new search should show pending status: ${JSON.stringify(rows)}`);
       assert.ok(!rows.includes('DEEP-SPACE alpha'),
         `the stale answer is being shown under the wrong query: ${JSON.stringify(rows)}`);
     } finally { slow.open(); never.open(); }
@@ -285,7 +284,7 @@ test('a deep response carrying no semantic rows leaves exactly the lexical list'
     const seen = await stubLeap(page, { deepRows: () => [] });
     await bootedShell(page, server.url);
     await leapTo(page, 'planets');
-    const before = await listing(page);
+    const before = (await listing(page)).filter(x => x.group !== 'By meaning' && x.row !== 'Searching by meaning…');
 
     await until(() => seen.done.length > 0, 'the deep response to be delivered');
     await settle(page);
@@ -449,5 +448,101 @@ test('Enter on a row that acts activates it and asks nothing by meaning', async 
       'the palette. Acting closes the palette, which empties the box, so that answer is ' +
       'dropped by the staleness check in deepen() — the request is an embedding round trip ' +
       'and a full re-chunk spent on a response that is thrown away.');
+  });
+});
+
+test('pending search appears before lexical response and Enter does not duplicate it', async () => {
+  await withPage(browser, 'leap-pending', async page => {
+    await bootedShell(page, server.url);
+    const lex = gate(), deep = gate();
+    let deepCount = 0;
+    await page.route(u => u.pathname === '/api/leap', async route => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('q') !== 'slow') return route.fulfill({ json: [VERB] });
+      if (url.searchParams.get('deep') === '1') { deepCount++; await deep.wait(); }
+      else await lex.wait();
+      await route.fulfill({ json: [VERB] });
+    });
+    try {
+      await page.locator('#q').click();
+      await page.locator('#q').fill('slow');
+      await until(async () => (await rowTexts(page)).includes('Searching by meaning…'), 'pending search');
+      await selectRow(page, 'Searching by meaning…');
+      await page.locator('#q').press('Enter');
+      await until(() => deepCount === 1, 'deep request');
+      await page.locator('#q').press('Enter');
+      await settle(page);
+      assert.equal(deepCount, 1);
+      lex.open(); deep.open();
+      await until(async () => !(await rowTexts(page)).includes('Searching by meaning…'), 'pending clear');
+    } finally { lex.open(); deep.open(); }
+  });
+});
+
+test('an old response cannot replace a later search for the same text', async () => {
+  await withPage(browser, 'leap-repeat-query', async page => {
+    const first = gate();
+    let count = 0;
+    await page.route(u => u.pathname === '/api/leap', async route => {
+      const url = new URL(route.request().url()), text = url.searchParams.get('q');
+      if (url.searchParams.get('deep') !== '1') return route.fulfill({json: [...content(text), VERB]});
+      const n = text === 'alpha' ? ++count : 0;
+      if (n === 1) await first.wait();
+      await route.fulfill({json: [{id:'tbl:planets', group:'by meaning', label:n === 1 ? 'OLD' : 'NEW'}]});
+    });
+    await bootedShell(page, server.url);
+    try {
+      await page.locator('#q').click();
+      await page.locator('#q').fill('alpha');
+      await until(() => count === 1, 'first alpha request');
+      await page.locator('#q').fill('beta');
+      await page.locator('#q').fill('alpha');
+      await until(() => count === 2, 'second alpha request');
+      await until(async () => (await rowTexts(page)).includes('NEW'), 'second alpha result');
+      first.open();
+      await settle(page);
+      assert.ok(!(await rowTexts(page)).includes('OLD'));
+    } finally { first.open(); }
+  });
+});
+
+test('a failed deep request shows an error and leaves lexical results', async () => {
+  await withPage(browser, 'leap-deep-error', async page => {
+    await page.route(u => u.pathname === '/api/leap', async route => {
+      const url = new URL(route.request().url()), text = url.searchParams.get('q');
+      if (url.searchParams.get('deep') === '1') return route.abort();
+      await route.fulfill({json: [...content(text), VERB]});
+    });
+    await bootedShell(page, server.url);
+    await leapTo(page, 'alpha');
+    await until(async () => (await rowTexts(page)).includes('Search by meaning is unavailable. Try again.'), 'error');
+    assert.ok((await rowTexts(page)).includes('LEX-A alpha'));
+  });
+});
+
+test('a delayed lexical response keeps the pending row selected', async () => {
+  await withPage(browser, 'leap-pending-selection', async page => {
+    const lex = gate(), deep = gate();
+    let deepCount = 0;
+    await page.route(u => u.pathname === '/api/leap', async route => {
+      const url = new URL(route.request().url()), text = url.searchParams.get('q');
+      if (text !== 'slow') return route.fulfill({json: [VERB]});
+      if (url.searchParams.get('deep') === '1') { deepCount++; await deep.wait(); }
+      else await lex.wait();
+      await route.fulfill({json: [...content(text), VERB]});
+    });
+    await bootedShell(page, server.url);
+    try {
+      await page.locator('#q').click();
+      await page.locator('#q').fill('slow');
+      await until(async () => (await rowTexts(page)).includes('Searching by meaning…'), 'pending search');
+      await selectRow(page, 'Searching by meaning…');
+      lex.open();
+      await until(async () => (await rowTexts(page)).includes('LEX-A slow'), 'lexical response');
+      assert.equal(await page.locator('#results .res.sel .title').textContent(), 'Searching by meaning…');
+      await page.locator('#q').press('Enter');
+      await until(() => deepCount === 1, 'deep request');
+      assert.equal(await page.locator('#q').inputValue(), 'slow');
+    } finally { lex.open(); deep.open(); }
   });
 });

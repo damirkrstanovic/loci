@@ -25,6 +25,7 @@
             [loci.mold :as mold]
             [loci.notebook :as nb]
             [loci.sandbox :as sbx]
+            [loci.semantic-cache :as semantic-cache]
             [loci.source :as src]
             [loci.substrate :as sub]
             [loci.tablestore :as tbl]
@@ -762,19 +763,16 @@
                     {:seen (conj seen (:object c)) :out (conj out c)}))
                 {:seen #{} :out []} chunks)))
 
+(defonce ^:private deep-vector-cache (atom nil))
+(defonce ^:private deep-pending-cache (atom nil))
+
 (defn- deep-entries
   "The `by meaning` group: the query embedded once, scored by exact cosine
    against every embedded chunk, best first, one row per object.
 
-   **Exact cosine, no index.** 101 chunks over the EDN rollback and ~150–170 over
-   the live corpus, where chunking per heading gives more than the design's
-   projected 94. Measured 2026-08-08 at 1024 dims: 0.028 ms per cosine, 2.8 ms
-   for 101 of them, 5.8 ms for the whole scored-and-sorted scan, 7.8 ms at 202
-   chunks. The design's 0.61 ms does NOT reproduce against `embed/cosine` over
-   stored vectors — it is ten times that — and the conclusion is unchanged
-   anyway: the embedding round trip this scan waits on is 20–50 ms, so an ANN
-   index would shave single-digit milliseconds off a request that is already off
-   the keystroke path. Revisit past a few thousand chunks, not before.
+   Exact cosine scans every embedded chunk. Prepared double arrays avoid reading
+   boxed values for every query. The cache follows the chunk snapshot and model;
+   unchanged records retain their arrays across a chunk update.
 
    **No rerank.** It is a further 50–100 ms round trip on top of the embedding,
    and LEAP is a navigation gesture rather than a research answer.
@@ -804,16 +802,16 @@
 
       :else
       (let [model (:model r)          ; the CONFIGURED name, which is what sweep! stamped
-            qv    (first (:vectors r))
+            qv    (double-array (first (:vectors r)))
             objs  (sub/objects st)
-            hits  (->> (ch/embedded cs model)
+            hits  (->> (vals (semantic-cache/prepared deep-vector-cache cs model))
                        ;; `embedded` has already dropped retired chunks; this
                        ;; also drops a chunk whose object went away since the
                        ;; last sweep, which would otherwise open nothing.
-                       (keep (fn [c]
-                               (when-let [o (and (not (already (:object c)))
-                                                 (get objs (:object c)))]
-                                 (assoc c :score (embed/cosine qv (:vec c)) :obj o))))
+                       (keep (fn [{:keys [record array]}]
+                               (when-let [o (and (not (already (:object record)))
+                                                 (get objs (:object record)))]
+                                 (assoc record :score (semantic-cache/cosine qv array) :obj o))))
                        ;; Not a relevance threshold — one of those would need
                        ;; calibrating per model, which is why loci.memory refuses
                        ;; to merge on an uncalibrated one. Cosine ≤ 0 is the
@@ -834,58 +832,10 @@
                                   :kind    (name (:kind o))
                                   :score   (:score c)
                                   :touched (touched (:object c) 0)}))))
-            ;; Against the substrate, not the file, so a chunks.edn that was
-            ;; never built reports every chunk it implies rather than "0 awaiting"
-            ;; over an empty group. ~170 on the live corpus before a first sweep.
-            ;;
-            ;; It re-chunks and re-hashes the whole substrate to answer. A
-            ;; lake-backed table no longer costs a row read for that:
-            ;; `all-chunks` builds its synopsis from `tbl/column-samples`, which
-            ;; the lake answers with one `SELECT DISTINCT … LIMIT 3` per column
-            ;; and memoizes per `[lake version from cols per-col]` — see
-            ;; `lake/sample-cache`. A `:lake` handle is immutable and its FROM
-            ;; text already names its snapshot, so each one is queried once in
-            ;; the life of the process.
-            ;;
-            ;; A passthrough `:source` handle is NOT once per process. Its key
-            ;; carries the handle's `:at`, so a `refresh!` mints a fresh entry:
-            ;; once per refresh rather than once per handle. And a miss costs
-            ;; more there — the FROM text is `read_csv(…)` over the file itself,
-            ;; so every one of those per-column queries re-parses it.
-            ;;
-            ;; Re-measured 2026-08-16 over the live corpus, 154 objects / 306
-            ;; chunks / 31 row-bearing tables. Interleaved after 30 warmup
-            ;; rounds, median of 15 — an un-warmed first call reads 150-250 ms
-            ;; and will mislead whoever measures this next:
-            ;;
-            ;;   14.8 ms  chunking and hashing alone, samples already in hand
-            ;;   15.2 ms  every table handle-backed, cache warm ← what a sweep pays
-            ;;   25.7 ms  the same tables inline
-            ;;   1061 ms  every table handle-backed, cache cold (fresh lake, median of 5)
-            ;;
-            ;; Warm is within a millisecond of pure chunking — the lake work
-            ;; disappears — and beats the inline path, which still walks 3,957
-            ;; rows in Clojure to sample them. Cold is 169 queries, one per
-            ;; column across the 31 tables, at 6.3 ms each; it is paid once per
-            ;; handle for the life of the process, where the hydrating version
-            ;; this replaced paid 297 ms on every 15-second sweep.
-            ;;
-            ;; The SHAPE of the cost changed with it, and that is the part worth
-            ;; knowing. Each query is a full column scan, NOT bounded by
-            ;; `tbl/mold-cap` the way hydrating was, so a cold miss scales with
-            ;; the table rather than being capped: measured on one 10M-row table,
-            ;; 20 ms for a 7-distinct-value column against 399-423 ms for
-            ;; high-cardinality ones. The trade is an unbounded one-time cost for
-            ;; a bounded recurring one, and a description that covers the whole
-            ;; column instead of its first 2,000 rows.
-            ;;
-            ;; So it is still affordable HERE and nowhere else, and now for a
-            ;; sharper reason: warm it is ~1× the pure-chunking cost, but the
-            ;; first ?deep=1 after a restart — or after any write that mints a
-            ;; new handle — is ~70×. It is one of the reasons this function may
-            ;; only ever be reached by ?deep=1, and the reason a cheaper answer
-            ;; is an open question.
-            awaiting (count (ch/pending st cs model))]
+            ;; Record history and the chunk snapshot invalidate this count.
+            ;; A write during the computation makes the cache retry.
+            awaiting (semantic-cache/pending-count deep-pending-cache st (:!chunks cs) model
+                                                   #(sub/history st) #(count (ch/pending st cs model)))]
         (cond-> hits
           (pos? awaiting)
           (conj (deep-note (str awaiting " chunk(s) awaiting embedding") {:awaiting awaiting})))))))
